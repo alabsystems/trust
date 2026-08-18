@@ -73,8 +73,18 @@ cat > a1_never.rs <<'EOF'
 pub fn bad() -> u32 { identity(u32::MAX) }
 EOF
 
+# NOTE (2026-08-13): the `-Copt-level=0` row does NOT vary the opt level alone.
+# rustc infers `debug-assertions` from the opt level when the flag is absent --
+# ON at 0, OFF above (measured: `rustc -Copt-level=0` on a
+# `#[cfg(debug_assertions)] compile_error!` crate errors, `-Copt-level=3`
+# compiles). So that row moves two variables at once. The assertions here are
+# unaffected -- every row must REJECT, and they all do -- but the row on its own
+# is not the clean "opt level only" control the header claims. The fourth row
+# below isolates it; keeping both preserves coverage of the assertions-ON
+# configuration rather than trading one confound for another.
 echo "A1 — requires must be enforced at every optimization level:"
 expect_reject "-Copt-level=0"                      a1.rs -Copt-level=0
+expect_reject "-Copt-level=0 -Cdebug-assertions=off [ctl]" a1.rs -Copt-level=0 -Cdebug-assertions=off
 expect_reject "-Copt-level=1"                      a1.rs -Copt-level=1
 expect_reject "-Copt-level=3"                      a1.rs -Copt-level=3
 expect_reject "-Copt-level=3 -Zinline-mir=no  [ctl]" a1.rs -Copt-level=3 -Zinline-mir=no

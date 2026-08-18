@@ -976,7 +976,7 @@ mod tests {
     }
 
     fn taint_body(blocks: Vec<BasicBlock>, locals: Vec<LocalDecl>) -> VerifiableBody {
-        VerifiableBody { locals, blocks, arg_count: 0, return_ty: Ty::Unit }
+        VerifiableBody { locals, blocks, arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() }
     }
 
     // -------------------------------------------------------------------

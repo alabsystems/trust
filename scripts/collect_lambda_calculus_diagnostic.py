@@ -1920,7 +1920,6 @@ def collect(
         )
         expected_compiler_argv = [
             str(tools["trustc"]),
-            "-Ztrust-dump=mir-only:<dir>",
             f"-Ztrust-dump=mir-only:{generated / 'full'}",
             "-Ztrust-policy=advisory",
             "--edition",

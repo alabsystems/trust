@@ -106,7 +106,7 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 "add64".to_string(),
                 "i64::add64".to_string(),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t() },
+                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
             )
         }
         // ---- checked `a - b` / `a * b` : the MIR-faithful tuple idiom. ----
@@ -157,7 +157,7 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 nm.to_string(),
                 format!("i64::{nm}"),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t() },
+                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
             )
         }
         // ---- signed `a / b` : div-by-zero guard, i64::MIN/-1 guard, bare sdiv. ----
@@ -238,7 +238,7 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 "div64".to_string(),
                 "i64::div64".to_string(),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t() },
+                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
             )
         }
         // ---- `a << b` (i64): shift-amount-in-range guard, bare ishl. ----
@@ -289,7 +289,7 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 "shl64".to_string(),
                 "i64::shl64".to_string(),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t() },
+                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
             )
         }
     };
@@ -494,7 +494,10 @@ impl<'a> Executor<'a> {
             }
 
             if let Some((condition, target, _fallthrough)) = cond_branch {
-                let path_cond = condition_to_formula(&state, condition);
+                // A condition the machine model does not evaluate must REFUSE
+                // this replay, not become an `always taken` path condition.
+                let path_cond = condition_to_formula(&state, condition)
+                    .map_err(|er| ExecError::Unsupported(format!("condition at {pc:#x}: {er}")))?;
                 let target_pc = const_addr(&target)
                     .ok_or_else(|| ExecError::Unsupported(format!("indirect bcond at {pc:#x}")))?;
                 let fall_pc = pc + 4;

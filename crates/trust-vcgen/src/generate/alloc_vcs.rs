@@ -328,13 +328,300 @@ pub(super) fn is_collect_sink(callee: &str) -> bool {
     matches!(callee_tail(callee), "collect" | "from_iter")
 }
 
-/// Adaptors that preserve the source iterator's length, so the collected count
-/// equals the count of their own source (recurse through them).
-pub(super) fn is_len_preserving_adaptor(tail: &str) -> bool {
+// ======================================================================
+// The AUTHENTICATED-STD-END-TO-END identity for a bounded iterator chain
+// ======================================================================
+//
+// Everything in this section exists because of one measured false proof
+// (2026-08-16). The chain walk below GRANTS: reaching a std collection producer
+// through length-non-increasing adaptors makes `generate_unbounded_allocation_vcs`
+// `continue` past the collect, so the obligation is not weakened, it DISAPPEARS.
+// The old adaptor step tested the callee's LAST PATH SEGMENT and nothing else —
+// no crate named, no root anchored, no stamp consulted:
+//
+//     pub struct Endless { pub i: u64 }
+//     impl Iterator for Endless { fn next(&mut self) -> Option<u8> { … Some(0) } }
+//     pub struct Adapt;
+//     impl Adapt { pub fn map(s: core::slice::Iter<'_, u8>, _f: u8) -> Endless { … } }
+//     // consumer, an ORDINARY crate name — no impersonation, no `--crate-name` trick:
+//     pub fn boom(v: &Vec<u8>) -> Vec<u8> { mycrate::Adapt::map(v.iter(), 0).collect() }
+//
+// `mycrate::Adapt::map`'s tail is `map`, so the walk stepped through it to
+// argument 0, found the genuine `core::slice::<impl [u8]>::iter`, concluded
+// "bounded", and deleted the obligation — while `Endless::next` never returns
+// `None`, so `boom` allocates without bound in every execution.
+//
+// AUTHENTICATED IS NOT THE SAME PROPERTY AS BOUNDED. That sentence is the
+// 2026-08-17 (round 4) correction, and it is the reason the list below has four
+// entries instead of two. The walk's conclusion is `count <= source.len()`, a
+// BOUNDEDNESS claim; provenance authentication — however perfect — cannot carry
+// it. MEASURED refutation, `fixtures/refute3-rangefrom/`: an impersonating crate
+// declares
+//
+//     impl<'a, T> IntoIterator for &'a Vec<T> {
+//         type IntoIter = core::ops::RangeFrom<u64>;          // GENUINE `core`
+//         fn into_iter(self) -> …  { core::ops::RangeFrom { start: 0 } }
+//     }
+//
+// `RangeFrom` is real `core`, is correctly NOT stamped, and never returns `None`.
+// Both provenance halves read `true` and the obligation was deleted: consumer
+// exit 0 with ZERO diagnostics on `stage2 (0a3cd0152)`, against exit 1 / 49
+// diagnostic lines for the byte-identical aux renamed `mycrate`.
+//
+// FOUR conditions, each closing something none of the others does:
+//
+//   * the CALLEE path of every step (leaf producer and adaptor alike) must be an
+//     authenticated sysroot spelling. This is what refuses `mycrate::Adapt::map`
+//     and the crate-free module names (`hash_map::`, `::str::`) — and, via the
+//     `__trust_crate@` stamp, what refuses a crate built `--crate-name alloc`.
+//     Each side anchors the HALF of a qualified `<Self as Trait>::m` spelling
+//     that its own claim is about: an ADAPTOR's claim is about the trait method
+//     (`vc_callee_is_std_iter_trait_method` anchors the TRAIT path), a leaf
+//     PRODUCER's claim is "at most the receiver collection's length"
+//     (`producer_receiver_path` anchors the SELF type). Anchoring the raw
+//     qualified string instead refuses both — `.into_iter()` is always that
+//     spelling — which is the over-decline the 2026-08-17 repair removed.
+//   * the RECEIVER of a leaf producer must authenticate as a sysroot collection
+//     BY ITS OWN `Ty`, not only by the crate name rendered into the callee string
+//     ([`producer_receiver_value_is_authenticated_sysroot`]). The string half is
+//     not sufficient: the extractor's stamp is keyed on the callee's DEFINING
+//     crate, so an impersonator's crate name appearing only as the qualified SELF
+//     TYPE of a real-`core` trait method is never stamped, and
+//     `producer_receiver_path` then reads `std::` straight out of the forgery.
+//     The receiver OPERAND's type is stamped (it is an ADT name), which is why
+//     this conjunct closes the class the string cannot.
+//   * the VALUE at every step must have an authenticated sysroot ITERATOR type,
+//     read from the MIR local's `Ty` (the compiler's own rendering of the type
+//     whose `next` will actually run). This is what refuses a std-rooted callee
+//     that RETURNS a user iterator — e.g. the generic spelling
+//     `core::iter::traits::collect::IntoIterator::into_iter::<mycrate::Endless>`,
+//     whose root anchors perfectly and whose `next` is arbitrary user code.
+//   * the VALUE at every step must not be a KNOWN-UNBOUNDED sysroot iterator
+//     ([`ty_is_unbounded_sysroot_iterator`]) — the boundedness half. It does NOT
+//     survive a total failure of provenance authentication: it is a deny-list of
+//     sysroot names, so a marker the extractor never renders is not seen (below).
+//
+// No pair of these is a substitute for another. The extractor stamps callee paths
+// AND `Ty::Adt` names (both renderers, since 2026-08-17) but stamps neither when
+// the impersonator's name reaches the string as somebody else's generic argument;
+// the type of a value says nothing about which crate's function produced it; and
+// a genuine sysroot type says nothing at all about how many elements it yields.
+
+/// Adaptors that preserve the source iterator's length EXACTLY, so the collected
+/// count equals the count of their own source (recurse through them).
+///
+/// GRANTING — takes the `callee`, not only its tail, ON PURPOSE. The bare
+/// `is_len_preserving_adaptor(tail)` this replaces was consumed at two sites and
+/// authenticated nothing at either; giving the predicate no tail-only spelling is
+/// what stops the next caller from re-opening the hole. [`vc_callee_is_std_iter_trait_method`]
+/// is the shared iterator-protocol authenticator already used by the yield-fact
+/// lane: it accepts both spellings the extractor produces for a std `Iterator`
+/// method — the generic `std::iter::Iterator::map` and the qualified
+/// `<core::slice::iter::Iter<'_, T> as core::iter::traits::iterator::Iterator>::cloned::<'_, T>`
+/// (both spellings measured in the real dump corpus) — and refuses a trait path
+/// that is not `core::iter::`/`std::iter::`-rooted.
+pub(super) fn is_authenticated_std_len_preserving_adaptor(callee: &str, tail: &str) -> bool {
     matches!(
         tail,
         "map" | "filter_map" | "inspect" | "enumerate" | "copied" | "cloned" | "rev" | "by_ref"
-    )
+    ) && vc_callee_is_std_iter_trait_method(callee, "Iterator", tail)
+}
+
+/// Adaptors that yield AT MOST the source iterator's length — the exactly-length
+/// -preserving set plus the ones that drop elements. Sound for the bounded-source
+/// walk (`<= source.len()` is all it needs) but NOT for count reconstruction,
+/// which is why [`is_authenticated_std_len_preserving_adaptor`] stays separate.
+///
+/// GRANTING, and authenticated for the same reason. `Option::map`/`Option::filter`
+/// (measured in the corpus as `std::option::Option::<T>::map`) used to satisfy the
+/// old tail-only test; they are refused here, at no cost — `Option` is not an
+/// `Iterator`, so no `Option::map` result can reach a `collect` sink.
+pub(super) fn is_authenticated_std_len_nonincreasing_adaptor(callee: &str, tail: &str) -> bool {
+    is_authenticated_std_len_preserving_adaptor(callee, tail)
+        || (matches!(tail, "filter" | "take" | "skip" | "step_by" | "take_while")
+            && vc_callee_is_std_iter_trait_method(callee, "Iterator", tail))
+}
+
+/// An authenticated FREE function in std's iterator module (`core::iter::repeat_n`),
+/// as opposed to an `Iterator` trait method. Anchored to the `core::iter::`/
+/// `std::iter::` module root after generic stripping, so `mycrate::iter::repeat_n`
+/// and `mycrate::repeat_n` fail closed.
+pub(super) fn is_authenticated_std_iter_free_fn(callee: &str, name: &str) -> bool {
+    if callee.contains(" as ") || callee.starts_with('<') {
+        return false;
+    }
+    let normalized = vc_strip_generics(callee);
+    (normalized.starts_with("core::iter::") || normalized.starts_with("std::iter::"))
+        && normalized.strip_suffix(name).is_some_and(|head| head.ends_with("::"))
+}
+
+/// The VALUE-side half of the identity: `ty` is an authenticated sysroot
+/// ITERATOR-carrying type, i.e. the `next` that will run is std's own code.
+///
+/// A `Ty::Ref` is transparent (`Iterator::by_ref` hands out `&mut I`, and a
+/// reference's iterator identity is its pointee's). Everything else that is not a
+/// root-authenticated ADT fails closed — a user ADT, a type parameter, a
+/// `Ty::Unsupported`, a bare integer placeholder.
+///
+/// This is deliberately a ROOT test and not a closed list of std iterator ADTs:
+/// the closed list would have to be maintained against every std release, and it
+/// buys nothing against the only forgery a root test misses (a crate built
+/// `--crate-name core` can name its struct `core::iter::adapters::map::Map` just
+/// as easily as `core::Whatever`). That forgery is closed on the CALLEE side, by
+/// the stamp; see the module note above.
+///
+/// PROVENANCE ONLY, and the name says so: a `true` here means "std's own `next`
+/// runs", never "the iterator is finite". `core::ops::range::RangeFrom` passes
+/// this test and yields forever. The boundedness question is
+/// [`ty_is_unbounded_sysroot_iterator`]'s, and the walk asks BOTH.
+pub(super) fn ty_is_authenticated_std_iterator(ty: &Ty) -> bool {
+    match ty {
+        Ty::Ref { inner, .. } => ty_is_authenticated_std_iterator(inner),
+        Ty::Adt { name, .. } => trust_types::path_root_is_authenticated_sysroot_crate(name),
+        _ => false,
+    }
+}
+
+/// The sysroot iterator ADTs that are GENUINELY UNBOUNDED — a `Some` here is a
+/// refusal, so the set is a DENY-list and every entry is a fact about std, not
+/// about provenance.
+///
+/// Two anchored families, and the anchoring is the same shape both lanes already
+/// use so they cannot drift:
+///
+///  * the RANGE family, read through [`range_family_adt_name`]. This is the exact
+///    COMPLEMENT of [`iter_collect_count`]'s bounded pair: that function counts
+///    `Range` and `RangeInclusive` and refuses the rest of the family (its doc
+///    records `RangeFrom` by name — *"it is unbounded, has no `end` field"*).
+///    Writing the complement rather than a second literal list is what stops the
+///    two lanes from disagreeing about which ranges are finite the next time the
+///    family grows.
+///  * `core::iter::`/`std::iter::`-rooted sources and adaptors that yield forever
+///    on their own account, enumerated from this tree's `library/core/src/iter/
+///    sources/` (`repeat`, `repeat_with`, `successors`, `from_fn`,
+///    `from_coroutine`) plus the one adaptor that manufactures infinity from a
+///    finite source, `adapters::cycle::Cycle`. The other `sources` siblings are
+///    deliberately absent because they are finite by construction and refusing
+///    them would be an over-decline: `Empty` (0), `Once`/`OnceWith` (1), and
+///    `RepeatN` (`n`, and no arm of the bounded-source walk produces one).
+///
+/// Matched on the LAST SEGMENT of the path HEAD — everything before the first
+/// `<` — under a `core::iter::` / `std::iter::` root, so both spellings the
+/// extractor emits are covered (the defining-module
+/// `core::iter::sources::repeat::Repeat` and the re-export `core::iter::Repeat`)
+/// while a user `mycrate::iter::Repeat` is not.
+///
+/// The head, and not [`vc_strip_generics`], for a MEASURED reason: that helper
+/// counts `<`/`>` and a function-pointer argument contains a bare `>` in its
+/// `->`, so `RepeatWith<fn() -> u8>` normalizes to `…::RepeatWith u8` and the
+/// last segment stops matching. A REFUSING predicate that silently stops
+/// refusing is the worst failure direction available, so this one does not
+/// depend on balanced-angle-bracket parsing at all. (The same mis-parse exists in
+/// `vc_strip_generics`' other callers; it is disclosed as a residual rather than
+/// repaired here, because those are GRANTING lanes where it fails closed.)
+pub(super) fn unbounded_sysroot_iterator_adt_name(name: &str) -> Option<&'static str> {
+    if let Some(family) = range_family_adt_name(name) {
+        return (!matches!(family, "Range" | "RangeInclusive")).then_some(family);
+    }
+    let head = name.split('<').next().unwrap_or(name).trim_end_matches("::");
+    if !(head.starts_with("core::iter::") || head.starts_with("std::iter::")) {
+        return None;
+    }
+    match head.rsplit("::").next()? {
+        "Repeat" => Some("Repeat"),
+        "RepeatWith" => Some("RepeatWith"),
+        "Successors" => Some("Successors"),
+        "FromFn" => Some("FromFn"),
+        "FromCoroutine" => Some("FromCoroutine"),
+        "Cycle" => Some("Cycle"),
+        _ => None,
+    }
+}
+
+/// The BOUNDEDNESS half of the value-side identity: `ty` is (or CONTAINS) a
+/// sysroot iterator that yields without end, so no walk may conclude
+/// `count <= source.len()` about it.
+///
+/// REFUSING, not granting — a `true` deletes a grant, so the failure direction is
+/// safe and the recursion may fail closed. It is a separate function from
+/// [`ty_is_authenticated_std_iterator`] on purpose: three rounds were spent
+/// perfecting provenance authentication, and the refutation that survived them
+/// defeated the value side with a GENUINE, correctly-unstamped `core` ADT. These
+/// are two different properties and the source now spells them separately.
+///
+/// THE FIELD WALK IS LOAD-BEARING, and measured. A name test alone reads
+/// `core::iter::adapters::map::Map` — bounded-sounding, `core`-rooted — for the
+/// value `Map<RangeFrom<u64>, fn(u64) -> u64>`, because
+/// [`vc_strip_generics`] drops exactly the argument that carries the infinity.
+/// The impersonator only has to write `type IntoIter = core::iter::Map<…>`, which
+/// MEASURABLY still deletes the unbounded-allocation row on the unpatched tree
+/// (`fixtures/unbounded-sysroot-iterator-2026-08-17/`). The compiler's own
+/// rendering of the local's type carries `Map`'s `iter` field, and that field IS
+/// the `RangeFrom`, so the answer is already in the bundle.
+///
+/// MEASURED FAIL-OPEN, do not read this as a closed refusal: the walk answers
+/// `false` (grant) for any rendering that is not `Ref`/`RawPtr`/`Adt`/`Tuple`.
+/// The extractor compacts a field subtree over 64 nodes into `Ty::Datatype` and
+/// an expanding same-ADT recursion into `Ty::Unsupported`, so a deny-listed
+/// marker nested deeply enough is ERASED before this sees it — measured with
+/// `Fuse<StepBy<Skip<Peekable<Enumerate<Cycle<Range<u64>>>>>>>`, where the
+/// `Cycle` disappears and an infinite `collect` yields zero rows. Closing it
+/// means reading the `Datatype` NAME (which `compact_oversized_field`
+/// preserves) and refusing an unrendered subtree under a `core::iter::` root —
+/// and it must be measured against the 209 of 2587 checked-in bundles that
+/// carry a marker, or it will over-decline.
+pub(super) fn ty_is_unbounded_sysroot_iterator(ty: &Ty) -> bool {
+    ty_is_unbounded_sysroot_iterator_rec(ty, 0)
+}
+
+fn ty_is_unbounded_sysroot_iterator_rec(ty: &Ty, depth: usize) -> bool {
+    if depth > TY_UNBOUNDED_SCAN_DEPTH {
+        return true;
+    }
+    match ty {
+        Ty::Ref { inner, .. } => ty_is_unbounded_sysroot_iterator_rec(inner, depth + 1),
+        Ty::RawPtr { pointee, .. } => ty_is_unbounded_sysroot_iterator_rec(pointee, depth + 1),
+        Ty::Adt { name, fields, .. } => {
+            unbounded_sysroot_iterator_adt_name(name).is_some()
+                || fields.iter().any(|(_, f)| ty_is_unbounded_sysroot_iterator_rec(f, depth + 1))
+        }
+        Ty::Tuple(elems) => {
+            elems.iter().any(|e| ty_is_unbounded_sysroot_iterator_rec(e, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+/// Field-nesting budget for [`ty_is_unbounded_sysroot_iterator`]. MEASURED: the
+/// deepest iterator value in the 2 572-bundle corpus is
+/// `alloc::vec::into_iter::IntoIter`, whose rendered field tree bottoms out at 6;
+/// 16 leaves room for a nested adaptor stack without ever making the budget
+/// itself the answer for a real iterator.
+const TY_UNBOUNDED_SCAN_DEPTH: usize = 16;
+
+/// [`ty_is_unbounded_sysroot_iterator`] for the type of the local an operand
+/// reads. `false` when there is no such local — this is the REFUSING side, so an
+/// unreadable value is handled by [`operand_is_authenticated_std_iterator_value`],
+/// which requires the same local and fails closed on its absence.
+pub(super) fn operand_is_unbounded_sysroot_iterator_value(
+    func: &VerifiableFunction,
+    op: &Operand,
+) -> bool {
+    operand_local(op)
+        .and_then(|local| crate::local_ty_ref(func, local))
+        .is_some_and(ty_is_unbounded_sysroot_iterator)
+}
+
+/// [`ty_is_authenticated_std_iterator`] for the type of the local an operand
+/// reads. `false` for anything without a single unprojected local — the same
+/// shape [`operand_local`] already requires of every step of the walk.
+pub(super) fn operand_is_authenticated_std_iterator_value(
+    func: &VerifiableFunction,
+    op: &Operand,
+) -> bool {
+    operand_local(op)
+        .and_then(|local| crate::local_ty_ref(func, local))
+        .is_some_and(ty_is_authenticated_std_iterator)
 }
 
 /// The (single, unprojected) local a value operand reads, if any.
@@ -368,11 +655,27 @@ pub(super) fn local_def(func: &VerifiableFunction, local: usize) -> Option<Local
 }
 
 /// Reconstruct the element count feeding a `collect`/`from_iter` sink when it is
-/// statically derivable: a `Range` aggregate (`a..b` ⇒ `b - a`, constant-folded
-/// so the ceiling skip still applies), optionally behind length-preserving
-/// adaptors (`map`/`filter_map`/…) or capped by `take(n)`. Returns `None` when the
-/// length is not recoverable — SOUND: emit no obligation rather than a false
-/// positive on every `collect` (which would break drop-in Rust compatibility).
+/// statically derivable: a `Range` aggregate (`a..b` ⇒ `b - a`) or a
+/// `RangeInclusive` one (`a..=b` ⇒ `b - a + 1`), constant-folded so the ceiling
+/// skip still applies, optionally behind length-preserving adaptors
+/// (`map`/`filter_map`/…) or capped by `take(n)`. Returns `None` when the length
+/// is not recoverable — SOUND: emit no obligation rather than a false positive on
+/// every `collect` (which would break drop-in Rust compatibility).
+///
+/// DIRECTION OF THE APPROXIMATION, for both range families. The formula is EXACT
+/// on a non-empty range. On an EMPTY one (`end < start` for `..`, `end + 1 <
+/// start` for `..=`) it goes non-positive while the true count is `0` — an
+/// under-count, but only in the region where both values are far below the
+/// ceiling, so the obligation `count < CEILING` is discharged for the same reason
+/// in both readings. A `RangeInclusive` whose `exhausted` flag is already `true`
+/// yields nothing while the formula still says `end - start + 1`: an OVER-count,
+/// which can only ADD an obligation. Neither direction can turn an unbounded
+/// allocation into a proof.
+///
+/// `RangeFrom` (`a..`) is deliberately absent from the aggregate arm: it is
+/// unbounded, has no `end` field, and must reach a `take(n)` before any count
+/// exists. The pre-2026-08-17 `name.contains("Range")` test matched it and then
+/// fell out through `ops.get(1)?`; the family-anchored match refuses it up front.
 pub(super) fn iter_collect_count(func: &VerifiableFunction, iter_op: &Operand) -> Option<Formula> {
     iter_collect_count_rec(func, iter_op, 0)
 }
@@ -387,30 +690,78 @@ pub(super) fn iter_collect_count_rec(
     }
     let local = operand_local(iter_op)?;
     match local_def(func, local)? {
+        // GRANTING: the count this returns becomes the obligation's own count, so
+        // an UNDER-count is a false proof (the solver discharges a ceiling the
+        // program does not respect). The old test was `name.contains("Range")`,
+        // which named no crate — a user `struct MyRange { a, b }` implementing an
+        // endless `Iterator` matched it — and which also swallowed
+        // `RangeInclusive` into the EXCLUSIVE arithmetic, under-counting it by one
+        // at the ceiling boundary. [`range_family_adt_name`] is the anchored
+        // range-family identity this crate already uses for the slice-index and
+        // yield-fact lanes (one authenticator, not a second spelling of it); the
+        // two families now get their own arithmetic instead of one being declined.
         LocalDef::Rvalue(Rvalue::Aggregate(AggregateKind::Adt { name, .. }, ops))
-            if name.contains("Range") =>
+            if matches!(range_family_adt_name(name), Some("Range" | "RangeInclusive")) =>
         {
-            // `a..b` ⇒ Aggregate(Range, [start, end]); count = end - start.
+            // `a..b`  ⇒ Aggregate(Range,          [start, end]);            count = end - start
+            // `a..=b` ⇒ Aggregate(RangeInclusive, [start, end, exhausted]); count = end - start + 1
+            //
+            // The RangeInclusive field list is MEASURED, not assumed: stock rustc
+            // (nightly-2026-04-20) renders `(0..=5)` as
+            // `RangeInclusive::<i32> { start: const 0_i32, end: const 5_i32,
+            // exhausted: const false }`. The arity is required exactly, so a future
+            // std layout change fails closed (no count ⇒ a visible Unknown row)
+            // instead of reading some other field as `end`.
+            let inclusive = range_family_adt_name(name) == Some("RangeInclusive");
+            if inclusive && ops.len() != 3 {
+                return None;
+            }
             let start = ops.first()?;
             let end = ops.get(1)?;
             let start_f = operand_to_formula(func, start);
             let end_f = operand_to_formula(func, end);
             match (&start_f, &end_f) {
-                (Formula::Int(s), Formula::Int(e)) => Some(Formula::Int(e - s)),
-                _ => Some(Formula::Sub(Box::new(end_f), Box::new(start_f))),
+                // CHECKED, both families: the previous `e - s` was a raw i128
+                // subtraction, so a `Range` whose endpoints straddle the i128
+                // extremes wrapped to a SMALL positive count — a count the ceiling
+                // skip then waved through. `None` here is the fail-closed answer
+                // (a visible `count-not-derivable` Unknown).
+                (Formula::Int(s), Formula::Int(e)) => {
+                    let span = e.checked_sub(*s)?;
+                    Some(Formula::Int(if inclusive { span.checked_add(1)? } else { span }))
+                }
+                _ => {
+                    let span = Formula::Sub(Box::new(end_f), Box::new(start_f));
+                    Some(if inclusive {
+                        Formula::Add(Box::new(span), Box::new(Formula::Int(1)))
+                    } else {
+                        span
+                    })
+                }
             }
         }
         // `let it = <iter>; it.collect()` — chase the move/copy alias.
         LocalDef::Rvalue(Rvalue::Use(inner)) => iter_collect_count_rec(func, inner, depth + 1),
+        // Every arm here is AUTHENTICATED on the callee, for the reason on the
+        // `Range` arm above: the count it returns is what the obligation is
+        // solved against, so `mycrate::Adapt::map(0..3, f)` returning an endless
+        // iterator used to buy the count `3`. The value-side identity is NOT
+        // needed in this function and is deliberately not applied: every arm below
+        // is sound for ANY receiver once its own callee is genuinely std's
+        // (`Iterator::take(it, n)` yields at most `n` whatever `it` is; a
+        // length-preserving hop just re-asks the question of argument 0), so
+        // requiring it here would decline counts without closing anything.
         LocalDef::Call { callee, args } => {
             let tail = callee_tail(callee);
-            if is_len_preserving_adaptor(tail) {
+            if is_authenticated_std_len_preserving_adaptor(callee, tail) {
                 // `src.map(f)` etc. — adaptor receiver is arg 0.
                 iter_collect_count_rec(func, args.first()?, depth + 1)
-            } else if tail == "take" {
+            } else if tail == "take"
+                && vc_callee_is_std_iter_trait_method(callee, "Iterator", "take")
+            {
                 // `src.take(n)` — at most `n` elements (receiver arg 0, n arg 1).
                 args.get(1).map(|n| operand_to_formula(func, n))
-            } else if tail == "repeat_n" {
+            } else if tail == "repeat_n" && is_authenticated_std_iter_free_fn(callee, "repeat_n") {
                 // `core::iter::repeat_n(x, n).collect()` — a free fn yielding EXACTLY
                 // `n` elements (element arg 0, count arg 1). The dominant constructor
                 // for a runtime-sized homogeneous Vec that is not `vec![x; n]`.
@@ -431,6 +782,18 @@ pub(super) fn iter_collect_count_rec(
 /// source collection (whose own allocation this pass already gated when it was
 /// built) — it is therefore bounded and introduces no NEW unbounded-allocation
 /// hazard. Conservative: any unrecognized step returns `false` (stays gated).
+///
+/// AUTHENTICATED STD END TO END. Every recursion of this function is one step of
+/// the chain, and it re-establishes BOTH halves of the identity described at
+/// [`is_authenticated_std_len_preserving_adaptor`]: the VALUE it is asked about
+/// must have an authenticated sysroot iterator type, and the CALLEE that produced
+/// that value must be an authenticated sysroot iterator adaptor or collection
+/// producer. Applying the value check HERE — at the single recursion entry rather
+/// than once at the sink — is what makes the property hold of every intermediate
+/// and not only of the collected operand: it is the collect's `Self` type at
+/// depth 0, the adaptor's receiver type at every deeper step, and (for a
+/// `FromIterator::from_iter` sink, whose `Self` is the CONTAINER and not the
+/// iterator) the only place the iterator's identity appears at all.
 pub(super) fn collect_source_is_bounded_std_collection(
     func: &VerifiableFunction,
     iter_op: &Operand,
@@ -442,6 +805,18 @@ pub(super) fn collect_source_is_bounded_std_collection(
     let Some(local) = operand_local(iter_op) else {
         return false;
     };
+    // The value-side PROVENANCE half. A user ADT anywhere in the chain fails
+    // closed here, whatever its producer's path spells — including a std-rooted
+    // producer path that RETURNS a user iterator.
+    if !operand_is_authenticated_std_iterator_value(func, iter_op) {
+        return false;
+    }
+    // The value-side BOUNDEDNESS half, and a DIFFERENT property from the line
+    // above: `core::ops::range::RangeFrom` is genuine, correctly unstamped `core`
+    // and still yields forever. See the module note.
+    if operand_is_unbounded_sysroot_iterator_value(func, iter_op) {
+        return false;
+    }
     match local_def(func, local) {
         // `let it = <iter>; it.collect()` — chase the move/copy alias.
         Some(LocalDef::Rvalue(Rvalue::Use(inner))) => {
@@ -449,15 +824,22 @@ pub(super) fn collect_source_is_bounded_std_collection(
         }
         Some(LocalDef::Call { callee, args }) => {
             let tail = callee_tail(callee);
-            if is_std_collection_iter_producer(callee, tail)
-                || is_str_view_iter_producer(callee, tail)
+            // The leaf grant — the one place this walk returns a bare grant of
+            // its own (every other `true` is a recursive answer). Both
+            // conjuncts are required: the callee-path predicates authenticate the
+            // receiver's crate as RENDERED, and
+            // `producer_receiver_value_is_authenticated_sysroot` authenticates the
+            // receiver OPERAND, which is where the stamp actually lands.
+            if (is_std_collection_iter_producer(callee, tail)
+                || is_str_view_iter_producer(callee, tail))
+                && producer_receiver_value_is_authenticated_sysroot(func, args)
             {
                 return true;
             }
             // `a.chain(b)` yields `a.len() + b.len()` — bounded iff BOTH sides are
             // bounded collection sources (the sum of two already-gated allocations
             // is itself bounded). Receiver is arg 0, the chained iterator arg 1.
-            if tail == "chain" {
+            if tail == "chain" && vc_callee_is_std_iter_trait_method(callee, "Iterator", "chain") {
                 return args
                     .first()
                     .is_some_and(|a| collect_source_is_bounded_std_collection(func, a, depth + 1))
@@ -467,12 +849,10 @@ pub(super) fn collect_source_is_bounded_std_collection(
             }
             // Walk back through length-NON-INCREASING adaptors (each yields
             // `<= source` elements), receiver is arg 0.
-            if is_len_preserving_adaptor(tail)
-                || matches!(tail, "filter" | "take" | "skip" | "step_by" | "take_while")
+            if is_authenticated_std_len_nonincreasing_adaptor(callee, tail)
+                && let Some(recv) = args.first()
             {
-                if let Some(recv) = args.first() {
-                    return collect_source_is_bounded_std_collection(func, recv, depth + 1);
-                }
+                return collect_source_is_bounded_std_collection(func, recv, depth + 1);
             }
             false
         }
@@ -480,12 +860,161 @@ pub(super) fn collect_source_is_bounded_std_collection(
     }
 }
 
+/// The RECEIVER path of a producer callee, normalized so its ROOT can be
+/// anchored and so the collection-module disjuncts below read the receiver's own
+/// path rather than a substring of some generic argument.
+///
+///  * `<alloc::vec::Vec<u8> as core::iter::…::IntoIterator>::into_iter` -> `alloc::vec::Vec`
+///  * `<&std::collections::hash::map::HashMap<K, V> as …>::into_iter` -> `std::collections::hash::map::HashMap`
+///  * `core::slice::<impl [u8]>::iter` -> `core::slice::iter`  (unqualified: the callee itself)
+///
+/// TWO normalizations, and each one is a measured defect on its own:
+///
+///  * **the qualified split.** The receiver of `.into_iter()` is spelled
+///    `<Self as Trait>::into_iter`, which starts with `<`. Anchoring THAT string
+///    refuses every `v.into_iter().collect()` in the language — the round-1 form
+///    of this fix did exactly that, and `<alloc::vec::Vec<u8> as
+///    core::iter::…::IntoIterator>::into_iter` went from a proved collect to an
+///    `UnsupportedMir{count-not-derivable}` Unknown.
+///  * **generic stripping.** The pre-2026-08-17 disjuncts scanned the WHOLE
+///    callee, so a substring in a GENERIC ARGUMENT bought the grant for a
+///    receiver that is not a collection at all. Measured on `main`:
+///    `<core::iter::adapters::chain::Chain<mycrate::Endless,
+///    core::slice::iter::Iter<'_, u8>> as core::iter::…::IntoIterator>::into_iter`
+///    is `true` there — a Chain over an endless user iterator, granted "bounded"
+///    because one of its type arguments mentions `core::slice::`. Reading the
+///    receiver's own path closes that; see the `deliberate narrowings` note in
+///    `authenticated_std_iter_chain_tests`.
+pub(super) fn producer_receiver_path(callee: &str) -> String {
+    let self_ty = vc_qualified_self_ty(callee).unwrap_or(callee);
+    vc_strip_generics(vc_peel_reference_prefixes(self_ty))
+}
+
+/// The producer/str-view anchor: the callee carries no unauthenticated-crate
+/// stamp ANYWHERE, and the ROOT of its RECEIVER is an authenticated sysroot
+/// crate.
+///
+/// The whole-string stamp scan and the receiver-root anchor are a conjunction
+/// and neither is redundant. The scan alone reads a stamp placed at the front as
+/// an ordinary path component (`__trust_crate@…::alloc::vec::Vec::<u8>::iter`
+/// contains `alloc::vec::`); the anchor alone would read the AUTHENTICATED root
+/// of a receiver whose generic argument came from an impersonator. Splitting the
+/// qualifier for the anchor does not weaken the scan, because the scan still
+/// runs on the untouched callee — a stamp in the trait half or in a generic
+/// argument is still fatal.
+pub(super) fn producer_receiver_is_authenticated_sysroot(callee: &str) -> bool {
+    !trust_types::path_has_unauthenticated_crate_stamp(callee)
+        && trust_types::path_root_is_authenticated_sysroot_crate(&producer_receiver_path(callee))
+}
+
+/// The receiver's provenance read from the RECEIVER OPERAND'S OWN `Ty` instead of
+/// from the rendered callee string — the second half of the producer anchor, and
+/// the half that closes what [`producer_receiver_is_authenticated_sysroot`]
+/// structurally cannot.
+///
+/// WHY A STRING IS NOT ENOUGH, measured. The extractor's `__trust_crate@` stamp is
+/// keyed on the DEFINING crate of the thing being rendered. For
+/// `<&std::vec::Vec<u8> as core::iter::traits::collect::IntoIterator>::into_iter`
+/// the impersonator's crate name is not the callee's defining crate — it is
+/// somebody else's qualified SELF TYPE — so no stamp is minted anywhere on that
+/// string, and [`producer_receiver_path`] reads `std::vec::Vec` off the forgery
+/// and authenticates it. The receiver OPERAND's type is an ADT NAME, which the
+/// type-name renderer DOES stamp, so asking the operand asks a source the
+/// impersonator does not control.
+///
+/// The accepted shapes are exactly the receiver shapes MEASURED at the ten
+/// bounded-source grant sites in the 2 572-bundle corpus, and nothing else:
+///
+///  * an ADT whose root is an authenticated sysroot crate (`alloc::vec::Vec`) —
+///    a stamped or user-rooted ADT is refused, which is the whole point;
+///  * a primitive sequence — `[T]`, `str`, `[T; N]` — reached through any number
+///    of `&`/`*` wrappers. Four of the six genuine grants are
+///    `core::slice::<impl [T]>::iter` on a `&[T]`, whose element type is
+///    sometimes `TyKind::Param` or a tuple, so the ELEMENT is deliberately not
+///    inspected. A primitive carries no crate to impersonate, coherence forbids a
+///    foreign `IntoIterator` impl on one, and the inherent impls that produce
+///    their iterators exist only in std — where an impersonating definer WOULD be
+///    stamped, because for an unqualified inherent path the defining crate is the
+///    impersonator itself.
+///
+/// Everything else — no receiver argument, a constant/symbolic receiver, a
+/// projection this cannot resolve, a `TyKind::Param` receiver — fails CLOSED.
+/// MEASURED cost of that: zero rows across the 2 572 real bundles and the 533
+/// `tests/ui/trust` bundles.
+pub(super) fn producer_receiver_value_is_authenticated_sysroot(
+    func: &VerifiableFunction,
+    args: &[Operand],
+) -> bool {
+    args.first()
+        .and_then(|recv| operand_place_ty(func, recv))
+        .is_some_and(ty_receiver_is_authenticated_sysroot)
+}
+
+/// See [`producer_receiver_value_is_authenticated_sysroot`]. GRANTING, so every
+/// unrecognized shape returns `false`.
+fn ty_receiver_is_authenticated_sysroot(ty: &Ty) -> bool {
+    match ty {
+        Ty::Ref { inner, .. } => ty_receiver_is_authenticated_sysroot(inner),
+        Ty::RawPtr { pointee, .. } => ty_receiver_is_authenticated_sysroot(pointee),
+        Ty::Adt { name, .. } => trust_types::path_root_is_authenticated_sysroot_crate(name),
+        Ty::Slice { .. } | Ty::Str | Ty::Array { .. } | Ty::SymArray { .. } => true,
+        _ => false,
+    }
+}
+
+/// The `Ty` an operand reads, resolving the place projections a receiver actually
+/// wears. `Deref` unwraps a reference/raw pointer and `Field(i)` selects a struct
+/// or tuple field, so `s.items.iter()` — which MIR lowers as a call on
+/// `Copy((_1.0))` — is answered instead of being declined. Any other projection
+/// (`Index`, `Downcast`, `Subslice`, …), a non-place operand, or a field index the
+/// rendered type does not carry returns `None`, and every caller treats `None` as
+/// a refusal.
+pub(super) fn operand_place_ty<'f>(func: &'f VerifiableFunction, op: &Operand) -> Option<&'f Ty> {
+    let place = match op {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        _ => return None,
+    };
+    let mut ty = crate::local_ty_ref(func, place.local)?;
+    for projection in &place.projections {
+        ty = match (projection, ty) {
+            (Projection::Deref, Ty::Ref { inner, .. }) => inner,
+            (Projection::Deref, Ty::RawPtr { pointee, .. }) => pointee,
+            (Projection::Field(i), Ty::Adt { fields, .. }) => &fields.get(*i)?.1,
+            (Projection::Field(i), Ty::Tuple(elems)) => elems.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(ty)
+}
+
 /// An iterator-producer method that yields at most the receiver collection's
-/// current length, matched by FULL callee path to a std collection so a custom
-/// `iter()` (which could be unbounded) is never mistaken for one. Generative
-/// producers (`Range`, `repeat`, `repeat_with`) are intentionally excluded.
+/// current length, matched by the RECEIVER's full path to a std collection so a
+/// custom `iter()` (which could be unbounded) is never mistaken for one.
+/// Generative producers (`Range`, `repeat`, `repeat_with`) are intentionally
+/// excluded.
+///
+/// GRANTING, so the receiver is authenticated first
+/// ([`producer_receiver_is_authenticated_sysroot`]). A `true` here can make
+/// [`collect_source_is_bounded_std_collection`] `continue` past the whole
+/// unbounded-allocation obligation — the collect is not weakened, it DISAPPEARS —
+/// on the strength of the claim "this iterator yields at most the receiver's
+/// current length". That claim is a theorem about std's collections only.
+///
+/// MEASURED false proof this closes: the old test was the unanchored
+/// `callee.contains("alloc::vec::")`, which is satisfied by
+/// `__trust_crate@1973d11b2baa21fa::alloc::vec::Vec::<u8>::iter` — the spelling the
+/// extractor emits once it has REFUSED to authenticate a crate built
+/// `--crate-name alloc` (fixture
+/// `fixtures/trusted-root-spoof-endless-iter-2026-08-16`). The producer's stamp was
+/// rendered inert here, so an impersonator's `Vec::iter` returning an endless
+/// iterator collected without an obligation. Both conditions in the helper are
+/// needed: the anchor rejects a stamp read past at the FRONT, the stamp scan
+/// rejects an unauthenticated component under a genuine root. The bare-module
+/// disjuncts below (`hash_map::`, `btree_set::`, …) name no crate at all and were
+/// forgeable by any user module of that name, stamp or not; the anchored
+/// receiver root now covers them too.
 pub(super) fn is_std_collection_iter_producer(callee: &str, tail: &str) -> bool {
-    matches!(
+    if !matches!(
         tail,
         "iter"
             | "iter_mut"
@@ -496,19 +1025,26 @@ pub(super) fn is_std_collection_iter_producer(callee: &str, tail: &str) -> bool 
             | "values_mut"
             | "into_keys"
             | "into_values"
-    ) && (callee.contains("alloc::vec::")
-        || callee.contains("std::vec::")
-        || callee.contains("alloc::slice::")
-        || callee.contains("core::slice::")
-        || callee.contains("std::collections::")
-        || callee.contains("alloc::collections::")
-        || callee.contains("hash_map::")
-        || callee.contains("hash_set::")
-        || callee.contains("btree_map::")
-        || callee.contains("btree_set::")
-        || callee.contains("vec_deque::")
-        || callee.contains("binary_heap::")
-        || callee.contains("linked_list::"))
+    ) {
+        return false;
+    }
+    if !producer_receiver_is_authenticated_sysroot(callee) {
+        return false;
+    }
+    let recv = producer_receiver_path(callee);
+    recv.contains("alloc::vec::")
+        || recv.contains("std::vec::")
+        || recv.contains("alloc::slice::")
+        || recv.contains("core::slice::")
+        || recv.contains("std::collections::")
+        || recv.contains("alloc::collections::")
+        || recv.contains("hash_map::")
+        || recv.contains("hash_set::")
+        || recv.contains("btree_map::")
+        || recv.contains("btree_set::")
+        || recv.contains("vec_deque::")
+        || recv.contains("binary_heap::")
+        || recv.contains("linked_list::")
 }
 
 /// A str-view iterator producer (`chars`/`char_indices`/`bytes`/`encode_utf16`) on
@@ -518,11 +1054,24 @@ pub(super) fn is_std_collection_iter_producer(callee: &str, tail: &str) -> bool 
 /// `String` is an already-materialized input, so collecting a non-amplifying view of
 /// it is linear-in-input — the SAME bounded-source invariant that already waves
 /// through `Vec::iter().map(..).collect()` (a stride blowup), only strictly weaker.
+///
+/// GRANTING, and receiver-authenticated for the same reason as
+/// [`is_std_collection_iter_producer`] — it feeds the same `continue`. Its
+/// `contains("::str::")` disjunct was the weakest matcher of the pair: it named no
+/// crate at all, so `mycrate::str::Endless::chars` matched. `<impl str>` receivers
+/// still authenticate because their genuine spelling is
+/// `core::str::<impl str>::chars`, which normalizes to `core::str::chars`
+/// (measured in the real dump corpus), and a `<alloc::string::String as …>::chars`
+/// qualified spelling normalizes to `alloc::string::String`.
 pub(super) fn is_str_view_iter_producer(callee: &str, tail: &str) -> bool {
-    matches!(tail, "chars" | "char_indices" | "bytes" | "encode_utf16")
-        && (callee.contains("::str::")
-            || callee.contains("alloc::string::")
-            || callee.contains("std::string::"))
+    if !matches!(tail, "chars" | "char_indices" | "bytes" | "encode_utf16") {
+        return false;
+    }
+    if !producer_receiver_is_authenticated_sysroot(callee) {
+        return false;
+    }
+    let recv = producer_receiver_path(callee);
+    recv.contains("::str::") || recv.contains("alloc::string::") || recv.contains("std::string::")
 }
 
 /// Summary-aware rvalue-safety generation: the array/slice INDEX-BOUNDS lane
@@ -743,6 +1292,40 @@ pub(super) fn v2_build_overflow_vc(
     // The checked op's overflow is asserted at the block's Assert terminator, so
     // conjoin whole-block defs (`stmt_index = None`).
     v2_build_overflow_vc_for_operands(func, block, op, lhs, rhs, span, None)
+}
+
+/// Whether the `Overflow(op)` assert guarding this block provably cannot fire.
+///
+/// WHY THIS EXISTS SEPARATELY from the builder. In the assert lane a builder that
+/// returns `None` means "could not analyse this", and the lane turns that into
+/// `RecognizedSafetyAssertProofGap` — a fail-closed runtime check. So an
+/// obligation that must not be minted at all has to be suppressed BEFORE the
+/// builder is called, exactly as Div/Rem do with
+/// `v2_assert_failure_is_known_false`. (`AssertMessage::BoundsCheck` used to be
+/// cited here too; it no longer suppresses anything — its literal in-range case
+/// mints a real, certifiable obligation. See the arm in `safety.rs`.)
+/// `Overflow` was the arm that had no such
+/// gate, which is why its provably-safe case could only be expressed as a
+/// constant-false formula that no downstream authority could ever discharge.
+///
+/// Operand recovery MIRRORS `v2_build_overflow_vc` above — the same
+/// `CheckedBinaryOp` scan of the same block — so this predicate answers for the
+/// same operands the builder would have used. The actual decision is delegated
+/// to `v2_signed_mul_provably_cannot_overflow`, which both share.
+pub(super) fn v2_overflow_assert_provably_cannot_fire(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    op: BinOp,
+) -> bool {
+    let Some((lhs, rhs)) = block.stmts.iter().find_map(|stmt| {
+        let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(stmt_op, l, r), .. } = stmt else {
+            return None;
+        };
+        if *stmt_op == op { Some((l, r)) } else { None }
+    }) else {
+        return false;
+    };
+    v2_signed_mul_provably_cannot_overflow(func, block, op, lhs, rhs, None)
 }
 
 /// Build an ArithmeticOverflow VC for `lhs OP rhs` (op in Add/Sub/Mul) from the

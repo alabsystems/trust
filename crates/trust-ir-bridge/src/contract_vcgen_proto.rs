@@ -350,6 +350,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts,
             preconditions: vec![],

@@ -6,7 +6,7 @@
 //@[slice_progress] build-pass
 //@[mutable_store] build-pass
 //@[mutation] check-fail
-//@[alias] check-fail
+//@[alias] build-pass
 //@ dont-check-compiler-stderr
 //! End-to-end E4 coverage for the deliberately narrow collection model. The
 //! immutable positive revisions bind source `xs.len()` and `xs[0]` to the same
@@ -14,9 +14,10 @@
 //! revision pins a supported fixed-array Store/Select transition; the mutation
 //! negative uses the same admitted shape with a genuinely false invariant. The
 //! progress revision pins the exact `usize` domain shared by a slice length,
-//! an index invariant, and an E5 distance measure. The alias negative keeps
-//! the Rust operation feasible while demonstrating that retained collection
-//! aliases still fail closed.
+//! an index invariant, and an E5 distance measure. The alias revision retains
+//! an exact immutable view across the loop and passes it to a safe Rust reader;
+//! shared scalar collections are Freeze, so that call cannot mutate the modeled
+//! sequence in a well-defined execution.
 
 #[cfg(slice)]
 pub fn read_slice(xs: &[u32], keep: bool) -> u32
@@ -78,13 +79,16 @@ fn observe_alias(xs: &[u32; 4]) -> u32 {
 }
 
 #[cfg(alias)]
-pub fn retain_alias(xs: &[u32; 4], keep: bool) -> u32 { //[alias]~ ERROR Trust Level 0 safety verification incomplete for
-    //[alias]~^ ERROR Trust strict verification failed for
+pub fn retain_alias(xs: &[u32; 4], keep: bool) -> u32 {
     let alias = xs;
-    let _n = xs.len();
-    let first = xs[0];
-    while keep invariant _n == xs.len() && first == xs[0] {}
-    observe_alias(alias)
+    let _n = alias.len();
+    let first = alias[0];
+    let mut observed = 0;
+    while keep invariant _n == alias.len() && first == alias[0] {
+        observed = alias[0];
+    }
+    let after = observe_alias(alias);
+    if observed == after { after } else { observed }
 }
 
 fn main() {}

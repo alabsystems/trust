@@ -1787,6 +1787,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: trust_types::Ty::unit_ty(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],

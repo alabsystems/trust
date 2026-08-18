@@ -628,6 +628,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let result = resolve_all_trait_calls(&resolver, &body);
@@ -656,6 +657,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let result = resolve_all_trait_calls(&resolver, &body);
@@ -684,6 +686,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let result = resolve_all_trait_calls(&resolver, &body);
@@ -713,6 +716,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let result = resolve_all_trait_calls(&resolver, &body);
@@ -987,6 +991,7 @@ mod tests {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let result = resolve_all_trait_calls(&resolver, &body);

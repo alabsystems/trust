@@ -4,6 +4,20 @@
 #   proved/*.rs  -> MUST verify (exit 0)
 #   mutant/*.rs  -> MUST be rejected by Trust verification (exit 1)
 #
+# POLICY (2026-08-04, task #37): every fixture runs under `-Ztrust-policy=certify`
+# — full static discharge, the release gate. The DEFAULT policy (policy B,
+# 1b920410d9) tolerates an undischarged obligation whose operation keeps its
+# runtime check, exiting 0; under that default the two shift-reduction mutants
+# scored `proved` and the gate reported them as false accepts when nothing false
+# was proved (see reports/2026-08-04-falsification-gate-first-end-to-end-run.md,
+# RETRACTION and its correction). The fixtures were written for full static
+# discharge (their comments' `-full` predates the flag-surface unification that
+# renamed it; `certify` is that policy today), so the gate must pin it
+# explicitly rather than inherit whatever the development default tolerates.
+# `classify_verdict` additionally refuses to read exit 0 as `proved` when the
+# report shows non-static rows — armor so a policy or flag drift turns into a
+# red row, never a false "SURVIVING/proved".
+#
 # Exit 1 is accepted for a mutant only when stderr contains an explicit Trust
 # verification-failure verdict. Argument errors, ordinary Rust errors, crashes,
 # timeouts, output-limit failures, and background descendants are tool failures,
@@ -326,10 +340,28 @@ contains_trust_incompleteness_verdict() {
 # report a green mutation score while catching nothing.
 #
 # Counterexample is checked FIRST because a real refutation prints the header too.
+# STATIC-INCOMPLETE ACCEPT: exit 0, but the compiler's own report says some
+# obligation was NOT statically proved (runtime-checked, unknown, or timed out
+# rows in a `Trust verification:` summary). Under `-Ztrust-policy=certify` this
+# cannot happen (certify exits nonzero for any undischarged row); the predicate
+# is fail-closed armor so that a future policy or flag drift can never again
+# turn "tolerated at runtime" into a `proved` gate row. A fixture with no
+# report line at all stays `proved` — the zero-obligation acceptance fixtures
+# (README, defined `as` casts) emit no headline by design.
+contains_incomplete_static_accept() {
+  local stderr_path=$1
+  LC_ALL=C grep -a 'Trust verification: [0-9]* proved,' "$stderr_path" \
+    | LC_ALL=C grep -Evq ', 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of'
+}
+
 classify_verdict() {
   local rc=$1 stderr_path=$2
   if ((rc == 0)); then
-    printf 'proved\n'
+    if contains_incomplete_static_accept "$stderr_path"; then
+      printf 'runtime-checked\n'
+    else
+      printf 'proved\n'
+    fi
     return 0
   fi
   if ((rc == 1)) && ! contains_tool_error "$stderr_path"; then
@@ -433,7 +465,7 @@ verify_fixture() {
   if run_bounded_process "$timeout" "$MAX_VERIFY_STREAM_BYTES" "$stdout_path" "$stderr_path" \
     env -i PATH="$CLEAN_PATH" HOME="$TMPDIR_GATE/home" TMPDIR="$TMPDIR_GATE/tmp" \
       LC_ALL=C LANG=C TZ=UTC "$trustc" --edition 2021 --crate-type lib --emit=metadata -Cpanic=abort \
-      "$fixture" -o "$artifact"; then
+      -Ztrust-policy=certify "$fixture" -o "$artifact"; then
     rc=0
   else
     rc=$?
@@ -586,6 +618,16 @@ main() {
         # the mutation. Counting this as a refutation is how a gate reports a mutation score
         # it has not earned.
         printf 'FAIL  mutant   %s  — UNCAUGHT MUTANT: verification was incomplete, not refuting\n' "$name"
+        failed=1
+        ;;
+      runtime-checked)
+        # Also not a pass, and worth its own message rather than the `*)` catch-all's
+        # "non-verdict tool result" — this IS a verdict. The compiler exited 0 under policy
+        # B while RETAINING the runtime check for an undischarged obligation, so the mutation
+        # was neither refuted nor proved: rustc will trap it at run time exactly as vanilla
+        # Rust would. Safe, but not a static catch, and the mutant lane measures static
+        # catches.
+        printf 'FAIL  mutant   %s  — UNCAUGHT MUTANT: obligation left runtime-checked, not refuting\n' "$name"
         failed=1
         ;;
       proved)

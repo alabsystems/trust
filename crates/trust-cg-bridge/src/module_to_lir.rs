@@ -247,6 +247,99 @@ pub enum ModuleLirError {
     UnsupportedAggregate { name: String, detail: String },
 }
 
+/// THE ONE INTEGER TYPE a FIELDLESS (C-like) enum's value occupies, or `None`
+/// when this type is not such an enum or the module does not carry enough to
+/// decide (fail-closed).
+///
+/// # Why this is exact, and not a guess about rustc's layout
+///
+/// A fieldless enum has no payload, so its VALUE *is* its discriminant tag —
+/// there is nothing else in it. What must be pinned is the tag's INTEGER TYPE,
+/// and that is not read off trust-ir's own canonical enum layout (which is
+/// deliberately not rustc's — see `trust_ir::EnumDef`'s doc). It is read off the
+/// producer's `EnumLayoutDescriptor`, which the F1 producer only ever fills from
+/// rustc's OWN layout query and only under a check that pins the two together:
+/// `trust_thir_lower::producer_enum_layout_descriptor` emits
+/// `EnumTagEncoding::Direct` **only** when `def.canonical_tag_repr()` equals
+/// `enum_tag_repr_of_scalar(rustc's tag scalar)`, and sets `size` to
+/// `l.size.bytes()` from that same rustc layout. So on the F1 path, for a
+/// `Direct`-encoded def, `canonical_tag_repr()` IS rustc's tag scalar type.
+///
+/// Everything else fails closed:
+///
+/// * a NICHE encoding — the value is not a plain tag there;
+/// * a payload-carrying variant — the value is not just the tag;
+/// * a def with fewer than 2 variants — 1 variant is a ZST and 0 is
+///   uninhabited; rustc gives both `PassMode::Ignore`, so neither is a register
+///   value and neither belongs in this fragment;
+/// * a missing layout descriptor, an unresolvable/duplicated discriminant set, a
+///   `#[repr]` hint too narrow for the values (all `None` from
+///   `canonical_tag_repr`), or a total size that is not exactly the tag's — the
+///   last one is what would betray a payload or padding this rule does not model.
+pub(crate) fn fieldless_enum_carrier(module: &Module, ty: &Ty) -> Option<Ty> {
+    let Ty::Enum(id) = ty else { return None };
+    let def = module.enums.get(id.as_usize())?;
+    if def.variants.len() < 2 || !def.variants.iter().all(|v| v.fields.is_empty()) {
+        return None;
+    }
+    let layout = def.layout.as_ref()?;
+    // A fieldless enum's tag sits at offset 0 and IS the whole value.
+    if !matches!(layout.encoding, trust_ir::EnumTagEncoding::Direct { tag_offset: 0 }) {
+        return None;
+    }
+    let repr = def.canonical_tag_repr()?;
+    let tag_bytes = match repr {
+        trust_ir::EnumTagRepr::U8 | trust_ir::EnumTagRepr::I8 => 1,
+        trust_ir::EnumTagRepr::U16 | trust_ir::EnumTagRepr::I16 => 2,
+        trust_ir::EnumTagRepr::U32 | trust_ir::EnumTagRepr::I32 => 4,
+        trust_ir::EnumTagRepr::U64 | trust_ir::EnumTagRepr::I64 => 8,
+    };
+    if layout.size != tag_bytes {
+        return None;
+    }
+    Some(repr.ty())
+}
+
+/// `true` when `disc` is one of `ty`'s DECLARED discriminants.
+///
+/// This is the value-validity half of the fieldless-enum admission. rustc's ABI
+/// marks such a value `NoUndef` with a validity range, and a returned tag that
+/// is not a declared discriminant would be an invalid value of the type — so the
+/// converter refuses to materialize one. Together with the fact that the only
+/// enum-typed sites this converter maps are `Inst::Const`, block parameters and
+/// the signature (every other instruction still fails closed on an enum type),
+/// this makes every enum-typed value in an admitted function either a caller's
+/// argument or a checked declared discriminant.
+pub(crate) fn fieldless_enum_has_discriminant(module: &Module, ty: &Ty, disc: i128) -> bool {
+    let Ty::Enum(id) = ty else { return false };
+    let Some(def) = module.enums.get(id.as_usize()) else { return false };
+    def.effective_discriminants().is_some_and(|d| d.contains(&disc))
+}
+
+/// Public re-export of the fieldless-enum carrier rule for offline census
+/// tooling. Same function, no second definition.
+pub fn fieldless_enum_carrier_pub(module: &Module, ty: &Ty) -> Option<Ty> {
+    fieldless_enum_carrier(module, ty)
+}
+
+/// [`map_scalar_int_ty`] plus the FIELDLESS-ENUM carrier.
+///
+/// Used at exactly the four sites an enum-typed value may legally appear in this
+/// fragment — the signature's parameters and return, block parameters, and
+/// `Inst::Const`. Every other use of an enum type still reaches the module-blind
+/// [`map_scalar_int_ty`] and fails closed there, which is what keeps enum values
+/// out of arithmetic, casts, comparisons and memory.
+fn map_scalar_int_ty_in(
+    module: &Module,
+    ty: &Ty,
+    context: &str,
+) -> Result<LirType, ModuleLirError> {
+    match fieldless_enum_carrier(module, ty) {
+        Some(carrier) => map_scalar_int_ty(&carrier, context),
+        None => map_scalar_int_ty(ty, context),
+    }
+}
+
 /// Map a scalar integer `trust_ir::Ty` to a LIR `Type`.
 ///
 /// FAIL-CLOSED: only the fixed-width integer types (and `Bool`, lowered to the
@@ -410,7 +503,36 @@ fn map_int_binop(op: BinOp, ty: &Ty, name: &str) -> Result<Opcode, ModuleLirErro
         | BinOp::FDiv
         | BinOp::FRem
         | BinOp::FMin
-        | BinOp::FMax => {
+        | BinOp::FMax
+        // Trust: the boolean-carrier LOGICAL connectives are REFUSED here, not
+        // mapped onto `Band`/`Bor`/`Bxor`. On a well-formed 0/1 carrier the two
+        // agree, but that premise is exactly what this converter cannot check
+        // locally — it sees a `BinOp` and a `Ty`, not the provenance that
+        // established the operands are 0/1. trust-ir introduced `BAnd`/`BOr`/
+        // `BXor` precisely BECAUSE `And`/`Or`/`Xor` overload bitwise and logical
+        // readings in a way the Lean semantics does not share (`semIntBinOp .And`
+        // is `Int.land` unconditionally), so silently collapsing them back onto
+        // the bitwise opcodes would re-create the ambiguity the split exists to
+        // remove — inside VERIFIED CODEGEN, where the cost is a wrong binary
+        // rather than a failed proof. A narrow enforced fragment refuses what it
+        // has not modelled; widening it is a deliberate, provable act.
+        | BinOp::BAnd
+        | BinOp::BOr
+        | BinOp::BXor => {
+            return Err(ModuleLirError::UnsupportedBinOp {
+                name: name.to_string(),
+                op: binop_name(op),
+            });
+        }
+        // Trust (#53): the BOOLEAN connectives (trust-ir 4b06918). This converter is
+        // `map_INT_binop` and its caller has already established an INTEGER type, so
+        // reaching here means a Bool-only opcode arrived on an integer operand --
+        // ill-typed IR that trust-ir's own validator rejects. Fail closed with the
+        // same UnsupportedBinOp the float ops take, rather than silently lowering to
+        // Band/Bor/Bxor: the bitwise instruction would be the RIGHT answer on the
+        // 0/1 Bool carrier and the WRONG one on the integer operand actually present,
+        // and this arm only sees the latter.
+        BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
             return Err(ModuleLirError::UnsupportedBinOp {
                 name: name.to_string(),
                 op: binop_name(op),
@@ -434,6 +556,9 @@ fn binop_name(op: BinOp) -> &'static str {
         BinOp::FMul => "fmul",
         BinOp::FDiv => "fdiv",
         BinOp::FRem => "frem",
+        BinOp::BAnd => "band",
+        BinOp::BOr => "bor",
+        BinOp::BXor => "bxor",
         BinOp::FMin => "fmin",
         BinOp::FMax => "fmax",
         BinOp::And => "and",
@@ -442,6 +567,12 @@ fn binop_name(op: BinOp) -> &'static str {
         BinOp::Shl => "shl",
         BinOp::LShr => "lshr",
         BinOp::AShr => "ashr",
+        // Trust: named so the refusal diagnostic distinguishes the logical
+        // connective from its bitwise namesake — `band` vs `and` is the whole
+        // point of the split.
+        BinOp::BAnd => "band",
+        BinOp::BOr => "bor",
+        BinOp::BXor => "bxor",
     }
 }
 
@@ -456,8 +587,9 @@ fn binop_name(op: BinOp) -> &'static str {
 ///     (`interpret::eval_int_unop`) are `!value.raw`; the AArch64 ISel lowers
 ///     `Bnot` to `MVN`/`ORN Xd, XZR, Xn` (`~x`), so the byte-level complement
 ///     follows the opcode exactly. `!a` here is the INTEGER bitwise complement;
-///     the producer routes `!bool` through `Select`, so an integer-only `UnOp`
-///     is complete.
+///     a scalar-`Bool` `!` is respelled `ICmp Eq(x, false)` by the producer
+///     (`trust-ir-bridge`'s `LoweringCtx::emit_unop`) and is refused outright
+///     below, so an integer-only `UnOp` is complete — CHECKED here, not assumed.
 ///   * `Neg -> Ineg` — two's-complement negation (`0 - x`). The trust-ir
 ///     semantics are `0u128.wrapping_sub(value.raw)` — WRAPPING, so at the value
 ///     level `Neg` never traps (`i32::MIN` negates to `i32::MIN`). The AArch64
@@ -475,6 +607,9 @@ fn binop_name(op: BinOp) -> &'static str {
 ///
 /// FAIL-CLOSED (the verified integer-unary ISel slice this bridge proves over is
 /// i8..i64 only):
+///   * a scalar `Bool` carrier — `Bnot` on the byte-wide bool carrier computes
+///     `0xFE` for `!true`, and `Ineg` on a bool has no meaning; the sibling
+///     proof-of-output lane already refuses it, so this lane must too.
 ///   * 128-bit `Not`/`Neg` — the AArch64 ISel routes i128 unary through a
 ///     register-pair sequence (`select_int_unaryop`'s I128 arm), outside this
 ///     bridge's proven single-instruction envelope, so they fail closed.
@@ -486,6 +621,26 @@ fn binop_name(op: BinOp) -> &'static str {
 fn map_int_unop(op: UnOp, ty: &Ty, name: &str) -> Result<Opcode, ModuleLirError> {
     let opcode = match op {
         UnOp::Not | UnOp::Neg => {
+            // FAIL CLOSED on a scalar `Bool` carrier. `map_scalar_int_ty` maps
+            // `Ty::Bool` to the byte-wide `I8` LIR carrier, so a bool `!` would have
+            // emitted `Bnot`/`MVN` — the BITWISE complement of a 0/1 byte
+            // (`!true -> 0xFE`), not `!b` — and a bool `-` `Ineg`/`NEG`, which has no
+            // meaning at all. The doc above asserts "the producer routes `!bool`
+            // through `Select`, so an integer-only `UnOp` is complete"; that premise
+            // was stated but never CHECKED, and the trust-ir producer did emit
+            // `UnOp { op: Not, ty: Bool }` until `LoweringCtx::emit_unop` respelled it.
+            // Check it here so the two lanes agree: the sibling proof-of-output lane
+            // already refuses this exact shape ("UnOp on a bool carrier is not
+            // modeled (fail-closed)", `verify_output_trust_ir`), and a code generator
+            // that emits what its own verifier declines to model is a hole. Nothing
+            // sound is lost: no producer in the tree emits it, and `Bnot` on a bool
+            // carrier does not compute `!b` under any reading.
+            if matches!(ty, Ty::Bool) {
+                return Err(ModuleLirError::UnsupportedUnOp {
+                    name: name.to_string(),
+                    op: unop_name(op),
+                });
+            }
             // The single-instruction integer-unary envelope is i8..i64; i128
             // negate/complement are register-pair (outside the proven envelope).
             if matches!(map_scalar_int_ty(ty, "unary operand")?, LirType::I128) {
@@ -1158,9 +1313,9 @@ fn lower_trust_ir_function_to_lir_impl(
 
     let mut params = Vec::with_capacity(func_ty.params.len());
     for p in &func_ty.params {
-        params.push(map_scalar_int_ty(p, "function parameter")?);
+        params.push(map_scalar_int_ty_in(module, p, "function parameter")?);
     }
-    let return_ty = map_scalar_int_ty(&func_ty.returns[0], "function return")?;
+    let return_ty = map_scalar_int_ty_in(module, &func_ty.returns[0], "function return")?;
     let signature = Signature { params, returns: vec![return_ty] };
 
     // --- Body: one OR MORE basic blocks with SSA block-param merges. ---
@@ -1202,7 +1357,7 @@ fn lower_trust_ir_function_to_lir_impl(
         });
     }
     for ((param_id, param_ty), sig_ty) in entry_block.params.iter().zip(&func_ty.params) {
-        let lir_ty = map_scalar_int_ty(param_ty, "entry block param")?;
+        let lir_ty = map_scalar_int_ty_in(module, param_ty, "entry block param")?;
         if param_ty != sig_ty {
             return Err(ModuleLirError::UnsupportedSignature {
                 name: name.clone(),
@@ -1222,7 +1377,7 @@ fn lower_trust_ir_function_to_lir_impl(
         let block = blocks_by_id[&bid];
         if bid != function.entry.index() {
             for (param_id, param_ty) in &block.params {
-                let lir_ty = map_scalar_int_ty(param_ty, "block param")?;
+                let lir_ty = map_scalar_int_ty_in(module, param_ty, "block param")?;
                 let v = vmap.define(*param_id);
                 value_types.insert(v, lir_ty);
             }
@@ -1396,7 +1551,7 @@ fn lower_trust_ir_function_to_lir_impl(
                         .iter()
                         .map(|(pid, pty)| {
                             let v = vmap.resolve(*pid, name)?;
-                            let lty = map_scalar_int_ty(pty, "block param")?;
+                            let lty = map_scalar_int_ty_in(module, pty, "block param")?;
                             Ok((v, lty))
                         })
                         .collect::<Result<_, ModuleLirError>>()?
@@ -1465,7 +1620,7 @@ fn lower_trust_ir_function_to_lir_impl(
                 .iter()
                 .map(|(pid, pty)| {
                     let v = vmap.resolve(*pid, name)?;
-                    let lty = map_scalar_int_ty(pty, "block param")?;
+                    let lty = map_scalar_int_ty_in(module, pty, "block param")?;
                     Ok((v, lty))
                 })
                 .collect::<Result<_, ModuleLirError>>()?
@@ -3018,10 +3173,30 @@ fn lower_value_inst(
         }
         Inst::Const { ty, value } => {
             let result = expect_single_result(node, name)?;
-            let lir_ty = map_scalar_int_ty(ty, "Const")?;
+            let lir_ty = map_scalar_int_ty_in(module, ty, "Const")?;
             let imm = match value {
                 Constant::Int(v) => i128_to_i64(*v, name)?,
                 Constant::Bool(b) => i64::from(*b),
+                // A FIELDLESS-ENUM literal. The producer spells it as the
+                // canonical `(Ty::Enum, Aggregate([Int(disc), fields...]))` seed
+                // whose field 0 is the DISCRIMINANT typed at the def's canonical
+                // tag repr (`trust_thir_lower`'s enum registration contract). For
+                // a fieldless def there are no further fields, so the whole value
+                // is that one tag — and it must be a DECLARED discriminant, or
+                // this constant would materialize an invalid value of the type.
+                Constant::Aggregate(fields)
+                    if fields.len() == 1
+                        && fieldless_enum_carrier(module, ty).is_some()
+                        && matches!(fields[0], Constant::Int(d)
+                            if fieldless_enum_has_discriminant(module, ty, d)) =>
+                {
+                    let Constant::Int(d) = fields[0] else {
+                        return Err(ModuleLirError::UnsupportedConstant {
+                            name: name.to_string(),
+                        });
+                    };
+                    i128_to_i64(d, name)?
+                }
                 _ => return Err(ModuleLirError::UnsupportedConstant { name: name.to_string() }),
             };
             let dst = vmap.resolve(result, name)?;
@@ -5133,7 +5308,7 @@ mod tests {
     use trust_ir::Block;
     use trust_ir::inst::ICmpOp;
     use trust_ir::node::InstrNode;
-    use trust_ir::ty::FuncTy;
+    use trust_ir::ty::{EnumTagRepr, FuncTy};
     use trust_ir::value::{BlockId, FuncId, FuncTyId};
 
     use super::*;
@@ -5560,6 +5735,35 @@ mod tests {
         assert!(matches!(block.instructions[1].opcode, Opcode::Ineg));
         assert!(matches!(block.instructions[2].opcode, Opcode::Return));
         assert!(lir.stack_slots.is_empty(), "integer unary must materialize no memory");
+    }
+
+    #[test]
+    fn fail_closed_on_scalar_bool_unary() {
+        // A scalar-`Bool` `UnOp` must be REFUSED, not mapped. `map_scalar_int_ty`
+        // maps `Ty::Bool` to the byte-wide `I8` carrier, so before this refusal a
+        // bool `!` became `Bnot`/`MVN` — the bitwise complement of a 0/1 byte
+        // (`!true -> 0xFE`), a silent MISCOMPILE of `!b`. The producer respells a
+        // bool `!` as `ICmp Eq(x, false)` (`trust-ir-bridge`'s
+        // `LoweringCtx::emit_unop`) and the sibling proof-of-output lane already
+        // declines this shape ("UnOp on a bool carrier is not modeled"), so this
+        // lane must decline it too rather than emit bytes its own verifier will
+        // not model. BOTH ops are covered: `Ineg` on a bool is meaningless as well.
+        for op in [UnOp::Not, UnOp::Neg] {
+            let body = vec![
+                InstrNode::new(Inst::UnOp { op, ty: Ty::Bool, operand: ValueId::new(0) })
+                    .with_result(ValueId::new(2)),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
+            ];
+            let module = module_with_body("boolun", vec![Ty::I32], body);
+            assert!(
+                matches!(
+                    lower_module_to_lir(&module, FuncId::new(0)),
+                    Err(ModuleLirError::UnsupportedUnOp { .. })
+                ),
+                "a scalar-bool UnOp::{op:?} must be refused, got {:?}",
+                lower_module_to_lir(&module, FuncId::new(0))
+            );
+        }
     }
 
     #[test]
@@ -6623,5 +6827,288 @@ mod tests {
             lower_module_to_lir(&module, FuncId::new(0)),
             Err(ModuleLirError::UnsupportedAggregate { .. })
         ));
+    }
+
+    // =====================================================================
+    // FIELDLESS (C-like) ENUMS
+    //
+    // Two rules, tested through `lower_module_to_lir` rather than through the
+    // helpers directly, because what ships is the converter's answer:
+    //
+    //  1. the LIR carrier of an enum-typed slot is the PRODUCER's tag width
+    //     (`EnumLayoutDescriptor` + `canonical_tag_repr`), never a guess;
+    //  2. an enum-typed `Inst::Const` is admitted ONLY at a DECLARED
+    //     discriminant.
+    //
+    // Every test here pairs its fail-closed half with a POSITIVE CONTROL that
+    // only passes once the carrier rule exists. Without the control a refusal
+    // is consistent with "the converter refuses all enums", which is what HEAD
+    // does and is not what is being asserted.
+    // =====================================================================
+
+    /// A fieldless enum def SHAPED EXACTLY AS THE PRODUCER WRITES IT.
+    ///
+    /// Not invented: every field here was READ BACK out of a real
+    /// `-Ztrust-ir-lower --emit=trust-ir` module for the corresponding Rust
+    /// source (`trust-ir convert --from bin --to json`). For
+    /// `enum Three { X, Y, Z }` the producer writes explicit
+    /// `discriminants: [0, 1, 2]`, `repr: null`, and
+    /// `layout: { Direct { tag_offset: 0 }, size: 1, align: 1,
+    /// variant_field_offsets: [[], [], []] }`. `repr` is only `Some` when
+    /// `widen_enum_repr_to_rustc_tag_lane` had to move the lane onto rustc's tag
+    /// — measured on `#[repr(u32)] enum Wide { A, B, C }`, which comes out
+    /// `repr: U32, size: 4`.
+    fn fieldless_enum(discs: &[i128], repr: Option<EnumTagRepr>, size: u64) -> trust_ir::EnumDef {
+        let variants = (0..discs.len())
+            .map(|i| trust_ir::EnumVariant {
+                name: format!("V{i}"),
+                fields: Vec::new(),
+                field_names: Vec::new(),
+            })
+            .collect();
+        let mut def = trust_ir::EnumDef::new(trust_ir::EnumId::new(0), "E", variants);
+        def.discriminants = discs.iter().map(|d| Some(*d)).collect();
+        def.repr = repr;
+        def.layout = Some(trust_ir::EnumLayoutDescriptor {
+            encoding: trust_ir::EnumTagEncoding::Direct { tag_offset: 0 },
+            size,
+            align: size,
+            variant_field_offsets: vec![Vec::new(); discs.len()],
+        });
+        def
+    }
+
+    /// The three-variant `enum Three { X, Y, Z }` shape, verbatim from the
+    /// producer: the default fixture for everything that is not about widths.
+    fn three_variant_enum() -> trust_ir::EnumDef {
+        fieldless_enum(&[0, 1, 2], None, 1)
+    }
+
+    /// `fn k() -> E { <disc> }` over `def` — the producer's canonical fieldless
+    /// enum literal, whose `Inst::Const` is `(Ty::Enum, Aggregate([Int(disc)]))`
+    /// with field 0 the DISCRIMINANT. Measured on a real compile of
+    /// `pub fn three_z() -> Three { Three::Z }`, whose body is
+    /// `%0 = const enum.0 { 2 } ; ret %0`.
+    fn enum_const_module(def: trust_ir::EnumDef, disc: i128) -> Module {
+        let mut module = Module::new("t");
+        module.enums.push(def);
+        let ety = Ty::Enum(trust_ir::EnumId::new(0));
+        module.func_types.push(FuncTy {
+            params: Vec::new(),
+            returns: vec![ety.clone()],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "k", FuncTyId::new(0), BlockId::new(0));
+        let mut block = Block::new(BlockId::new(0));
+        block.body = vec![
+            InstrNode::new(Inst::Const {
+                ty: ety,
+                value: Constant::Aggregate(vec![Constant::Int(disc)]),
+            })
+            .with_result(ValueId::new(0)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }),
+        ];
+        f.blocks.push(block);
+        module.functions.push(f);
+        module
+    }
+
+    /// The carrier is the PRODUCER's tag width — and the immediate is the
+    /// discriminant itself, because for a fieldless enum the value IS the tag.
+    ///
+    /// The four rows are the four real producer shapes measured above:
+    /// `enum Three { X, Y, Z }` (u8), `#[repr(u32)] enum Wide { A, B, C }`
+    /// (u32), `enum Big { P = 0, Q = 300 }` (u16, hint-less — the width comes
+    /// from the VALUES), and `enum Neg { M = -1, N = 0 }` (i8, signed).
+    ///
+    /// No hardcoded carrier can pass this: any single fixed width fails at
+    /// least two of the four rows.
+    #[test]
+    fn fieldless_enum_carrier_is_the_producers_tag_width() {
+        for (name, discs, repr, size, tag, want) in [
+            ("Three (u8)", &[0i128, 1, 2][..], None, 1u64, 2i64, LirType::I8),
+            ("Wide (repr u32)", &[0, 1, 2][..], Some(EnumTagRepr::U32), 4, 2, LirType::I32),
+            ("Big (u16 by value)", &[0, 300][..], None, 2, 300, LirType::I16),
+            ("Neg (i8, signed)", &[-1, 0][..], None, 1, -1, LirType::I8),
+        ] {
+            let module = enum_const_module(fieldless_enum(discs, repr, size), i128::from(tag));
+            let lir = lower_module_to_lir(&module, FuncId::new(0))
+                .unwrap_or_else(|e| panic!("{name}: fieldless enum must lower, got {e:?}"));
+            assert_eq!(lir.signature.params, Vec::<LirType>::new(), "{name}");
+            assert_eq!(lir.signature.returns, vec![want], "{name}: carrier width");
+            let block = lir.blocks.get(&Block(0)).expect("entry block");
+            assert!(
+                matches!(block.instructions[0].opcode, Opcode::Iconst { imm, .. } if imm == tag),
+                "{name}: the immediate must be the DISCRIMINANT itself, got {:?}",
+                block.instructions[0].opcode
+            );
+            assert!(matches!(block.instructions[1].opcode, Opcode::Return), "{name}");
+        }
+    }
+
+    /// The carrier comes from the DESCRIPTOR, so a def the descriptor does not
+    /// pin stays refused — even though its `canonical_tag_repr` alone would
+    /// happily name a width.
+    ///
+    /// The `Direct { size 1, repr U8 }` control at the top is the row that only
+    /// passes with the carrier rule in place; every row below it is a
+    /// perturbation of exactly one field of that same def.
+    #[test]
+    fn fieldless_enum_carrier_fails_closed_without_a_pinning_descriptor() {
+        let control = enum_const_module(three_variant_enum(), 2);
+        lower_module_to_lir(&control, FuncId::new(0)).expect("control: pinned def must lower");
+
+        // (a) No descriptor at all: nothing ties the tag width to rustc's.
+        let mut def = three_variant_enum();
+        def.layout = None;
+
+        // (b) The descriptor's total size is not the tag's — that is what would
+        // betray a payload or padding this rule does not model.
+        let mut size_mismatch = three_variant_enum();
+        size_mismatch.layout.as_mut().expect("layout").size = 4;
+
+        // (c) A NICHE encoding: the value is not a plain tag there.
+        let mut niche = three_variant_enum();
+        niche.layout.as_mut().expect("layout").encoding = trust_ir::EnumTagEncoding::Niche {
+            untagged_variant: 0,
+            niche_variants_start: 1,
+            niche_variants_end: 2,
+            niche_start: 1,
+            niche_offset: 0,
+            niche_ty: EnumTagRepr::U8,
+        };
+
+        // (d) A tag at a non-zero offset is not the whole value.
+        let mut offset_tag = three_variant_enum();
+        offset_tag.layout.as_mut().expect("layout").encoding =
+            trust_ir::EnumTagEncoding::Direct { tag_offset: 4 };
+
+        // (e) A PAYLOAD-carrying variant: the value is not just the tag.
+        let mut payload = three_variant_enum();
+        payload.variants[1].fields.push(Ty::I32);
+
+        // (f) Fewer than 2 variants: rustc gives a 1-variant enum
+        // `PassMode::Ignore`, so it is not a register value at all.
+        let single = fieldless_enum(&[0], None, 1);
+
+        // (g) A `#[repr]` hint too narrow for the values has no canonical tag.
+        let too_narrow = fieldless_enum(&[0, 300], Some(EnumTagRepr::U8), 2);
+
+        for (why, def) in [
+            ("no layout descriptor", def),
+            ("size 4 with a 1-byte tag", size_mismatch),
+            ("niche encoding", niche),
+            ("tag at offset 4", offset_tag),
+            ("a payload-carrying variant", payload),
+            ("a single-variant enum", single),
+            ("a repr hint narrower than the values", too_narrow),
+        ] {
+            let m = enum_const_module(def, 0);
+            assert!(
+                matches!(
+                    lower_module_to_lir(&m, FuncId::new(0)),
+                    Err(ModuleLirError::UnsupportedType { .. })
+                ),
+                "{why} must fail closed"
+            );
+        }
+    }
+
+    /// The VALUE-VALIDITY half. rustc marks a fieldless-enum slot `NoUndef`
+    /// with a validity range, so materializing a tag the def does not DECLARE
+    /// would be an invalid value of the type. Both halves are asserted in one
+    /// test: the declared tags lower (this is the half that fails without the
+    /// change), the undeclared ones do not.
+    #[test]
+    fn fieldless_enum_const_must_be_a_declared_discriminant() {
+        // Declared: 0, 1, 2.
+        for disc in [0i128, 1, 2] {
+            let m = enum_const_module(three_variant_enum(), disc);
+            let lir = lower_module_to_lir(&m, FuncId::new(0))
+                .unwrap_or_else(|e| panic!("declared discriminant {disc} must lower: {e:?}"));
+            let block = lir.blocks.get(&Block(0)).expect("entry block");
+            let want = i64::try_from(disc).expect("fits");
+            assert!(
+                matches!(block.instructions[0].opcode, Opcode::Iconst { imm, .. } if imm == want),
+                "declared discriminant {disc} must materialize as itself"
+            );
+        }
+        // Not declared: past the last variant, elsewhere in the carrier's range,
+        // its top value, and a negative.
+        for disc in [3i128, 7, 255, -1] {
+            let m = enum_const_module(three_variant_enum(), disc);
+            assert!(
+                matches!(
+                    lower_module_to_lir(&m, FuncId::new(0)),
+                    Err(ModuleLirError::UnsupportedConstant { .. })
+                ),
+                "tag {disc} is not a DECLARED discriminant and must fail closed"
+            );
+        }
+        // "Declared" is read off the def, not assumed to be `0..variant_count`:
+        // `enum E { A = 10, B = 20 }` admits 10 and 20 and refuses 0, 1 and 11.
+        let def = fieldless_enum(&[10, 20], None, 1);
+        for (disc, ok) in [(10i128, true), (20, true), (0, false), (1, false), (11, false)] {
+            let m = enum_const_module(def.clone(), disc);
+            let got = lower_module_to_lir(&m, FuncId::new(0));
+            assert_eq!(
+                got.is_ok(),
+                ok,
+                "explicit-discriminant def: tag {disc} should be {}, got {got:?}",
+                if ok { "admitted" } else { "refused" }
+            );
+        }
+    }
+
+    /// The enum type is admitted at the FOUR sites the fragment allows and
+    /// NOWHERE else: an enum-typed value never reaches arithmetic, a compare or
+    /// a cast. The `Return`-only control lowers; the same module with one
+    /// arithmetic node added does not.
+    #[test]
+    fn enum_typed_values_stay_out_of_arithmetic() {
+        let ety = Ty::Enum(trust_ir::EnumId::new(0));
+
+        // Control: signature + Const + Return is in the fragment.
+        let control = enum_const_module(three_variant_enum(), 2);
+        lower_module_to_lir(&control, FuncId::new(0)).expect("control must lower");
+
+        // Same module, one `add` on the enum-typed value: refused.
+        let mut m = enum_const_module(three_variant_enum(), 2);
+        let block = &mut m.functions[0].blocks[0];
+        block.body.insert(
+            1,
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Add,
+                ty: ety.clone(),
+                lhs: ValueId::new(0),
+                rhs: ValueId::new(0),
+            })
+            .with_result(ValueId::new(1)),
+        );
+        let got = lower_module_to_lir(&m, FuncId::new(0));
+        assert!(
+            matches!(&got, Err(ModuleLirError::UnsupportedType { ty: Ty::Enum(_), .. })),
+            "arithmetic on an enum-typed value must fail closed ON THE ENUM TYPE, not for \
+             some unrelated reason; got {got:?}"
+        );
+
+        // ... and one `icmp`: refused.
+        let mut m = enum_const_module(three_variant_enum(), 2);
+        let block = &mut m.functions[0].blocks[0];
+        block.body.insert(
+            1,
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Eq,
+                ty: ety,
+                lhs: ValueId::new(0),
+                rhs: ValueId::new(0),
+            })
+            .with_result(ValueId::new(1)),
+        );
+        let got = lower_module_to_lir(&m, FuncId::new(0));
+        assert!(
+            matches!(&got, Err(ModuleLirError::UnsupportedType { ty: Ty::Enum(_), .. })),
+            "comparing enum-typed values must fail closed ON THE ENUM TYPE; got {got:?}"
+        );
     }
 }

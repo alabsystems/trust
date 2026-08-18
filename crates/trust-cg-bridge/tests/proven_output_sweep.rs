@@ -107,6 +107,7 @@ fn make_binop_fn(name: &str, op: BinOp, ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: ty_dummy(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -142,6 +143,7 @@ fn make_cmp_fn(name: &str, op: BinOp, ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::bool_ty(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -166,6 +168,7 @@ fn make_neg_fn(name: &str, ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: ty,
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -190,6 +193,7 @@ fn make_cast_fn(name: &str, src: Ty, dst: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: dst,
+            datatype_defs: Default::default(),
         },
     )
 }

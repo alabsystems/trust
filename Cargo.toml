@@ -86,6 +86,8 @@ members = [
   "crates/trust-lift",
   "crates/trust-loop",
   "crates/trust-machine-sem",
+  # first-party memchr; package name is `memchr` (see its manifest)
+  "crates/trust-memchr",
   # trust: rustc_private MIR/THIR frontends — need the bootstrap/RUSTC_BOOTSTRAP
   # env (build only via the staged rustc; a plain stable
   # `cargo build --workspace` cannot compile their rustc_private path deps).
@@ -195,6 +197,12 @@ codegen-units = 1
 # If you want to use a crate with local modifications, you can set a path or git dependency here.
 # For git dependencies, also add your source to ALLOWED_SOURCES in src/tools/tidy/src/extdeps.rs.
 [patch.crates-io]
+# memchr is first-party now. Upstream memchr is hand-vectorised over raw
+# pointers and cannot be verified — it is what stops `./x.py build --stage 2`,
+# because the bootstrap graph is the one graph Trust verifies. See
+# crates/trust-memchr for the API-compatibility contract and the measured
+# obligation counts.
+memchr = { path = "crates/trust-memchr" }
 rustc-hash = { path = "first-party/ty/crates/tla-hash-fx" }
 rustc_version = { path = "vendor/rustc_version_0_4_1" }
 
@@ -318,7 +326,7 @@ warnings = "warn"
 
 # trust: workspace-level package metadata for verification pipeline crates
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alabsystems/trust"

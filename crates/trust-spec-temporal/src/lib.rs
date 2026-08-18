@@ -24,18 +24,16 @@
 //! needs); it grows as real models demand. The translation is mechanical:
 //! `<=` ⇒ `=<`, `if/else` ⇒ `IF/THEN/ELSE`, `&&`/`||` ⇒ `/\`/`\/`.
 
-// Let the `trust_model!` macro's absolute `::trust_spec_temporal::*` paths resolve
-// to THIS crate, so the macro works inside this crate's own tests too (not only in
-// downstream crates that name the dependency).
-extern crate self as trust_spec_temporal;
-
+mod automatic_finite_proof;
+mod automatic_scalar_proof;
 mod certified_temporal;
 mod clean_model_lane;
 mod clean_surface;
 mod clean_ty_lane;
 mod dependency_coherence;
+pub mod literal_refinement;
+pub mod model_program_refinement;
 mod r5_parity;
-mod r5_scorecard;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -173,6 +171,15 @@ mod in_process_ty_transaction_tests {
     }
 }
 
+pub use automatic_finite_proof::{
+    CLEAN_AUTOMATIC_FINITE_PROOF_SCHEMA_V1, CleanAutomaticFiniteProof,
+    certify_automatic_clean_finite_model, recheck_automatic_clean_finite_model,
+};
+pub use automatic_scalar_proof::{
+    CLEAN_AUTOMATIC_SCALAR_PROOF_SCHEMA_V1, CleanAutomaticScalarProof,
+    CleanAutomaticScalarProofFamily, certify_automatic_clean_scalar_model,
+    recheck_automatic_clean_scalar_model,
+};
 pub use certified_temporal::{
     CERTIFIED_TEMPORAL_EVIDENCE_SCHEMA_V1, CertifiedTemporalError, CertifiedTemporalEvidence,
     CertifiedTemporalPropertyClass, certify_liveness_with_ty, recheck_certified_temporal_evidence,
@@ -211,6 +218,11 @@ pub use clean_ty_lane::{
     CLEAN_TY_COUNTDOWN_SCHEMA_V2, CleanTyCountdownCertificate, CleanTyCountdownError,
     certify_clean_countdown_with_ty, recheck_clean_countdown_with_ty,
 };
+pub use model_program_refinement::{
+    MODEL_PROGRAM_REFINEMENT_SCHEMA_V1, MODEL_PROGRAM_REFINEMENT_SCHEMA_V2,
+    ModelProgramRefinementCertificate, ModelProgramRefinementError, ModelProgramRefinementTheorem,
+    certify_model_program_refinement, recheck_model_program_refinement,
+};
 pub use r5_parity::{
     R5_MODEL_ABI_AMBITION_BLOCKERS, R5_TEMPORAL_MACRO_DEPRECATION_ALLOWED,
     R5_TEMPORAL_MACRO_RETIREMENT_ALLOWED, R5_TEMPORAL_PARITY_BLOCKERS,
@@ -218,13 +230,6 @@ pub use r5_parity::{
     R5_TEMPORAL_RETIREMENT_BLOCKERS, R5TemporalParityBlocker, R5TemporalParityReport,
     R5TemporalParityReportValidationError, R5TemporalParityStatus, r5_temporal_parity_report,
 };
-pub use r5_scorecard::{
-    CapabilityReplacementStatus, R5_MACRO_CAPABILITY_SCORECARD,
-    R5_MACRO_CAPABILITY_SCORECARD_SCHEMA_V1, R5CapabilityRow, R5MacroCapability,
-    R5MacroCapabilityRecord, R5MacroCapabilityScorecard, R5MacroCapabilityScorecardError,
-    R5MacroSurface, capability_row, macro_surface_emits_deprecation, r5_macro_capability_scorecard,
-};
-
 /// A value in the model's (bounded-integer / boolean) semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
@@ -1269,78 +1274,10 @@ pub fn evict_full_model() -> Model {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Deprecated macro compatibility integration (docs/TY_ANNOTATION_FEATURE.md).
-// `trust_model!` still expands to a `Model`, while `check_model` delegates to
-// the pinned in-process certificate, exact-binding, kernel-recheck, and
-// replayed-non-vacuity lane below. New temporal models use the Clean scalar
-// surface instead of this macro DSL.
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
-
-/// Compatibility macros that expand the legacy inline DSL to a [`Model`]
-/// literal. Re-exported from `trust-spec-temporal-macros`. The deprecation
-/// policy is **per capability**: see [`r5_macro_capability_scorecard`].
-///
-/// `trust_model!`'s capability — a bounded scalar-integer SAFETY machine — is
-/// `FullyReplaced` (owner policy flip 2026-07-21): the live Clean lane
-/// certifies byte-identically (author a temporal [`Model`], or a `clean { … }`
-/// island, and certify with [`certify_bound_clean_scalar_model_with_ty`]), and
-/// bind the exact applied safety claim, and its
-/// formerly narrower admission domain now covers the owner-ratified
-/// operational macro-parity domain (interner + name caps deleted, depth cap
-/// widened to a decode-cost guard, positive near-cap vectors certified
-/// end-to-end). Both macros therefore carry the advisory `#[deprecated]`
-/// nudge — the D1+ ratchet. Expansion is unchanged: every existing use keeps
-/// compiling and behaving identically; a legacy call site that must stay
-/// warning-free acknowledges the nudge explicitly:
-///
-/// ```no_run
-/// #![allow(deprecated)] // legacy compatibility surface, advisory nudge acknowledged
-/// use trust_spec_temporal::{Model, trust_model};
-///
-/// fn legacy_model() -> Model {
-///     trust_model! {
-///         Legacy {
-///             const Buggy = 0;
-///             var x = 0;
-///             action Step { x = x; }
-///             invariant Stable: x == x;
-///         }
-///     }
-/// }
-///
-/// fn main() {}
-/// ```
-///
-/// `temporal_model!` is the item-position spelling and expands to a model
-/// constructor fn. Its former automatic link-time inventory registration was
-/// deleted as extraneous (owner ruling 2026-07-20) — the live Targo gates never
-/// trusted the linked registry, and callers enumerate the definitions they
-/// certify explicitly. It exercises the same `FullyReplaced` scalar-safety
-/// core and carries the same advisory nudge:
-///
-/// ```no_run
-/// #![allow(deprecated)] // legacy compatibility surface, advisory nudge acknowledged
-/// use trust_spec_temporal::temporal_model;
-///
-/// temporal_model! {
-///     LegacyItem {
-///         const Buggy = 0;
-///         var x = 0;
-///         action Step { x = x; }
-///         invariant Stable: x == x;
-///     }
-/// }
-///
-/// fn main() {}
-/// ```
-#[allow(deprecated)]
-pub use trust_spec_temporal_macros::{temporal_model, trust_model};
 
 /// Diagnostic result for one model.
 ///
@@ -1784,7 +1721,7 @@ fn model_expr_sort<'m, S: AsRef<str>>(
             E::Var(name) => {
                 let name = name.as_ref();
                 if model.vars.iter().any(|variable| variable.name.as_ref() == name)
-                    || bound.iter().any(|binder| *binder == name)
+                    || bound.contains(&name)
                 {
                     sorts.push(ModelExprSort::Int);
                 } else if let Some(variable) =
@@ -1839,7 +1776,7 @@ fn model_expr_sort<'m, S: AsRef<str>>(
                 let index = index.as_ref();
                 validate_temporal_identifier(index, "quantifier index")
                     .map_err(model_setup_error)?;
-                if globals.contains(index) || bound.iter().any(|binder| *binder == index) {
+                if globals.contains(index) || bound.contains(&index) {
                     return Err(model_setup_error(format!(
                         "quantifier index `{index}` shadows another model identifier"
                     )));
@@ -1886,7 +1823,7 @@ fn model_expr_sort<'m, S: AsRef<str>>(
                 let index = index.as_ref();
                 validate_temporal_identifier(index, "comprehension index")
                     .map_err(model_setup_error)?;
-                if globals.contains(index) || bound.iter().any(|binder| *binder == index) {
+                if globals.contains(index) || bound.contains(&index) {
                     return Err(model_setup_error(format!(
                         "comprehension index `{index}` shadows another model identifier"
                     )));
@@ -1938,29 +1875,32 @@ pub(crate) fn validate_model_for_certification<'m, S: AsRef<str>>(
     }
 
     let mut globals: BTreeSet<&'m str> = BTreeSet::from(["Init", "Next", "Spec", "vars"]);
-    let mut register = |name: &'m str, role: &str| -> Result<(), TyCertifyError> {
-        validate_temporal_identifier(name, role).map_err(model_setup_error)?;
-        if !globals.insert(name) {
-            return Err(model_setup_error(format!("duplicate or reserved {role} name `{name}`")));
+    {
+        let mut register = |name: &'m str, role: &str| -> Result<(), TyCertifyError> {
+            validate_temporal_identifier(name, role).map_err(model_setup_error)?;
+            if !globals.insert(name) {
+                return Err(model_setup_error(format!(
+                    "duplicate or reserved {role} name `{name}`"
+                )));
+            }
+            Ok(())
+        };
+        for (name, _) in &model.consts {
+            register(name.as_ref(), "constant")?;
         }
-        Ok(())
-    };
-    for (name, _) in &model.consts {
-        register(name.as_ref(), "constant")?;
+        for variable in &model.vars {
+            register(variable.name.as_ref(), "variable")?;
+        }
+        for variable in &model.fn_vars {
+            register(variable.name.as_ref(), "function variable")?;
+        }
+        for action in &model.actions {
+            register(action.name.as_ref(), "action")?;
+        }
+        for invariant in &model.invariants {
+            register(invariant.name.as_ref(), "invariant")?;
+        }
     }
-    for variable in &model.vars {
-        register(variable.name.as_ref(), "variable")?;
-    }
-    for variable in &model.fn_vars {
-        register(variable.name.as_ref(), "function variable")?;
-    }
-    for action in &model.actions {
-        register(action.name.as_ref(), "action")?;
-    }
-    for invariant in &model.invariants {
-        register(invariant.name.as_ref(), "invariant")?;
-    }
-    drop(register);
 
     for variable in &model.fn_vars {
         let variable_name = variable.name.as_ref();
@@ -2161,8 +2101,10 @@ fn bind_model_configuration<S: AsRef<str>>(
     Ok(())
 }
 
-/// Whether the model needs the Clean finite-product reconstruction rather than
-/// the legacy one-scalar explicit-fixpoint lane.
+/// Whether the model may need the Clean finite-product reconstruction rather
+/// than the scalar-shaped closed lane. A digest-bound TY parametric unbounded
+/// witness takes precedence later: its exact multi-scalar/relational kernel
+/// legs do not enumerate a finite product.
 ///
 /// A function-valued variable is a product even when it is the only declared
 /// variable: its `[1..N -> BOOLEAN]` domain flattens to one Bool slot per key.
@@ -2697,6 +2639,27 @@ pub(crate) fn recheck_model_bound_clean_kernel<S: AsRef<str>>(
         return recheck_bound_clean_kernel(bound);
     }
 
+    // A multi-scalar model is not necessarily a finite product. TY's exact
+    // unbounded tuple and relational families carry universally quantified
+    // initiation/consecution/preservation terms; routing those through S4's
+    // finite enumerator would inevitably hit its state cap and discard valid
+    // parametric authority. Inspect the fully typed, digest-covered object
+    // (never the loose JSON-presence mirror), then let the ordinary explicit
+    // rechecker re-derive its shape and kernel-check every leg. Any malformed
+    // object still fails closed inside `recheck_bound_clean_kernel`.
+    if bound.cert.explicit_fixpoint.is_some() {
+        let producer = tla_check::cert::SafetyCertificate::from_json(&bound.raw_json)
+            .map_err(TyCertifyError::KernelRecheckDeclined)?;
+        if producer
+            .explicit_fixpoint
+            .as_ref()
+            .and_then(|fixpoint| fixpoint.unbounded_invariant.as_ref())
+            .is_some()
+        {
+            return recheck_bound_clean_kernel(bound);
+        }
+    }
+
     let _ty_transaction = in_process_ty_transaction_lock();
     let expected_invariants =
         model.invariants.iter().map(|invariant| invariant.name.as_ref()).collect::<Vec<_>>();
@@ -3069,39 +3032,68 @@ fn valid_temporal_capability(capability: &str) -> bool {
 // `certify_bound_clean_scalar_model_with_ty` directly.
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod trust_fabric_tests {
     use super::*;
 
     fn grouping_sensitive_model() -> Model {
-        trust_model! {
-            GroupingSensitive {
-                const Buggy = 0;
-                var x = 9;
-                action Step {
-                    x = if Buggy == 0 { 10 - (x + 1) } else { 0 };
-                }
-                invariant Positive: x > 0;
-            }
+        Model {
+            name: "GroupingSensitive",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 9 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update {
+                    var: "x",
+                    expr: if_(
+                        eq(cst("Buggy"), int(0)),
+                        sub(int(10), add(var("x"), int(1))),
+                        int(0),
+                    ),
+                }],
+            }],
+            invariants: vec![Invariant { name: "Positive", expr: gt(var("x"), int(0)) }],
         }
     }
 
     fn edge_gate_model() -> Model {
-        trust_model! {
-            EdgeGate {
-                const Buggy = 0;
-                var granted = 0;
-                var decision = 0;
-                action Grant when (granted <= 0) {
-                    granted = 1;
-                    decision = if 1 + Buggy > 0 { 1 } else { 0 };
-                }
-                action Revoke when (granted > 0) {
-                    granted = 0;
-                    decision = if 0 + Buggy > 0 { 1 } else { 0 };
-                }
-                invariant FailClosed: decision <= granted;
-            }
+        Model {
+            name: "EdgeGate",
+            consts: vec![("Buggy", 0)],
+            vars: vec![
+                StateVar { name: "granted", init: 0 },
+                StateVar { name: "decision", init: 0 },
+            ],
+            fn_vars: vec![],
+            actions: vec![
+                Action {
+                    name: "Grant",
+                    guard: Some(le(var("granted"), int(0))),
+                    updates: vec![
+                        Update { var: "granted", expr: int(1) },
+                        Update {
+                            var: "decision",
+                            expr: if_(gt(add(int(1), cst("Buggy")), int(0)), int(1), int(0)),
+                        },
+                    ],
+                },
+                Action {
+                    name: "Revoke",
+                    guard: Some(gt(var("granted"), int(0))),
+                    updates: vec![
+                        Update { var: "granted", expr: int(0) },
+                        Update {
+                            var: "decision",
+                            expr: if_(gt(add(int(0), cst("Buggy")), int(0)), int(1), int(0)),
+                        },
+                    ],
+                },
+            ],
+            invariants: vec![Invariant {
+                name: "FailClosed",
+                expr: le(var("decision"), var("granted")),
+            }],
         }
     }
 
@@ -4250,27 +4242,32 @@ Safety == x >= 0\n\
     /// TY's exact fixpoint proves safety. The safe but unreachable state
     /// `x = 2`, however, has a real `Next` edge to unsafe `x = 3`.
     ///
-    /// This is the load-bearing counterexample for R5 macro retirement:
-    /// automatically applying `FiniteModel.safetyClaimOfInductive` to the
-    /// authored invariants cannot cover the certifiable macro domain. A sound
-    /// bridge must transport TY's stronger reachable-set invariant `J` into
-    /// the exact applied `FiniteModel` proposition and prove J-initiation,
-    /// J-consecution, and J-to-safety preservation there.
+    /// This remains a load-bearing regression for the automatic Clean bridge:
+    /// direct induction over the authored invariants is insufficient, so the
+    /// finite lane must preserve TY's stronger reachable-set invariant.
     #[test]
     fn certified_reachable_safety_can_have_noninductive_authored_invariants() {
-        let model = trust_model! {
-            ReachableSafeNonInductive {
-                const Buggy = 0;
-                var x = 0;
-                action Reachable when (x == 0) {
-                    x = 1;
-                }
-                action EscapeFromUnreachableSafeState when (x == 2) {
-                    x = 3;
-                }
-                invariant NonVacuity: Buggy <= x;
-                invariant Safe: x <= 2;
-            }
+        let model = Model {
+            name: "ReachableSafeNonInductive",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![
+                Action {
+                    name: "Reachable",
+                    guard: Some(eq(var("x"), int(0))),
+                    updates: vec![Update { var: "x", expr: int(1) }],
+                },
+                Action {
+                    name: "EscapeFromUnreachableSafeState",
+                    guard: Some(eq(var("x"), int(2))),
+                    updates: vec![Update { var: "x", expr: int(3) }],
+                },
+            ],
+            invariants: vec![
+                Invariant { name: "NonVacuity", expr: le(cst("Buggy"), var("x")) },
+                Invariant { name: "Safe", expr: le(var("x"), int(2)) },
+            ],
         };
 
         let outcome = certify_model(&model);

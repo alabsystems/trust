@@ -339,6 +339,7 @@ fn binop_fn(name: &str, op: BinOp, ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: ty,
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -367,6 +368,7 @@ fn cmp_fn(name: &str, op: BinOp, ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::bool_ty(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -390,6 +392,7 @@ fn neg_fn(name: &str, ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: ty,
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -413,6 +416,7 @@ fn cast_fn(name: &str, src: Ty, dst: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: dst,
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -454,6 +458,7 @@ fn madd_fn() -> VerifiableFunction {
             }],
             arg_count: 3,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -905,6 +910,7 @@ fn novel_and_xor_sum() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -948,6 +954,7 @@ fn novel_sub_is_negative() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::bool_ty(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -1012,6 +1019,7 @@ fn autospec_generality_novel_functions_no_handspec() {
             }],
             arg_count: 2,
             return_ty: Ty::bool_ty(),
+            datatype_defs: Default::default(),
         },
     );
     let unsigned_auto = trust_ir_semantics(&f_u).expect("interpreter on unsigned variant");
@@ -1085,6 +1093,7 @@ fn interpreter_fails_closed_on_unsupported_shapes() {
             }],
             arg_count: 2,
             return_ty: Ty::Float { width: 32 },
+            datatype_defs: Default::default(),
         },
     );
     assert!(

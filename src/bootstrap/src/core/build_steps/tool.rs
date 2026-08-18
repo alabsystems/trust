@@ -1052,13 +1052,13 @@ pub(crate) fn upstream_compat_bin_for_tool_source(src_name: &str) -> Option<&str
     // retained upstream-compat alias emitted here is `cargo` — rustup refuses to
     // register a toolchain whose bin/ lacks a `cargo` entrypoint, and `cargo
     // +trust` must resolve. (The matching `rustc` name is materialized on a
-    // separate path: `materialize_local_compiler_aliases` / `Assemble`.) Every
-    // other stock secondary name — rustdoc, cargo-trust, cargo-clippy,
-    // clippy-driver, cargo-fmt, rustfmt, rust-analyzer, cargo-miri, miri — is
-    // intentionally NOT materialized. This stops those names at the source (the
-    // root-cause replacement for the former scripts/purge-stock-names.sh, which
-    // deleted them post-build). Note: `rustdoc` also had a *second* producer,
-    // the Rustdoc step's `bin_rustdoc` closure, fixed in tandem.
+    // separate path: `materialize_local_compiler_aliases` / `Assemble`, and
+    // `rustdoc` on the Rustdoc step's `bin_rustdoc` closure — cargo's doctest
+    // phase spawns that stock name.) Every other stock secondary name —
+    // cargo-trust, cargo-clippy, clippy-driver, cargo-fmt, rustfmt,
+    // rust-analyzer, cargo-miri, miri — is intentionally NOT materialized.
+    // This stops those names at the source (the root-cause replacement for the
+    // former scripts/purge-stock-names.sh, which deleted them post-build).
     match src_name {
         "cargo" => Some("cargo"),
         _ => None,
@@ -1686,8 +1686,11 @@ fn rustdoc_sysroot_bins(
         // while also materializing the branded hard-link for Trust-native tests.
         (inherited_rustdoc, vec![trustdoc])
     } else {
-        // User-facing stage2+ sysroots install only the Trust-branded name.
-        (trustdoc, Vec::new())
+        // Stage2+: trustdoc is the primary name, but keep the inherited
+        // `rustdoc` alias — cargo's doctest phase spawns `bin/rustdoc` and
+        // rustup's proxy fails a linked toolchain without it ("'rustdoc' is
+        // not installed"). Same contract that keeps `bin/rustc` in Assemble.
+        (trustdoc, vec![inherited_rustdoc])
     }
 }
 
@@ -1729,15 +1732,8 @@ impl Step for Rustdoc {
             let sysroot = builder.sysroot(target_compiler);
             let bindir = sysroot.join("bin");
             t!(fs::create_dir_all(&bindir));
-            let inherited_rustdoc = bindir.join(exe("rustdoc", target_compiler.host));
-            if target_compiler.stage >= 2 {
-                // Trust: at stage>=2 ship ONLY the `trustdoc` name; do NOT emit a
-                // stock `rustdoc` bin alias (Trust-branded-names-only policy — the
-                // root-cause replacement for scripts/purge-stock-names.sh, which
-                // deleted `rustdoc` post-build). Remove any stale `rustdoc` a prior
-                // build left so the invariant also holds on additive trees.
-                let _ = fs::remove_file(&inherited_rustdoc);
-            }
+            // `rustdoc` is (re-)materialized as an alias at every stage;
+            // copy_link removes a stale destination first, so no pre-purge.
             rustdoc_sysroot_bins(
                 &bindir,
                 target_compiler.stage,
@@ -1938,6 +1934,16 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 // `try_trait_v2_residual` joined in the 1.99 migration: the newer `Try` trait
 // requires `type Residual: Residual<Self::Output>`, so `Discharge` now also
 // implements `std::ops::Residual`.
+// This list is a LIABILITY, not a convenience: every entry is an unstable
+// feature the compiler's own build graph is then permitted to depend on.
+// `variant_count` was briefly added here for `crates/trust-machine-sem` (which
+// entered the graph via `compiler/rustc_codegen_trust_cg` and
+// `crates/trust-cg-bridge`) to back a const assertion that its `Effect` name
+// table named every variant. It has been REMOVED: that crate now expands the
+// name table and its wildcard-free match from a single token list
+// (`declare_effect_census!` in `effect.rs`), so the drift is unrepresentable
+// rather than asserted — a stronger check that costs no unstable feature. Prefer
+// that shape to a new entry here.
 pub(super) const CARGO_TRUST_ALLOW_FEATURES: &str =
     "min_specialization,specialization,try_trait_v2,try_trait_v2_residual";
 

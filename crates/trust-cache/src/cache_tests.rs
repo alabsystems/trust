@@ -75,6 +75,7 @@ fn make_function(name: &str) -> VerifiableFunction {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

@@ -11,7 +11,8 @@ use super::{
     generate_callsite_precondition_vcs_attributed, generate_v2_safety_vcs,
     parse_projection_suffix, precondition_interval_dominance, substitute_summary_params,
     v2_float_binop_cannot_overflow, v2_float_binop_cannot_overflow_at,
-    v2_float_contract_magnitude_hypotheses, v2_float_overflow_witness_formula,
+    float_witness_width_is_supported, v2_float_contract_magnitude_hypotheses,
+    v2_float_overflow_witness_formula,
 };
 use crate::modular::{FunctionSummary, SummaryDatabase};
 use std::sync::Arc;
@@ -53,7 +54,7 @@ fn make(
         name: "fixture".into(),
         def_path: "test::fixture".into(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty },
+        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
         contracts: vec![],
         preconditions,
         postconditions: vec![],
@@ -3234,4 +3235,73 @@ fn temp_copy_of_contracted_param_resolves_to_the_contract_bound() {
     let formulas = float_overflow_formulas(&func);
     assert_eq!(formulas.len(), 1);
     assert!(!has_any_bvule(&formulas[0]), "multi-def temp must refuse: {:?}", formulas[0]);
+}
+
+// ── unmodellable float widths must not vanish (2026-08-03) ───────────────────
+
+/// Build `_3 = <op>(_1, _2)` over two float params of the given width.
+fn float_binop_fixture_w(width: u32, op: BinOp) -> VerifiableFunction {
+    let fty = Ty::Float { width };
+    make(
+        vec![
+            decl(0, fty.clone(), None),
+            decl(1, fty.clone(), Some("a")),
+            decl(2, fty.clone(), Some("b")),
+            decl(3, fty.clone(), None),
+        ],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(
+                Place { local: 3, projections: vec![] },
+                Rvalue::BinaryOp(
+                    op,
+                    Operand::Copy(Place { local: 1, projections: vec![] }),
+                    Operand::Copy(Place { local: 2, projections: vec![] }),
+                ),
+            )],
+            terminator: Terminator::Return,
+        }],
+        2,
+        fty,
+        vec![],
+    )
+}
+
+/// f32 and f64 both emit their obligation. (f32 previously emitted none at all —
+/// every witness arm was hardcoded to width 64.)
+#[test]
+fn supported_float_widths_emit_an_obligation() {
+    for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div] {
+        for width in [32u32, 64] {
+            assert_eq!(
+                float_overflow_kinds(&float_binop_fixture_w(width, op)).len(),
+                1,
+                "f{width} {op:?} must emit exactly one FloatOverflowToInfinity obligation"
+            );
+        }
+    }
+}
+
+/// THE DURABLE FIX. A width the witness arms do not cover must be refused
+/// LOUDLY — a visible, undischargeable obligation — never by returning `None`,
+/// which the caller cannot distinguish from "proved safe" and which therefore
+/// mints a `no_obligations` / `proved` row that checked nothing.
+///
+/// f16/f128 are the live instances today; the assertion is really about the
+/// conflation, so it keeps holding for any width added later.
+#[test]
+fn unmodellable_float_width_emits_a_visible_obligation_not_silence() {
+    assert!(float_witness_width_is_supported(32));
+    assert!(float_witness_width_is_supported(64));
+    assert!(!float_witness_width_is_supported(16));
+    assert!(!float_witness_width_is_supported(128));
+
+    for width in [16u32, 128] {
+        assert_eq!(
+            float_overflow_kinds(&float_binop_fixture_w(width, BinOp::Add)).len(),
+            1,
+            "f{width} cannot be modelled here, so it must emit a VISIBLE unproved \
+             obligation rather than silently vanish into a `proved` row"
+        );
+    }
 }

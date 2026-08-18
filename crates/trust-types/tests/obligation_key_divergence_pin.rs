@@ -346,7 +346,7 @@ fn mint_sites_still_have_the_pinned_shape() {
         vc_mints, 3,
         "expected exactly the three carrier-index safety mint sites in verifier_api.rs \
          (verifier_vc_content_identity_with_source_digest_and_crate_name, \
-         function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_name, \
+         function_to_verifier_api_bundle_for_target, \
          trust_vc_mir_memory_metadata); found {vc_mints} — \
          the mint changed, re-take the frozen artifacts"
     );

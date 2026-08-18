@@ -8,9 +8,9 @@
 #
 # This governor watches *available* memory while a build runs and, when it dips
 # below the critical floor, SIGSTOPs the largest compiler child (rustc/trustc/
-# cc1/cc1plus) to relieve pressure — then SIGCONTs paused children once memory
-# recovers. Pausing (not killing) means the build always finishes; it just
-# serializes the heaviest steps under pressure instead of dying.
+# cc1/cc1plus) to prevent further allocation — then SIGCONTs paused children
+# once memory recovers. SIGSTOP does not release RSS; the up-front job cap is
+# the primary protection. This is a last-resort brake scoped to this build tree.
 #
 # Usage:
 #   ./scripts/build-mem-governor.sh <ROOT_PID>
@@ -36,6 +36,8 @@ readonly POLL_SEC="${TRUST_GOV_POLL_SEC:-3}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/process_tree.sh
+. "$SCRIPT_DIR/lib/process_tree.sh"
 readonly LOG="${TRUST_GOV_LOG:-$REPO_ROOT/metrics/build-governor.log}"
 mkdir -p "$(dirname "$LOG")"
 
@@ -64,13 +66,12 @@ avail_mib() {
   echo $(( ( ${free:-0} + ${inactive:-0} + ${spec:-0} + ${purge:-0} ) * pagesize / 1048576 ))
 }
 
-# Heaviest live hog by RSS among descendants of ROOT_PID (and the wider build).
-# Returns "PID RSS_MIB" or empty. (Build subprocesses aren't all direct children
-# of ROOT_PID under cargo/x.py, so match by command across the session.)
+# Heaviest live compiler by RSS among ROOT_PID and its descendants. Never scan
+# the wider login session: the old host-wide command match could SIGSTOP an
+# unrelated rustc/clang/lld owned by another build.
+# Returns "PID RSS_MIB" or empty.
 heaviest_hog() {
-  ps -axo pid=,rss=,comm= 2>/dev/null \
-    | awk -v re="$HOG_RE" '$3 ~ re && $1 != '"$$"' {print $1, int($2/1024)}' \
-    | sort -k2 -nr | head -1
+  trust_heaviest_matching_descendant "$ROOT_PID" "$HOG_RE"
 }
 
 resume_all() {
@@ -98,7 +99,8 @@ while kill -0 "$ROOT_PID" 2>/dev/null; do
   if [ "$avail" -lt "$crit_mib" ]; then
     # Under pressure: pause the single largest compiler process not already paused.
     read -r hp hr <<<"$(heaviest_hog)"
-    if [ -n "${hp:-}" ] && ! printf '%s' " $PAUSED " | grep -q " $hp "; then
+    if [ -n "${hp:-}" ] && ! printf '%s' " $PAUSED " | grep -q " $hp " &&
+       trust_process_is_descendant "$ROOT_PID" "$hp"; then
       if kill -STOP "$hp" 2>/dev/null; then
         PAUSED="$PAUSED $hp"
         PAUSE_EVENTS=$((PAUSE_EVENTS+1))

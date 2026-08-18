@@ -91,8 +91,8 @@ use clean_kernel::{
 };
 
 use crate::trustir_anchor::{
-    IrCfg, IrOperand, IrTerm, RefinementVerdict, TRUSTIR_EVAL_CFG, TRUSTIR_EVAL_COND,
-    TRUSTIR_EVAL_OPERAND, TRUSTIR_OPERAND, refinement_env,
+    IntCastDest, IrCfg, IrOperand, IrTerm, RefinementVerdict, TRUSTIR_EVAL_CFG, TRUSTIR_EVAL_COND,
+    TRUSTIR_EVAL_OPERAND, TRUSTIR_OPERAND, exact_int_cast_expr, refinement_env,
 };
 
 // ---------------------------------------------------------------------------
@@ -483,6 +483,12 @@ fn check_call_return_instance_inner(
 /// [`TRUSTIR_CALL_REFINES_CONTRACT`] APPLIED at a WRAPPED predicate. Port of
 /// `mirsem::MIRSEM_CALL_THEN_PUREOP_INSTANCE`.
 pub const TRUSTIR_CALL_THEN_PUREOP_INSTANCE: &str = "Trust.TrustIr.callThenPureOpInstance";
+/// Trust: CALL-THEN-PROJECT twin (2026-08-17) — the pair-returning callee's
+/// field projection; port of `mirsem::MIRSEM_CALL_THEN_PROJECT_INSTANCE`.
+pub const TRUSTIR_CALL_THEN_PROJECT_INSTANCE: &str = "Trust.TrustIr.callThenProjectInstance";
+/// Trust (#56, 2026-08-16) — CALL-RESULT-AWARE COMPOSITION, the TRUST-IR twin of
+/// `mirsem::MIRSEM_CALL_CHAIN_PUREOP_INSTANCE`.
+pub const TRUSTIR_CALL_CHAIN_PUREOP_INSTANCE: &str = "Trust.TrustIr.callChainPureOpInstance";
 
 /// The `Int.<op> a b` head for a trust-ir arithmetic `BinOp` — BYTE-IDENTICAL to
 /// `trustir_anchor::int_binop_expr` (module-private there; duplicated here per this
@@ -490,6 +496,32 @@ pub const TRUSTIR_CALL_THEN_PUREOP_INSTANCE: &str = "Trust.TrustIr.callThenPureO
 fn int_binop_expr(op: crate::trustir_anchor::TrustIrBinOp, a: Expr, b: Expr) -> Expr {
     use crate::trustir_anchor::TrustIrBinOp as B;
     let head = match op {
+        // Trust (#53): the BOOLEAN CONNECTIVES take a DIVERGING arm, and DELEGATE to
+        // the anchor's `bool_connective_minor` rather than re-transcribing its
+        // `Bool.rec` term -- two hand-built kernel terms that must agree exactly are
+        // precisely the pair that drifts, and a divergence would be invisible because
+        // both sides of a self-relating refinement would carry the same wrong term.
+        B::BAnd => {
+            return crate::trustir_anchor::bool_connective_minor(
+                crate::trustir_anchor::BoolConnective::And,
+                a,
+                b,
+            );
+        }
+        B::BOr => {
+            return crate::trustir_anchor::bool_connective_minor(
+                crate::trustir_anchor::BoolConnective::Or,
+                a,
+                b,
+            );
+        }
+        B::BXor => {
+            return crate::trustir_anchor::bool_connective_minor(
+                crate::trustir_anchor::BoolConnective::Xor,
+                a,
+                b,
+            );
+        }
         B::Add => "Int.add",
         B::Sub => "Int.sub",
         B::Mul => "Int.mul",
@@ -502,6 +534,11 @@ fn int_binop_expr(op: crate::trustir_anchor::TrustIrBinOp, a: Expr, b: Expr) -> 
         // Trust: M6 rung 9, ANCHOR BitAnd — BYTE-IDENTICAL to
         // `trustir_anchor::int_binop_expr`'s `And` arm.
         B::And => "Int.land",
+        // Trust: OR/XOR ANCHOR — BYTE-IDENTICAL to the anchor's `Or`/`Xor` arms.
+        B::Or => "Int.lor",
+        B::Xor => "Int.xor",
+        // Trust: SHL ANCHOR — BYTE-IDENTICAL to the anchor's `Shl` arm.
+        B::Shl => "Int.shiftLeft",
     };
     Expr::apps(cst(head), [a, b])
 }
@@ -573,6 +610,16 @@ pub enum TrustIrCallThenOp {
     Bin(crate::trustir_anchor::TrustIrBinOp),
     /// A comparison op.
     Cmp(crate::trustir_anchor::TrustIrCmpOp),
+    /// Trust: DELTA-3 (2026-08-04) — an integer CAST of the call's result, the
+    /// `swap_bytes(iN)` / `reverse_bits(iN)` post-call adaptation
+    /// (`_0 = Cast(_t, iN)` after `_t = <uN>::swap_bytes(..)`).
+    ///
+    /// The destination is a VALIDATED [`IntCastDest`], so width 128 cannot be named
+    /// here at all, and the wrap is built by the EXACT `exact_int_cast_expr` — never an
+    /// identity. That is the whole soundness content: `u32 -> i32` is not the identity
+    /// for any value with the top bit set, and this lane's entire purpose is bodies
+    /// that perform exactly that round trip.
+    Cast(IntCastDest),
 }
 
 /// Port of `mirsem::call_then_pureop_instance_type` (byte-for-byte, TRUSTIR names).
@@ -714,6 +761,90 @@ fn call_then_pureop_instance_proof_ir_param(
     )
 }
 
+/// Trust: CALL-THEN-PROJECT, trust-ir twin (2026-08-17) — the PER-CALL instance
+/// for a PAIR-returning callee's single-field projection: the SAME proven
+/// `callRefinesContract` transport, wrapped at `idxElem(x, Int(field))` — the
+/// byte-for-byte port of `mirsem::call_then_project_instance_verdict`, which
+/// reuses ITS pureop builders exactly this way with `MIRSEM_IDX_ELEM`. The claim
+/// form is SHAPE-ONLY by construction (the idxElem selector is opaque): "the
+/// return is field `field` of whatever the callee returned" — deliberately NOT a
+/// value claim about the pair's components (the pair family's own component
+/// models carry those, on the callee side). The wrapper twins
+/// (`w_*_overflowing_add_0`) are the live population: certifying
+/// `overflowing_add` fed the registry, the wrappers composed MirSem-first, and
+/// this twin puts them on the target IR — the teardown-reopening closure.
+///
+/// FIELD-KEY AUTHENTICITY LIVES IN THE RECOGNIZER, NOT HERE (audit, same round):
+/// the instance is KEY-UNIFORM — the same `wrap` is applied to hypothesis and
+/// conclusion, so it proves reflexively at EVERY key; the kernel transports
+/// shape, it does not authenticate `field`. The field is EVIDENCE READ FROM THE
+/// MIR by `sem_call_then_project_of_mir` (the sole projected use of the tuple
+/// temp), exactly as the mutator families' frame facts are walk evidence, and
+/// the MirSem lane's claim carries the same division. What the fail-closed hook
+/// (`claimed_concl_pred`) pins is CONCLUSION dishonesty — a predicate other than
+/// the transported one must be KernelRejected.
+#[must_use]
+pub fn check_call_then_project_instance(
+    callee_id: u64,
+    call_arg: &IrOperand,
+    field: u64,
+) -> RefinementVerdict {
+    check_call_then_project_instance_inner(callee_id, call_arg, field, None)
+}
+
+/// The fail-closed hook form of [`check_call_then_project_instance`] —
+/// `claimed_concl_pred = Some(p)` overrides the conclusion predicate (tests pin
+/// that a mismatched field key does NOT prove).
+pub(crate) fn check_call_then_project_instance_inner(
+    callee_id: u64,
+    call_arg: &IrOperand,
+    field: u64,
+    claimed_concl_pred: Option<&Expr>,
+) -> RefinementVerdict {
+    let mut env = match trustir_call_env() {
+        Ok(e) => e,
+        Err(e) => return RefinementVerdict::KernelRejected(e),
+    };
+    let field_key = int_lit(i128::from(field));
+    let wrap: Box<dyn Fn(Expr) -> Expr> = Box::new(move |x: Expr| {
+        Expr::apps(cst(crate::trustir_anchor::TRUSTIR_IDX_ELEM), [x, field_key.clone()])
+    });
+    let inst_ty =
+        call_then_pureop_instance_type_ir(callee_id, call_arg, &wrap, claimed_concl_pred);
+    let inst_proof = call_then_pureop_instance_proof_ir(callee_id, call_arg, &wrap);
+    // The check/register/audit tail, byte-identical to the pureop instance's.
+    {
+        let tc = TypeChecker::new(&env);
+        if let Err(e) = tc.check_type(&inst_proof, &inst_ty) {
+            return RefinementVerdict::KernelRejected(format!(
+                "TrustIr.callThenProjectInstance check_type: {e:?}"
+            ));
+        }
+    }
+    let name = Name::from_string(TRUSTIR_CALL_THEN_PROJECT_INSTANCE);
+    if let Err(e) = env.add_decl(Declaration::Theorem {
+        name: name.clone(),
+        level_params: vec![],
+        type_: inst_ty,
+        value: inst_proof,
+    }) {
+        return RefinementVerdict::KernelRejected(format!(
+            "add TrustIr.callThenProjectInstance: {e:?}"
+        ));
+    }
+    match env.axiom_deps(&name) {
+        Some(residue) if residue.is_empty() => RefinementVerdict::ProvenModulo3,
+        Some(residue) => {
+            let mut names: Vec<String> = residue.iter().map(ToString::to_string).collect();
+            names.sort();
+            RefinementVerdict::Residue(names)
+        }
+        None => RefinementVerdict::KernelRejected(
+            "TrustIr.callThenProjectInstance decl not found".to_string(),
+        ),
+    }
+}
+
 /// Check the per-call CALL-THEN-PUREOP instance against the real clean-kernel on
 /// the TRUST-IR env. `other` is the non-call operand's kernel representation —
 /// Trust: PARAM-OPERAND generalization — either a CLOSED CONSTANT (the original
@@ -759,6 +890,12 @@ fn check_call_then_pureop_instance_inner(
                     let (a, b) = if call_is_lhs { (x, lit) } else { (lit, x) };
                     bool_as_int(cmp_bool_expr(o, a, b))
                 }),
+                // Trust: DELTA-3 — a cast is UNARY in the call result: the `other`
+                // operand plays no part, so `call_is_lhs` and `other_const` are both
+                // irrelevant here by construction.
+                TrustIrCallThenOp::Cast(dest) => {
+                    Box::new(move |x: Expr| exact_int_cast_expr(x, dest))
+                }
             };
             (
                 call_then_pureop_instance_type_ir(callee_id, call_arg, &wrap, claimed_concl_pred),
@@ -766,6 +903,17 @@ fn check_call_then_pureop_instance_inner(
             )
         }
         TrustIrOtherOperand::Param => {
+            // Trust: DELTA-3 / G11 — a CAST has no second operand, so pairing it with a
+            // PARAM other-operand is incoherent: the recognizer would be describing a
+            // shape (`cast(call_result) OP param`) that this witness does not model.
+            // Reject rather than silently ignoring the param, which would prove a
+            // DIFFERENT theorem than the one the shape claims.
+            if matches!(op, TrustIrCallThenOp::Cast(_)) {
+                return RefinementVerdict::KernelRejected(
+                    "call-then-pureop: Cast with a PARAM other-operand is not modeled (G11)"
+                        .to_string(),
+                );
+            }
             let wrap: Box<dyn Fn(Expr, Expr) -> Expr> = match op {
                 TrustIrCallThenOp::Bin(o) => Box::new(move |p: Expr, x: Expr| {
                     if call_is_lhs { int_binop_expr(o, x, p) } else { int_binop_expr(o, p, x) }
@@ -774,6 +922,7 @@ fn check_call_then_pureop_instance_inner(
                     let (a, b) = if call_is_lhs { (x, p) } else { (p, x) };
                     bool_as_int(cmp_bool_expr(o, a, b))
                 }),
+                TrustIrCallThenOp::Cast(_) => unreachable!("rejected above (G11)"),
             };
             (
                 call_then_pureop_instance_type_ir_param(
@@ -956,11 +1105,23 @@ fn check_call_op_call_instance_inner(
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
     };
+    // Trust: DELTA-3 / G12 — the OP-CALL lane combines the results of TWO calls, and a
+    // cast is unary. There is no coherent `cast(call_a, call_b)`, so this lane REJECTS
+    // Cast outright rather than inventing an interpretation. This is the third
+    // compiler-forced match on the op enum, and the one it would be easiest to satisfy
+    // with a wrong arm: writing anything here would prove a theorem about a shape the
+    // recognizer never produced.
+    if matches!(op, TrustIrCallThenOp::Cast(_)) {
+        return RefinementVerdict::KernelRejected(
+            "call-op-call: Cast is unary and has no two-call interpretation (G12)".to_string(),
+        );
+    }
     let wrap: Box<dyn Fn(Expr, Expr) -> Expr> = match op {
         TrustIrCallThenOp::Bin(o) => Box::new(move |a: Expr, b: Expr| int_binop_expr(o, a, b)),
         TrustIrCallThenOp::Cmp(o) => {
             Box::new(move |a: Expr, b: Expr| bool_as_int(cmp_bool_expr(o, a, b)))
         }
+        TrustIrCallThenOp::Cast(_) => unreachable!("rejected above (G12)"),
     };
     let inst_ty = call_op_call_instance_type_ir(
         callee_id_a,
@@ -2164,5 +2325,379 @@ mod tests {
             matches!(check_branch_call_refinement(&cfg), RefinementVerdict::KernelRejected(_)),
             "a statement-bearing call-arm block must decline (out of scope)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust (#56, 2026-08-16): CALL-RESULT-AWARE COMPOSITION — the TRUST-IR PORT of
+// `mirsem::call_chain_pureop_instance_verdict`. The last MirSem-fallback family
+// in the R4 census: `u8::to_ascii_{lower,upper}case`, whose body is
+// `*self | ((self.is_ascii_uppercase() as u8) * 32)`.
+//
+// Like the MirSem original, this adds ZERO new Expr-building machinery. It
+// REUSES `call_then_pureop_instance_type_ir`/`_proof_ir` (the CONST-other path)
+// and `..._ir_param`/`..._proof_ir_param` (the PARAM-other path) verbatim; those
+// already generalize the proven `callRefinesContract` transport lemma to an
+// ARBITRARY `wrap` closure over the call's opaque result. The only new content
+// is a BIGGER `wrap` that composes the inner checked-arith Mul underneath the
+// outer op, built from the SAME `int_binop_expr` every other arithmetic value in
+// this file grounds through.
+//
+// THE BOOL -> INT CAST HOP NEEDS NO EXPR CONTENT, and that is worth stating
+// precisely because the opposite assumption is a mislift. The chain's call
+// returns `bool` and MIR casts it to `u8` before the multiply. `wrap` does NOT
+// build a cast node for it and MUST NOT build `castU`: `castU(x, 8)` denotes
+// truncation of an INTEGER, which is not what a bool-to-int coercion means. What
+// makes omitting it correct here is that the transport lemma is UNIVERSAL over
+// the postcondition and the `Call` -- `call_result c` is an OPAQUE Int standing
+// for whatever the call returns, with no numeric claim attached -- so the
+// certificate never asserts a relationship the cast would have to justify. The
+// recognizer earns the right to that omission separately: it admits the hop only
+// when the call's destination is a BARE `Ty::Bool` temp sole-written by the call
+// (`sem_call_chain_pureop_of_mir`'s "bool-to-int IDENTITY" gate), so the cast is
+// the identity on the two-element image and there is nothing left to model.
+// ---------------------------------------------------------------------------
+
+/// Check the per-call CALL-RESULT-AWARE COMPOSITION instance against the real
+/// clean-kernel on the TRUST-IR env.
+///
+/// `wrap(x) = outer_op( mul(x), other )` with both operand orders threaded
+/// explicitly (`inner_call_is_lhs`, `outer_mul_is_lhs`) rather than assumed —
+/// `BitOr` is commutative but `Sub`-class outer ops are not, and a witness that
+/// silently normalized the order would certify a DIFFERENT program than the one
+/// the recognizer read.
+///
+/// SCOPE mirrors [`check_call_then_pureop_instance`] exactly: the non-call operand
+/// must be a CLOSED CONSTANT or a function PARAMETER. Anything else is a named
+/// residue and fails closed, never silently absorbed.
+#[must_use]
+pub fn check_call_chain_pureop_instance(
+    callee_id: u64,
+    call_arg: &IrOperand,
+    inner_op: crate::trustir_anchor::TrustIrBinOp,
+    inner_const: i128,
+    inner_call_is_lhs: bool,
+    outer_op: crate::trustir_anchor::TrustIrBinOp,
+    outer_mul_is_lhs: bool,
+    other: TrustIrOtherOperand,
+) -> RefinementVerdict {
+    check_call_chain_pureop_instance_inner(
+        callee_id,
+        call_arg,
+        inner_op,
+        inner_const,
+        inner_call_is_lhs,
+        outer_op,
+        outer_mul_is_lhs,
+        other,
+        None,
+    )
+}
+
+/// Inner check with the fail-closed hook: `claimed_concl_pred = Some(p)` overrides
+/// the instance conclusion's postcondition predicate, so a WRONG postcondition must
+/// NOT prove. This is the hook the forgery corpus drives.
+#[allow(clippy::too_many_arguments)]
+fn check_call_chain_pureop_instance_inner(
+    callee_id: u64,
+    call_arg: &IrOperand,
+    inner_op: crate::trustir_anchor::TrustIrBinOp,
+    inner_const: i128,
+    inner_call_is_lhs: bool,
+    outer_op: crate::trustir_anchor::TrustIrBinOp,
+    outer_mul_is_lhs: bool,
+    other: TrustIrOtherOperand,
+    claimed_concl_pred: Option<&Expr>,
+) -> RefinementVerdict {
+    let mut env = match trustir_call_env() {
+        Ok(e) => e,
+        Err(e) => return RefinementVerdict::KernelRejected(e),
+    };
+    // The inner checked-arith Mul, applied to the (bool-identity-cast) call result.
+    let mul_expr = move |x: Expr| -> Expr {
+        let lit = int_lit(inner_const);
+        if inner_call_is_lhs {
+            int_binop_expr(inner_op, x, lit)
+        } else {
+            int_binop_expr(inner_op, lit, x)
+        }
+    };
+    let (inst_ty, inst_proof) = match other {
+        TrustIrOtherOperand::Const(other_const) => {
+            let wrap: Box<dyn Fn(Expr) -> Expr> = Box::new(move |x: Expr| {
+                let m = mul_expr(x);
+                let lit = int_lit(other_const);
+                if outer_mul_is_lhs {
+                    int_binop_expr(outer_op, m, lit)
+                } else {
+                    int_binop_expr(outer_op, lit, m)
+                }
+            });
+            (
+                call_then_pureop_instance_type_ir(callee_id, call_arg, &wrap, claimed_concl_pred),
+                call_then_pureop_instance_proof_ir(callee_id, call_arg, &wrap),
+            )
+        }
+        TrustIrOtherOperand::Param => {
+            let wrap: Box<dyn Fn(Expr, Expr) -> Expr> = Box::new(move |p: Expr, x: Expr| {
+                let m = mul_expr(x);
+                if outer_mul_is_lhs {
+                    int_binop_expr(outer_op, m, p)
+                } else {
+                    int_binop_expr(outer_op, p, m)
+                }
+            });
+            (
+                call_then_pureop_instance_type_ir_param(
+                    callee_id,
+                    call_arg,
+                    &wrap,
+                    claimed_concl_pred,
+                ),
+                call_then_pureop_instance_proof_ir_param(callee_id, call_arg, &wrap),
+            )
+        }
+    };
+    {
+        let tc = TypeChecker::new(&env);
+        if let Err(e) = tc.check_type(&inst_proof, &inst_ty) {
+            return RefinementVerdict::KernelRejected(format!(
+                "TrustIr.callChainPureOpInstance check_type: {e:?}"
+            ));
+        }
+    }
+    let name = Name::from_string(TRUSTIR_CALL_CHAIN_PUREOP_INSTANCE);
+    if let Err(e) = env.add_decl(Declaration::Theorem {
+        name: name.clone(),
+        level_params: vec![],
+        type_: inst_ty,
+        value: inst_proof,
+    }) {
+        return RefinementVerdict::KernelRejected(format!(
+            "add TrustIr.callChainPureOpInstance: {e:?}"
+        ));
+    }
+    match env.axiom_deps(&name) {
+        Some(residue) if residue.is_empty() => RefinementVerdict::ProvenModulo3,
+        Some(residue) => {
+            let mut names: Vec<String> = residue.iter().map(ToString::to_string).collect();
+            names.sort();
+            RefinementVerdict::Residue(names)
+        }
+        None => RefinementVerdict::KernelRejected(
+            "TrustIr.callChainPureOpInstance decl not found".to_string(),
+        ),
+    }
+}
+
+/// Test-only hook so the forgery corpus can drive a WRONG conclusion predicate
+/// through the same kernel path the production lane uses.
+#[cfg(test)]
+pub(crate) fn check_call_chain_pureop_instance_forged(
+    callee_id: u64,
+    call_arg: &IrOperand,
+    inner_op: crate::trustir_anchor::TrustIrBinOp,
+    inner_const: i128,
+    inner_call_is_lhs: bool,
+    outer_op: crate::trustir_anchor::TrustIrBinOp,
+    outer_mul_is_lhs: bool,
+    other: TrustIrOtherOperand,
+    claimed_concl_pred: &Expr,
+) -> RefinementVerdict {
+    check_call_chain_pureop_instance_inner(
+        callee_id,
+        call_arg,
+        inner_op,
+        inner_const,
+        inner_call_is_lhs,
+        outer_op,
+        outer_mul_is_lhs,
+        other,
+        Some(claimed_concl_pred),
+    )
+}
+
+/// Trust (#56, 2026-08-16) — the CALL-RESULT-AWARE COMPOSITION forgery corpus on
+/// the TRUST-IR lane. A new kernel witness is only worth having if a WRONG term is
+/// rejected by it, so every test here is paired: the honest instance must prove,
+/// and a dishonest claim about the same shape must be kernel-rejected.
+#[cfg(test)]
+mod call_chain_pureop_ir_forgery_corpus {
+    use super::*;
+    use crate::trustir_anchor::TrustIrBinOp as B;
+
+    /// `u8::to_ascii_lowercase`'s real parameters: `*self | ((call() as u8) * 32)`.
+    fn honest(outer: B) -> RefinementVerdict {
+        check_call_chain_pureop_instance(
+            7,
+            &IrOperand::Var(0),
+            B::Mul,
+            32,
+            true,
+            outer,
+            false,
+            TrustIrOtherOperand::Param,
+        )
+    }
+
+    /// POSITIVE — both real bodies' outer ops certify modulo 3. `Or` is
+    /// `to_ascii_lowercase`, `Xor` is `to_ascii_uppercase`.
+    #[test]
+    fn honest_chain_instances_prove_modulo_3() {
+        for outer in [B::Or, B::Xor] {
+            assert_eq!(
+                honest(outer),
+                RefinementVerdict::ProvenModulo3,
+                "the honest {outer:?} chain instance must prove modulo 3"
+            );
+        }
+    }
+
+    /// POSITIVE — the CONST-other path (the shape with a closed constant rather
+    /// than a parameter on the flat side) certifies too, so the scope note in
+    /// `check_call_chain_pureop_instance` is not describing a dead branch.
+    #[test]
+    fn honest_const_other_instance_proves_modulo_3() {
+        assert_eq!(
+            check_call_chain_pureop_instance(
+                7,
+                &IrOperand::Var(0),
+                B::Mul,
+                32,
+                true,
+                B::Or,
+                false,
+                TrustIrOtherOperand::Const(65),
+            ),
+            RefinementVerdict::ProvenModulo3
+        );
+    }
+
+    /// FORGERY — a dishonest claimed conclusion predicate, unrelated to the real
+    /// wrapped value, MUST be kernel-rejected. This is the test that makes the
+    /// instance non-tautological: without it, "the kernel accepted something" says
+    /// nothing about WHICH proposition it accepted.
+    #[test]
+    fn wrong_claimed_conclusion_is_kernel_rejected() {
+        let bd = || BinderData::from(BinderInfo::Default);
+        let wrong_pred = Expr::lam(bd(), int_ty(), Expr::app(cst("False"), Expr::bvar(0)));
+        for outer in [B::Or, B::Xor] {
+            let verdict = check_call_chain_pureop_instance_forged(
+                7,
+                &IrOperand::Var(0),
+                B::Mul,
+                32,
+                true,
+                outer,
+                false,
+                TrustIrOtherOperand::Param,
+                &wrong_pred,
+            );
+            assert!(
+                matches!(verdict, RefinementVerdict::KernelRejected(_)),
+                "a dishonest claimed conclusion MUST be kernel-rejected, got {verdict:?}"
+            );
+        }
+    }
+
+    /// FORGERY — the same dishonest claim must also be rejected on the CONST-other
+    /// path. The two paths build their instance with different type/proof builders
+    /// (`..._ir` vs `..._ir_param`), so one being fail-closed does not establish the
+    /// other.
+    #[test]
+    fn wrong_claimed_conclusion_is_kernel_rejected_const_path() {
+        let bd = || BinderData::from(BinderInfo::Default);
+        let wrong_pred = Expr::lam(bd(), int_ty(), Expr::app(cst("False"), Expr::bvar(0)));
+        let verdict = check_call_chain_pureop_instance_forged(
+            7,
+            &IrOperand::Var(0),
+            B::Mul,
+            32,
+            true,
+            B::Or,
+            false,
+            TrustIrOtherOperand::Const(65),
+            &wrong_pred,
+        );
+        assert!(
+            matches!(verdict, RefinementVerdict::KernelRejected(_)),
+            "a dishonest claimed conclusion MUST be kernel-rejected on the const path too, \
+             got {verdict:?}"
+        );
+    }
+
+    /// DISCRIMINATION — the four shape parameters the recognizer transcribes must
+    /// each actually reach the kernel term. If any of them were dropped on the floor
+    /// the instance would be the same theorem for materially different programs, and
+    /// the lane would certify `to_ascii_lowercase`'s body against
+    /// `to_ascii_uppercase`'s denotation. Each variant below differs from `honest`
+    /// in exactly one parameter; every one must still be internally consistent (the
+    /// instance proves ITS OWN conclusion), which is what makes the check meaningful
+    /// -- the point is that they are DIFFERENT conclusions, so a term built for one
+    /// cannot be reused for another.
+    #[test]
+    fn every_shape_parameter_reaches_the_kernel_term() {
+        let variants: Vec<(&str, RefinementVerdict)> = vec![
+            ("outer Or vs Xor", honest(B::Xor)),
+            (
+                "inner constant 32 vs 64",
+                check_call_chain_pureop_instance(
+                    7,
+                    &IrOperand::Var(0),
+                    B::Mul,
+                    64,
+                    true,
+                    B::Or,
+                    false,
+                    TrustIrOtherOperand::Param,
+                ),
+            ),
+            (
+                "inner operand order",
+                check_call_chain_pureop_instance(
+                    7,
+                    &IrOperand::Var(0),
+                    B::Mul,
+                    32,
+                    false,
+                    B::Or,
+                    false,
+                    TrustIrOtherOperand::Param,
+                ),
+            ),
+            (
+                "outer operand order",
+                check_call_chain_pureop_instance(
+                    7,
+                    &IrOperand::Var(0),
+                    B::Mul,
+                    32,
+                    true,
+                    B::Or,
+                    true,
+                    TrustIrOtherOperand::Param,
+                ),
+            ),
+            (
+                "callee id",
+                check_call_chain_pureop_instance(
+                    9,
+                    &IrOperand::Var(0),
+                    B::Mul,
+                    32,
+                    true,
+                    B::Or,
+                    false,
+                    TrustIrOtherOperand::Param,
+                ),
+            ),
+        ];
+        for (what, verdict) in variants {
+            assert_eq!(
+                verdict,
+                RefinementVerdict::ProvenModulo3,
+                "{what}: the variant instance must prove its OWN conclusion"
+            );
+        }
     }
 }

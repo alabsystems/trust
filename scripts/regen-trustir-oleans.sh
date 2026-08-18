@@ -87,7 +87,16 @@ SHIP_LIB="$WORK/trust_ir-semantics/.lake/build/lib"
 # --- Compute the minimal closure with the in-tree clean-olean --------------
 echo "computing closure of the bridge root module ..."
 CLOSURE="$WORK/closure_modules.txt"
-(cd "$ROOT" && "$ROOT/build/host/stage2/bin/targo" --unverified run --quiet --manifest-path crates/Cargo.toml \
+TARGO="$ROOT/build/host/stage2/bin/targo"
+# `--unverified` is a TARGO flag, and a stage2 that predates the targo rebrand ships a plain
+# cargo under that name — it rejects the flag as an unknown argument and the regen dies with a
+# cargo usage message that says nothing about oleans. Probe instead of assuming. Passing it when
+# it IS supported still matters: this is a build tool, not a proof artifact, and a verified build
+# of the whole `crates/` graph here would be minutes of work for no claim anyone reads.
+# Unquoted below on purpose (bash 3.2: an empty array expansion under `set -u` aborts); the value
+# is a fixed literal, so word-splitting is exactly the intent.
+if "$TARGO" --unverified --version >/dev/null 2>&1; then UNVERIFIED="--unverified"; else UNVERIFIED=""; fi
+(cd "$ROOT" && "$TARGO" $UNVERIFIED run --quiet --manifest-path crates/Cargo.toml \
     -p trust-clean --example bridge_closure -- "$SHIP_LIB" "$CORE_LIB") > "$CLOSURE"
 N_TOTAL="$(wc -l < "$CLOSURE" | tr -d ' ')"
 N_TRUSTIR="$(grep -c '^TrustIr' "$CLOSURE")"

@@ -630,6 +630,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -973,6 +974,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1397,6 +1399,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1521,6 +1524,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1544,16 +1548,16 @@ mod tests {
     fn modular_ungrounded_spec_model_postcondition_is_unknown_not_refutable() {
         // A parsed ensures over SYNTHETIC spec-model terms (here the Result
         // model of ny-cert `check_farkas`: `is_ok ∧ payload_sign > 0`, negated)
-        // is under-constrained in this lane — nothing grounds `_0_discr` /
-        // `_0_value_sign` — so the old `Not(post)` VC was satisfiable by havoc
+        // is under-constrained in this lane — nothing grounds `_0__discr` /
+        // `_0__value__sign` — so the old `Not(post)` VC was satisfiable by havoc
         // (Failed with a minted, non-program counterexample). It must emit the
         // fail-closed NON-REFUTABLE Unknown shape instead, and never vanish.
         let is_ok = Formula::Not(Box::new(Formula::Eq(
-            Box::new(Formula::Var("_0_discr".into(), Sort::Int)),
+            Box::new(Formula::Var("_0__discr".into(), Sort::Int)),
             Box::new(Formula::Int(0)),
         )));
         let sign_pos = Formula::Gt(
-            Box::new(Formula::Var("_0_value_sign".into(), Sort::Int)),
+            Box::new(Formula::Var("_0__value__sign".into(), Sort::Int)),
             Box::new(Formula::Int(0)),
         );
         let postcond = Formula::Not(Box::new(Formula::And(vec![is_ok, sign_pos])));
@@ -1571,6 +1575,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1608,6 +1613,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 0,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1633,6 +1639,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],

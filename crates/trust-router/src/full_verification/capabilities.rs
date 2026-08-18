@@ -2,7 +2,10 @@
 
 use trust_verifier_api::{EngineCapability, ObligationKind, SupportLevel};
 
-use super::policy::{TRUST_VC_HARDENED_NAMESPACE, TRUST_VC_HARDENED_WILDCARD};
+use super::policy::{
+    TRUST_VC_HARDENED_NAMESPACE, TRUST_VC_HARDENED_WILDCARD,
+    TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE,
+};
 use super::routing::{PrimaryEngine, obligation_route_for_kind};
 
 pub(super) fn all_full_verification_capabilities() -> Vec<EngineCapability> {
@@ -33,6 +36,13 @@ pub(super) fn all_full_verification_obligation_kinds() -> Vec<ObligationKind> {
         ObligationKind::Protocol,
     ];
     kinds.extend(hardened_custom_obligation_kinds());
+    // The allocation-capacity lane (#nia-oom), trust-vc-owned via the
+    // certificate-import route (`obligation_route_for_kind`); the `name` is the
+    // producer's single spelling (`vc_obligation_kind` in trust-mir-extract).
+    kinds.push(ObligationKind::Custom {
+        namespace: TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE.to_string(),
+        name: "unbounded_allocation".to_string(),
+    });
     kinds
 }
 

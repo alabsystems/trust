@@ -1136,6 +1136,95 @@ fn required_native_engines_route_primary_obligation_families_fail_closed() {
     }
 }
 
+// Trust (#nia-oom, batch 6): the `trust.vc.unbounded_allocation` namespace is
+// trust-vc-owned via the certificate-import route (the BoundsCheck precedent).
+// Ownership is DISPATCH, never proof: without a validated MIR-memory proof unit
+// + replayed certificate the obligation stays Unsupported (fail-closed), which
+// is exactly what this pin asserts. It must NEVER route to trust-mc — the
+// whole-function CHC does not encode `count >= ceiling` and that mapping
+// false-proved unbounded allocations (the recorded P0 at trust-verifier-api's
+// namespace constant).
+#[cfg(feature = "trust-build")]
+#[test]
+fn unbounded_allocation_namespace_routes_to_trust_vc_fail_closed() {
+    let engine = FullVerificationEngine::with_required_native_engines();
+    // Namespace-keyed: the name is a label within the admitted namespace.
+    for name in ["unbounded_allocation", "a_name_no_consumer_knows"] {
+        let kind = ObligationKind::Custom {
+            namespace: trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE
+                .to_string(),
+            name: name.to_string(),
+        };
+        let obligation_id = format!("obligation-unbounded-alloc-{name}");
+        let bundle = bundle_with_obligation(
+            kind,
+            &obligation_id,
+            None,
+            Some(ProofStrength::deductive()),
+        );
+        assert!(engine.supports(&bundle.obligations[0]).is_supported());
+
+        let result =
+            engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-unbounded-alloc"));
+        assert_eq!(result.status, VerificationRunStatus::Inconclusive);
+        assert_eq!(result.summary.proved, 0, "no proof may be minted without a certificate");
+        assert_eq!(result.summary.unsupported, 1);
+        let structured = result.full_verification_obligation_evidence();
+        assert_eq!(
+            structured[0].primary_suite.as_deref(),
+            Some("trust-vc"),
+            "the capacity obligation is trust-vc-owned, never trust-mc/CHC"
+        );
+        assert_eq!(structured[0].decisions[0].status, EvidenceStatus::Unsupported);
+    }
+}
+
+// Cross-table agreement for the trust-vc MIR-memory certificate-import lane:
+// the router's route table, the trust-vc adapter's ownership predicate, and
+// the shared producer/consumer native-kind mapping must agree on exactly which
+// public kinds ride the proof-unit transport. A drift here is how an
+// obligation ends up Pending in a native bundle with no certificate
+// (MissingTrustVcEvidenceForObligation poisoning the whole function) — or,
+// worse, routed to an engine whose proof does not encode its property.
+#[cfg(feature = "trust-build")]
+#[test]
+fn mir_memory_transport_kind_tables_agree() {
+    let unbounded = ObligationKind::Custom {
+        namespace: trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE
+            .to_string(),
+        name: "unbounded_allocation".to_string(),
+    };
+    let engine = FullVerificationEngine::with_required_native_engines();
+    for kind in [
+        ObligationKind::MemorySafety,
+        ObligationKind::Ownership,
+        ObligationKind::BoundsCheck,
+        unbounded,
+    ] {
+        // Router table: trust-vc primary.
+        let obligation_id = format!("obligation-agreement-{kind:?}");
+        let bundle = bundle_with_obligation(
+            kind.clone(),
+            &obligation_id,
+            None,
+            Some(ProofStrength::deductive()),
+        );
+        let result =
+            engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-agreement"));
+        let structured = result.full_verification_obligation_evidence();
+        assert_eq!(structured[0].primary_suite.as_deref(), Some("trust-vc"), "{kind:?}");
+        // Adapter ownership predicate.
+        assert!(trust_vc_bridge::is_trust_vc_owned_obligation_kind(&kind), "{kind:?}");
+        assert!(trust_vc_bridge::requires_trust_vc_ownership_context(&kind), "{kind:?}");
+        // Producer/consumer native-suite kind mapping.
+        assert_eq!(
+            trust_vc_bridge::trust_vc_native_trust_ir_kind_for_public_obligation(&kind),
+            Some(trust_ir::ObligationKind::MemorySafety),
+            "{kind:?}"
+        );
+    }
+}
+
 // Trust (P1.2 precedent, extended to preconditions and E4/E5): a body-aware VC
 // carrying the accepted typed formula envelope must be DISPATCHED to trust-mc for
 // Postcondition (the `#[ensures]` VC), Precondition (the call-site

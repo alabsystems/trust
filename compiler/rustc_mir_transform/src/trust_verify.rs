@@ -238,11 +238,6 @@ struct PendingImportCitation {
     /// solver-UNKNOWN / bare-Proved entries. A refuted or timed-out row never
     /// reaches this list.
     postcondition_indices: Vec<usize>,
-    /// Premise of the whole-function panic-freedom subsumption lane, captured
-    /// in-walk where the native bundle is in scope. The post-walk lane must
-    /// reach the verdict the in-walk lane WOULD have reached, so it replays that
-    /// lane with the same premise rather than assuming it either way.
-    native_bundle_built: bool,
     /// The body's provisional artifacts, attached by `run_pass` when it
     /// quarantines. `None` means the walk recorded the pending citation but
     /// never reached publication for this body (a skip or abort lane returned
@@ -1921,6 +1916,17 @@ pub(crate) struct VerificationArtifacts {
     // only (never serialized), so it cannot enter any equality/seal. Populated on
     // the native lane; empty elsewhere, which makes the elision seam a no-op.
     overflow_check_origins: OverflowCheckOrigins,
+    // Trust (coroutine resume-state contract): the bridge's authenticated
+    // evidence that THIS function's native lowering converted its ResumedAfter*
+    // sentinels to refutable, solver-owned obligations under the recognized
+    // resume-state entry contract. Extracted ONLY from the live native bundle's
+    // module (`trust_ir_bridge::coroutine_resume_contract_module_evidence`) —
+    // never from transport rows or re-pattern-matched MIR (the info-flow/
+    // forgery class). Private and in-memory only, exactly like
+    // `overflow_check_origins`: a deserialized or hand-built artifacts value
+    // cannot carry it. `None` (every non-native constructor) keeps the
+    // fail-closed `assumption:coroutine` + strict-abort behavior byte-for-byte.
+    coroutine_resume_contract: Option<trust_ir_bridge::CoroutineResumeContractModuleEvidence>,
 }
 
 /// Trust (runtime ledger): the fail-closed origin map for proven-overflow-check
@@ -2276,40 +2282,34 @@ enum ResultProofAuthority {
         row: ExactResultRowIdentity,
         binding: ResultObligationBinding,
     },
-    /// Trust: WHOLE-FUNCTION PANIC-FREEDOM BY STRUCTURAL SUBSUMPTION (default
-    /// lane). Minted ONLY by `apply_whole_function_panic_freedom_subsumption`
-    /// when, for this function, ALL of:
-    ///  (1) the native typed-TrustIr lowering COMPLETED (bundle built) — so the
-    ///      VC row set enumerates every panic source: each assert/panic site,
-    ///      each call (proven, summarized-total, or an assumption row), each
-    ///      drop; an unlowerable construct would instead abort or fold into the
-    ///      aggregate's description;
-    ///  (2) the aggregate row still carries the CANONICAL "panic freedom: no
-    ///      assertion, …" description — a folded extern-call / absent-callee /
-    ///      drop-glue gap REPLACES that text and is never subsumed;
-    ///  (3) EVERY other result row of the function is `is_static_proof_for` —
-    ///      a real private proof authority. The assumption-bookkeeping variants
-    ///      (`DefinitionEntryAssumption`, `AssumedTotalCalleeAssumption`) are
-    ///      NOT static proofs, so any may-panic assumption row blocks the
-    ///      discharge; an unproved absent-callee/drop-glue row is never
-    ///      `proved` and blocks it likewise.
-    /// Under (1)–(3) the aggregate is entailed by the conjunction of its
-    /// premises — the same structural argument as trust-mc's trivially-safe
-    /// whole-function harness, generalized from "no error rule" to "every
-    /// error rule individually carries a private static proof". Reported
-    /// Trusted/Deductive like the other compiler-composed derivations
-    /// (`ExactSourceClauseDischarge`, `CallerPropagation`); never Certified.
-    /// A `Failed`/refuted row anywhere in the function suppresses the
-    /// discharge entirely — a refutation is never overridden.
-    WholeFunctionPanicFreedomSubsumption {
-        row: ExactResultRowIdentity,
-        /// `None` ONLY for a row the compiler's own grounding pass re-pointed
-        /// (its binding was deliberately retired by
-        /// `rewrite_result_formula_revoking_binding`, and the grounded formula
-        /// did not certify). The mint requires that recorded provenance, so an
-        /// absent binding is never a way to dodge the binding check.
-        binding: Option<ResultObligationBinding>,
-    },
+    //
+    // REMOVED (2026-08-14, FALSE PROOF): `WholeFunctionPanicFreedomSubsumption`
+    // — the "every OTHER row is a static proof ⟹ the synthesized
+    // `assertion:panic-freedom:0` aggregate holds" derivation. Its premise (1),
+    // "the row set enumerates every panic source", is FALSE BY CONSTRUCTION.
+    // `lower_function` (trust-ir-bridge) emits that aggregate ONLY when the body
+    // has a diverging panic `Terminator::Call` (`panic!`/`assert!`/
+    // `unreachable!`) or an absent-callee / drop-glue / coroutine-resume
+    // assumption marker — i.e. EXACTLY the panic classes that never become a
+    // counted per-site obligation. A `Terminator::Assert` (overflow / bounds /
+    // div) body, whose sites DO all get per-site rows, gets no aggregate at all.
+    // So whenever the aggregate exists, at least one panic source is carried by
+    // it ALONE and no conjunction over the sibling rows can entail it.
+    //
+    // The sound lane for the same aggregate already exists and is strictly
+    // stronger: `refute_full_assert_obligations` requires EVERY assert/panic
+    // block to be individually refuted-unreachable (`refuted == 0 &&
+    // left_unknown == 0 && !proved_vcs.is_empty()`) AND every other obligation
+    // Proved, then discharges the aggregate in place against the GROUNDED
+    // residual disjunction so the clean CIC kernel re-checks it. The subsumption
+    // fired precisely in that lane's complement — when a panic site was left
+    // Unknown — which is why it false-proved:
+    //   `while i < 4 { assert!(n != i); t ^= i; i += 1; }` verified rc=0
+    //   ("2 proved") off the UNRELATED `i += 1` overflow proof, and panics for
+    //   every `n` in 0..4.
+    // Do not reintroduce this without publishing a real per-site row for each
+    // diverging-panic site first; see tests/trust-falsification/mutant/
+    // pf_subsume_*.rs.
     /// Trust: E9 ensures-citation discharge (design note
     /// 2026-07-15-e9-discharge-criterion §5d). The cited island theorem was
     /// kernel-graded `Certified` against the postcondition goal
@@ -2632,10 +2632,7 @@ fn live_authority_run_seal_key(
         | ResultProofAuthority::AssumedTotalCalleeAssumption { .. }
         | ResultProofAuthority::EnsuresCitationDischarge { .. }
         | ResultProofAuthority::SolverRevalidated { .. }
-        | ResultProofAuthority::CallerPropagation { .. }
-        // The subsumption authority carries no live run seal — its premises
-        // each validated their own.
-        | ResultProofAuthority::WholeFunctionPanicFreedomSubsumption { .. } => None,
+        | ResultProofAuthority::CallerPropagation { .. } => None,
     }
 }
 
@@ -2732,9 +2729,6 @@ impl ResultProofAuthority {
                 authority.authorizes_compiler_result(result)
             }
             Self::CallerPropagation { sealed, .. } => r1_attributed_verdict_matches(result, sealed),
-            // The subsumption flip sets exactly `Proved`; any other result
-            // shape means the token was moved/stale — reject it.
-            Self::WholeFunctionPanicFreedomSubsumption { .. } => result.is_proved(),
             Self::KernelCertified { .. }
             | Self::BodyBoundNativeReplay { .. }
             | Self::BodyBoundKernelCertified { .. }
@@ -2777,9 +2771,6 @@ impl ResultProofAuthority {
             Self::ExactSourceClauseDischarge { row, binding: exact, body_proofs } => {
                 row == &current_row && binding == Some(exact) && !body_proofs.is_empty()
             }
-            Self::WholeFunctionPanicFreedomSubsumption { row, binding: exact } => {
-                row == &current_row && exact.as_ref() == binding
-            }
         }
     }
 
@@ -2805,14 +2796,7 @@ impl ResultProofAuthority {
                     // R1 is a real static proof for this closed-world carrier,
                     // but not an unconditional all-input proof. Consumers that
                     // need the latter use `is_unconditional_static_proof_for`.
-                    | Self::CallerPropagation { .. } // `WholeFunctionPanicFreedomSubsumption` is DELIBERATELY
-                                                     // excluded: it is a DERIVED conjunction over the rows this
-                                                     // predicate inspects, so admitting it here would let a
-                                                     // discharged aggregate serve as its own premise class
-                                                     // (e.g. in `all_results_have_static_proof_authority`
-                                                     // consumers such as the R1-mono lowering-abort suppression
-                                                     // and the panic-free callee registry). Derived authority
-                                                     // never feeds registries that expect independent proofs.
+                    | Self::CallerPropagation { .. }
             )
     }
 
@@ -2852,15 +2836,12 @@ impl ResultProofAuthority {
         result: &VerificationResult,
         binding: Option<&ResultObligationBinding>,
     ) -> bool {
-        // The panic-freedom subsumption is a REPORTABLE proof (its disposition
-        // is Trusted/Deductive) but deliberately NOT an `is_static_proof_for`
-        // premise (a derived conjunction must never feed the registries that
-        // expect independent proofs — see the variant doc). Split the two
-        // concerns here: transport/report acceptance takes either.
+        // Historically this admitted one extra REPORTABLE-but-not-premise
+        // authority (the removed whole-function panic-freedom subsumption).
+        // With that lane gone the transport bar is exactly the premise bar; a
+        // new reportable-only authority must re-add its own arm here rather
+        // than inherit one.
         self.is_static_proof_for(index, vc, result, binding)
-            || (self.matches_row(index, vc, binding)
-                && self.matches_compiler_result(result)
-                && matches!(self, Self::WholeFunctionPanicFreedomSubsumption { .. }))
     }
 
     fn is_definition_entry_assumption_for(
@@ -2991,9 +2972,7 @@ impl ResultProofAuthority {
             | Self::AssumedTotalCalleeAssumption { .. }
             | Self::EnsuresCitationDischarge { .. }
             | Self::SolverRevalidated { .. }
-            | Self::CallerPropagation { .. }
-            // A derived conjunction has no single kernel proof term of its own.
-            | Self::WholeFunctionPanicFreedomSubsumption { .. } => None,
+            | Self::CallerPropagation { .. } => None,
         }
     }
 }
@@ -3434,13 +3413,6 @@ fn trust_disposition_for_authority(
         // component proofs were kernel-replayed, but the attributed end claim
         // is not an isolated-VC kernel theorem, so report Trusted/Deductive.
         ResultProofAuthority::CallerPropagation { .. } => {
-            Some((TrustStatus::Trusted, TrustProofStrength::Deductive))
-        }
-        // The whole-function panic-freedom aggregate derived from the complete,
-        // individually-authorized premise row set (see the variant doc). A
-        // compiler-composed conjunction, not an isolated-VC kernel theorem:
-        // Trusted/Deductive, exactly like the source-clause and R1 derivations.
-        ResultProofAuthority::WholeFunctionPanicFreedomSubsumption { .. } => {
             Some((TrustStatus::Trusted, TrustProofStrength::Deductive))
         }
     }
@@ -4414,16 +4386,53 @@ fn publish_body_verification_outcome<'tcx>(
     // and memory-safe lanes reject the premise after preserving all result
     // rows and diagnostics, so a zero-data-obligation coroutine can never
     // manufacture `no_obligations` proof credit over a hidden Assume.
-    let coroutine_protocol_rows =
-        rows_with_coroutine_protocol_assumption(tcx, body, rows_before_coroutine_assumption);
-    let effective_rows =
-        coroutine_protocol_rows.as_deref().unwrap_or(rows_before_coroutine_assumption);
-    if coroutine_protocol_rows.is_some() && output_mode.emit_human() {
-        eprintln!(
-            "Trust: ASSUMPTION [{COROUTINE_PROTOCOL_ASSUMPTION_TAG}] `{func_path}`: \
-             {COROUTINE_PROTOCOL_ASSUMPTION_DETAIL} — recorded as an unverified \
-             assumption (NOT proved)"
-        );
+    let coroutine_protocol_rows = coroutine_protocol_disposition(
+        tcx,
+        body,
+        rows_before_coroutine_assumption,
+        artifacts.as_ref(),
+        &func_path,
+    );
+    let effective_rows = match &coroutine_protocol_rows {
+        Some(
+            CoroutineProtocolDisposition::ContractPublished(rows)
+            | CoroutineProtocolDisposition::UnprovedAssumption(rows),
+        ) => rows.as_slice(),
+        None => rows_before_coroutine_assumption,
+    };
+    if output_mode.emit_human() {
+        match &coroutine_protocol_rows {
+            Some(CoroutineProtocolDisposition::UnprovedAssumption(_)) => eprintln!(
+                "Trust: ASSUMPTION [{COROUTINE_PROTOCOL_ASSUMPTION_TAG}] `{func_path}`: \
+                 {COROUTINE_PROTOCOL_ASSUMPTION_DETAIL} — recorded as an unverified \
+                 assumption (NOT proved)"
+            ),
+            // Trust (coroutine resume-state contract): the sentinels were
+            // genuinely solver-proved under the bridge's exported entry
+            // precondition, so the premise publishes as a CONTRACT row
+            // (verified-modulo-callers) instead of an unverified assumption.
+            Some(CoroutineProtocolDisposition::ContractPublished(rows)) => {
+                let states = rows
+                    .iter()
+                    .rev()
+                    .find_map(|row| {
+                        trust_types::assumption::parse_coroutine_resume_contract_row_description(
+                            &row.description,
+                        )
+                    })
+                    .map(|states| {
+                        trust_types::assumption::coroutine_resume_contract_states_render(&states)
+                    })
+                    .unwrap_or_else(|| "{..}".to_string());
+                eprintln!(
+                    "Trust: CONTRACT [coroutine-resume-state] `{func_path}`: \
+                     ResumedAfterReturn/Panic/Drop sentinels PROVED under exported \
+                     precondition resume state ∈ {states}; the crate's proof remains \
+                     conditional on every caller establishing the resume state"
+                );
+            }
+            None => {}
+        }
     }
 
     // Trust #542: Emit structured JSON transport only when requested.
@@ -4502,7 +4511,16 @@ fn publish_body_verification_outcome<'tcx>(
     // Pass the policy so diagnostics distinguish strict, survey, and
     // memory-safe runs.
     report_strict_l0_verification_failure(tcx, body, &func_path, artifacts.as_ref(), &policy);
-    if strict && coroutine_protocol_rows.is_some() && !memory_safe {
+    // A PUBLISHED contract (sentinels solver-proved under the exported
+    // precondition) is verified-modulo-callers and does not abort; only the
+    // UNPROVED premise keeps the fail-closed strict rejection.
+    if strict
+        && matches!(
+            &coroutine_protocol_rows,
+            Some(CoroutineProtocolDisposition::UnprovedAssumption(_))
+        )
+        && !memory_safe
+    {
         abort_on_coroutine_protocol_assumption(tcx, body, &func_path);
     }
 
@@ -4862,6 +4880,11 @@ fn trust_loop_monitor_places<'tcx>(
         })?;
         let expected_ty = runtime_monitor_domain_ty(tcx, *domain)?;
         let mut candidates = Vec::new();
+        let mut identity_matches = 0usize;
+        let mut non_inlined_matches = 0usize;
+        let mut visible_scope_matches = 0usize;
+        let mut type_matches = 0usize;
+        let mut initialized_matches = 0usize;
         for (local, decl) in body.local_decls.iter_enumerated() {
             let candidate_hir_local_id = match &decl.local_info {
                 ClearCrossCrate::Set(info) => match &**info {
@@ -4875,19 +4898,24 @@ fn trust_loop_monitor_places<'tcx>(
                 },
                 ClearCrossCrate::Clear => None,
             };
-            if candidate_hir_local_id != Some(*hir_local_id)
-                || decl.source_info.scope.inlined_instance(&body.source_scopes).is_some()
-            {
+            if candidate_hir_local_id != Some(*hir_local_id) {
                 continue;
             }
+            identity_matches += 1;
+            if decl.source_info.scope.inlined_instance(&body.source_scopes).is_some() {
+                continue;
+            }
+            non_inlined_matches += 1;
             let Some(distance) =
                 source_scope_ancestor_distance(body, header_scope, decl.source_info.scope)
             else {
                 continue;
             };
+            visible_scope_matches += 1;
             if decl.ty != expected_ty {
                 continue;
             }
+            type_matches += 1;
             let place = Place::from(local);
             let LookupResult::Exact(path) = move_data.rev_lookup.find(place.as_ref()) else {
                 continue;
@@ -4895,13 +4923,17 @@ fn trust_loop_monitor_places<'tcx>(
             if uninitialized.contains(path) {
                 continue;
             }
+            initialized_matches += 1;
             candidates.push((distance, place));
         }
         candidates.sort_by_key(|(distance, place)| (*distance, place.local.as_usize()));
         candidates.dedup();
         let Some(best_distance) = candidates.first().map(|(distance, _)| *distance) else {
             return Err(format!(
-                "no exact, initialized MIR source binding exists for loop monitor variable `{name}`"
+                "no exact, initialized MIR source binding exists for loop monitor variable \
+                 `{name}` (identity={identity_matches}, non-inlined={non_inlined_matches}, \
+                 visible-scope={visible_scope_matches}, exact-type={type_matches}, \
+                 initialized={initialized_matches})"
             ));
         };
         let mut best = candidates
@@ -7242,18 +7274,26 @@ fn trust_check_clean_islands(
     // namespaces, `open`s, notation, options, and declarations affect later
     // islands. Sort by authored source position before feeding one stateful
     // Environment + FileContext session for this crate.
-    let mut island_spans = Vec::new();
+    //
+    // The island TEXT rides along on the HIR node: `rustc_parse` captured the
+    // exact bytes it handed to the Clean parser (ruling v7/D1), so the
+    // elaborator below sees the same bytes by construction rather than by a
+    // second source-map lookup that could disagree. The parse payload
+    // (`decls`) is deliberately NOT consumed here — elaboration re-parses with
+    // its own tactic-pattern table, and a parse-time success carries no
+    // authority.
+    let mut island_spans: Vec<(rustc_span::Span, String)> = Vec::new();
     for item_id in tcx.hir_crate_items(()).free_items() {
         let item = tcx.hir_item(item_id);
-        let rustc_hir::ItemKind::CleanIsland { content_span } = item.kind else {
+        let rustc_hir::ItemKind::CleanIsland { content_span, text, .. } = item.kind else {
             continue;
         };
-        island_spans.push(content_span);
+        island_spans.push((content_span, text.to_string()));
     }
-    island_spans.sort_by_key(|span| (span.lo(), span.hi()));
+    island_spans.sort_by_key(|(span, _)| (span.lo(), span.hi()));
     let ambiguous_order = island_spans.windows(2).find_map(|pair| {
-        let earlier = pair[0];
-        let later = pair[1];
+        let earlier = pair[0].0;
+        let later = pair[1].0;
         let same_start = earlier.lo() == later.lo();
         let overlaps = earlier.hi() > later.lo();
         (same_start || overlaps).then_some((earlier, later))
@@ -7280,14 +7320,33 @@ fn trust_check_clean_islands(
             )
             .emit();
     } else {
-        for content_span in island_spans {
-            let Ok(text) = tcx.sess.source_map().span_to_snippet(content_span) else {
-                clean_session.invalidate();
-                tcx.dcx().span_err(
-                    content_span,
-                    "Clean island body could not be recovered from the source map",
-                );
-                continue;
+        // I1: COLLECT every island's text before checking any of it. Header-first
+        // checking elaborates every declaration's signature across the whole
+        // crate before any body, so the batch cannot begin until the last
+        // island's text exists. The authored sort above is still load-bearing —
+        // it orders `FileContext` state (namespace / `open` / options /
+        // notation) and the diagnostics — but it no longer decides which names
+        // a declaration can resolve.
+        let mut batch_islands: Vec<(rustc_span::Span, String)> = Vec::new();
+        for (content_span, text) in island_spans {
+            // Normal path: the text came straight off the HIR node, captured
+            // by the parser. An EMPTY payload is either a genuinely empty
+            // island or the one case the parser could not capture (no source
+            // behind the span); both are cheap to settle through the source
+            // map, and an island whose bytes cannot be recovered at all still
+            // fails closed exactly as before.
+            let text = if text.is_empty() {
+                let Ok(recovered) = tcx.sess.source_map().span_to_snippet(content_span) else {
+                    clean_session.invalidate();
+                    tcx.dcx().span_err(
+                        content_span,
+                        "Clean island body could not be recovered from the source map",
+                    );
+                    continue;
+                };
+                recovered
+            } else {
+                text
             };
             // E6 program admissions are minted only after the body walk. An
             // island that names one of those constants must therefore be
@@ -7299,41 +7358,101 @@ fn trust_check_clean_islands(
             // the complete authored suffix as well: a later island may depend
             // on its namespace, `open`, notation, options, or declarations
             // even when its own text does not repeat `trust_import_`.
+            //
+            // This partition survives I1: source-order independence holds
+            // WITHIN the pre-walk batch and within the post-walk one, not
+            // across that boundary, because the post-walk islands need
+            // constants that do not exist until program admissions are minted.
             defer_island_suffix |= text.contains("trust_import_");
             if defer_island_suffix {
                 deferred_islands.push((content_span, text));
                 continue;
             }
-            let outcome = clean_session.check(&text);
-            if outcome.is_rejected() {
-                for err in &outcome.errors {
-                    let start = err.start.min(text.len());
-                    let end = err.end.max(start).min(text.len());
+            batch_islands.push((content_span, text));
+        }
+
+        if !batch_islands.is_empty() {
+            let texts: Vec<&str> =
+                batch_islands.iter().map(|(_, text)| text.as_str()).collect();
+            let batch = clean_session.check_all(&texts);
+
+            // A dependency cycle is reported against every island that carries
+            // one of its members, so the author sees both ends of a cross-island
+            // cycle rather than one arbitrary half.
+            for cycle in &batch.cycles {
+                let Some(primary) = cycle.sites.first() else { continue };
+                let site_span = |site: &trust_certify::clean_island_batch::CleanIslandCycleSite| {
+                    let (content_span, text) = &batch_islands[site.island];
+                    let start = site.start.min(text.len());
+                    let end = site.end.max(start).min(text.len());
                     let lo = content_span.lo() + BytePos(start as u32);
                     let mut hi = content_span.lo() + BytePos(end as u32);
                     if hi == lo && lo < content_span.hi() {
                         hi = lo + BytePos(1);
                     }
-                    let span = content_span.with_lo(lo).with_hi(hi);
+                    content_span.with_lo(lo).with_hi(hi)
+                };
+                let mut diagnostic = tcx.dcx().struct_span_err(
+                    site_span(primary),
+                    format!(
+                        "Clean declarations form a dependency cycle: {}",
+                        cycle.render()
+                    ),
+                );
+                for site in cycle.sites.iter().skip(1) {
+                    diagnostic = diagnostic.with_span_label(
+                        site_span(site),
+                        format!("`{}` closes the cycle", site.name),
+                    );
+                }
+                diagnostic
+                    .with_note(
+                        "declaration headers are collected across every Clean island before \
+                         any body is registered, so this cycle is found structurally rather \
+                         than by the kernel diverging; nothing from these islands was \
+                         registered",
+                    )
+                    // Clean's own refusal, verbatim. It names the ways forward
+                    // in order of preference and says what each one costs;
+                    // paraphrasing it here would let the two repos drift about
+                    // what the fix actually is.
+                    .with_note(cycle.message.clone())
+                    .emit();
+            }
+
+            for (index, outcome) in batch.outcomes.iter().enumerate() {
+                let (content_span, text) = &batch_islands[index];
+                let content_span = *content_span;
+                if outcome.is_rejected() {
+                    for err in &outcome.errors {
+                        let start = err.start.min(text.len());
+                        let end = err.end.max(start).min(text.len());
+                        let lo = content_span.lo() + BytePos(start as u32);
+                        let mut hi = content_span.lo() + BytePos(end as u32);
+                        if hi == lo && lo < content_span.hi() {
+                            hi = lo + BytePos(1);
+                        }
+                        let span = content_span.with_lo(lo).with_hi(hi);
+                        tcx.dcx()
+                            .struct_span_err(span, err.message.clone())
+                            .with_note(
+                                "the island was parsed by the Clean parser and checked by the \
+                                 Clean CIC kernel during this build (two-language design E10)",
+                            )
+                            .emit();
+                    }
+                } else if !outcome.registered.is_empty() {
                     tcx.dcx()
-                        .struct_span_err(span, err.message.clone())
-                        .with_note(
-                            "the island was parsed by the Clean parser and checked by the \
-                             Clean CIC kernel during this build (two-language design E10)",
+                        .struct_span_note(
+                            content_span,
+                            format!(
+                                "Clean island kernel-checked: {} declaration(s) registered ({})",
+                                outcome.registered.len(),
+                                outcome.registered.join(", ")
+                            ),
                         )
                         .emit();
                 }
-            } else if !outcome.registered.is_empty() {
-                tcx.dcx()
-                    .struct_span_note(
-                        content_span,
-                        format!(
-                            "Clean island kernel-checked: {} declaration(s) registered ({})",
-                            outcome.registered.len(),
-                            outcome.registered.join(", ")
-                        ),
-                    )
-                    .emit();
             }
         }
     }
@@ -8756,6 +8875,10 @@ fn strict_l0_verification_failure(
     result_bindings: &[Option<ResultObligationBinding>],
     proof_authorities: &[Option<ResultProofAuthority>],
     full_verification: Option<&trust_verifier_api::VerificationRunResult>,
+    // Callee names whose FATAL absent-callee rows are adversarially refutable
+    // (open uncontracted generic trait dispatch) — see
+    // `adversarially_refutable_open_dispatch_callees`. Empty set = no effect.
+    adversarial_open_dispatch: &FxHashSet<String>,
 ) -> Option<FullVerificationFailure> {
     let mut failure =
         FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 0, skipped: 0 };
@@ -8857,6 +8980,23 @@ fn strict_l0_verification_failure(
         // discharged safety obligation; see `is_native_unsupported_strict_l0_safety_mir`.
         if !matches!(result, VerificationResult::Proved { .. })
             && is_native_unsupported_strict_l0_safety_mir(&vc.kind)
+        {
+            failure.failed += 1;
+            continue;
+        }
+
+        // Trust (adversarial-instantiation refutation): the FATAL absent-callee
+        // row for an OPEN, uncontracted, unresolved generic trait dispatch. The
+        // universal panic-freedom claim it stands for is constructively FALSE
+        // (a downstream impl may panic — the witness the R3 fixtures name), so
+        // a non-`Proved` row is a refutation, not a coverage gap. Reclassify to
+        // `failed`. SOUND: the witness argument needs the trait OPEN and the
+        // resolution `Ok(None)` — both checked at collection
+        // (`adversarially_refutable_open_dispatch_callees`), which errs closed
+        // on every other shape; and only a NON-`Proved` result reaches here, so
+        // a rung-1/rung-2 discharge is never overridden.
+        if !matches!(result, VerificationResult::Proved { .. })
+            && vc_names_adversarially_refutable_absent_callee(&vc.kind, adversarial_open_dispatch)
         {
             failure.failed += 1;
             continue;
@@ -8975,6 +9115,98 @@ fn is_known_panicking_call_unsupported_mir(kind: &VcKind) -> bool {
     )
 }
 
+/// The FATAL absent-callee arm's obligation text prefix, up to the callee name.
+/// Kept in lockstep with trust-ir-bridge's absent-callee row mint.
+const ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX: &str =
+    "[trust-absent-callee-assumption] call to absent callee `";
+
+/// Trust (falsification gate, `absent_callee_call_only_generic` /
+/// `trait_default_body_generic_caller`): the ADVERSARIAL-INSTANTIATION witness
+/// set for OPEN generic trait dispatch.
+///
+/// A call to `<T as D>::m` that `Instance::try_resolve` cannot pin
+/// (`Ok(None)`, instantiation-dependent) on an OPEN trait (a downstream crate
+/// can add impls this compilation never sees), with NO
+/// `#[trust::panic_free]` contract on the trait method, has a panic-freedom
+/// obligation quantified over ALL instantiations — and that universal claim is
+/// PROVABLY FALSE by construction: `impl D for W { fn m(&self) -> u32 {
+/// panic!() } }` composed with the caller is a concrete panicking execution
+/// (the trait_default fixture's own comment names exactly this witness; a
+/// DEFAULT body changes nothing, since an impl may override it — the T5b
+/// hazard). Recording these calls lets the strict summary report the row as
+/// `failed` (a refutation of the universal claim) instead of `unknown` (a
+/// capability gap).
+///
+/// SOUNDNESS BOUNDARY — every arm errs closed toward NOT refuting:
+/// * `Ok(Some(_))` resolutions are excluded: a pinned body's panic-freedom is a
+///   question about that body, not about all instantiations.
+/// * `dyn_trait_sealedness == Sealed` is excluded: a closed impl set means the
+///   adversarial impl cannot exist; the row stays an honest unknown (rung 2
+///   proves it instead when every enumerated target is verified).
+/// * A `#[trust::panic_free]` trait contract is excluded (rung 1): the
+///   obligation was moved to the implementors, not left universal.
+/// * The match key is the FATAL absent-callee row text; `#[trust::skip]` /
+///   expected-absent / compiler-total calls never carry it.
+fn adversarially_refutable_open_dispatch_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> FxHashSet<String> {
+    let typing_env = body.typing_env(tcx);
+    let mut out = FxHashSet::default();
+    for block in body.basic_blocks.iter() {
+        let (TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. }) =
+            &block.terminator().kind
+        else {
+            continue;
+        };
+        let Some((callee_def_id, gen_args)) = func.const_fn_def() else {
+            continue;
+        };
+        let Some(trait_def_id) = tcx.trait_of_assoc(callee_def_id) else {
+            continue;
+        };
+        if !matches!(
+            ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args),
+            Ok(None)
+        ) {
+            continue;
+        }
+        if trait_panic_free::generic_call_relies_on_panic_free_contract(tcx, callee_def_id) {
+            continue;
+        }
+        if dyn_trait_sealedness(tcx, trait_def_id) != trust_vcgen::TraitSealedness::Open {
+            continue;
+        }
+        out.insert(trust_mir_extract::func_operand_name(tcx, func));
+    }
+    out
+}
+
+/// Whether this obligation is the FATAL absent-callee row for a callee in the
+/// adversarial-instantiation witness set. Non-`Proved` such rows count as
+/// `failed` in the strict summary: the universal panic-freedom claim they
+/// stand for is constructively refuted, not merely unproved.
+fn vc_names_adversarially_refutable_absent_callee(
+    kind: &VcKind,
+    adversarial: &FxHashSet<String>,
+) -> bool {
+    if adversarial.is_empty() {
+        return false;
+    }
+    let text = match kind {
+        VcKind::Assertion { message } => message.as_str(),
+        VcKind::UnsupportedMir { detail, .. } => detail.as_str(),
+        _ => return false,
+    };
+    let Some(rest) = text.split(ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX).nth(1) else {
+        return false;
+    };
+    let Some(name) = rest.split('`').next() else {
+        return false;
+    };
+    adversarial.contains(name)
+}
+
 /// Trust: fail-closed on absent-callee panic (revert of d8a9bbc28e fail-open;
 /// unproven panic MUST fail closed). The `FullVerification::<kind>` prefixes the
 /// native round-trip stamps onto an `UnsupportedMir` VC for a STRICT-L0 SAFETY
@@ -9050,12 +9282,14 @@ fn report_strict_l0_verification_failure<'tcx>(
     policy: &TrustVerifyPolicy,
 ) {
     let strict = policy.fail_closed();
+    let adversarial_open_dispatch = adversarially_refutable_open_dispatch_callees(tcx, body);
     let Some(failure) = strict_l0_verification_failure(
         tcx.sess.overflow_checks(),
         &artifacts.results,
         &artifacts.result_bindings,
         &artifacts.proof_authorities,
         artifacts.full_verification.as_ref(),
+        &adversarial_open_dispatch,
     ) else {
         return;
     };
@@ -10847,6 +11081,30 @@ struct CrateVerificationState {
     /// fail-closed regardless).
     l0_verdict_withheld: bool,
     panic_free_proven_funcs: FxHashSet<String>,
+    /// Trust (assumption-root gate): for each body whose verification reached the
+    /// USER-AXIOM CENSUS, whether that verification was established free of
+    /// user-written axioms — `#[trust::assume_total]` and `#[trust::skip]` CALLEES
+    /// whose call keys the bundle SPENT, i.e. handed to the bridge in
+    /// `assumed_total` / `expected_absent`.
+    ///
+    /// NOT "every callee anywhere in the bundle": the census reads the root body
+    /// and the DefId walk, which is measurably not the whole bundle (see
+    /// `bundled_def_id_reads_complete`). It does not need to be — a user axiom the
+    /// bundle did not spend leaves its call site an unproved absent callee, which
+    /// conjunct 1 of the shared bar refuses on its own. The full case split, and
+    /// the programs that measure both of its branches, are on
+    /// [`verdict_rests_on_user_axiom`].
+    ///
+    /// `false` means the verdict is CONDITIONAL on a user declaration; ABSENT
+    /// means no census was ever taken, which is UNANSWERED, not clean. Both
+    /// refuse — see [`verdict_rests_on_user_axiom`], the ONE authenticator every
+    /// premise lane consults.
+    ///
+    /// Conjoined on insert (`&=`): one def can be verified as more than one
+    /// bundle, and a single axiom-bearing bundle is enough to make its verdict
+    /// conditional. Session state, like `panic_free_proven_funcs`, so parallel
+    /// workers see it and a later crate with the same def-path cannot inherit it.
+    axiom_free_verdicts: FxHashMap<DefId, bool>,
     /// Exact extracted call identities for bodyless foreign, non-unwinding
     /// C-family imports. Only the compiler's `is_foreign_item` classification
     /// can populate this set; a local Rust `extern "C" fn` is never admitted.
@@ -11748,6 +12006,27 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
         state.env = island_env_clone;
     });
     if !verification_enabled(tcx.sess) {
+        // Trust (loud-when-off): silent-vanilla must be unrepresentable. When
+        // the explicit `-Ztrust-verify=off` argv spelling compiled a crate the
+        // batteries-on toolchain COULD have verified, say so once per crate,
+        // in-band — a note, deliberately not a lint and not a warning, so it
+        // can neither be `allow`ed away nor promoted to an error by
+        // `-Dwarnings` (the deferred-verification lane note in
+        // `rustc_interface::passes` is the mechanism precedent). Three
+        // deauthorizations are announced elsewhere and stay quiet here:
+        // deauthorized-by-design frontends (embedded/doctest) and the
+        // inherited `TRUST_NO_VERIFY=1` transport never set the explicitness
+        // bit; a Targo-resolved scope always carries a non-`unscoped`
+        // reporting role (its session inventory records the exclusion); and
+        // harnesses that stamp the flag as recorded policy (compiletest
+        // isolation, bootstrap's non-self-proving build) set the
+        // diagnostic-only `TRUST_VANILLA_ANNOUNCED` env marker.
+        if tcx.sess.opts.trust_verify_explicit_off
+            && tcx.sess.trust_crate_role() == rustc_session::TrustCrateRole::Unscoped
+            && !env_flag_enabled("TRUST_VANILLA_ANNOUNCED")
+        {
+            tcx.dcx().note("compiled WITHOUT Trust verification — 0 obligations checked");
+        }
         // Islands remain mandatory language-integrity checks when verification
         // is disabled. No body walk means no program admissions, so a deferred
         // import legitimately cannot elaborate, but it must fail visibly
@@ -11792,6 +12071,12 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
     for local in trust_callee_first_demand_order(tcx, &eligible_bodies) {
         tcx.ensure_done().optimized_mir(local.to_def_id());
     }
+    // Trust rung 1 (§(a)+(b)): every implementation of a `#[trust::panic_free]`
+    // trait method carries the inherited obligation to PROVE panic-freedom, and
+    // a failure is reported at the implementation that owns the body. Runs here,
+    // after the walk, so every `trust_proof_results` it reads is already
+    // computed and no impl can be discharged against a stale or missing verdict.
+    trait_panic_free::discharge_trait_panic_free_contracts(tcx);
     // E6 kernel-import: the walk above populated the facet table + body
     // inventory, so mint admissions for recognized facet-certified functions into
     // the session env BEFORE the citation sweep reads it.
@@ -13166,8 +13451,12 @@ fn try_harvest_flip<'tcx>(
     // Gate one candidate formula `cand` against F's namespace; `Some(gated)` iff admissible.
     let gate_candidate = |cand: trust_types::Formula| -> Option<trust_types::Formula> {
         let mut pv = vec![cand];
+        // `None`: this lane gates a SYNTHESIZED candidate precondition, not an
+        // authored clause, and has no HIR parameter vector to hand. The forced
+        // restatement therefore declines — correct here regardless, since a
+        // proposer's candidate is already written in the body's own namespace.
         let reasons = trust_mir_extract::contract_assumption_gate::gate_contract_preconditions(
-            &mut pv, &f_vf.body, &dbg,
+            &mut pv, &f_vf.body, &dbg, None,
         );
         if !reasons.is_empty() || pv.is_empty() {
             return None;
@@ -13540,8 +13829,12 @@ fn try_harvest_generic_mono_flip<'tcx>(
         let dbg = trust_mir_extract::build_debug_name_multimap(&mono_body);
         let gate_candidate = |cand: trust_types::Formula| -> Option<trust_types::Formula> {
             let mut pv = vec![cand];
+            // `None`: this lane gates a SYNTHESIZED candidate precondition, not an
+            // authored clause, and has no HIR parameter vector to hand. The forced
+            // restatement therefore declines — correct here regardless, since a
+            // proposer's candidate is already written in the body's own namespace.
             let reasons = trust_mir_extract::contract_assumption_gate::gate_contract_preconditions(
-                &mut pv, &f_vf.body, &dbg,
+                &mut pv, &f_vf.body, &dbg, None,
             );
             if !reasons.is_empty() || pv.is_empty() {
                 return None;
@@ -13991,8 +14284,12 @@ fn try_harvest_recursive_flip<'tcx>(
         let m_vf_body = m_vf.body.clone();
         let gate_candidate = |cand: trust_types::Formula| -> Option<trust_types::Formula> {
             let mut pv = vec![cand];
+            // `None`: this lane gates a SYNTHESIZED candidate precondition, not an
+            // authored clause, and has no HIR parameter vector to hand. The forced
+            // restatement therefore declines — correct here regardless, since a
+            // proposer's candidate is already written in the body's own namespace.
             let reasons = trust_mir_extract::contract_assumption_gate::gate_contract_preconditions(
-                &mut pv, &m_vf_body, &dbg,
+                &mut pv, &m_vf_body, &dbg, None,
             );
             if !reasons.is_empty() || pv.is_empty() {
                 return None;
@@ -14827,6 +15124,7 @@ fn unsupported_contract_artifacts(
         result_bindings: Vec::new(),
         proof_authorities,
         overflow_check_origins: OverflowCheckOrigins::default(),
+        coroutine_resume_contract: None,
     }
 }
 
@@ -14882,6 +15180,7 @@ fn dump_only_artifacts(tcx: TyCtxt<'_>, body: &Body<'_>, def_path: &str) -> Veri
         result_bindings: Vec::new(),
         proof_authorities,
         overflow_check_origins: OverflowCheckOrigins::default(),
+        coroutine_resume_contract: None,
     }
 }
 
@@ -14928,6 +15227,7 @@ fn memory_admission_artifacts(
         result_bindings: Vec::new(),
         proof_authorities,
         overflow_check_origins: OverflowCheckOrigins::default(),
+        coroutine_resume_contract: None,
     }
 }
 
@@ -15436,7 +15736,43 @@ fn dyn_trait_sealedness<'tcx>(
 /// dispatch cannot cycle the query engine. Any impl that is missing, guarded
 /// out, unverified, or fails refinement yields `false` — the conservative
 /// answer that suppresses the proved dynamic-dispatch summary.
-fn has_nonzero_accounted_static_proof(results: &TrustProofResults) -> bool {
+/// Trust (assumption-root gate): `sess`/`def_id` are REQUIRED, not conveniences.
+/// Every caller of this predicate is spending ANOTHER body's verdict as a premise
+/// (the `dyn` contract summary's per-impl and default-body checks, and rung 2's
+/// sealed closed-world dispatch), and a verdict that consumed a user axiom is
+/// conditional — with no trace of it in `results` (measured: empty dispositions,
+/// `no_obligations`/`proved`). Threading the identity through the ONE predicate
+/// they share is what keeps a future caller from inheriting the hole instead of
+/// the check, and it is why THIS is the function with the obvious name: a call
+/// written from memory lands on the gated wrapper, not on the pure core.
+fn has_nonzero_accounted_static_proof(
+    sess: &Session,
+    def_id: DefId,
+    results: &TrustProofResults,
+) -> bool {
+    nonzero_accounted_static_proof_decision(verdict_rests_on_user_axiom(sess, def_id), results)
+}
+
+/// The WHOLE decision the gated wrapper above makes, with only the Session lookup
+/// factored out. Both conjuncts are here, so a unit test can pin the gated
+/// behaviour — including the contract-assumed bookkeeping seam that must never
+/// seed a dynamic-dispatch summary, and the census decline that must veto a row
+/// set which would otherwise pass. A `Session` cannot be built in a unit test, so
+/// this split is what makes the production decision testable at all; the pure
+/// row-only core below is the narrower half and covers only the row accounting.
+fn nonzero_accounted_static_proof_decision(
+    axiom_decline: Option<&str>,
+    results: &TrustProofResults,
+) -> bool {
+    axiom_decline.is_none() && results_are_nonzero_accounted_static_proof(results)
+}
+
+/// The pure core of the gate above: everything decidable from the RESULT ROWS
+/// alone. Separate so the row-accounting boundary stays directly unit-testable
+/// without a `Session` (same reason `all_calls_target_proven_or_abi_total_in_sets`
+/// is split out), and NOT to be called from production — the axiom census is not
+/// in `results`, so a row-only answer is only half the question.
+fn results_are_nonzero_accounted_static_proof(results: &TrustProofResults) -> bool {
     results.is_fully_verified()
         && results.summary.total > 0
         && results.summary.trusted.saturating_add(results.summary.certified)
@@ -15511,7 +15847,12 @@ fn all_trait_impls_verified<'tcx>(
 
                 let self_verified = matches!(
                     tcx.trust_proof_results(ty::InstanceKind::Item(impl_method_def_id)),
-                    Some(results) if has_nonzero_accounted_static_proof(results),
+                    Some(results)
+                        if has_nonzero_accounted_static_proof(
+                            tcx.sess,
+                            impl_method_def_id,
+                            results,
+                        ),
                 );
                 if !self_verified {
                     if probe {
@@ -15597,7 +15938,12 @@ fn all_trait_impls_verified<'tcx>(
                 }
                 let default_verified = matches!(
                     tcx.trust_proof_results(ty::InstanceKind::Item(trait_method_def_id)),
-                    Some(results) if has_nonzero_accounted_static_proof(results),
+                    Some(results)
+                        if has_nonzero_accounted_static_proof(
+                            tcx.sess,
+                            trait_method_def_id,
+                            results,
+                        ),
                 );
                 if !default_verified {
                     if probe {
@@ -15708,20 +16054,36 @@ fn sealed_generic_dispatch_impls_all_panic_free<'tcx>(
             return false;
         }
         let results = tcx.trust_proof_results(ty::InstanceKind::Item(target));
-        let verified = matches!(
-            results,
-            Some(r) if has_nonzero_accounted_static_proof(r)
-                // Ran (query returned results for a LOCAL, non-skip'd item)
-                // with ZERO obligations and zero rows: vcgen emits an
-                // obligation for every panic-capable construct, so an empty
-                // set means the body has none — trivially panic-free (e.g. a
-                // field read). Contract-panic and failed rows make the set
-                // NON-empty and land in the accounted branch above, which
-                // rejects them (trusted+certified must equal total).
-                || (r.summary.total == 0
-                    && r.dispositions.is_empty()
-                    && r.has_aligned_obligation_arrays()),
-        );
+        // Trust (assumption-root gate): the `#[trust::skip]` bail above is the
+        // ATTRIBUTE ON THE TARGET. A skip or `#[trust::assume_total]` on a CALLEE
+        // inside the target's own bundle produces the same "zero obligations,
+        // trivially panic-free" shape and carries no attribute here to gate on —
+        // measured. Consulted AFTER the query above, which is what forces the
+        // verdict and writes the census.
+        let axiom_decline = verdict_rests_on_user_axiom(tcx.sess, target);
+        let verified = axiom_decline.is_none()
+            && matches!(
+                results,
+                Some(r) if has_nonzero_accounted_static_proof(tcx.sess, target, r)
+                    // Ran (query returned results for a LOCAL, non-skip'd item)
+                    // with ZERO obligations and zero rows: vcgen emits an
+                    // obligation for every panic-capable construct, so an empty
+                    // set means the body has none — trivially panic-free (e.g. a
+                    // field read). Contract-panic and failed rows make the set
+                    // NON-empty and land in the accounted branch above, which
+                    // rejects them (trusted+certified must equal total).
+                    || (r.summary.total == 0
+                        && r.dispositions.is_empty()
+                        && r.has_aligned_obligation_arrays()),
+            );
+        if let Some(reason) = axiom_decline
+            && probe
+        {
+            eprintln!(
+                "TRUST_RUNG2_PROBE: bail=assumption-root target={} ({reason})",
+                tcx.def_path_str(target)
+            );
+        }
         if probe {
             match results {
                 Some(r) => eprintln!(
@@ -16443,8 +16805,10 @@ fn callee_param_names<'tcx>(tcx: TyCtxt<'tcx>, callee_def_id: DefId) -> Vec<Stri
         // Mutual-recursion members have a pre-steal immutable snapshot. Use it
         // for the same authoritative MIR debug names as ordinary callees,
         // instead of silently degrading cyclic calls to `fn_arg_idents`.
-        if trust_mir_is_mutually_recursive(tcx, local) {
-            return mir_param_names(tcx.mir_for_trust_verification(local));
+        if trust_mir_is_mutually_recursive(tcx, local)
+            && let Some(body) = tcx.mir_for_trust_verification(local)
+        {
+            return mir_param_names(body);
         }
         // A direct self call is already in progress but is not a mutual cycle;
         // querying its optimized MIR would re-enter the exact live query. Keep
@@ -16962,7 +17326,8 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
     }
     let solver_vcs = dedupe_exact_vcs(trust_vcgen::filter_vcs_by_level(solver_vcs, max_level));
     // Trust #spine: VERDICT-IDENTICAL trust-ir verdict flip.
-    let solver_vcs = apply_spine_verdict_flip(&func, solver_vcs);
+    let (solver_vcs, spine_unchecked_obligations) =
+        apply_spine_verdict_flip(&func, solver_vcs, &discharged);
     // Trust #spine (R-L1): VERDICT-IDENTICAL trust-ir L1 CONTRACT verdict flip.
     let mut solver_vcs =
         apply_spine_contract_verdict_flip(&func, spine_module.as_ref(), solver_vcs);
@@ -16982,6 +17347,14 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
     // obligations it owns while guaranteeing the unsafe findings reach the
     // router unmodified. SOUNDNESS: fail-closed — these VCs are always-SAT,
     // so appending them can only ADD a refutation, never remove one.
+    // Trust (#57, 2026-08-17): FAIL-CLOSE the producer disagreement. Appended here
+    // for the SAME reason the two unsafe sweeps below are: these are compiler-side
+    // findings, not spine-derivable L0 safety obligations, so the native-gen flip
+    // would classify them as L0 and drop them.
+    solver_vcs.extend(synthetic_unchecked_obligation_vcs(
+        &func.def_path,
+        &spine_unchecked_obligations,
+    ));
     solver_vcs.extend(synthetic_unmodeled_unsafe_call_vcs(tcx, body, &func.def_path));
     solver_vcs.extend(synthetic_nonmodeled_unsafe_op_vcs(tcx, body, &func.def_path));
     debug!(
@@ -17048,12 +17421,25 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
 /// as the migration cross-check oracle. Otherwise the verdict-flip runs (which
 /// spine-sources the formulas it can). This is sound by construction: the native set
 /// is used only on an exact match, so dispatched verdicts are identical either way.
+/// Trust (#57, 2026-08-17): the obligations the trust-ir spine derived that
+/// trust-vcgen neither dispatched nor discharged, returned so the caller can
+/// fail-close on them. Empty on every other path.
 fn apply_spine_verdict_flip(
     func: &trust_types::VerifiableFunction,
     solver_vcs: Vec<VerificationCondition>,
-) -> Vec<VerificationCondition> {
-    let (dispatched, outcome) =
-        trust_ir_bridge::generate_native_or_flip_safety_vcs(func, solver_vcs);
+    // Trust (#57): the obligations trust-vcgen PROVED at generation time. They are
+    // checked — more strongly than the dispatched ones — so the producer
+    // comparison below must count them as present. Passing `&[]` here would make
+    // the alarm claim "nothing verifies this" about obligations trust-vcgen
+    // discharged (measured: `bounded_add`, `inc_gt`, `helper`).
+    discharged: &[(VerificationCondition, trust_types::VerificationResult)],
+) -> (Vec<VerificationCondition>, Vec<trust_ir_bridge::ObligationKey>) {
+    let mut unchecked = Vec::new();
+    let (dispatched, outcome) = trust_ir_bridge::generate_native_or_flip_safety_vcs_with_discharged(
+        func,
+        solver_vcs,
+        discharged.iter().map(|(vc, _)| vc),
+    );
     match outcome {
         trust_ir_bridge::NativeGenOutcome::NativeGenerated(n) => {
             debug!(
@@ -17073,8 +17459,96 @@ fn apply_spine_verdict_flip(
                 report.trust_vcgen_sourced(),
             );
         }
+        // Trust (#57, 2026-08-17) — THE MISSING-OBLIGATION ALARM. The two
+        // independent producers disagree about WHICH obligations exist. Dispatch is
+        // unchanged (this is the same fallback path), but the disagreement is no
+        // longer discarded.
+        //
+        // `native_only` is the direction that matters: the dispatched set is
+        // trust-vcgen's, so an obligation only the spine derived — and that
+        // trust-vcgen neither emitted nor discharged — is a proposition NOTHING
+        // checks. It cannot surface anywhere downstream, because an obligation that
+        // is never emitted produces silence, and silence reads as success even to
+        // the kernel.
+        //
+        // Reported rather than fail-closed, and that is measured rather than
+        // timid: across all 2326 committed dumps the surviving population is 31,
+        // every one of them the spine over-generating a trivially-true
+        // constant-divisor check (`n % 2`), which is not an unchecked obligation.
+        // Failing the build on those would reject valid Rust — a release gate. The
+        // gate that CAN be sharp lives where the population is measurable:
+        // `flip::missing_obligation_ratchet`, which goes red on any obligation
+        // class outside that known-benign one. Fail-closing here becomes correct
+        // once the spine stops emitting them; the ratchet is what keeps the number
+        // from drifting up in the meantime.
+        trust_ir_bridge::NativeGenOutcome::Disagreed { diff, report } => {
+            if !diff.native_only.is_empty() {
+                info!(
+                    "Trust-IR PRODUCER DISAGREEMENT for {}: {} obligation(s) derived by the \
+                     trust-ir spine that trust-vcgen neither emitted nor discharged — nothing \
+                     checks these: {:?}",
+                    func.def_path,
+                    diff.native_only.len(),
+                    diff.native_only,
+                );
+            }
+            debug!(
+                "Trust-IR spine verdict-flip for {} (producers disagree): {} spine-only, {} \
+                 vcgen-only (spine coverage gap); {} spine-sourced (formula), {} \
+                 trust-vcgen-sourced",
+                func.def_path,
+                diff.native_only.len(),
+                diff.vcgen_only.len(),
+                report.spine_sourced_formula(),
+                report.trust_vcgen_sourced(),
+            );
+            unchecked = diff.native_only;
+        }
     }
-    dispatched
+    (dispatched, unchecked)
+}
+
+/// Trust (#57, 2026-08-17) — FAIL-CLOSED findings for obligations the trust-ir
+/// spine derived and NOTHING checks.
+///
+/// An obligation trust-vcgen never emitted is not dispatched, and one it never
+/// discharged is not proved — so it produces SILENCE, which is indistinguishable
+/// from success at every layer below, including the Clean kernel (a kernel can only
+/// re-check propositions it is handed). This turns that silence into a finding.
+///
+/// SOUNDNESS: identical in shape and argument to
+/// [`synthetic_unmodeled_unsafe_call_vcs`] — an always-SAT `Assertion`, appended
+/// after the spine flips. It can only ADD a refutation, never remove one, so it
+/// cannot make a previously-refuted function pass.
+///
+/// WHY THIS IS SAFE TO TURN ON NOW, and why it was not before: measured across all
+/// 2326 committed dumps, this list is EMPTY for every function
+/// (`trust_ir_bridge::flip::missing_obligation_ratchet`, a hard zero-gate). Before
+/// the shared static-truth fold landed it held 31 entries, every one of them the
+/// spine over-generating a trivially-true constant-divisor check — failing closed
+/// on those would have rejected valid Rust, which is a release gate. The fold
+/// removed them at the source rather than whitelisting them here.
+///
+/// The message follows principle 10 / v7-D3: a refusal must carry the fix. It names
+/// the obligation class, the span, and the two concrete resolutions — because the
+/// finding does not say a violation exists, it says nobody looked.
+fn synthetic_unchecked_obligation_vcs(
+    def_path: &str,
+    unchecked: &[trust_ir_bridge::ObligationKey],
+) -> Vec<VerificationCondition> {
+    unchecked
+        .iter()
+        .map(|key| VerificationCondition {
+            kind: VcKind::Assertion { message: key.unchecked_finding_message() },
+            function: trust_types::Symbol::intern(def_path),
+            location: key.location.clone(),
+            // Always SAT = always a finding: nothing checked this obligation.
+            formula: trust_types::Formula::Bool(true),
+            contract_metadata: None,
+            // Not a contract-derived VC: no obligation to back-reference.
+            obligation: None,
+        })
+        .collect()
 }
 
 /// Trust #spine (R-L1): apply the trust-ir L1 CONTRACT verdict-flip to a function's
@@ -17131,10 +17605,157 @@ fn apply_spine_contract_verdict_flip(
 /// Record that `def_path` is proven fully panic-free for all inputs. Session
 /// state is required both for parallel worker visibility and to prevent a later
 /// rustc_driver crate with the same def-path from inheriting the proof.
-fn register_proven_panic_free(sess: &Session, def_path: &str) {
+///
+/// Trust (assumption-root gate): the registry is SPENT interprocedurally —
+/// `all_calls_target_proven_panic_free` discharges any caller in this crate whose
+/// every call targets a registered name — so an entry here is a PREMISE, not a
+/// report. A verdict that rests on a user axiom may therefore not be registered:
+/// through this channel the caller's bundle contains no trace of the axiom (the
+/// callee is not bundled — that is why the interprocedural route fired), so the
+/// axiom would VANISH exactly as it does through the `dyn`/`write_fmt` reductions.
+/// The refusal is at the PRODUCER because the registry has several consumers and
+/// one writer; the body's OWN verdict is untouched.
+fn register_proven_panic_free(sess: &Session, def_id: DefId, def_path: &str) {
+    if let Some(reason) = verdict_rests_on_user_axiom(sess, def_id) {
+        debug!(
+            "Trust: NOT registering {def_path} as proven panic-free: {reason}; its verdict is \
+             conditional and must not discharge another body's obligation"
+        );
+        return;
+    }
     with_crate_verification_state(sess, |state| {
         state.panic_free_proven_funcs.insert(def_path.to_string());
     });
+}
+
+/// Trust (assumption-root gate): record whether ONE verification of `def_id` was
+/// established free of user-written axioms.
+///
+/// Written from the single place the user-axiom census is taken — the bundle
+/// closure in [`build_native_trust_ir_bundle_for_verifier_api`], over the ROOT
+/// BODY AND EVERY BUNDLED MEMBER — so it cannot drift from the sets the bridge is
+/// actually handed. Conjoined, never overwritten.
+fn record_verdict_axiom_freedom(sess: &Session, def_id: DefId, axiom_free: bool) {
+    with_crate_verification_state(sess, |state| {
+        let entry = state.axiom_free_verdicts.entry(def_id).or_insert(true);
+        *entry &= axiom_free;
+    });
+}
+
+/// Trust (assumption-root gate): may `def_id`'s verdict be SPENT as a premise for
+/// another body's obligation? `Some(reason)` = NO.
+///
+/// THE ONE AUTHENTICATOR. Every lane that discharges one body's obligation using
+/// ANOTHER body's verdict consults this, because the defect it closes is not a
+/// property of any one lane: a verdict that consumed an `#[trust::assume_total]`
+/// (or `#[trust::skip]`) callee is CONDITIONAL, and every reduction that mints a
+/// positive discharge from it erases the condition instead of inheriting it.
+/// MEASURED on pristine main: an axiom-dependent `write_str` publishes
+/// `no_obligations`/`proved` — byte-identical rows to a genuinely obligation-free
+/// body, an EMPTY disposition list, an empty transport-row list, and a native run
+/// whose summary is `requested_obligations: 0`. There is no in-band evidence left
+/// at the premise bar, which is why the census is recorded out of band at the
+/// point of consumption rather than read back off a row.
+///
+/// FAIL CLOSED ON ABSENCE. No record means no census was taken for this body's
+/// verification, which is UNANSWERED — a verdict whose axiom inputs were never
+/// inspected is not a verdict known to be unconditional.
+///
+/// WHAT MAKES IT TRANSITIVE, precisely — and it is NOT "the census walks the whole
+/// bundle", which is false (see `bundled_def_id_reads_complete`). Three MEASURED
+/// ways a user axiom under a verdict is caught, and one MEASURED spelling that is
+/// not. This is a scope statement, not a completeness proof:
+///
+/// * SPENT — the axiom's call key is in the `assumed_total` / `expected_absent`
+///   sets the bridge receives, so the call takes the recorded-assumption arm.
+///   Those sets are written for a user declaration ONLY by
+///   `insert_user_axiom_absent_call_identity`, which records the census in the same
+///   statement, and `bundle_census_is_axiom_free` re-checks that the bridge's set is
+///   covered by the census. So a spent axiom always answers `Some(false)` here.
+/// * MENTIONED BUT NOT SPENT — the axiom changed no call's lowering, but a walked
+///   body names the item as a `ty::FnDef` VALUE. `collect_user_axiom_value_mentions`
+///   records that in the census only (never in a bridge set), so conjunct 1 of
+///   `bundle_census_is_axiom_free` refuses. MEASURED, both states, on one program
+///   each: `let f: fn() = boom; f();` under the `write!` reduction (X2), under `dyn`
+///   C-FLOW (X7), under drop glue (X8) and bare (X5) all read `axiom_free=true`
+///   without that scan and `axiom_free=false` with it.
+/// * REACHED THROUGH CONSTANT MEMORY — the axiom is named in no walked body at all;
+///   only its function pointer is, inside a `static`'s (or a vtable's) evaluated
+///   allocation. `census_user_axioms_in_constant_memory` follows the constant
+///   operand into that allocation. MEASURED, both states: `static TABLE: [fn(); 1]
+///   = [boom]; (TABLE[0])()` under the `write!` reduction (Y1), under `dyn` C-FLOW
+///   (Y4) and under drop glue (Y5) is rc=0 on pristine main and rc=0 on the round-3
+///   compiler, where the census prints `axiom_free=true` on every root; it is rc=1
+///   here. (Pristine main has no census at all — it prints no `axiom census` line —
+///   so `axiom_free` is a round-3-and-later measurement only, and any claim about
+///   its value on base would be unmeasurable.) Where that walk cannot decide it
+///   clears `const_memory_reads_complete` (conjunct 4) rather than assuming the
+///   memory holds no axiom; the four such places are enumerated at its definition.
+/// * NEITHER SPENT NOR MENTIONED IN A WALKED BODY — e.g. the axiom sits in a bundle
+///   member the DefId walk does not read. Then the call gets NO assumption marker,
+///   takes the bridge's plain absent-callee arm, and the resulting unproved
+///   assumption-panic row refuses the body at conjunct 1 of
+///   [`trait_panic_free::instance_discharges_panic_freedom`] — before conjunct 5 is
+///   ever consulted. MEASURED on pristine main: programs Z1 (axiom on the local
+///   `write_str`, reached only through core's B-lane frame) and Z2 (axiom under a
+///   hand-written `write_fmt` routed through `core::fmt::write`) are BOTH rc=1
+///   there, with `assumed_total=0` in the caller's census.
+///
+/// STILL NOT COVERED, and MEASURED so rather than argued away. Do NOT read the four
+/// cases above as a partition of the space — two successive revisions of this
+/// comment claimed a partition and both were refuted by a program, first by
+/// fn-pointer reification and then by the constant-memory route. What is measured
+/// open today, each under a real consumer:
+///
+/// * A `Const::Unevaluated` operand. The constant-memory walk needs an allocation
+///   and an unevaluated constant has none. MEASURED that today's two constant
+///   spellings do not exploit it: `const TABLE: [fn(); 1] = [boom]` (probe Y2) and
+///   an associated `impl Sink { const F: fn() = boom; }` (probe Y3) are rc=1 on the
+///   PRISTINE base compiler, under the `write!` consumer. That is a measurement of
+///   two programs, not a proof that no third spelling evaluates differently.
+/// * A `#[trust::assume_total]` item in a bundle member the DefId walk cannot read,
+///   which is carried by conjunct 3 (`bundled_def_id_reads_complete`) only for the
+///   members it iterates; round 2 MEASURED 29 fixtures where `bundled_def_ids`
+///   undercounts the published bundle, so bundle membership does not decide this
+///   and is not used to.
+///
+/// The two spellings whose closure this gate DOES claim are the ones with fixtures
+/// (`*_assumed_total_fn_pointer_root_stays_closed.rs`,
+/// `*_assumed_total_static_table_root_stays_closed.rs`), each watched accepting its
+/// planted violation on a prior binary before being written down as check-fail.
+///
+/// ORDERING IS LOAD-BEARING at every call site: the record is written DURING the
+/// verification that produces the verdict, so this must be consulted only AFTER
+/// that verdict has been forced. Asking first declines everything.
+///
+/// Deliberately NOT refused here: `abi_total_panic_free` (bodyless foreign
+/// non-unwinding), `type_total_std` (type-verified std iterator advance),
+/// `compiler_total` (the `?` desugar, rung-1 Φ) and the reliance lanes' own
+/// `dyn_contract_total`. Those are facts this compiler derived and they emit no
+/// assumption row in any mode; only USER declarations are axioms here.
+fn verdict_rests_on_user_axiom(sess: &Session, def_id: DefId) -> Option<&'static str> {
+    let recorded =
+        with_crate_verification_state(sess, |state| state.axiom_free_verdicts.get(&def_id).copied());
+    verdict_axiom_decline_for_census(recorded)
+}
+
+/// The pure three-way core of [`verdict_rests_on_user_axiom`]: what one census
+/// record (or its ABSENCE) means. Split out so the fail-closed direction is
+/// directly unit-testable — `None => decline` is the conjunct a future refactor is
+/// most likely to "simplify" into `unwrap_or(true)`.
+fn verdict_axiom_decline_for_census(recorded: Option<bool>) -> Option<&'static str> {
+    match recorded {
+        Some(true) => None,
+        Some(false) => Some(
+            "its verdict RESTS ON a user-written axiom: the bundle it was verified as SPENT a \
+             `#[trust::assume_total]` / `#[trust::skip]` callee as an assumption, so the verdict \
+             is conditional on a declaration nobody proved",
+        ),
+        None => Some(
+            "no user-axiom census was recorded for the verification that produced its verdict, so \
+             it cannot be established free of `#[trust::assume_total]`/`#[trust::skip]` callees",
+        ),
+    }
 }
 
 /// Record a compiler-authenticated bodyless foreign non-unwinding boundary.
@@ -17158,6 +17779,210 @@ fn register_type_total_std_callee(sess: &Session, call_identity: &str) {
 
 /// Record that the compiler's grounding pass re-pointed `row`'s formula at the
 /// grounded residual violation and retired its binding for `obligation_id`.
+/// Trust (#5-PRE-A follow-through — call-site L0 replay, REFUTATION-ONLY): when a
+/// call-site `VcKind::Precondition` obligation is `Failed` WITH a genuine solver
+/// model, the caller provably can violate the callee's `#[requires]` — but that row
+/// is L1Functional, invisible to both refutation-proper reporters
+/// (`strict_l0_verification_failure` filters on `is_strict_l0_vc_kind`;
+/// `escalate_refuted_l0_safety_counterexamples` needs an L0 kind and a forced
+/// ground violation), so the abort classifies as mere incompleteness even though
+/// the compiler holds a concrete violating witness. This lane replays the ENTAILED
+/// callee-side Level-0 consequence at the call site: it regenerates the callee's
+/// body VCs from the summary's `extracted_body` WITHOUT the callee's precondition,
+/// rebinds them to the caller's actuals under the same σ as the `P[σ]`
+/// construction, conjoins the caller's path condition, and re-solves with the
+/// in-process ay backend (`trust_vcgen::generate_callsite_l0_replay_candidates`
+/// documents every fail-closed candidate gate). A SAT model appends a NEW `Failed`
+/// row carrying the callee's REAL L0 kind at the call span, which flows into
+/// `strict_l0_verification_failure`'s `Failed` arm — and thus the
+/// "Level 0 summary: N failed" refutation header — with no reporter change.
+///
+/// SOUNDNESS (refutation-only, strictly additive):
+///   * TRIGGER: only a `Failed` Precondition row carrying a NONEMPTY solver
+///     counterexample. The `fail_closed_unproved_precondition` reclassification
+///     (Unknown -> Failed inside `build_proof_results`, which runs AFTER this
+///     pass and on a separate status carrier) never attaches a model, and the
+///     refute-only appenders that do append `Failed` rows here
+///     (`refute_full_assert_obligations`, the bitmask probe) stamp
+///     `counterexample: None` — so a minted/witness-less failure can never
+///     trigger a replay.
+///   * #5-PRE-A CRITICAL SCOPING: a def-site `requires` marker row is
+///     `Precondition { callee == own name }` with `contract_metadata` populated
+///     (see `exact_definition_entry_requires_rows`) and is never dispatched, so
+///     it is excluded three ways (metadata, self-name, no model). Recursive
+///     self-calls are excluded by the same self-name guard (both the short
+///     `func.name` and the full `func.def_path` spelling).
+///   * OUTPUT: only `VerificationResult::Failed` rows are ever appended; an
+///     UNSAT (`Proved`) or Unknown/Timeout replay appends NOTHING and discharges
+///     NOTHING — not the caller's Precondition obligation, not the callee's own
+///     rows — and a `None` binding/authority slot (extended by the caller) means
+///     the row can never feed evidence publication or authority registries.
+///     The `solver` symbol is restamped `trust-callsite-l0-replay` as the row's
+///     provenance tag (the same channel `trust-assert-refute` /
+///     `trust-bitmask-refute` use), while ay's own model is kept as the witness.
+fn refute_callsite_l0_replays_for_unmet_preconditions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &trust_types::VerifiableFunction,
+    results: &mut Vec<(VerificationCondition, VerificationResult)>,
+    deadline: Option<std::time::Instant>,
+) {
+    // Collect qualifying call sites first (immutable pass), then append.
+    let mut sites: Vec<(String, SourceSpan)> = Vec::new();
+    for (vc, result) in results.iter() {
+        let VcKind::Precondition { callee } = &vc.kind else {
+            continue;
+        };
+        let VerificationResult::Failed { counterexample: Some(cex), .. } = result else {
+            continue;
+        };
+        if cex.assignments.is_empty() {
+            continue;
+        }
+        // Def-site contract markers carry their source contract metadata;
+        // genuine call-site rows are minted with `contract_metadata: None`
+        // (see `generate_callsite_precondition_vcs`).
+        if vc.contract_metadata.is_some() {
+            continue;
+        }
+        // #5-PRE-A scoping: never replay a self-call (definition-entry
+        // assumption territory), under either name spelling.
+        if callee.as_str() == func.name || callee.as_str() == func.def_path {
+            continue;
+        }
+        if !sites.iter().any(|(c, l)| c == callee && *l == vc.location) {
+            sites.push((callee.clone(), vc.location.clone()));
+        }
+    }
+    if sites.is_empty() {
+        return;
+    }
+    // Same summary DB the VC routes were generated against (session-memoized
+    // callee bodies, so this is a cheap re-read at this point in the walk).
+    // Cross-crate/generic callees have no `extracted_body` attached and the
+    // producer declines them — the honest `incomplete` residual stands.
+    let summaries = build_callee_contract_summaries(tcx, body);
+    for (callee, location) in sites {
+        for candidate in trust_vcgen::generate_callsite_l0_replay_candidates(
+            func,
+            &summaries,
+            &callee,
+            &location,
+        ) {
+            // Recompute the remaining budget before every query (the assert
+            // refutation lane's deadline discipline).
+            let Some(timeout_ms) = remaining_solver_timeout_ms(
+                vc_timeout_ms(tcx.sess),
+                deadline,
+                std::time::Instant::now(),
+            ) else {
+                return;
+            };
+            let ay = trust_router::Router::deterministic_in_process_ay(timeout_ms);
+            let Some((vc, res)) = ay
+                .verify_all_with_deadline(std::slice::from_ref(&candidate), deadline)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            match res {
+                // SAT with a model: a composed counterexample UNDER the
+                // conjoined caller model — the producer's gates guarantee
+                // every free var is caller-entry state or def-pinned, and the
+                // model satisfies every CAPTURED caller-side hypothesis
+                // (guards/defs/facts). Genuineness beyond that rests on the
+                // vcgen guard/def assembly capturing every dominating
+                // constraint and on the callee body VCs' fidelity. Surface it.
+                VerificationResult::Failed { time_ms, counterexample: Some(cex), .. }
+                    if !cex.assignments.is_empty() =>
+                {
+                    results.push((
+                        vc,
+                        VerificationResult::Failed {
+                            solver: trust_types::Symbol::intern("trust-callsite-l0-replay"),
+                            time_ms,
+                            counterexample: Some(cex),
+                        },
+                    ));
+                }
+                // UNSAT (`Proved`), Unknown, Timeout, or a witness-less Failed:
+                // append NOTHING. In particular a replay `Proved` is DROPPED —
+                // it must never discharge the caller's Precondition obligation,
+                // the callee's own rows, or reach any authority machinery.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Trust (BMC bounded-reduction refutation, REFUTATION-ONLY): refute a
+/// statically-sized array reduction whose accumulator GENUINELY overflows.
+///
+/// `build_accumulator_bound_facts` is the proving side and is deliberately
+/// self-limiting: when `init + K*per_max` does not fit the accumulator type it
+/// emits nothing, the per-add overflow obligation stays undischarged, and the
+/// build DECLINES with the incompleteness header. On the falsification gate's
+/// mutant lane a decline scores as an UNCAUGHT MUTANT
+/// (`shift_reduction_overflow`, `i128_shift_accumulator_overflow`). For the one
+/// shape where the loop has a statically known trip count and a straight-line
+/// body, a COMPLETE unroll is exact, so a solver model is a genuine
+/// counterexample. `trust_vcgen::generate_bounded_reduction_bmc_refutation_candidates`
+/// documents every recognition gate and the encoding's exactness argument.
+///
+/// SOUNDNESS (identical discipline to `refute_callsite_l0_replays_for_unmet_preconditions`):
+///   * OUTPUT: only `VerificationResult::Failed` rows are ever APPENDED, and only
+///     on an ay SAT verdict carrying a NON-EMPTY model. UNSAT (`Proved`),
+///     Unknown, Timeout and a witness-less `Failed` append NOTHING and discharge
+///     NOTHING — no obligation is retired, no proof authority is granted, and the
+///     appended rows get `None` binding/eligibility/authority slots at the call
+///     site, so they can never acquire evidence.
+///   * The producer emits AT MOST ONE candidate per function and only for a
+///     recognized shape; a partial unroll is never built (over the cap it
+///     declines), because a partial unroll can only ever refute and its UNSAT
+///     would mean nothing.
+///   * `solver` is restamped `trust-bmc-reduction-refute` as the row's provenance
+///     tag (the channel `trust-assert-refute` / `trust-callsite-l0-replay` use)
+///     while ay's own model is kept as the witness.
+fn refute_bounded_reduction_bmc_overflows(
+    sess: &Session,
+    func: &trust_types::VerifiableFunction,
+    results: &mut Vec<(VerificationCondition, VerificationResult)>,
+    deadline: Option<std::time::Instant>,
+) {
+    for candidate in trust_vcgen::generate_bounded_reduction_bmc_refutation_candidates(func) {
+        let Some(timeout_ms) =
+            remaining_solver_timeout_ms(vc_timeout_ms(sess), deadline, std::time::Instant::now())
+        else {
+            return;
+        };
+        let ay = trust_router::Router::deterministic_in_process_ay(timeout_ms);
+        let Some((vc, res)) = ay
+            .verify_all_with_deadline(std::slice::from_ref(&candidate), deadline)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        match res {
+            VerificationResult::Failed { time_ms, counterexample: Some(cex), .. }
+                if !cex.assignments.is_empty() =>
+            {
+                results.push((
+                    vc,
+                    VerificationResult::Failed {
+                        solver: trust_types::Symbol::intern("trust-bmc-reduction-refute"),
+                        time_ms,
+                        counterexample: Some(cex),
+                    },
+                ));
+            }
+            // Everything else is DROPPED — unproved is not refuted.
+            _ => {}
+        }
+    }
+}
+
 fn record_grounded_panic_freedom_obligation(
     sess: &Session,
     obligation_id: &str,
@@ -17168,6 +17993,15 @@ fn record_grounded_panic_freedom_obligation(
     });
 }
 
+/// Did the compiler's own grounding pass re-point (and thereby retire the
+/// binding of) this exact result row? The complete canonical row identity is
+/// required because row indices restart for every verified function.
+///
+/// The production caller was the whole-function panic-freedom subsumption,
+/// removed on 2026-08-14 as a false proof. The predicate is retained (test-only)
+/// because the grounding record it reads is still written by
+/// `refute_full_assert_obligations` and consumed by `grounded_panic_freedom_row`.
+#[cfg(test)]
 fn row_was_compiler_grounded_in(
     grounded: &FxHashMap<String, ExactResultRowIdentity>,
     index: usize,
@@ -17181,15 +18015,6 @@ fn row_was_compiler_grounded_in(
     #[allow(rustc::potential_query_instability)]
     let was_grounded = grounded.values().any(|recorded| recorded == &current);
     was_grounded
-}
-
-/// Did the compiler's own grounding pass re-point (and thereby retire the
-/// binding of) this exact result row? The complete canonical row identity is
-/// required because row indices restart for every verified function.
-fn row_was_compiler_grounded(sess: &Session, index: usize, vc: &VerificationCondition) -> bool {
-    with_crate_verification_state(sess, |state| {
-        row_was_compiler_grounded_in(&state.grounded_panic_freedom_obligations, index, vc)
-    })
 }
 
 fn grounded_panic_freedom_row(
@@ -18081,6 +18906,17 @@ fn bridge_v1_ay_proofs_into_native_results(
         // Failed), exactly as before this change. Likewise every L0 safety kind.
         let accept = if matches!(vc.kind, VcKind::Postcondition) {
             matches!(res, VerificationResult::Proved { .. })
+        } else if matches!(vc.kind, VcKind::Unreachable) {
+            // Trust (falsification regression 2026-08-13): REFUTE-ONLY, the mirror
+            // image of the `Postcondition` asymmetry above. ay SAT on an unreachable
+            // trap's reachability formula is a REAL counterexample (a concrete input
+            // reaches `unreachable_unchecked` — UB), so `Failed` substitutes. An ay
+            // `Proved` is NOT substituted: a dead trap is discharged by
+            // `promote_structurally_dead_unreachable` on the propositional-UNSAT
+            // evidence it already requires, and routing proof authority for this kind
+            // through the bridge would add a trust edge for no gain. Fail-closed:
+            // Unknown/Timeout keep the existing verdict.
+            matches!(res, VerificationResult::Failed { .. })
         } else {
             definitive(&res)
         };
@@ -18701,10 +19537,6 @@ fn record_pending_import_citation(
         func: func.clone(),
         cited: cited.to_vec(),
         postcondition_indices: postcondition_indices.to_vec(),
-        // Conservative default: the in-walk stamp below supplies the real
-        // premise. Absent it, the post-walk lane declines the subsumption
-        // derivation rather than assuming a bundle it never observed.
-        native_bundle_built: false,
         artifacts: None,
     };
     tcx.sess.with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
@@ -18712,21 +19544,6 @@ fn record_pending_import_citation(
             return;
         }
         state.bodies.entry(local).or_insert(record);
-    });
-}
-
-/// Stamp the panic-freedom subsumption premise onto a quarantined body, from the
-/// one place the native bundle is in scope. No-op for every ordinary body.
-fn note_pending_import_citation_native_bundle(
-    tcx: TyCtxt<'_>,
-    body: &Body<'_>,
-    native_bundle_built: bool,
-) {
-    let Some(local) = body.source.def_id().as_local() else { return };
-    tcx.sess.with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
-        if let Some(pending) = state.bodies.get_mut(&local) {
-            pending.native_bundle_built = native_bundle_built;
-        }
     });
 }
 
@@ -18813,19 +19630,11 @@ fn finalize_pending_import_citations(
                     }
                 }
             }
-            // LAST in the authority phase in-walk, and last here: it consumes
-            // every other row's FINAL authority as a premise. Re-running it after
-            // the citation authority exists is what keeps a deferred-theorem body
-            // from earning LESS credit than an identical body citing an ordinary
-            // island. Monotone by construction — it bails on any Failed/Timeout
-            // row and never overwrites an existing authority.
-            apply_whole_function_panic_freedom_subsumption(
-                tcx.sess,
-                record.native_bundle_built,
-                &mut artifacts.results,
-                &artifacts.result_bindings,
-                &mut artifacts.proof_authorities,
-            );
+            // (The whole-function panic-freedom subsumption used to re-run here,
+            // after the citation authority existed, so a deferred-theorem body
+            // earned the same credit as one citing an ordinary island. That lane
+            // was removed as a false proof; nothing replays here now, and the
+            // post-walk verdict is exactly what the in-walk pipeline reached.)
             let cleancic = certify_all(&artifacts.results, None);
             artifacts.proof_results = build_proof_results(
                 tcx.sess,
@@ -19332,10 +20141,18 @@ fn collect_full_verification_artifacts<'tcx>(
             &selected.proof_authorities,
         ) || zero_obligation_run_establishes_unconditional_panic_freedom(tcx.sess, &selected);
     // Coroutine resume-state safety is published as an explicit protocol
-    // assumption after artifact collection. It is therefore never unconditional
-    // registry authority, even when all data-safety rows are independently proved.
-    if established && !body_has_coroutine_protocol_assert(body) {
-        register_proven_panic_free(tcx.sess, &func.def_path);
+    // assumption/contract after artifact collection. It is therefore never
+    // unconditional registry authority, even when all data-safety rows are
+    // independently proved. Belt (D1 coupling): bridge contract evidence also
+    // blocks registration — it witnesses that the solved module carries the
+    // entry resume-state Assume, so every proof in it is CONDITIONAL on
+    // callers, even in the (structurally excluded) case of a sentinel-free
+    // MIR body.
+    if established
+        && !body_has_coroutine_protocol_assert(body)
+        && selected.coroutine_resume_contract.is_none()
+    {
+        register_proven_panic_free(tcx.sess, body.source.def_id(), &func.def_path);
     }
     selected
 }
@@ -19386,6 +20203,20 @@ fn collect_full_verification_artifacts_once<'tcx>(
             native_trust_ir_bundle = Err(reason);
             None
         }
+    };
+    // Trust (coroutine resume-state contract): extract the bridge's
+    // authenticated sentinel-conversion evidence from the LIVE native bundle's
+    // module, before any verification consumes it. `None` whenever the bundle
+    // failed to build or the contract lane did not (fully) engage — the
+    // publish seam then keeps the fail-closed `assumption:coroutine` + strict
+    // abort. Belt: the evidence must be about THIS function (the extractor
+    // recomputes the recognizer decision from `func`'s own body).
+    let coroutine_resume_contract = match &native_trust_ir_bundle {
+        Ok(Some(native_bundle)) => trust_ir_bridge::coroutine_resume_contract_module_evidence(
+            func,
+            &native_bundle.module,
+        ),
+        _ => None,
     };
     // A definition-site `requires(P)` is the callee's modular entry
     // assumption, not a proposition to prove for arbitrary inputs. Keep its
@@ -19528,6 +20359,39 @@ fn collect_full_verification_artifacts_once<'tcx>(
     );
     revalidation_eligibilities
         .extend((result_count_before_assert_refutation..results.len()).map(|_| None));
+    // Trust (#5-PRE-A follow-through): call-site L0 replay for solver-witnessed
+    // unmet preconditions — refutation-only, appends only `Failed` rows with the
+    // callee's REAL L0 kind so `strict_l0_verification_failure` counts them in
+    // its `failed` arm and the refutation-proper header fires. Runs AFTER the
+    // bridge (which is what substitutes the ay `Failed { counterexample }`
+    // verdict onto the Precondition row this lane keys off) and BEFORE
+    // `certify_all`/`build_result_proof_authorities_with_revalidations`, so the
+    // appended rows are covered by the (None) binding/eligibility/authority
+    // slots below and can never acquire evidence or authority. See
+    // `refute_callsite_l0_replays_for_unmet_preconditions` for the full
+    // soundness argument.
+    let result_count_before_callsite_replay = results.len();
+    refute_callsite_l0_replays_for_unmet_preconditions(
+        tcx,
+        body,
+        func,
+        &mut results,
+        context.deadline,
+    );
+    result_bindings.extend((result_count_before_callsite_replay..results.len()).map(|_| None));
+    revalidation_eligibilities
+        .extend((result_count_before_callsite_replay..results.len()).map(|_| None));
+    // Trust (BMC bounded-reduction refutation): the same refutation-only,
+    // append-only discipline for a fixed-size array reduction whose accumulator
+    // genuinely overflows — the complete unroll's SAT model IS the counterexample.
+    // Placed beside the callsite replay so the appended rows are covered by the
+    // (None) binding/eligibility/authority slots and can never acquire evidence.
+    // See `refute_bounded_reduction_bmc_overflows`.
+    let result_count_before_bmc_reduction = results.len();
+    refute_bounded_reduction_bmc_overflows(tcx.sess, func, &mut results, context.deadline);
+    result_bindings.extend((result_count_before_bmc_reduction..results.len()).map(|_| None));
+    revalidation_eligibilities
+        .extend((result_count_before_bmc_reduction..results.len()).map(|_| None));
     // Trust (`[unreach]`/`[divzero]`): the legacy/full-verification path also gets
     // the structural propositional-UNSAT discharge — an exhaustive `Unreachable`
     // trap or a guarded division whose violation reduces to a trivial Boolean/
@@ -19765,16 +20629,6 @@ fn collect_full_verification_artifacts_once<'tcx>(
     // unless EVERY ensures clause of the function Certified-grades).
     let mut discharged_citations =
         discharge_ensures_citations_in_walk(tcx, body, func, &mut results);
-    // Trust (item 10 phase 2): if the lane above quarantined this body for
-    // post-walk adjudication, hand it the panic-freedom subsumption premise from
-    // here, where the native bundle is in scope. The post-walk lane must be able
-    // to reach the verdict THIS pipeline would have reached; it cannot infer the
-    // premise from the artifacts alone. No-op for every ordinary body.
-    note_pending_import_citation_native_bundle(
-        tcx,
-        body,
-        native_trust_ir_bundle.as_ref().is_ok_and(|bundle| bundle.is_some()),
-    );
     // R4 §1: the composed defeq lane runs only when the cited lane owned
     // nothing (all-uncited surface); mixed surfaces discharge nothing.
     if discharged_citations.is_empty() {
@@ -19803,18 +20657,13 @@ fn collect_full_verification_artifacts_once<'tcx>(
             eprintln!("TRUST_E9_DEBUG AUTHORITY-ROW-NONE index={index}");
         }
     }
-    // LAST in the authority phase, by construction: it consumes every other
-    // row's FINAL private authority as a premise, so every earlier lane
-    // (source-clause, body-bound, R1, citation) must already have installed
-    // its tokens. Runs only when the native bundle BUILT (`Ok(Some)`), so the
-    // row set enumerates the whole panic surface.
-    apply_whole_function_panic_freedom_subsumption(
-        tcx.sess,
-        native_trust_ir_bundle.as_ref().is_ok_and(|bundle| bundle.is_some()),
-        &mut results,
-        &result_bindings,
-        &mut proof_authorities,
-    );
+    // NOTE (2026-08-14): the whole-function panic-freedom STRUCTURAL SUBSUMPTION
+    // ran here, last in the authority phase, deriving the synthesized
+    // `assertion:panic-freedom:0` aggregate from "every other row is a static
+    // proof". It was a FALSE PROOF and is gone — the aggregate exists only for
+    // panic sources that have NO per-site row, so no conjunction over the
+    // siblings can entail it. The aggregate's sound discharge is the per-site
+    // one in `refute_full_assert_obligations`, which already ran upstream.
     let proof_results = build_proof_results(
         tcx.sess,
         &results,
@@ -19842,6 +20691,7 @@ fn collect_full_verification_artifacts_once<'tcx>(
         result_bindings,
         proof_authorities,
         overflow_check_origins: overflow_check_origins.clone(),
+        coroutine_resume_contract,
     }
 }
 
@@ -21197,6 +22047,14 @@ fn build_full_verification_input<'tcx>(
     let feedback_candidates = loop_feedback_candidates(loop_feedback);
     let crate_name = tcx.crate_name(body.source.def_id().krate).to_string();
     let stable_crate_id = tcx.stable_crate_id(body.source.def_id().krate).as_u64();
+    // Pointer-sized spec binders (`forall i: usize, …`) take their exact
+    // domain from THIS compilation target's pointer width — the same
+    // `tcx.data_layout` authority the certified-monitor lane already uses. An
+    // unnameable/unsupported width stays `None` and those binders keep failing
+    // closed inside the bundle constructors. Both constructors below MUST see
+    // the same width, or reference/bundle predicate digests would diverge.
+    let target_pointer_width_bits =
+        monitor_target_pointer_width(tcx).ok().map(|width| width.bits());
     // Build an independent, compiler-owned contract-only reference before any
     // monitor metadata is stamped. Positive monitor authority requires an
     // exact row match against this fresh constructor output; the full bundle's
@@ -21208,6 +22066,7 @@ fn build_full_verification_input<'tcx>(
             compiler_contracts,
             &crate_name,
             stable_crate_id,
+            target_pointer_width_bits,
         );
     let mut bundle =
         trust_mir_extract::function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compiler_identity(
@@ -21217,11 +22076,21 @@ fn build_full_verification_input<'tcx>(
             &feedback_candidates,
             &crate_name,
             stable_crate_id,
+            target_pointer_width_bits,
         );
     let definition_entry_markers =
         ExactDefinitionEntryMarkerSet::freeze_from_compiler_reference(&monitor_reference, &bundle);
     stamp_certified_monitor_metadata(tcx, body, &monitor_reference, &mut bundle);
     let mut body_bound_carriers = Vec::new();
+    // Trust (assumption-root gate): this early-out skips
+    // `build_native_trust_ir_bundle_for_verifier_api`, which is where the user-axiom
+    // census is written — so a body that times out HERE gets no census record and
+    // `verdict_rests_on_user_axiom` reads it as UNANSWERED. That is the fail-closed
+    // direction (a timed-out verdict is unspendable as a premise, its own verdict
+    // untouched) and it is not the only thing refusing such a body: with no bundle
+    // there is no `full_verification`, so conjunct 4 of the shared bar already
+    // refuses it before conjunct 5 is consulted. Not exercised by any fixture —
+    // recorded so a future reader does not mistake a deadline decline for an axiom.
     let native_trust_ir_bundle = if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
         Err("per-function verification budget expired before native trust-ir bundle construction"
             .to_string())
@@ -21428,6 +22297,19 @@ struct LiveFullVerificationDispatch {
 /// site for [`InitialLiveBodyBoundReceipt`]; callers cannot turn a deserialized
 /// `VerificationRunResult` into one after the fact. The private finalizer below
 /// is the sole promotion from that live receipt to consumable authority.
+///
+/// INERT IN EVERY SHIPPED trustc, MEASURED 2026-08-12 (task #44). The only
+/// thing that mints a direct TrustVC receipt lives behind trust-router's
+/// `trust-vc-native` feature, and `rustc_mir_transform` has never enabled it
+/// (`git log -S` on its Cargo.toml finds no such commit) — only
+/// `targo-trust`'s `trust-vc-in-process` does. So in this binary
+/// `has_exact_deferred_direct_trust_vc_transport` is its `cfg(not(...))` arm, a
+/// literal `false`, and this path can never receive a receipt to act on.
+///
+/// It is vacuous in the SAFE direction — a row that would need a live receipt
+/// is rejected, never accepted — so this is a capability gap, not a soundness
+/// bug. Recorded here so the next reader does not re-derive it from five red
+/// tests; see reports/2026-08-12-direct-trust-vc-lane-is-inert.md.
 fn verify_full_bundle_with_body_bound_receipts(
     bundle: &trust_verifier_api::TrustContractBundle,
     obligations: &[trust_verifier_api::TrustObligation],
@@ -21685,6 +22567,19 @@ fn is_permitted_bridge_publication_transition(
 /// final post-publication carrier. The public run is attribution only: without
 /// one of these affine receipts, an otherwise byte-identical public `Proved`
 /// row cannot enter this authority variant.
+///
+/// INERT IN EVERY SHIPPED trustc, MEASURED 2026-08-12 (task #44). The only
+/// thing that mints a direct TrustVC receipt lives behind trust-router's
+/// `trust-vc-native` feature, and `rustc_mir_transform` has never enabled it
+/// (`git log -S` on its Cargo.toml finds no such commit) — only
+/// `targo-trust`'s `trust-vc-in-process` does. So in this binary
+/// `has_exact_deferred_direct_trust_vc_transport` is its `cfg(not(...))` arm, a
+/// literal `false`, and this path can never receive a receipt to act on.
+///
+/// It is vacuous in the SAFE direction — a row that would need a live receipt
+/// is rejected, never accepted — so this is a capability gap, not a soundness
+/// bug. Recorded here so the next reader does not re-derive it from five red
+/// tests; see reports/2026-08-12-direct-trust-vc-lane-is-inert.md.
 fn install_direct_trust_vc_live_authorities(
     bundle: &trust_verifier_api::TrustContractBundle,
     dispatched_obligations: &[trust_verifier_api::TrustObligation],
@@ -22665,6 +23560,37 @@ const TRUST_MC_TYPED_CHC_LOWERING_STATUS_METADATA_KEY: &str =
     "trust-trust-mc.typed-chc-obligation.lowering_status";
 const TRUST_MC_TYPED_CHC_UNSUPPORTED_REASON_METADATA_KEY: &str =
     "trust-trust-mc.typed-chc-obligation.unsupported_reason";
+// Trust: producer attestation that the typed CHC this row will carry does NOT
+// faithfully encode its body — the ChcVc-PRODUCTION stage that
+// `trust_mc_core::ChcPdrEncodingConcreteness` explicitly declines to cover and
+// hands to the consumer ("consumers must account for it on their own side of
+// the boundary"). Read by trust-bmc's refutation gate
+// (`TrustMcChcRefutationAdmissibility`), which demotes a `Refuted` verdict on an
+// attested row to Unknown.
+//
+// Only ever set to the negative value below. ABSENCE means "unattested", never
+// "attested exact", and the consumer now demotes both states to Unknown. A
+// positive `exact` value is reserved for a future compiler proof that accounts
+// for every source-to-ChcVc fidelity edge; this producer must not emit it yet.
+// Deliberately not a native-transport key, so it lives inside the obligation's
+// canonical public semantic digest and cannot be stripped from the row it
+// describes. It is also NOT added to the whole-function
+// panic-freedom metadata allowlists — those gate a PROOF credit, and this key is
+// never stamped on an obligation that routes to the structural whole-CFG CHC.
+const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY: &str =
+    "trust-trust-mc.typed-chc-obligation.encoding_fidelity";
+/// The flattened single-formula typed CHC (one nullary `error` relation, one
+/// constraint-only rule) was emitted for a body whose CFG has a BACK EDGE.
+///
+/// There is no loop transition relation in that formula, so every loop-carried
+/// local appears in it as a free variable with no defining constraint. The
+/// formula therefore OVER-APPROXIMATES the reachable states: sound for proofs
+/// (UNSAT of a superset implies UNSAT of the real set — this is why a loop with
+/// a `requires` that boxes the free variable in still proves), and not evidence
+/// for refutations (a satisfying model may assign a loop-carried local a value
+/// the program can never produce).
+const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED: &str =
+    "loop_elided_over_approximation";
 const TRUST_MC_DEFAULT_FUNCTION_OBLIGATION_METADATA_KEY: &str =
     trust_verifier_api::TRUST_MC_DEFAULT_FUNCTION_OBLIGATION_METADATA_KEY;
 // Trust: tags a COUNTED whole-function panic-freedom obligation (synthesized by
@@ -22696,6 +23622,19 @@ const TRUST_WP_TYPED_FORMULA_SOURCE_COMPILER_VC_VALUE: &str =
 const TRUST_WP_TYPED_FORMULA_SOURCE_BODY_BOUND_VALUE: &str =
     "compiler-native-trust-ir-body-bound-ensures";
 const NATIVE_TRUST_IR_MAX_LOCAL_CALLEE_CLOSURE: usize = 32;
+
+/// Total bundle size once the monomorphic FOREIGN lane
+/// (`native_trust_ir_monomorphic_foreign_callees`) has run.
+///
+/// Deliberately a SECOND constant rather than a raise of the local cap above:
+/// the local/workspace closure keeps its existing budget and its existing
+/// behavior, and only the new lane may grow the bundle past it. Real std bodies
+/// are many small frames — a single `slice::sort` reaches 34 foreign bodies, so
+/// a 32-frame ceiling is exceeded before the caller's own callees are counted.
+/// Truncation stays fail-soft in the same direction as everywhere else in this
+/// closure: an omitted callee keeps the honest may-panic marker at its call
+/// site, so a smaller bundle is less complete, never falsely proved.
+const NATIVE_TRUST_IR_MAX_BUNDLE_FUNCTIONS: usize = 96;
 
 fn append_compiler_certified_paired_condvar_wait_sites<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -22753,8 +23692,18 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
     }
 
     let mut bundled_def_ids: FxHashSet<DefId> = FxHashSet::default();
-    let trust_ir_functions =
-        native_trust_ir_verifiable_function_closure(tcx, body, func, policy, &mut bundled_def_ids)?;
+    // Trust (rung 1 §(c)): `dyn`-dispatch facts for THIS bundle — every vtable
+    // coercion it contains, every trait whose vtable set it cannot bound, and
+    // every `InstanceKind::Virtual` call site keyed by its exact bridge identity.
+    let mut dyn_facts = dyn_dispatch_reliance::DynDispatchBundleFacts::new();
+    let trust_ir_functions = native_trust_ir_verifiable_function_closure(
+        tcx,
+        body,
+        func,
+        policy,
+        &mut bundled_def_ids,
+        &mut dyn_facts,
+    )?;
     // PAIRED-CONDVAR authority is a fresh compiler-owned sidecar, never a
     // serialized callee suffix. Reconcile the whole-crate certificate against
     // this exact rustc MIR and extracted target before bridge lowering.
@@ -22799,6 +23748,46 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
     let mut type_total_std = FxHashSet::default();
     // Compiler-decided totals the bridge cannot decide (the `?` desugar).
     let mut compiler_total = FxHashSet::default();
+    // Trust (assumption-root gate): the USER-AXIOM CENSUS for this bundle — the
+    // exact call keys `collect_expected_absent_callees` classified absent because
+    // of `#[trust::assume_total]` / `#[trust::skip]`, over the root body and every
+    // member the DefId walk below reads.
+    let mut user_axiom_keys: FxHashSet<String> = FxHashSet::default();
+    // Did the DefId walk below read every member it iterated? It degrades
+    // gracefully for classification (an unavailable/stolen MIR member is skipped),
+    // and a member nobody read cannot be asserted axiom-free.
+    //
+    // THIS IS NOT A BUNDLE-COMPLETENESS CLAIM, and must never be read as one.
+    // `bundled_def_ids` is NOT the bundle: the B-lane admits a member with
+    // `bundled_mono_defs.insert(...); functions.push(callee_func);` and no
+    // `bundled.insert` (`native_trust_ir_verifiable_function_closure`, the
+    // monomorphic-foreign drain), and bundled DESTRUCTORS are documented absent
+    // from it at `ADMITTED_DESTRUCTOR_ADTS` — measured there as
+    // `bundled_members=1 destructor_adts={}` on a fixture whose bundle held
+    // `<Vec<u8> as Drop>::drop`. So this flag covers the DefId walk only.
+    //
+    // WHAT CARRIES TRANSITIVITY is the COUPLING plus the two census scans, not this
+    // flag. An axiom that changes a call's lowering reaches the verdict through
+    // `expected_absent` / `assumed_total`, those sets are written for a user
+    // declaration only by `insert_user_axiom_absent_call_identity`, and that
+    // function writes the census in the same statement; an axiom that changes NO
+    // lowering is caught instead by `collect_user_axiom_value_mentions` (a reified
+    // `fn` pointer) or by `census_user_axioms_in_constant_memory` (a pointer held
+    // in a `static`'s or a vtable's memory), both census-only. An axiom in an
+    // UNWALKED member escapes all of them, and is then also unspent: its call site
+    // gets no assumption marker, takes the bridge's plain absent-callee arm, and
+    // the resulting unproved row refuses the body at conjunct 1-4 of the shared bar
+    // before conjunct 5 is consulted. MEASURED on pristine main, both directions,
+    // by two programs whose axiom is deliberately placed where this walk cannot see
+    // it — see `verdict_rests_on_user_axiom`, which also names the spellings
+    // MEASURED to escape every one of them.
+    let mut bundled_def_id_reads_complete = true;
+    // Trust (assumption-root gate): the constant-memory half of the census — a
+    // function pointer held in a `static`'s (or any const allocation's) memory is
+    // named in NO walked body, so round 3's value-mention scan could not see it and
+    // three consumers spent the resulting verdict (probes Y1/Y4/Y5). Cleared where
+    // that walk cannot decide; conjunct 4 of `bundle_census_is_axiom_free`.
+    let mut const_memory_reads_complete = true;
     collect_expected_absent_callees(
         tcx,
         body,
@@ -22807,6 +23796,8 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
         &mut assumed_total,
         &mut type_total_std,
         &mut compiler_total,
+        &mut user_axiom_keys,
+        &mut const_memory_reads_complete,
     );
     collect_structural_drop_adts(tcx, body, &mut structural_drop);
     // Trust: NEVER query `optimized_mir` for a closure member whose peek would form an
@@ -22834,12 +23825,20 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
             continue;
         }
         if !tcx.is_mir_available(member) {
+            // Trust (assumption-root gate): unread member — see
+            // `bundled_def_id_reads_complete`.
+            bundled_def_id_reads_complete = false;
             continue;
         }
         let callee_body = if optimized_mir_query_would_cycle(tcx, member) {
-            match member.as_local() {
-                Some(local) => tcx.mir_for_trust_verification(local),
-                None => continue,
+            match member.as_local().and_then(|local| tcx.mir_for_trust_verification(local)) {
+                Some(body) => body,
+                // Stolen with no pre-steal snapshot (a dynamic cycle outside any
+                // static SCC): skip, same degradation as an unavailable callee.
+                None => {
+                    bundled_def_id_reads_complete = false;
+                    continue;
+                }
             }
         } else {
             tcx.optimized_mir(member)
@@ -22852,6 +23851,8 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
             &mut assumed_total,
             &mut type_total_std,
             &mut compiler_total,
+            &mut user_axiom_keys,
+            &mut const_memory_reads_complete,
         );
         collect_structural_drop_adts(tcx, callee_body, &mut structural_drop);
         if let Some(certificate) = paired_condvar_certificate.as_deref() {
@@ -22867,6 +23868,38 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
                 );
             }
         }
+    }
+    // Trust (assumption-root gate): PUBLISH THE CENSUS. Written here — after the
+    // root+member walk that took it and BEFORE anything reads another body's
+    // verdict (`resolve_reliance` below forces them) — so it is on every path that
+    // reaches the bundle, including the `?` error paths further down. A body whose
+    // verification never gets here has no record, and `verdict_rests_on_user_axiom`
+    // reads absence as UNANSWERED, not clean.
+    //
+    // The answer is computed by `bundle_census_is_axiom_free` and not inlined,
+    // because its second conjunct is a CROSS-CHECK of this census against the set
+    // the bridge is about to receive: if `assumed_total` ever holds a key the
+    // census never recorded, the census understated the bundle and this verdict
+    // becomes unspendable rather than clean.
+    let axiom_free = bundle_census_is_axiom_free(
+        &user_axiom_keys,
+        &assumed_total,
+        bundled_def_id_reads_complete,
+        const_memory_reads_complete,
+    );
+    record_verdict_axiom_freedom(tcx.sess, caller_def_id, axiom_free);
+    if std::env::var_os("TRUST_DYN_RELIANCE_PROBE").is_some() {
+        with_no_trimmed_paths!(eprintln!(
+            "TRUST_DYN_RELIANCE_PROBE: axiom census root={} axiom_free={axiom_free} \
+             (defid_walk_members={}, defid_reads_complete={bundled_def_id_reads_complete}, \
+             const_memory_reads_complete={const_memory_reads_complete}, \
+             user_axiom_keys={}, assumed_total={}, expected_absent={})",
+            tcx.def_path_str(caller_def_id),
+            bundled_def_ids.len(),
+            user_axiom_keys.len(),
+            assumed_total.len(),
+            expected_absent.len(),
+        ));
     }
     // Make these exact identities visible before the later interprocedural
     // assertion/panic-freedom discharge. Set insertion is idempotent.
@@ -22897,6 +23930,33 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
         abi: None,
         struct_passing: Default::default(),
     });
+    // Trust (rung 1 §(c)): decide every `dyn` virtual site against the two
+    // completeness certificates. A site that fails BOTH is simply absent from
+    // this set and keeps the bridge's fail-closed absent-callee obligation,
+    // byte-for-byte as before the rule existed. Computed AFTER the closure so the
+    // provenance covers every bundled body, and after `structural_drop`/absent
+    // collection so the query traffic (`trust_proof_results` on each case-split
+    // member) happens once.
+    let mut dyn_contract_total = FxHashSet::default();
+    dyn_facts.resolve_reliance(tcx, caller_def_id, &mut dyn_contract_total);
+    // ADTs whose DESTRUCTOR BODY is in this bundle. Derived from `bundled_def_ids`
+    // — what was ACTUALLY admitted — so it cannot drift from `admit_foreign_destructor`'s
+    // gates, and it needs no name parsing: a member whose parent impl is `Drop` names
+    // its self ADT directly.
+    // Drained from where admission actually happened. Deriving this by re-walking
+    // `bundled_def_ids` did NOT work: that collection does not contain bundled
+    // destructors (measured `bundled_members=1 destructor_adts={}` on a fixture
+    // whose bundle held `<Vec<u8> as Drop>::drop`).
+    let bundled_destructor_adts: FxHashSet<String> =
+        ADMITTED_DESTRUCTOR_ADTS.with(|set| set.borrow().clone());
+    if env_flag_enabled("TRUST_DROP_GATE_DEBUG") {
+        eprintln!(
+            "[DROP_DERIVE] fn={} bundled_members={} destructor_adts={:?}",
+            func.def_path,
+            bundled_def_ids.len(),
+            bundled_destructor_adts
+        );
+    }
     let native = build_native_trust_ir_bundle_from_verifiable_functions(
         func,
         bundle,
@@ -22908,6 +23968,8 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
         &abi_total_panic_free,
         &assumed_total,
         &compiler_total,
+        &dyn_contract_total,
+        &bundled_destructor_adts,
         paired_condvar_certificate.as_deref(),
         &certified_paired_condvar_wait_sites,
         body_bound_carriers,
@@ -22934,6 +23996,139 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
 /// so a no-`Drop` struct/enum reachable only through a NESTED field — e.g.
 /// `serde_json::Number`/`Map`/`Vec<Value>` inside an `Option<serde_json::Value>` — is
 /// classified too, not just the generic-argument tree the old `ty::walk()` reached.
+thread_local! {
+    /// ADT def-paths whose destructor was ADMITTED into the current bundle by
+    /// `admit_foreign_destructor`.
+    ///
+    /// Recorded where admission happens rather than re-derived afterwards: the
+    /// first attempt read `bundled_def_ids`, which does NOT contain bundled
+    /// destructors (measured: `bundled_members=1 destructor_adts={}` on a fixture
+    /// whose bundle demonstrably held `<Vec<u8> as Drop>::drop`). Re-deriving would
+    /// also duplicate the admission gates and could drift from them.
+    ///
+    /// Cleared at the start of every bundle closure so entries cannot leak between
+    /// functions, and drained at the derivation point.
+    static ADMITTED_DESTRUCTOR_ADTS: std::cell::RefCell<FxHashSet<String>> =
+        std::cell::RefCell::new(FxHashSet::default());
+}
+
+thread_local! {
+    /// Types whose drop glue is CURRENTLY being resolved on this thread.
+    ///
+    /// Forcing `trust_proof_results` on `drop_in_place::<T>` can re-enter the
+    /// structural-drop closure for a type that transitively contains `T`
+    /// (`Vec<Node>` where `Node` holds a `Vec<Node>`), and a `trust_proof_results`
+    /// query cycle ABORTS compilation rather than declining. A self-check on the
+    /// root type cannot see the indirect A -> B -> A shape, so the guard spans the
+    /// whole resolution. Re-entry answers `false` = "not proved" = the node stays
+    /// cut = fail closed.
+    static DROP_GLUE_IN_PROGRESS: std::cell::RefCell<FxHashSet<String>> =
+        std::cell::RefCell::new(FxHashSet::default());
+}
+
+/// True only when `ty`'s drop glue is PROVED panic-free on the same evidence bar
+/// as every other premise (`instance_discharges_panic_freedom`).
+///
+/// FAIL-CLOSED ON EVERY AXIS. This function credits glue the structural lane
+/// currently refuses, so it is the fail-OPEN direction and every uncertain answer
+/// must be `false`: an unresolvable instance, absent MIR, a re-entrant cycle, or
+/// any `Err` from the shared ledger all leave the node cut. It never inspects the
+/// `Drop` impl's source or trusts a name — a user `impl Drop` that can panic mints
+/// an unproved row in its own body and fails the bar, which is what
+/// `tests/ui/trust/drop_glue_panicking_drop_stays_closed.rs` pins.
+fn drop_glue_discharges_panic_freedom<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let key = format!("{ty:?}");
+    let entered = DROP_GLUE_IN_PROGRESS.with(|set| set.borrow_mut().insert(key.clone()));
+    if !entered {
+        // Re-entry: this very type's glue is already being resolved further up the
+        // stack. Decline rather than recurse — a cycle would abort the compile.
+        return false;
+    }
+    struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DROP_GLUE_IN_PROGRESS.with(|set| {
+                set.borrow_mut().remove(&self.0);
+            });
+        }
+    }
+    let _guard = Guard(key);
+    // The USER `Drop::drop` METHOD, not the synthesized glue wrapper.
+    //
+    // MEASURED (trustc 11:27:23): asking about `Instance::resolve_drop_glue` got
+    // nowhere — glue is an `InstanceKind::Shim`, `TrustVerify` is a `MirPass` over
+    // `optimized_mir`, and a shim body never traverses that pipeline, so
+    // `trust_proof_results` returned `None` and the shared ledger's first arm
+    // refused every time. `<Vec<T> as Drop>::drop` is an ordinary `Item` with a
+    // real body and a real verdict.
+    //
+    // The glue around it is not skipped, it is DECOMPOSED: the synthesized wrapper
+    // runs the user `drop` and then the FIELD drops, and every field type is
+    // already carried through this same closure by `structural_drop_component_types`
+    // — a field whose own type is Drop-bearing recurses here and must clear the same
+    // bar. So the pair (user drop proved) + (fields structural) is the whole glue.
+    let ty::Adt(adt_def, args) = ty.kind() else {
+        return false;
+    };
+    let Some(destructor) = adt_def.destructor(tcx) else {
+        // `has_dtor` was true, so a destructor must exist; if it cannot be named,
+        // decline rather than guess.
+        return false;
+    };
+    let dbg = env_flag_enabled("TRUST_DROP_GLUE_DEBUG");
+    if !tcx.is_mir_available(destructor.did) {
+        if dbg {
+            eprintln!(
+                "[DROP_GLUE] {ty:?}: destructor {:?} has NO MIR -> cut",
+                tcx.def_path_str(destructor.did)
+            );
+        }
+        return false;
+    }
+    // MONOMORPHIZE. Asking about the GENERIC `<Vec<T, A> as Drop>::drop` got
+    // "the verifier produced no proof results for this body" every time — measured
+    // on trustc 13:50:25 with TRUST_DROP_GLUE_DEBUG. A generic body has no verdict
+    // because it cannot be verified without its arguments. The drop site is fully
+    // concrete, and the ADT carries its own args, so resolve the real instance.
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    let instance = match ty::Instance::try_resolve(tcx, typing_env, destructor.did, args) {
+        Ok(Some(instance)) => instance,
+        // Unresolvable (still generic, or a trait selection failure): decline.
+        _ => {
+            if dbg {
+                eprintln!(
+                    "[DROP_GLUE] {ty:?}: destructor {} did not resolve -> cut",
+                    tcx.def_path_str(destructor.did)
+                );
+            }
+            return false;
+        }
+    };
+    match trait_panic_free::instance_discharges_panic_freedom(tcx, instance.def) {
+        Ok(()) => {
+            if dbg {
+                eprintln!(
+                    "[DROP_GLUE] {}: destructor PROVES panic-free -> credited",
+                    tcx.def_path_str(destructor.did)
+                );
+            }
+            true
+        }
+        Err(reason) => {
+            // The reason is the whole point: it names WHICH arm of the shared
+            // ledger refused, which is the difference between "std's body has its
+            // own unproved callee" and "the query never ran".
+            if dbg {
+                eprintln!(
+                    "[DROP_GLUE] {}: destructor DECLINED -> cut; reason: {reason}",
+                    tcx.def_path_str(destructor.did)
+                );
+            }
+            false
+        }
+    }
+}
+
 fn collect_structural_drop_adts<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -22968,8 +24163,17 @@ fn collect_structural_drop_adts<'tcx>(
         drive_structural_drop_closure(
             drop_ty,
             STRUCTURAL_DROP_CLOSURE_FUEL,
-            // has_drop: only an ADT carrying a user `Drop` impl — that node is cut.
-            |ty| matches!(ty.kind(), ty::Adt(adt_def, _) if adt_def.has_dtor(tcx)),
+            // has_drop: an ADT carrying a user `Drop` impl is cut — UNLESS its drop
+            // glue is itself PROVED panic-free on the same evidence bar every other
+            // premise uses. `Vec<T>` is the motivating case: it carries `impl Drop`,
+            // so this node was cut unconditionally and every function touching a
+            // `Vec` inherited an unproved `[trust-drop-glue-assumption]` row.
+            |ty| match ty.kind() {
+                ty::Adt(adt_def, _) if adt_def.has_dtor(tcx) => {
+                    !drop_glue_discharges_panic_freedom(tcx, *ty)
+                }
+                _ => false,
+            },
             // on_structural: record each no-`Drop` ADT's def-path (the `!has_dtor`
             // fact the bridge cannot see); non-ADT component nodes carry no name.
             |ty| {
@@ -23428,6 +24632,340 @@ fn insert_exact_absent_call_identity(out: &mut FxHashSet<String>, call_key: &str
     out.insert(call_key.to_owned());
 }
 
+/// Trust (assumption-root gate): admit a call identity to a bridge set BECAUSE OF
+/// A USER DECLARATION (`#[trust::assume_total]` or `#[trust::skip]` on the callee),
+/// and record the census key in the SAME statement.
+///
+/// ONE WRITER OF THE BRIDGE SETS, and that is the whole point. The coupling this
+/// enforces is narrow and exact: no user-axiom key can enter `expected_absent` /
+/// `assumed_total` — the sets that decide which arm the bridge lowers an absent
+/// callee onto — without the census recording it in the same statement. Written as
+/// two adjacent statements that coupling is a review-time observation the next edit
+/// can silently break; written as one function it is a property of the program.
+///
+/// SCOPE, stated exactly because a looser version of this sentence has now been
+/// refuted twice. This is a claim about THESE TWO SETS and nothing else. It is NOT
+/// a claim that they are the only channel a `#[trust::assume_total]` /
+/// `#[trust::skip]` declaration has into a verdict: `item_has_trust_skip_attr` is
+/// read at a dozen other sites in this file (body-level opt-out, the reliance
+/// lanes, the destructor gate), and a body can reach an axiom without handing any
+/// key to the bridge at all — MEASURED: `let f: fn() = boom; f();` produces no
+/// `FnDef` call operand, and `static TABLE: [fn(); 1] = [boom]; (TABLE[0])()`
+/// produces no mention of `boom` in the calling body whatsoever. Those two
+/// spellings are censused by `collect_user_axiom_value_mentions` and
+/// `census_user_axioms_in_constant_memory`, into `user_axiom_keys` ONLY.
+///
+/// It records the KEY, not a flag, so the publish point can cross-check the census
+/// against the set the bridge actually receives (see
+/// `bundle_census_is_axiom_free`) instead of trusting that this is still the only
+/// writer. NOT a substitute for the coupling: a belt on top of the braces, and the
+/// only one of the two that survives a future second writer.
+fn insert_user_axiom_absent_call_identity(
+    out: &mut FxHashSet<String>,
+    call_key: &str,
+    user_axiom_keys: &mut FxHashSet<String>,
+) {
+    insert_exact_absent_call_identity(out, call_key);
+    user_axiom_keys.insert(call_key.to_owned());
+}
+
+/// Trust (assumption-root gate): may this bundle's verdict be spent as a premise?
+///
+/// Pure, so the fail-closed directions are unit-testable without a `TyCtxt`. Three
+/// independent reasons to refuse, and each one is a MEASURED hazard rather than a
+/// precaution:
+///
+/// 1. `user_axiom_keys` non-empty — the census saw an `#[trust::assume_total]` /
+///    `#[trust::skip]` item in the root body or a walked member, either as the
+///    callee of a direct call or as a `ty::FnDef` VALUE the body mentions. The
+///    second half has no `assumed_total` entry behind it, which is why this
+///    conjunct is keyed on the census and not on the bridge set.
+/// 2. `assumed_total` carries a key the census never recorded. Today impossible
+///    (`insert_user_axiom_absent_call_identity` is its only writer), which is
+///    exactly why this must be CHECKED rather than assumed: a future second writer
+///    would otherwise hand the bridge a user axiom that no census saw, and the
+///    bundle would publish `axiom_free` while resting on it.
+/// 3. `bundled_def_id_reads_complete == false` — a member of the DefId walk could
+///    not be read at all.
+/// 4. `const_memory_reads_complete == false` — the constant-memory half of the
+///    census hit something it could not follow (a foreign or unevaluable static, a
+///    vtable, a deallocated id, or its step budget). Kept as its OWN flag rather
+///    than folded into 3, because 3's declaration carries a hard-won and still
+///    accurate scope statement about the DefId walk that this must not blur.
+///
+/// This list is what the function CHECKS. It is not a claim that a user axiom has
+/// no other route into a verdict — three rounds have each found a route the
+/// previous one did not, and the routes still open are named at
+/// `verdict_rests_on_user_axiom` and at `census_user_axioms_in_constant_memory`.
+///
+/// The equivalent subset check for `#[trust::skip]` is NOT possible and must not be
+/// faked: skip keys land in `expected_absent`, which is a MIXED channel that also
+/// carries compiler classifications (non-unwinding local extern, the `?` desugar),
+/// so `expected_absent` being non-empty says nothing about a user declaration. The
+/// skip half is carried by conjunct 1 and by the coupling alone.
+fn bundle_census_is_axiom_free(
+    user_axiom_keys: &FxHashSet<String>,
+    assumed_total: &FxHashSet<String>,
+    bundled_def_id_reads_complete: bool,
+    const_memory_reads_complete: bool,
+) -> bool {
+    #[allow(rustc::potential_query_instability)]
+    let every_bridge_axiom_was_censused =
+        assumed_total.iter().all(|key| user_axiom_keys.contains(key));
+    user_axiom_keys.is_empty()
+        && every_bridge_axiom_was_censused
+        && bundled_def_id_reads_complete
+        && const_memory_reads_complete
+}
+
+/// Trust (assumption-root gate): census every `#[trust::assume_total]` /
+/// `#[trust::skip]` item this body MENTIONS AS A VALUE, not only the ones it calls
+/// through a `Terminator::Call` func operand.
+///
+/// WHY IT EXISTS — MEASURED, on the compiler that had only the call-operand census
+/// (`/private/tmp/ar5-r2/rustc-main`, this patch minus this function). `let f: fn()
+/// = boom; f();` lowers to a `ReifyFnPointer` cast plus an INDIRECT call, so
+/// `func.const_fn_def()` yields nothing, no key reaches the bridge sets, and the
+/// census stayed EMPTY while the body genuinely reached an
+/// `#[trust::assume_total] fn boom() { panic!() }`. Three consumers then credited
+/// the verdict — the `write!` reduction, the `dyn` C-FLOW case split and the
+/// drop-glue premise (probe programs X2 / X7 / X8, all `axiom_free=true`, rc=0;
+/// the direct-call control X6 already read `axiom_free=false`).
+///
+/// CENSUS-ONLY, and that is what makes a broad scan safe: it writes
+/// `user_axiom_keys` and nothing else. It cannot put a key into `expected_absent`
+/// or `assumed_total`, so it cannot change how any call lowers and cannot mint a
+/// discharge. The only direction it can move a verdict is to REFUSE it.
+///
+/// SCOPE, measured rather than assumed. It sees a `ty::FnDef` constant anywhere in
+/// this body — the operand of a reification, an argument passed as a fn item, a fn
+/// item stored into an aggregate — and the caller runs it over the root body and
+/// every walked member. Since round 4 it ALSO follows a constant operand that is a
+/// POINTER INTO CONSTANT MEMORY and censuses the axioms whose function pointers
+/// that memory holds, which is what closes `static TABLE: [fn(); 1] = [boom];
+/// (TABLE[0])()` — see [`census_user_axioms_in_constant_memory`] for that half,
+/// including the three places it cannot decide and fails closed.
+fn collect_user_axiom_value_mentions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    user_axiom_keys: &mut FxHashSet<String>,
+    const_memory_reads_complete: &mut bool,
+) {
+    struct Scan<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        user_axiom_keys: &'a mut FxHashSet<String>,
+        const_memory_reads_complete: &'a mut bool,
+        // rustc's OWN condition for "evaluating a static here may cycle", copied
+        // from `rustc_middle::mir::pretty::write_allocations`: risky only while
+        // looking at an early-phase body that is itself a const context.
+        static_eval_may_cycle: bool,
+    }
+    impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for Scan<'_, 'tcx> {
+        fn visit_operand(
+            &mut self,
+            operand: &Operand<'tcx>,
+            _location: rustc_middle::mir::Location,
+        ) {
+            let Operand::Constant(constant) = operand else {
+                return;
+            };
+            if let ty::FnDef(def_id, _) = *constant.const_.ty().kind() {
+                if item_has_trust_skip_attr(self.tcx, def_id)
+                    || item_has_trust_attr(self.tcx, def_id, "assume_total")
+                {
+                    // The same spelling the call-operand census uses, so a body that
+                    // both calls and reifies one axiom contributes one key and the
+                    // `assumed_total` subset cross-check still lines up.
+                    self.user_axiom_keys
+                        .insert(trust_mir_extract::func_operand_name(self.tcx, operand));
+                }
+                return;
+            }
+            census_user_axioms_in_constant_memory(
+                self.tcx,
+                constant,
+                self.static_eval_may_cycle,
+                self.user_axiom_keys,
+                self.const_memory_reads_complete,
+            );
+        }
+    }
+    let static_eval_may_cycle = body.phase
+        <= rustc_middle::mir::MirPhase::Runtime(rustc_middle::mir::RuntimePhase::PostCleanup)
+        && body
+            .source
+            .def_id()
+            .as_local()
+            .is_some_and(|local| tcx.hir_body_const_context(local).is_some());
+    let mut scan =
+        Scan { tcx, user_axiom_keys, const_memory_reads_complete, static_eval_may_cycle };
+    rustc_middle::mir::visit::Visitor::visit_body(&mut scan, body);
+}
+
+/// A hard step budget for the constant-memory walk. Reaching it is NOT a silent
+/// truncation: the walk sets `const_memory_reads_complete = false` and the bundle's
+/// verdict becomes unspendable, exactly as an unreadable static does.
+const TRUST_CONST_MEMORY_CENSUS_STEP_BUDGET: usize = 4096;
+
+/// Trust (assumption-root gate): follow ONE constant operand into constant memory
+/// and census every `#[trust::assume_total]` / `#[trust::skip]` function whose
+/// pointer is reachable from it.
+///
+/// WHY IT EXISTS — MEASURED, on the round-3 compiler that had the value-mention
+/// scan but not this walk (`/private/tmp/ar7-r3/rustc-main`). `static TABLE: [fn();
+/// 1] = [boom]; (TABLE[0])()` lowers the load as `_5 = const {alloc1: &[fn(); 1]}`
+/// — a pointer to `GlobalAlloc::Static(TABLE)` — and `boom as fn()` lives in
+/// TABLE's OWN initializer body, which the DefId walk never reads. The census
+/// therefore stayed empty and three consumers credited the verdict: the `write!`
+/// reduction (Y1), the `dyn` C-FLOW split (Y4) and the drop-glue premise (Y5), all
+/// rc=0 with `axiom_free=true`, while the byte-identical control with the attribute
+/// removed (Y6) was rc=1 on the same binary. So the clean build was bought entirely
+/// by the unproved user declaration.
+///
+/// CENSUS-ONLY, like its caller: it writes `user_axiom_keys` and the completeness
+/// flag, never a bridge set, so it cannot change how a call lowers and cannot mint
+/// a discharge. The only direction it can move a verdict is to REFUSE it.
+///
+/// THE KEY SPELLING IS DELIBERATELY DIFFERENT — `safe_def_path_str`, not
+/// `func_operand_name` — because there is no call operand here to render. That is
+/// sound for both consumers of the census: conjunct 1 of
+/// [`bundle_census_is_axiom_free`] tests EMPTINESS, and conjunct 2 tests that
+/// `assumed_total` is a SUBSET of the census, so extra keys can only strengthen
+/// both. It does mean one axiom that is both called and table-held contributes two
+/// keys; `user_axiom_keys.len()` is a probe counter, not an axiom count.
+///
+/// A VTABLE IS READ, NOT REFUSED, and that was a MEASURED correction rather than a
+/// design preference. The first revision of this function failed closed on
+/// `GlobalAlloc::VTable`. Probe Y11 — `static V: &dyn Tick = &S;` with NO axiom
+/// anywhere in the program — then read `const_memory_reads_complete=false` and
+/// `axiom_free=false` on `write_str` and `render`, while `<S as Tick>::tick` itself
+/// read `axiom_free=true`: a lost recovery bought for nothing. Materializing the
+/// vtable through `vtable_allocation` and walking it as ordinary memory restores
+/// Y11 to `axiom_free=true` AND strictly gains: probe Y10 (the same static, with
+/// `#[trust::assume_total]` on `S::tick`) goes from `axiom_free=true` on the
+/// round-3 compiler to `user_axiom_keys=1, axiom_free=false` here, because the
+/// axiom's pointer is IN the vtable. Y10's exit code does not move — that program
+/// is rc=1 on all three binaries because its virtual call retains an assertion for
+/// an unrelated reason — so Y10 is a census-level catch, not a closed exploit, and
+/// is not counted as one.
+///
+/// WHERE IT CANNOT DECIDE, IT FAILS CLOSED by clearing
+/// `const_memory_reads_complete`, which is conjunct 4 of
+/// [`bundle_census_is_axiom_free`]. Exactly four places:
+///
+/// 1. `try_get_global_alloc` returns `None` — a deallocated id.
+/// 2. `GlobalAlloc::Static` on a FOREIGN static: there is no initializer to read in
+///    this compilation, so what its pointer field holds is not knowable here.
+/// 3. `GlobalAlloc::Static` whose `eval_static_initializer` errors, or which is
+///    guarded off by rustc's own may-cycle condition (an early-phase const-context
+///    body). An ICE is a worse defect than a declined verdict.
+/// 4. A vtable allocation that does not come back as memory, and the step budget.
+///
+/// Of those four, ZERO fire anywhere in the checked-in `tests/ui/trust` corpus.
+/// MEASURED directly, not inferred from exit codes: the corpus was re-run under
+/// `TRUST_DYN_RELIANCE_PROBE=1` on both lanes, producing 790 `axiom census` records
+/// (443 lib + 347 bin), of which `const_memory_reads_complete=false` appears in
+/// ZERO, with zero ICEs or panics. So these are fail-closed arms with no measured
+/// cost and no measured exploit behind them; they are not load-bearing today and
+/// are not claimed to be. The two arms that DO run on real input — the static
+/// initializer and the vtable — are exercised by probes Y1/Y4/Y5 and Y10/Y11.
+///
+/// NOT fail-closed, each for a stated reason rather than convenience:
+/// `GlobalAlloc::TypeId` carries no pointer field at all; a `Const::Unevaluated`
+/// operand is not followed because it has no allocation yet — MEASURED that both
+/// constant spellings of this exploit (`const TABLE: [fn(); 1] = [boom]`, probe Y2,
+/// and an associated `const F: fn() = boom`, probe Y3) are already rc=1 on the
+/// PRISTINE base compiler, so nothing is riding on that omission today. It is a
+/// residual, not a claim of coverage.
+fn census_user_axioms_in_constant_memory<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    constant: &rustc_middle::mir::ConstOperand<'tcx>,
+    static_eval_may_cycle: bool,
+    user_axiom_keys: &mut FxHashSet<String>,
+    const_memory_reads_complete: &mut bool,
+) {
+    use rustc_middle::mir::interpret::GlobalAlloc;
+    use rustc_middle::mir::{Const, ConstValue};
+
+    let Const::Val(value, _) = constant.const_ else {
+        // `Const::Ty` / `Const::Unevaluated`: no allocation to walk. See the
+        // measured note above on why this is a residual and not a live route.
+        return;
+    };
+    let root = match value {
+        ConstValue::Scalar(rustc_middle::mir::interpret::Scalar::Ptr(ptr, _)) => {
+            ptr.provenance.alloc_id()
+        }
+        ConstValue::Slice { alloc_id, .. } | ConstValue::Indirect { alloc_id, .. } => alloc_id,
+        ConstValue::Scalar(rustc_middle::mir::interpret::Scalar::Int { .. })
+        | ConstValue::ZeroSized => return,
+    };
+    let mut seen: FxHashSet<rustc_middle::mir::interpret::AllocId> = FxHashSet::default();
+    seen.insert(root);
+    let mut todo = vec![root];
+    let mut steps = 0usize;
+    while let Some(id) = todo.pop() {
+        steps += 1;
+        if steps > TRUST_CONST_MEMORY_CENSUS_STEP_BUDGET {
+            *const_memory_reads_complete = false;
+            return;
+        }
+        let Some(global) = tcx.try_get_global_alloc(id) else {
+            *const_memory_reads_complete = false;
+            continue;
+        };
+        let contents = match global {
+            GlobalAlloc::Function { instance } => {
+                let def_id = instance.def_id();
+                if item_has_trust_skip_attr(tcx, def_id)
+                    || item_has_trust_attr(tcx, def_id, "assume_total")
+                {
+                    user_axiom_keys.insert(trust_mir_extract::safe_def_path_str(tcx, def_id));
+                }
+                continue;
+            }
+            GlobalAlloc::Memory(alloc) => alloc,
+            GlobalAlloc::Static(did) => {
+                if tcx.is_foreign_item(did) || static_eval_may_cycle {
+                    *const_memory_reads_complete = false;
+                    continue;
+                }
+                match tcx.eval_static_initializer(did) {
+                    Ok(alloc) => alloc,
+                    Err(_) => {
+                        *const_memory_reads_complete = false;
+                        continue;
+                    }
+                }
+            }
+            GlobalAlloc::VTable(ty, dyn_ty) => {
+                // Materialize the vtable as ordinary constant memory and let the
+                // same BFS read it, exactly as codegen does
+                // (`rustc_codegen_llvm::common`). Enumerating `vtable_entries`
+                // instead would miss the header's drop-glue slot, which carries a
+                // function pointer too.
+                let principal = dyn_ty
+                    .principal()
+                    .map(|principal| tcx.instantiate_bound_regions_with_erased(principal));
+                match tcx.try_get_global_alloc(tcx.vtable_allocation((ty, principal))) {
+                    Some(GlobalAlloc::Memory(alloc)) => alloc,
+                    _ => {
+                        *const_memory_reads_complete = false;
+                        continue;
+                    }
+                }
+            }
+            GlobalAlloc::TypeId { .. } => continue,
+        };
+        for pointer in contents.inner().provenance().ptrs().values() {
+            let next = pointer.alloc_id();
+            if seen.insert(next) {
+                todo.push(next);
+            }
+        }
+    }
+}
+
 /// Trust: collect the callee strings in `body` that are EXPECTEDLY absent — a
 /// callee the user `#[trust::skip]`'d, or a NON-UNWINDING C-family (`extern "C"`)
 /// boundary. This is quarantine bookkeeping, not a discharge: strict policies still
@@ -23458,7 +24996,31 @@ fn collect_expected_absent_callees<'tcx>(
     // authenticated SET channel instead of a forgeable `::<__trust_*>` name
     // suffix (the "spelling as authority" hazard).
     compiler_total_out: &mut FxHashSet<String>,
+    // Trust (assumption-root gate): the exact call identities this body had
+    // classified absent because of a USER DECLARATION — `#[trust::assume_total]`
+    // or `#[trust::skip]` on the callee. Recorded HERE, at the exact site the
+    // attribute is read, rather than re-derived from set emptiness afterwards:
+    // `out` and `compiler_total_out` also carry compiler classifications
+    // (non-unwinding local extern, sealed rung-2 dispatch, the `?` desugar, Φ),
+    // and refusing on those would decline verdicts that rest on no user axiom at
+    // all. Accumulated across the root body and every WALKED member by the caller.
+    //
+    // Written ONLY through `insert_user_axiom_absent_call_identity`, which writes
+    // the bridge set and this census in one statement. Do not insert into
+    // `assumed_total_out` (or into `out` for a user skip) any other way.
+    user_axiom_keys: &mut FxHashSet<String>,
+    // Trust (assumption-root gate): did the constant-memory half of the census read
+    // everything it needed? Cleared where it cannot decide — see
+    // `census_user_axioms_in_constant_memory`. Rides the same seam as the census
+    // itself, so a body whose constants could not be followed cannot be reached
+    // without the flag being cleared too.
+    const_memory_reads_complete: &mut bool,
 ) {
+    // Trust (assumption-root gate): census the VALUE mentions of a user axiom
+    // before the call walk. Called from HERE rather than from the caller's two
+    // walk sites so the census and the bridge-set collection can never come to
+    // cover different bodies — the caller has one seam, and both halves ride it.
+    collect_user_axiom_value_mentions(tcx, body, user_axiom_keys, const_memory_reads_complete);
     let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
     for block in body.basic_blocks.iter() {
         let (func, _) = match &block.terminator().kind {
@@ -23474,6 +25036,31 @@ fn collect_expected_absent_callees<'tcx>(
         // disambiguation in this exact key. A shorter `safe_def_path_str` silently
         // misses the bridge call row and turns an authenticated skip boundary
         // into a fatal ordinary absent callee.
+        //
+        // SOUNDNESS — every insert below is a per-SITE insert into a set the bridge
+        // spends by NAME, so this key must be INJECTIVE or one definition's audit
+        // discharges another definition's call. It was not, and
+        // `assumed_total_out` was exploited to a false proof (measured: a
+        // `#[trust::assume_total]` `write_char` override in one block discharged
+        // the identically-keyed call on a DIFFERENT block-scoped `S`). Two of
+        // these sets — `abi_total_out` and `type_total_out` — additionally escape
+        // this bundle into crate-scoped Session state
+        // (`register_abi_nonunwind_total_callee` / `register_type_total_std_callee`)
+        // and are spent name-keyed for every function in the crate, so a
+        // per-bundle ledger cannot contain them. The key is therefore NARROWED at
+        // the ONE rendering seam instead: see `trust_mir_extract::safe_def_path_str`
+        // and the `direct_call_def_path` doc comment. Do NOT reintroduce a per-set
+        // gate here in place of it.
+        //
+        // THE KEY IS STILL NOT INJECTIVE, and this comment must not be read as
+        // saying it is. `direct_call_def_path` residual 1 is a MEASURED, OPEN
+        // false proof: when `gen_args` contain a `ty::Param`, `call_key` is
+        // spelled exactly like the DEFINITION path of a generic body, and the
+        // bridge binds the call to that body by name. The `Ok(None)` arm below
+        // classifies exactly that call correctly — this function HAS the caller's
+        // `typing_env` and the bridge does not — so the fix belongs on the
+        // call-site identity handed to the bridge, not here and not at the
+        // renderer.
         let call_key = trust_mir_extract::func_operand_name(tcx, func);
         // ROBUST user-skip: a call to a `#[trust::skip]` callee is EXPECTED-absent
         // regardless of how `try_resolve` classifies it (a const-generic skip'd fn
@@ -23483,10 +25070,10 @@ fn collect_expected_absent_callees<'tcx>(
         // resolution arm below handles an attribute carried only by a resolved
         // implementation while retaining the same operand identity.
         if item_has_trust_skip_attr(tcx, callee_def_id) {
-            insert_exact_absent_call_identity(out, &call_key);
+            insert_user_axiom_absent_call_identity(out, &call_key, user_axiom_keys);
         }
         if item_has_trust_attr(tcx, callee_def_id, "assume_total") {
-            insert_exact_absent_call_identity(assumed_total_out, &call_key);
+            insert_user_axiom_absent_call_identity(assumed_total_out, &call_key, user_axiom_keys);
         }
         // COMPILER-decided, type-verified total std iterator advance. Kept in its
         // own set (never merged into `assumed_total_out`, which is the user
@@ -23545,7 +25132,25 @@ fn collect_expected_absent_callees<'tcx>(
             // every other shape (open trait, blanket impl, unverified/cycling
             // impl, zero impls) falls through to the fatal arm unchanged.
             Ok(None) => {
-                if let Some(trait_def_id) = tcx.trait_of_assoc(callee_def_id) {
+                // RUNG 1 — the callee's TRAIT METHOD carries `#[trust::panic_free]`,
+                // and every impl that can reach this call proved it where its body
+                // is written (`discharge_trait_panic_free_contracts` fails this
+                // compilation otherwise). The obligation is not waived, it was MOVED
+                // to the implementors — so this is a genuine discharge of the CALL's
+                // panic freedom and rides the authenticated compiler-total set, the
+                // arm that emits no obligation and no `Assert(false)` marker. It
+                // discharges panic freedom ONLY: the callee's result stays havoc'd by
+                // the ordinary absent-callee modeling, and no termination claim is
+                // made (Φ is a safety property; see `trait_panic_free`'s
+                // innermost-frame argument for why adding termination would be
+                // unsound). Checked BEFORE rung 2 because it subsumes it whenever it
+                // applies and, unlike rung 2, accepts blanket and generic impls.
+                if trait_panic_free::generic_call_relies_on_panic_free_contract(
+                    tcx,
+                    callee_def_id,
+                ) {
+                    insert_exact_absent_call_identity(compiler_total_out, &call_key);
+                } else if let Some(trait_def_id) = tcx.trait_of_assoc(callee_def_id) {
                     if sealed_generic_dispatch_impls_all_panic_free(
                         tcx,
                         body.source.def_id(),
@@ -23564,7 +25169,7 @@ fn collect_expected_absent_callees<'tcx>(
             Ok(Some(instance)) => {
                 let resolved = instance.def_id();
                 if item_has_trust_skip_attr(tcx, resolved) {
-                    insert_exact_absent_call_identity(out, &call_key);
+                    insert_user_axiom_absent_call_identity(out, &call_key, user_axiom_keys);
                 }
                 if callee_non_unwinding {
                     if tcx.is_foreign_item(resolved) {
@@ -23574,7 +25179,11 @@ fn collect_expected_absent_callees<'tcx>(
                     }
                 }
                 if item_has_trust_attr(tcx, resolved, "assume_total") {
-                    insert_exact_absent_call_identity(assumed_total_out, &call_key);
+                    insert_user_axiom_absent_call_identity(
+                        assumed_total_out,
+                        &call_key,
+                        user_axiom_keys,
+                    );
                 }
             }
             Err(_) => {}
@@ -23629,6 +25238,13 @@ fn build_native_trust_ir_bundle_for_test_verifier_api_with_carriers(
         &FxHashSet::default(),
         &FxHashSet::default(),
         &FxHashSet::default(),
+        // `dyn_contract_total_callees`. EMPTY is the conservative value and the
+        // one the parameter's own doc prescribes for this seam: with no
+        // rung-1 §(c) discharge supplied, every `dyn` call keeps its obligation.
+        &FxHashSet::default(),
+        // `bundled_destructor_adts`. Test harness: none, matching every other
+        // empty authenticated set above.
+        &FxHashSet::default(),
         None,
         &[],
         body_bound_carriers,
@@ -23653,6 +25269,14 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
     // Compiler-decided totals the bridge cannot decide for itself (the `?`
     // desugar). Authenticated by provenance: only this compiler path supplies it.
     compiler_total_callees: &FxHashSet<String>,
+    // Exact `dyn Trait` virtual-call identities discharged by rung 1 §(c) — a
+    // trait-method panic-freedom contract (C-UNIVERSAL), or a complete in-bundle
+    // enumeration of the receiver's vtable provenance whose every case-split
+    // member is independently proved (C-FLOW). Empty on the test seam, which
+    // makes every `dyn` call keep its obligation.
+    dyn_contract_total_callees: &FxHashSet<String>,
+    // ADTs whose destructor body is in this bundle; see the derivation site.
+    bundled_destructor_adts: &FxHashSet<String>,
     paired_condvar_certificate: Option<&trust_mir_extract::PairedCondvarCrateCertificate>,
     certified_paired_condvar_wait_sites: &[trust_mir_extract::CertifiedPairedCondvarWaitCallSite],
     body_bound_carriers: &mut Vec<CompilerFinalizedBodyBoundCarrier>,
@@ -23698,6 +25322,8 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
                         certificate,
                         paired_sites,
                         compiler_total_callees,
+                        dyn_contract_total_callees,
+                        bundled_destructor_adts,
                     )
                 }
                 None if paired_sites.is_empty() => {
@@ -23709,6 +25335,8 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
                         abi_total_panic_free_callees,
                         assumed_total_callees,
                         compiler_total_callees,
+                        dyn_contract_total_callees,
+                        bundled_destructor_adts,
                     )
                 }
                 None => {
@@ -23723,9 +25351,16 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
                 }
             }
         };
-    let mut module = match lower_functions(&trust_ir_functions, certified_paired_condvar_wait_sites)
-    {
-        Ok(module) => module,
+    // `lowered_members` is the EXACT input list the kept module was lowered
+    // from — `FuncId == index` holds only against that list, so the poison
+    // loop below must map owners through it, never through the pre-filter
+    // input `trust_ir_functions` (the survivor retry lowers a SUBSET, and an
+    // index into the wrong list silently misattributes a poison row).
+    let (mut module, lowered_members) = match lower_functions(
+        &trust_ir_functions,
+        certified_paired_condvar_wait_sites,
+    ) {
+        Ok(module) => (module, trust_ir_functions.clone()),
         Err(first_error) => {
             // CONTEXT-AWARE survivor pre-filter, iterated to a FIXED POINT.
             //
@@ -23765,6 +25400,11 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
             // the bridge's absent-callee / shim arms (honest may-panic marker +
             // PanicFreedom obligation).
             let mut survivors: Vec<trust_types::VerifiableFunction> = trust_ir_functions.clone();
+            // Every candidate the lane PUSHED, by bundled name. A survivor that
+            // still CALLS one of these after it was dropped is poisoned — see the
+            // dropped-candidate closure pass below.
+            let pushed_paths: FxHashSet<&str> =
+                trust_ir_functions.iter().map(|function| function.def_path.as_str()).collect();
             loop {
                 let mut next: Vec<trust_types::VerifiableFunction> =
                     Vec::with_capacity(survivors.len());
@@ -23780,8 +25420,48 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
                         next.push(survivors[index].clone());
                     }
                 }
-                let stabilized = next.len() == survivors.len();
-                survivors = next;
+                // Trust (falsification regression 2026-08-11, class A closer):
+                // DROPPED-CANDIDATE CLOSURE. A non-target survivor whose body
+                // calls a candidate that was PUSHED and then dropped would keep
+                // lowering fine — the call just becomes a fatal absent-callee
+                // marker plus a `[trust-absent-callee-assumption] … may panic`
+                // PanicFreedom row — and that fatal text then poisons the
+                // whole-function panic-freedom aggregate, which the canonical-
+                // prefix-only subsumption mint refuses. Before the bundling lane
+                // existed, neither the survivor nor its dropped callee was in the
+                // bundle at all, so the call site sat on the audited
+                // compiler-total / modeled arms and the aggregate stayed
+                // canonical. Restore exactly that: a partially-lowerable std
+                // subgraph reverts WHOLESALE to the pre-lane shape instead of
+                // leaking its lowering frontier into the caller's obligations.
+                //
+                // Scope guard: only names the lane itself PUSHED count — a call
+                // to something never bundled (an intrinsic, an expected-absent
+                // import, a modeled panic terminal) keeps its pre-existing arm
+                // and must not trigger the drop. SOUNDNESS: membership-only,
+                // monotonically shrinking, bounded below by the target (index 0),
+                // and dropping a member can only remove proof credit, never grant
+                // it — the same invariant the context probe above documents.
+                let next_paths: FxHashSet<&str> =
+                    next.iter().map(|function| function.def_path.as_str()).collect();
+                let closed: Vec<trust_types::VerifiableFunction> = next
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, function)| {
+                        *index == 0
+                            || !function.body.blocks.iter().any(|block| {
+                                matches!(
+                                    &block.terminator,
+                                    trust_types::Terminator::Call { func, .. }
+                                        if pushed_paths.contains(func.as_str())
+                                            && !next_paths.contains(func.as_str())
+                                )
+                            })
+                    })
+                    .map(|(_, function)| function.clone())
+                    .collect();
+                let stabilized = closed.len() == survivors.len();
+                survivors = closed;
                 if stabilized {
                     break;
                 }
@@ -23816,9 +25496,90 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
                     )
                 },
             )?;
-            module
+            (module, survivors)
         }
     };
+    // Trust (falsification 2026-08-12, round 3): MODEL-EXACT bundle-poison drop,
+    // iterated to a fixed point. The name-family declines above catch the
+    // measured entry chains, but ANY bundled std body may bottom out in a call
+    // the bridge can only lower as a FATAL absent callee (`#[track_caller]`
+    // internals reaching the `caller_location` intrinsic are the recurring
+    // shape) — and one such row poisons the caller's whole-function
+    // panic-freedom aggregate, which the canonical-prefix-only subsumption mint
+    // then refuses. Instead of chasing entry families by name, ask the LOWERED
+    // MODULE itself: any NON-TARGET member that OWNS a
+    // `[trust-absent-callee-assumption]` obligation is dropped and the bundle
+    // relowered — the exact wholesale reversion the dropped-candidate closure
+    // performs for pushed-then-dropped candidates, extended to never-pushed
+    // absents (intrinsics, foreign imports). SOUNDNESS: membership-only and
+    // monotonically shrinking (each pass drops >= 1 member or exits), bounded
+    // below by the target; dropping a member returns its call sites to the
+    // audited pre-lane arms and can only remove proof credit. Fail-soft: if a
+    // relower errs or no member name matches, keep the PREVIOUS module — its
+    // poisoned aggregate stays honest-unknown, never a false proof.
+    // ONE SPELLING ONLY. The lowered module names each function by the
+    // extractor's SHORT item name (`f`, `set`), while `VerifiableFunction`
+    // carries the full `def_path` (`crate::set`). Comparing the two spellings
+    // dropped perfectly-lowerable LOCAL callees as collateral (measured:
+    // `assert_mut_setter_identity`'s `set` was evicted alongside a genuinely
+    // poisoned `panic_fmt`, and f's call to it then lowered as a fatal absent
+    // callee — the very poison the loop exists to remove). Map the obligation's
+    // owner `FuncId` back to its `VerifiableFunction` instead: `FuncId == index`
+    // by construction in `lower_to_trust_ir_functions_impl` (`FuncId::new(index)`
+    // + `add_function` in order), so the index is the authoritative identity and
+    // `def_path` the single spelling. `current` tracks the member set across
+    // relowers so the mapping stays exact — SEEDED from `lowered_members`, not
+    // `trust_ir_functions`: after the survivor retry the module indexes the
+    // survivor subset, and seeding from the full pre-filter list misattributed
+    // panic_fmt's `caller_location` poison row to an already-dropped member
+    // (the relower then churned on phantom evictions and fail-soft kept the
+    // poisoned module — measured: memory_safe/demote_explicit_lowering_gap).
+    let mut current: Vec<trust_types::VerifiableFunction> = lowered_members;
+    loop {
+        let root_name = trust_ir_functions[0].def_path.as_str();
+        let mut poisoned: FxHashSet<String> = FxHashSet::default();
+        for obligation in &module.proof_obligations {
+            if !obligation.description.contains("[trust-absent-callee-assumption]") {
+                continue;
+            }
+            let Some(owner) = obligation.function else {
+                continue;
+            };
+            let Some(vf) = current.get(owner.index() as usize) else {
+                continue;
+            };
+            if vf.def_path != root_name {
+                poisoned.insert(vf.def_path.clone());
+            }
+        }
+        if poisoned.is_empty() {
+            break;
+        }
+        let retained: Vec<trust_types::VerifiableFunction> = current
+            .iter()
+            .filter(|vf| vf.def_path == root_name || !poisoned.contains(vf.def_path.as_str()))
+            .cloned()
+            .collect();
+        // Progress guard: the drop must actually shrink the member set, or a
+        // spelling mismatch would spin forever. Fail-soft break.
+        if retained.len() >= current.len() || retained.is_empty() {
+            break;
+        }
+        let retained_paired: Vec<_> = certified_paired_condvar_wait_sites
+            .iter()
+            .filter(|site| retained.iter().any(|vf| vf.def_path == site.function_def_path()))
+            .cloned()
+            .collect();
+        match lower_functions(&retained, &retained_paired) {
+            Ok(relowered) => {
+                module = relowered;
+                // Keep the FuncId->VerifiableFunction mapping exact for the next
+                // pass: the relowered module indexes `retained`, not the original.
+                current = retained;
+            }
+            Err(_) => break,
+        }
+    }
     // Trust: surface bridge-emitted native panic-freedom (user `assert!` /
     // `unreachable!` with no public VC twin) as a counted public Assertion
     // obligation, so a function whose only obligation is panic-freedom is
@@ -23859,7 +25620,13 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
     // metadata-only typed predicates need a real public contract link; creating
     // and linking that contract after bundle construction leaves the TrustIr
     // identities authorizing an older public record.
-    finalize_trust_mc_public_semantic_contracts(&native_function_name, func, bundle, &bindings)?;
+    finalize_trust_mc_public_semantic_contracts(
+        &native_function_name,
+        func,
+        bundle,
+        &bindings,
+        module.function_by_id(function_id),
+    )?;
     finalize_trust_wp_public_semantic_contracts(bundle, &bindings)?;
     // Trust (#23 Slice 1): body-bound trust-wp claims for uncited `ensures`.
     // Same pre-digest invariant as above: the derived let-envelope contract
@@ -24104,11 +25871,25 @@ fn native_trust_ir_verifiable_function_closure<'tcx>(
     // real calls — its `libc::write` must be classified too, or it surfaces
     // as an unresolvable absent callee in the CALLER's crate.
     bundled: &mut FxHashSet<DefId>,
+    // Trust (rung 1 §(c)): the `dyn`-dispatch facts, gathered HERE because this
+    // is the only place both the local bodies and the B-lane's INSTANTIATED
+    // foreign bodies exist. A polymorphic body names no concrete coercion source,
+    // so collecting from `optimized_mir` alone would decline every real case
+    // split; the mono body is the one the call site actually reaches.
+    dyn_facts: &mut dyn_dispatch_reliance::DynDispatchBundleFacts<'tcx>,
 ) -> Result<Vec<trust_types::VerifiableFunction>, String> {
+    // Fresh per closure: entries must never leak between functions.
+    ADMITTED_DESTRUCTOR_ADTS.with(|set| set.borrow_mut().clear());
     let mut functions = vec![root_func.clone()];
     let mut seen: FxHashSet<DefId> = FxHashSet::default();
     seen.insert(root_body.source.def_id());
     bundled.insert(root_body.source.def_id());
+    dyn_facts.observe_bundle_body(
+        tcx,
+        root_body,
+        ty::TypingEnv::post_analysis(tcx, root_body.source.def_id()),
+        true,
+    );
 
     // Trust: skip recursive callee expansion during stage1 bootstrap.
     // `tcx.optimized_mir(callee)` triggers a query cycle when the callee
@@ -24119,96 +25900,280 @@ fn native_trust_ir_verifiable_function_closure<'tcx>(
         return Ok(functions);
     }
 
-    let mut pending = native_trust_ir_direct_local_fn_callees(tcx, root_body);
+    let mut pending = native_trust_ir_direct_local_fn_callees(
+        tcx,
+        root_body,
+        ty::TypingEnv::post_analysis(tcx, root_body.source.def_id()),
+    );
+    // Trust (B-lane): the monomorphic FOREIGN worklist, carried alongside the
+    // `DefId` worklist because a std callee is identified by its INSTANCE, not
+    // its `DefId` (see `native_trust_ir_monomorphic_foreign_callees`). Seeded
+    // from the root and extended by every body this closure bundles — local
+    // bodies below, instantiated foreign bodies in the drain loop after.
+    let mut pending_mono = native_trust_ir_monomorphic_foreign_callees(
+        tcx,
+        root_body,
+        ty::TypingEnv::post_analysis(tcx, root_body.source.def_id()),
+    );
+    // Trust (D-LANE, foreign-body -> LOCAL-impl edge): the two lanes above are
+    // complementary by DefId locality, but until this fixpoint existed the
+    // `DefId` lane was only ever run over LOCAL bodies (the root and whatever it
+    // transitively reached). A body bundled by the B-lane is FOREIGN, and the
+    // B-lane declines any callee whose resolved body `is_local()` on the stated
+    // grounds that "the `DefId` lane already claims it" — but that lane was never
+    // offered the foreign body to walk. So a call from a std body to a LOCAL impl
+    // (`spec_write_fmt` -> `<W as fmt::Write>::write_str` for a user `W`) fell
+    // through BOTH lanes onto the fail-closed absent-callee arm, and was reported
+    // "body not in the lowered bundle" for a body that is local, present, and
+    // separately proved in the same compilation.
+    //
+    // The fix is to close the loop, not to widen a gate: the B-lane drain now
+    // also feeds the `DefId` worklist, and the two drains run to a joint
+    // fixpoint. Naming already lines up — `devirtualized_callee_name` rewrites
+    // such a call site to the resolved LOCAL impl path, which is exactly the
+    // spelling `extract_function_with_contract_bundle` gives the bundled body.
+    //
+    // Budget: the first `DefId` pass keeps its historical
+    // `NATIVE_TRUST_IR_MAX_LOCAL_CALLEE_CLOSURE` ceiling byte-for-byte, so no
+    // pre-existing bundle changes shape. Only the newly reachable cross-lane
+    // edges (which are discovered on a LATER pass, by definition) draw on the
+    // B-lane's `NATIVE_TRUST_IR_MAX_BUNDLE_FUNCTIONS` ceiling, exactly like every
+    // other body that lane admits. Truncation stays fail-soft in the same
+    // direction as the rest of this closure.
+    let mut local_lane_cap = NATIVE_TRUST_IR_MAX_LOCAL_CALLEE_CLOSURE;
+    // Defs the B-lane bundled under a PER-INSTANCE name. The `DefId` lane must not
+    // also bundle one under its generic spelling: two bodies for one def, one of
+    // them polymorphic, is the T9 mixed-case collision this file guards everywhere.
+    let mut bundled_mono_defs: FxHashSet<DefId> = FxHashSet::default();
+    let mut seen_mono: FxHashSet<String> = FxHashSet::default();
     let mut cursor = 0usize;
-    while let Some(callee_def_id) = pending.get(cursor).copied() {
-        // `seen` bounds this transitive callee walk by distinct-callee count; the
-        // deadline poll caps its slow-but-bounded tail. A truncated bundle is
-        // sound — an omitted callee's obligations fail closed downstream (Unknown
-        // / absent-callee), never a hidden proof.
-        if trust_types::verify_budget::budget_exhausted() {
-            break;
-        }
-        cursor += 1;
-        if !seen.insert(callee_def_id) {
-            continue;
-        }
-        // Trust (escape-hatch contradiction fix): a `#[trust::skip]` callee's body is
-        // NOT bundled and NOT traversed into. The user took responsibility for that
-        // function's safety, so re-lowering its (often DELIBERATELY panicking, e.g.
-        // idiomatic-alloc `.unwrap()`) body as a member of THIS bundle would resurrect
-        // the very panic obligations the skip waives — turning every caller's full
-        // verification fatal on the skip'd body's absent-callee rows and making the
-        // documented escape hatch self-defeating. Leaving it out keeps the caller's
-        // CALL site absent, where the expected-absent marker fires (the callee is
-        // in the caller's set via the syntactic-skip collector). Survey turns
-        // that marker into a visible assumption row; strict and memory-safe reject
-        // it. The skipped function itself is likewise a strict-scope error, so the
-        // omission cannot become a hidden strict proof.
-        if item_has_trust_skip_attr(tcx, callee_def_id) {
-            continue;
-        }
-        // An assumed-total callee remains outside the proof bundle so its call
-        // site takes the dedicated recorded-assumption boundary. Re-lowering
-        // the body here would contradict the explicit user assumption.
-        if item_has_trust_attr(tcx, callee_def_id, "assume_total") {
-            continue;
-        }
-        if functions.len() >= NATIVE_TRUST_IR_MAX_LOCAL_CALLEE_CLOSURE {
-            // FAIL-SOFT: bundle what fits instead of failing the whole bundle.
-            // Every callee left out lowers at its call sites via the bridge's
-            // absent-callee arm (honest may-panic marker + PanicFreedom
-            // obligation) — an omitted callee only makes the bundle LESS
-            // complete (Unknown), never a fabricated proof.
-            break;
+    let mut mono_cursor = 0usize;
+    loop {
+        let functions_at_pass_start = functions.len();
+        while let Some(callee_def_id) = pending.get(cursor).copied() {
+            // `seen` bounds this transitive callee walk by distinct-callee count; the
+            // deadline poll caps its slow-but-bounded tail. A truncated bundle is
+            // sound — an omitted callee's obligations fail closed downstream (Unknown
+            // / absent-callee), never a hidden proof.
+            if trust_types::verify_budget::budget_exhausted() {
+                break;
+            }
+            cursor += 1;
+            if !seen.insert(callee_def_id) {
+                continue;
+            }
+            // Trust (escape-hatch contradiction fix): a `#[trust::skip]` callee's body is
+            // NOT bundled and NOT traversed into. The user took responsibility for that
+            // function's safety, so re-lowering its (often DELIBERATELY panicking, e.g.
+            // idiomatic-alloc `.unwrap()`) body as a member of THIS bundle would resurrect
+            // the very panic obligations the skip waives — turning every caller's full
+            // verification fatal on the skip'd body's absent-callee rows and making the
+            // documented escape hatch self-defeating. Leaving it out keeps the caller's
+            // CALL site absent, where the expected-absent marker fires (the callee is
+            // in the caller's set via the syntactic-skip collector). Survey turns
+            // that marker into a visible assumption row; strict and memory-safe reject
+            // it. The skipped function itself is likewise a strict-scope error, so the
+            // omission cannot become a hidden strict proof.
+            if item_has_trust_skip_attr(tcx, callee_def_id) {
+                continue;
+            }
+            // An assumed-total callee remains outside the proof bundle so its call
+            // site takes the dedicated recorded-assumption boundary. Re-lowering
+            // the body here would contradict the explicit user assumption.
+            if item_has_trust_attr(tcx, callee_def_id, "assume_total") {
+                continue;
+            }
+            // Trust (D-LANE): already bundled by the B-lane under its per-instance
+            // name. Adding the generic body under the generic name would give one def
+            // two bodies, and the polymorphic one could then serve a call site the
+            // instantiated one was proved for.
+            if bundled_mono_defs.contains(&callee_def_id) {
+                continue;
+            }
+            if functions.len() >= local_lane_cap {
+                // FAIL-SOFT: bundle what fits instead of failing the whole bundle.
+                // Every callee left out lowers at its call sites via the bridge's
+                // absent-callee arm (honest may-panic marker + PanicFreedom
+                // obligation) — an omitted callee only makes the bundle LESS
+                // complete (Unknown), never a fabricated proof.
+                break;
+            }
+
+            // Trust #540 (R1 completeness #4 — mutual-recursion query-cycle safety): calling
+            // `tcx.optimized_mir(callee)` on a callee that is part of a call CYCLE reachable back
+            // into the already-`seen` closure (a MUTUAL-recursion SCC — e.g. an entry `E` calling
+            // `ping`↔`pong`) forms an `optimized_mir` QUERY CYCLE (E0391: "optimizing MIR for ping …
+            // requires optimizing MIR for pong … requires optimizing MIR for ping"), which HARD-
+            // ABORTS compilation. That cycle is INDEPENDENT of R1 (it reproduces with
+            // `-Ztrust-no-r1`),
+            // but before R1 could prove recursive callees there was never a reason to bundle one. A
+            // DIRECT self-call does NOT cycle `optimized_mir` (rustc handles single-fn self-recursion),
+            // so it keeps the optimized body. For a MUTUAL-recursion callee we instead read the
+            // NON-cycling elaborated-MIR snapshot (`mir_for_trust_verification` — the same MIR the
+            // verifier already extracts everywhere at this seam, minus the opt pipeline that cycles).
+            // `inner_optimized_mir` caches every mutual-recursion member's snapshot before stealing
+            // its source, so this branch is independent of query order and never probes mutable
+            // `Steal` state without doubling ordinary functions' MIR residency.
+            // SOUND: the recursive callee's OWN safety obligations are separately verified on its own
+            // `mir_keys` body (and R1 flips its bounds VC there); bundling the elaborated vs optimized
+            // body only changes which faithful MIR of the SAME function the caller's panic-freedom
+            // reasons over.
+            // Trust: `optimized_mir_query_would_cycle` also covers live query ancestors outside
+            // this closure's own `seen` path. Either signal routes the callee to the non-cycling
+            // elaborated-MIR snapshot below.
+            let cyclic = optimized_mir_query_would_cycle(tcx, callee_def_id);
+            let callee_func = if cyclic {
+                let Some(local) = callee_def_id.as_local() else { continue };
+                // FAIL-SOFT: `None` = stolen with no snapshot (dynamic cycle
+                // outside any static SCC) — skip like any unextractable callee.
+                let Some(body) = tcx.mir_for_trust_verification(local) else { continue };
+                // FAIL-SOFT: an unextractable callee is SKIPPED (its call sites
+                // lower via the bridge's absent-callee may-panic marker) instead
+                // of failing the whole bundle — less complete, never falsely
+                // proved.
+                let Ok(cf) = native_trust_ir_extract_callee_function(tcx, body) else {
+                    continue;
+                };
+                pending.extend(native_trust_ir_direct_local_fn_callees(
+                    tcx,
+                    body,
+                    ty::TypingEnv::post_analysis(tcx, body.source.def_id()),
+                ));
+                pending_mono.extend(native_trust_ir_monomorphic_foreign_callees(
+                    tcx,
+                    body,
+                    ty::TypingEnv::post_analysis(tcx, body.source.def_id()),
+                ));
+                dyn_facts.observe_bundle_body(
+                    tcx,
+                    body,
+                    ty::TypingEnv::post_analysis(tcx, body.source.def_id()),
+                    false,
+                );
+                cf
+            } else {
+                let callee_body = tcx.optimized_mir(callee_def_id);
+                // FAIL-SOFT: skip unextractable callees (see the snapshot arm).
+                let Ok(cf) = native_trust_ir_extract_callee_function(tcx, callee_body) else {
+                    continue;
+                };
+                pending.extend(native_trust_ir_direct_local_fn_callees(
+                    tcx,
+                    callee_body,
+                    ty::TypingEnv::post_analysis(tcx, callee_body.source.def_id()),
+                ));
+                pending_mono.extend(native_trust_ir_monomorphic_foreign_callees(
+                    tcx,
+                    callee_body,
+                    ty::TypingEnv::post_analysis(tcx, callee_body.source.def_id()),
+                ));
+                dyn_facts.observe_bundle_body(
+                    tcx,
+                    callee_body,
+                    ty::TypingEnv::post_analysis(tcx, callee_body.source.def_id()),
+                    false,
+                );
+                cf
+            };
+            bundled.insert(callee_def_id);
+            functions.push(callee_func);
         }
 
-        // Trust #540 (R1 completeness #4 — mutual-recursion query-cycle safety): calling
-        // `tcx.optimized_mir(callee)` on a callee that is part of a call CYCLE reachable back
-        // into the already-`seen` closure (a MUTUAL-recursion SCC — e.g. an entry `E` calling
-        // `ping`↔`pong`) forms an `optimized_mir` QUERY CYCLE (E0391: "optimizing MIR for ping …
-        // requires optimizing MIR for pong … requires optimizing MIR for ping"), which HARD-
-        // ABORTS compilation. That cycle is INDEPENDENT of R1 (it reproduces with
-        // `-Ztrust-no-r1`),
-        // but before R1 could prove recursive callees there was never a reason to bundle one. A
-        // DIRECT self-call does NOT cycle `optimized_mir` (rustc handles single-fn self-recursion),
-        // so it keeps the optimized body. For a MUTUAL-recursion callee we instead read the
-        // NON-cycling elaborated-MIR snapshot (`mir_for_trust_verification` — the same MIR the
-        // verifier already extracts everywhere at this seam, minus the opt pipeline that cycles).
-        // `inner_optimized_mir` caches every mutual-recursion member's snapshot before stealing
-        // its source, so this branch is independent of query order and never probes mutable
-        // `Steal` state without doubling ordinary functions' MIR residency.
-        // SOUND: the recursive callee's OWN safety obligations are separately verified on its own
-        // `mir_keys` body (and R1 flips its bounds VC there); bundling the elaborated vs optimized
-        // body only changes which faithful MIR of the SAME function the caller's panic-freedom
-        // reasons over.
-        // Trust: `optimized_mir_query_would_cycle` also covers live query ancestors outside
-        // this closure's own `seen` path. Either signal routes the callee to the non-cycling
-        // elaborated-MIR snapshot below.
-        let cyclic = optimized_mir_query_would_cycle(tcx, callee_def_id);
-        let callee_func = if cyclic {
-            let Some(local) = callee_def_id.as_local() else { continue };
-            let body = tcx.mir_for_trust_verification(local);
-            // FAIL-SOFT: an unextractable callee is SKIPPED (its call sites
-            // lower via the bridge's absent-callee may-panic marker) instead
-            // of failing the whole bundle — less complete, never falsely
-            // proved.
-            let Ok(cf) = native_trust_ir_extract_callee_function(tcx, body) else {
+        // Trust (B-lane): drain the monomorphic FOREIGN worklist. Each admitted
+        // instance is instantiated to a concrete body and bundled under its
+        // per-instance name, so the caller's call site resolves to a REAL body and
+        // its panic-freedom obligation is discharged BY PROOF instead of riding the
+        // absent-callee arm. Bundling cannot manufacture a proof: the body is the
+        // callee's own MIR, and its obligations are added to — never removed from —
+        // the root's verdict. If they do not discharge, the root stays unproved,
+        // exactly as it was when the callee was absent.
+        //
+        // Ordering: this runs AFTER the `DefId` walk so the local/workspace closure
+        // gets first claim on the shared budget. Every early exit here is fail-soft
+        // in the same direction as the walk above — an omitted callee only makes the
+        // bundle less complete (its call site keeps the honest may-panic marker).
+        while let Some((instance, bundled_name)) = pending_mono.get(mono_cursor).cloned() {
+            if trust_types::verify_budget::budget_exhausted() {
+                break;
+            }
+            mono_cursor += 1;
+            if !seen_mono.insert(bundled_name.clone()) {
+                continue;
+            }
+            if functions.len() >= NATIVE_TRUST_IR_MAX_BUNDLE_FUNCTIONS {
+                break;
+            }
+            // Already bundled by the `DefId` lane (an `#[automatically_derived]`
+            // cross-crate method) under its OWN name. A second copy would give
+            // `register_function_name` two ids for one key, and `insert_or_poison`
+            // would then REMOVE the key — losing the proof that lane already had.
+            if bundled.contains(&instance.def_id()) {
+                continue;
+            }
+            let generic_body = tcx.instance_mir(instance.def);
+            let Ok(mono_body) = instance.try_instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                ty::TypingEnv::fully_monomorphized(),
+                ty::EarlyBinder::bind(tcx, generic_body.clone()),
+            ) else {
                 continue;
             };
-            pending.extend(native_trust_ir_direct_local_fn_callees(tcx, body));
-            cf
-        } else {
-            let callee_body = tcx.optimized_mir(callee_def_id);
-            // FAIL-SOFT: skip unextractable callees (see the snapshot arm).
-            let Ok(cf) = native_trust_ir_extract_callee_function(tcx, callee_body) else {
+            // The instantiated body must be fully concrete. A residual param would
+            // mean the bundled body is not THE body this call reaches.
+            if mono_body.has_non_region_param()
+                || mono_body.has_non_region_infer()
+                || mono_body.has_non_region_placeholders()
+            {
                 continue;
-            };
-            pending.extend(native_trust_ir_direct_local_fn_callees(tcx, callee_body));
-            cf
-        };
-        bundled.insert(callee_def_id);
-        functions.push(callee_func);
+            }
+            let mut callee_func =
+                trust_mir_extract::extract_function_with_contract_bundle(tcx, &mono_body, None);
+            // Name BOTH keys `register_function_name` registers with the per-instance
+            // path. Leaving `name` at the extractor's generic spelling would let two
+            // instantiations of one `DefId` collide on it — poisoning that key and
+            // losing BOTH proofs.
+            callee_func.name = bundled_name.clone();
+            callee_func.def_path = bundled_name;
+            // Transitive: this body's own monomorphic foreign callees. It is already
+            // fully instantiated, so its call sites carry concrete arguments and the
+            // fully-monomorphized environment is the exact one they resolve in.
+            dyn_facts.observe_bundle_body(
+                tcx,
+                &mono_body,
+                ty::TypingEnv::fully_monomorphized(),
+                false,
+            );
+            pending_mono.extend(native_trust_ir_monomorphic_foreign_callees(
+                tcx,
+                &mono_body,
+                ty::TypingEnv::fully_monomorphized(),
+            ));
+            // Trust (D-LANE): and this body's LOCAL callees. A std body reaching a
+            // user impl (`spec_write_fmt` -> `<W as fmt::Write>::write_str`) is the
+            // edge that fell through both lanes; the `DefId` lane handles local
+            // bodies, it just never saw a foreign body to walk. `mono_body` is fully
+            // instantiated, so its trait-method call sites resolve concretely and
+            // that collector's own R3/T5/T9 guards apply unchanged.
+            pending.extend(native_trust_ir_direct_local_fn_callees(
+                tcx,
+                &mono_body,
+                ty::TypingEnv::fully_monomorphized(),
+            ));
+            bundled_mono_defs.insert(instance.def_id());
+            functions.push(callee_func);
+        }
+
+        // Trust (D-LANE): the B-lane drain just fed the `DefId` worklist. Re-drain
+        // until a whole pass adds nothing. Terminates unconditionally: `functions`
+        // only grows, and both caps bound it, so a pass that pushes nothing is the
+        // fixpoint (either both worklists are drained or a cap is holding, and in
+        // both cases another pass cannot bundle more).
+        if functions.len() == functions_at_pass_start
+            || trust_types::verify_budget::budget_exhausted()
+        {
+            break;
+        }
+        local_lane_cap = NATIVE_TRUST_IR_MAX_BUNDLE_FUNCTIONS;
     }
 
     Ok(functions)
@@ -24263,13 +26228,20 @@ fn callee_is_automatically_derived_method(tcx: TyCtxt<'_>, def_id: DefId) -> boo
         && tcx.is_automatically_derived(impl_def_id)
 }
 
+/// `typing_env` is the environment the CALLER's call sites resolve in. It is a
+/// parameter rather than a recomputed `post_analysis(body.source.def_id())`
+/// because this collector is now also run over B-lane bodies, which are foreign
+/// MIR already INSTANTIATED to concrete arguments: those sites must resolve
+/// against `fully_monomorphized`, not against the foreign definition's own
+/// generic param-env, or a concrete receiver reads back as still-generic and the
+/// R3 guard fails the call closed for the wrong reason.
 fn native_trust_ir_direct_local_fn_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
 ) -> Vec<DefId> {
     let mut callees = Vec::new();
     let mut seen = FxHashSet::default();
-    let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
 
     // Trust (R3 soundness guard, blueprint §5 / probe T5): PASS 1 — collect every
     // TRAIT-DECLARATION callee this body calls that `Instance::try_resolve` could
@@ -24413,6 +26385,605 @@ fn native_trust_ir_direct_local_fn_callees<'tcx>(
     callees
 }
 
+/// Trust (B-lane — a foreign body is a PROOF, a totality model is an ASSUMPTION):
+/// collect the std/core/alloc callees of `body` that are FULLY MONOMORPHIC at
+/// their call site, so the callee's real MIR body can be instantiated and
+/// BUNDLED. A bundled body discharges the call's panic-freedom obligation by
+/// proof; the only alternative this collector has is to DECLINE, which leaves
+/// the call on the existing fail-closed absent-callee arm. So every gate below
+/// is a `continue` — never an approximation, never a widening.
+///
+/// # Why this is a separate lane from `native_trust_ir_direct_local_fn_callees`
+///
+/// That collector keys the bundle by bare `DefId` and bundles
+/// `tcx.optimized_mir` — the GENERIC, un-instantiated body. That is precisely
+/// why std has to stay out of it: one entry for `str::find` would carry `P`
+/// unbound, and since the bridge matches callees by RENDERED NAME the single
+/// bundled body would serve `find::<char>` and `find::<&str>` alike — one
+/// instantiation discharged against another's body (the mixed-case collision
+/// the R3 guard's probe T9 exists to prevent). Flipping that crate filter is a
+/// false-proof risk, not a quick win, and it is deliberately left untouched.
+///
+/// # The identity gate is the whole design
+///
+/// Here the bundled function is named by `exact_def_path_str_with_args` — the
+/// PER-INSTANCE path — and admission REQUIRES that the caller's own call-site
+/// spelling is byte-equal to it. That spelling is not recomputed by hand: it is
+/// read from `func_operand_name`, the exact function whose output the bridge
+/// will look up in `known_functions`. Same producer on both sides, compared for
+/// equality before anything is bundled. A mismatch (any of the marker rewrites
+/// `func_operand_name` applies — intrinsic, wrapping, `?`-total, bulk-alloc,
+/// comparison sentinel, devirtualization, str-index) simply declines, so a
+/// modeled call keeps its model and an unmodeled one keeps its absent-callee
+/// obligation. Two instantiations of one `DefId` render two different strings,
+/// so they cannot collide; if a producer bug ever made them equal,
+/// `register_function_name`'s `insert_or_poison` removes the key and callee
+/// resolution fails closed rather than picking a body.
+///
+/// # Trait-method call sites (T-IMPL)
+///
+/// A std TRAIT-method callee (`<[u8] as AsRef<[u8]>>::as_ref`,
+/// `<[u8] as PartialEq<[u8]>>::eq`) is admitted when — and only when — this call
+/// site RESOLVES it to a concrete `InstanceKind::Item` body under a
+/// fully-concrete argument vector. rustc keeps the TRAIT method's `DefId` in the
+/// MIR terminator and devirtualizes at monomorphization, so before this lane
+/// covered them every call through a std trait — however trivial the impl — fell
+/// to the absent-callee arm. The BODY is taken from the resolved instance; the
+/// bundled NAME stays the syntactic `<Concrete as Trait<..>>::m` spelling,
+/// because that is exactly what `func_operand_name` renders at the call site
+/// (`devirtualized_callee_name` renames only when the impl is LOCAL, and a local
+/// impl belongs to the `DefId` lane). See the T-IMPL comment in the body for the
+/// T5/T9 soundness argument.
+fn native_trust_ir_monomorphic_foreign_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+) -> Vec<(ty::Instance<'tcx>, String)> {
+    // A/B measurement switch, DEFAULT ON. It can only SUBTRACT proofs: with the
+    // lane off every call this collector would have admitted falls back to the
+    // pre-existing fail-closed absent-callee arm, which is exactly where it sat
+    // before this lane existed. There is no setting of this variable that admits
+    // anything, downgrades a policy, or turns an obligation into an assumption —
+    // the only direction available is less proof, never more.
+    if env_flag_enabled("TRUST_NO_BUNDLE_STD") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+
+    // Trust (R3 soundness guard, probe T5/T9 — mirrors PASS 1 of the `DefId`
+    // lane): every TRAIT-DECLARATION callee in this body that `try_resolve`
+    // could NOT resolve. A sibling call that DOES resolve to the same
+    // trait-method `DefId` (i.e. to its default body) must not be bundled
+    // either: the bridge matches callees by rendered name, and the unresolved
+    // site would then match the bundled body and be falsely proved against it.
+    let mut unresolved_trait_decl_callees: FxHashSet<DefId> = FxHashSet::default();
+    for block in body.basic_blocks.iter() {
+        let (TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. }) =
+            &block.terminator().kind
+        else {
+            continue;
+        };
+        let Some((callee_def_id, gen_args)) = func.const_fn_def() else {
+            continue;
+        };
+        if tcx.trait_of_assoc(callee_def_id).is_some()
+            && !matches!(
+                ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args),
+                Ok(Some(_))
+            )
+        {
+            unresolved_trait_decl_callees.insert(callee_def_id);
+        }
+    }
+
+    for block in body.basic_blocks.iter() {
+        let (TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. }) =
+            &block.terminator().kind
+        else {
+            continue;
+        };
+        let Some((callee_def_id, gen_args)) = func.const_fn_def() else {
+            continue;
+        };
+        // WIDEN ONLY where the `DefId` lane declines. A local or non-std callee
+        // is already handled there; touching it here would double-bundle it.
+        if callee_def_id.is_local() {
+            continue;
+        }
+        let callee_krate = tcx.crate_name(callee_def_id.krate);
+        if !matches!(callee_krate.as_str(), "std" | "core" | "alloc") {
+            continue;
+        }
+        // Every gate below is a `continue`, so a declined callee leaves no trace
+        // in the bundle — it just reappears as an absent callee with no stated
+        // reason, which is exactly the shape that is expensive to diagnose. Dump
+        // the facts the gates read, once per std call site, when asked.
+        if env_flag_enabled("TRUST_NATIVE_DEBUG") {
+            let probe = ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args);
+            eprintln!(
+                "[NATIVE_TRUSTMC_FOREIGN_CALLEE] callee=`{}` kind={:?} trait_method={} \
+                 resolved={:?} mir_available={:?} call_site_name=`{}` bundled_name=`{}`",
+                trust_mir_extract::safe_def_path_str_with_args(tcx, callee_def_id, gen_args),
+                tcx.def_kind(callee_def_id),
+                tcx.trait_of_assoc(callee_def_id).is_some(),
+                probe.map(|opt| opt.map(|inst| format!("{:?}", inst.def))),
+                probe
+                    .ok()
+                    .flatten()
+                    .map(|inst| tcx.is_mir_available(inst.def_id())),
+                trust_mir_extract::func_operand_name(tcx, func),
+                trust_mir_extract::exact_def_path_str_with_args(tcx, callee_def_id, gen_args),
+            );
+        }
+        // Trust (T-IMPL): a std TRAIT-method callee is admitted ONLY when this
+        // call site RESOLVES it to a concrete impl body. The T5 hazard — "an
+        // impl may override the default body with a panicking one" — is exactly
+        // the case where resolution CANNOT pick the target; when
+        // `Instance::try_resolve` returns `Ok(Some(InstanceKind::Item(..)))`
+        // under a fully-concrete argument vector it has run the SAME trait
+        // selection rustc's own monomorphization collector and codegen run, so
+        // the body it names is the body that will actually execute. Coherence
+        // (the orphan rule) admits at most one impl for a concrete `Self`, and a
+        // selection that specialization leaves undecided returns `Ok(None)` and
+        // is declined below. `Virtual` (a `dyn` vtable call) is NOT an `Item`
+        // and stays on the irreducible floor. The one thing this must not do is
+        // bundle a body under a name the call site does not render — hence the
+        // resolved-vs-syntactic split at the identity gate below.
+        //
+        // Bundling can never MANUFACTURE a proof: the callee's own obligations
+        // are ADDED to the root's verdict, so a panicking `as_ref` would make
+        // the caller fail, not pass. The only failure mode this gate defends
+        // against is bundling the WRONG body.
+        // A/B measurement switch for THIS arm alone, DEFAULT ON. `TRUST_NO_BUNDLE_STD`
+        // turns off the whole lane, which cannot isolate the trait arm's effect;
+        // this one restores exactly the pre-T-IMPL behavior (every trait callee
+        // declined, and with it `name_args == instance.args` at the identity gate,
+        // since only a trait call can resolve to a different def). Same direction
+        // as the lane switch: the only thing it can do is move admitted callees
+        // back onto the fail-closed absent-callee arm — less proof, never more.
+        let callee_is_trait_decl = tcx.trait_of_assoc(callee_def_id).is_some();
+        if callee_is_trait_decl && env_flag_enabled("TRUST_NO_BUNDLE_STD_TRAIT_IMPL") {
+            continue;
+        }
+        if callee_is_trait_decl && unresolved_trait_decl_callees.contains(&callee_def_id) {
+            continue;
+        }
+        // A still-generic argument vector cannot select an impl, and feeding
+        // caller params to a `fully_monomorphized` param-env ICEs. Fail closed
+        // BEFORE resolution (the `is_pinned_total_std_primitive_cmp_call`
+        // precedent).
+        if callee_is_trait_decl && gen_args.has_non_region_param() {
+            continue;
+        }
+        // The bridge already DECIDES these traits, by typed receiver gate rather
+        // than by callee name (`slice_eq_total_builtin`, `trait_method_impl_tail`
+        // and friends). A bundled body competes with that decision and loses:
+        // measured, `a == b` on `&[u8]` regressed from passing to failing,
+        // because `<[u8] as PartialEq>::eq` lowers fine and then bottoms out at
+        // `core::intrinsics::compare_bytes` — an intrinsic with no body for any
+        // lane to reach. So the modeled-total call became a fail-closed absent
+        // callee and a crate that built stopped building, with nothing gained:
+        // the typed gate was already the audited answer.
+        //
+        // Identified by TRAIT IDENTITY, not name: `get_diagnostic_item` is a
+        // compiler registration a user crate cannot forge (`#[rustc_diagnostic_item]`
+        // is std-only), so a user trait merely NAMED `PartialEq` does not match
+        // and keeps the ordinary obligation-bearing path.
+        //
+        // The cost is real and accepted: `(u8, u8) == (u8, u8)` and
+        // `Option::<u8>::default()` would have been newly provable by body and
+        // are left unproved instead. Trading two new proofs for zero regressions
+        // is the right side of "never regress what already works"; recovering
+        // them means teaching the typed gates to defer to a bundled body, which
+        // is a bridge-side change, not a bundling one.
+        if callee_is_trait_decl
+            && tcx.trait_of_assoc(callee_def_id).is_some_and(|trait_def_id| {
+                [
+                    sym::PartialEq,
+                    sym::PartialOrd,
+                    sym::Ord,
+                    sym::Clone,
+                    sym::Default,
+                    sym::Debug,
+                    sym::Display,
+                    sym::Hash,
+                ]
+                .iter()
+                .any(|name| tcx.get_diagnostic_item(*name) == Some(trait_def_id))
+            })
+        {
+            continue;
+        }
+        // Kept consistent with the `DefId` lane: a provably-total derived trait
+        // call is SUMMARIZED to the total sentinel by `convert_terminator`, so
+        // bundling a body for it would contradict the call-site rewrite.
+        if trust_mir_extract::is_total_derived_trait_call(tcx, callee_def_id, gen_args) {
+            continue;
+        }
+        // Trust (falsification regression 2026-08-11, class A): the bridge's
+        // audited typed-receiver gate ALREADY decides std iterator advances total
+        // (`iter`/`into_iter`/`next`/`next_back` over the `total_std_iterator_ty`
+        // allowlist, registered through the `type_total_out` channel). Bundling
+        // such a body competes with that audited decision and loses: the body
+        // bottoms out in raw-pointer internals (`slice::iter::Iter::new`,
+        // `split_at`, `*::precondition_check`) that fail TrustIr lowering, get
+        // dropped by the survivor fixed-point, and resurface as FATAL
+        // absent-callee rows inside the kept caller — turning a compiler-total
+        // call site into an unprovable aggregate. Measured: 28 previously-proving
+        // loop fixtures (foreach_*, chunks_len, step_by_*, …) regressed exactly
+        // this way. Same shape as the PartialEq/derived-trait declines above:
+        // the typed gate was already the audited answer. Fail-closed: declining
+        // membership only returns the call site to the pre-existing audited
+        // compiler-total discharge; callees outside the audited set keep the
+        // bundling attempt with its honest fatal fallback.
+        if callee_is_type_verified_total_std_iterator(tcx, callee_def_id, gen_args) {
+            continue;
+        }
+        // Trust (falsification regression 2026-08-12, foreach_* class round 2):
+        // once a41baea710 made the rendered call-site and bundled names
+        // byte-identical, adapter CONSTRUCTORS over audited iterator types
+        // (`<Iter as Iterator>::enumerate`, `rev`, `take`, `skip`, `zip`, …)
+        // newly pass the identity gate and get bundled; their bodies drag
+        // `#[track_caller]` internals (`core::intrinsics::caller_location`)
+        // into the module as FATAL absent callees, and the panic-freedom
+        // aggregate loses its canonical form (measured: 14 foreach_* fixtures
+        // regressed 264 -> 250 with `[PF_SUBSUME] bail` naming
+        // caller_location). The audited typed-receiver world already owns
+        // EVERY protocol method on these types, so decline bundling ANY
+        // trait-method callee whose receiver is `total_std_iterator_ty`-true
+        // (or a peeled slice/array ref). Decline-only: the call site returns
+        // to the audited compiler-total / recognizer arms — less bundling,
+        // never more credit.
+        if callee_is_trait_decl
+            && let Some(self_ty) = gen_args.types().next()
+        {
+            let mut base = self_ty;
+            let mut peel = 0;
+            while let ty::Ref(_, inner, _) = base.kind() {
+                base = *inner;
+                peel += 1;
+                if peel > 4 {
+                    break;
+                }
+            }
+            // EXEMPT `AsRef` (identified by compiler diagnostic-item registration,
+            // unforgeable by user traits) from the slice/array-receiver blanket:
+            // the decline above targets the ITERATOR-protocol surface the audited
+            // typed-receiver world owns, but it also swallowed
+            // `<[u8] as AsRef<[u8]>>::as_ref` — a conversion method NO typed gate
+            // models (measured: it fell to the fail-closed absent-callee arm, and
+            // `native_bundle_std_trait_impl_body_proved`'s `probe_slice_as_ref`
+            // stayed red while the same-shape `<str as AsRef<str>>::as_ref`
+            // — a reborrow body, str receiver — bundles and PROVES). Bundling can
+            // never manufacture a proof (the body's own obligations join the
+            // root's verdict), and a body that fails to lower falls back to
+            // exactly today's absent-callee state via the survivor/poison
+            // machinery — worst case is the status quo.
+            let callee_is_as_ref = tcx.trait_of_assoc(callee_def_id).is_some_and(
+                |trait_def_id| tcx.get_diagnostic_item(sym::AsRef) == Some(trait_def_id),
+            );
+            if !callee_is_as_ref
+                && (matches!(base.kind(), ty::Slice(_) | ty::Array(_, _))
+                    || total_std_iterator_ty(tcx, base, TOTAL_STD_ITER_FUEL))
+            {
+                continue;
+            }
+        }
+        // Trust (falsification regression 2026-08-12, round 2 continued): the
+        // measured poison chain is INHERENT-method bundling —
+        // `core::slice::<impl [u32]>::iter` (no trait, so the receiver decline
+        // above cannot fire) -> `slice::iter::Iter::new` ->
+        // `ptr::mut_ptr::<impl *mut T>::add::precondition_check` ->
+        // `core::intrinsics::caller_location`, an INTRINSIC that is never
+        // PUSHED as a candidate (the InstanceKind::Item gate below declines
+        // it), so the dropped-candidate closure cannot drop its caller either,
+        // and the fatal absent row lands in the aggregate. These modules ARE
+        // the raw-pointer floor the survivor fixed-point exists to drop —
+        // bundling anything from them is net-negative by construction, and the
+        // audited slice/str recognizers already own their protocol surface.
+        // Decline the whole plumbing families. Decline-only, as above.
+        {
+            let callee_path =
+                trust_mir_extract::safe_def_path_str_with_args(tcx, callee_def_id, gen_args);
+            if callee_path.starts_with("core::slice::")
+                || callee_path.starts_with("core::str::")
+                || callee_path.starts_with("core::ptr::")
+                || callee_path.starts_with("core::intrinsics::")
+                || callee_path.starts_with("core::iter::")
+            {
+                continue;
+            }
+        }
+        // Same displaced-recognizer shape, wrapping-arithmetic family: the
+        // bridge's Gap-3 recognizer lowers `core::num::<impl uN/iN>::wrapping_*`
+        // calls directly to modular `BinOp`s (lower.rs, "Trust Gap 3") — an
+        // audited by-name model. A bundled body displaces it and bottoms out in
+        // intrinsics with no body (the measured `a.wrapping_shl(b)` regression
+        // the identity-gate comment below records). Now that renderings align,
+        // decline the family outright instead of relying on that accident.
+        {
+            let callee_path =
+                trust_mir_extract::safe_def_path_str_with_args(tcx, callee_def_id, gen_args);
+            if callee_path.contains("::num::")
+                && tcx.item_name(callee_def_id).as_str().starts_with("wrapping_")
+            {
+                continue;
+            }
+        }
+        // Same displaced-recognizer shape, StepBy CONSTRUCTION family: the
+        // bridge's `total_step_by_ctor_call` proves `(LO..HI).step_by(K)` total AT
+        // THE CALL SITE from a literal nonzero step. Bundling `Range::step_by` /
+        // `StepBy::new` / `SpecRangeSetup::setup` instead moves the
+        // `assert!(step != 0)` INSIDE the bundled body, where the step is a
+        // formal parameter and the assert cannot be discharged — a provable
+        // call-site fact traded for an unprovable body obligation. Measured:
+        // step_by_const_safe / step_by_step1_full pass pre-lane
+        // (TRUST_NO_BUNDLE_STD=1) and fail bundled. Every def path in the family
+        // spells `step_by` (the module of StepBy/SpecRangeSetup, or the
+        // `Iterator::step_by` method); declining on that substring is membership-
+        // only and fail-closed — the call sites return to the audited
+        // conditional-totality recognizer, and a symbolic/zero step still fails
+        // closed there.
+        if trust_mir_extract::safe_def_path_str_with_args(tcx, callee_def_id, gen_args)
+            .contains("step_by")
+        {
+            continue;
+        }
+        // REMOVED (see below): a decline of the panic machinery's own bodies used
+        // to sit here. It was measured to produce a FALSE PROOF — with it in
+        // place, `NotDone::absorb` whose body is `todo!()` reports
+        // "1 proved, 0 failed" and its `#[trust::panic_free]` violation
+        // disappears, and `dyn_dispatch_reliance_panicking_sink` reports its
+        // panicking sink as proved. Its own comment argued the drift "only costs
+        // proofs, never adds"; the two fixtures above are the counterexample.
+        // The spurious absent-callee rows it targeted are real and worth
+        // removing, but not by deleting the obligation that makes a panicking
+        // body fail. Any replacement must keep
+        // `tests/ui/trust/trait_panic_free_impl_todo_fails.rs` and
+        // `tests/ui/trust/dyn_dispatch_reliance_panicking_sink.rs` RED-on-regression.
+        // A primitive-integer division spelling that PANICS on a zero divisor
+        // must NOT be bundled. Bundling it is strictly worse than either
+        // alternative: its body's real `Assert { rhs != 0 }` lowers faithfully,
+        // but the module's public obligations are rebuilt from the compiler's
+        // obligation list, so nothing demands that assert — and the caller's own
+        // body contains no division, so it has no obligation of its own either.
+        //
+        // MEASURED (tests/ui/trust/wrapping_div_zero_false_proof.rs): `a / d` was
+        // correctly refused while `a.wrapping_div(b)` verified with NO
+        // diagnostics and panicked at runtime with "attempt to divide by zero".
+        //
+        // WHICH OBLIGATION DOES THIS REMOVE, AND WHAT STILL MAKES A BAD BODY
+        // FAIL? It removes the bundled BODY, not an obligation — and the call
+        // then becomes an absent callee, which MINTS the fail-closed
+        // `[trust-absent-callee-assumption] ... may panic` row. So this strictly
+        // ADDS an obligation; it is the opposite direction from the decline
+        // changes that have to stay reverted (see
+        // reports/false-proof-pattern-2026-08-11.md). The authority is not new:
+        // `is_total_primitive_int_arith_method` already withholds exactly these
+        // spellings, saying they "PANIC on a zero divisor".
+        if trust_mir_extract::func_operand_name(tcx, func)
+            .rsplit("::")
+            .next()
+            .is_some_and(trust_ir_bridge::is_panicking_primitive_int_div_method)
+        {
+            continue;
+        }
+        // The user waived this callee (`#[trust::skip]`) or asserted it total
+        // (`#[trust::assume_total]`). Re-lowering its body here would resurrect
+        // the obligations the waiver drops / contradict the explicit assumption —
+        // the same reasoning the `DefId` lane's two skips record.
+        if item_has_trust_skip_attr(tcx, callee_def_id)
+            || item_has_trust_attr(tcx, callee_def_id, "assume_total")
+        {
+            continue;
+        }
+        if !matches!(tcx.def_kind(callee_def_id), DefKind::Fn | DefKind::AssocFn) {
+            continue;
+        }
+        let Ok(Some(instance)) = ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args)
+        else {
+            continue;
+        };
+        // The bundled name is built from the SYNTACTIC def_id, because that is
+        // what the call site renders. A resolution landing on a DIFFERENT def
+        // is admitted ONLY for a trait-method call site (T-IMPL above), where
+        // the syntactic spelling `<Concrete as Trait<..>>::m` IS what
+        // `func_operand_name` renders and the resolved impl supplies the body.
+        // For any other callee a differing resolution would mean bundling a body
+        // under a name that does not describe it.
+        if instance.def_id() != callee_def_id && !callee_is_trait_decl {
+            continue;
+        }
+        // Real item bodies only. `DropGlue` / `FnPtrShim` / `ClosureOnceShim` /
+        // `Virtual` / `Intrinsic` are compiler-synthesized or dynamically
+        // dispatched: there is no source body to prove anything about, so they
+        // are the irreducible floor that stays with the modeling lane.
+        let ty::InstanceKind::Item(_) = instance.def else {
+            continue;
+        };
+        // The BODY comes from the resolved instance, so MIR availability, the
+        // contract check and the crate filter must all be asked about IT.
+        let body_def_id = instance.def_id();
+        // A resolved impl that is LOCAL, or that lives outside std/core/alloc,
+        // is already claimed by the `DefId` lane — and for a local one
+        // `devirtualized_callee_name` RENAMES the call site to the impl path, so
+        // the identity gate below would reject it anyway. Stay strictly
+        // complementary: widen only where that lane declines.
+        //
+        // "Already claimed" holds only when the CALLER is local, because the
+        // `DefId` lane walks local bodies. A FOREIGN caller reaching a LOCAL impl
+        // — `core`'s `spec_write_fmt` calling this crate's `<W as Write>::write_str`
+        // — is walked by neither lane, so declining here dropped it onto the
+        // fail-closed absent-callee arm. Measured: that `write_str` resolves to a
+        // local `InstanceKind::Item`, has MIR, and VERIFIES CLEAN as its own root
+        // in the same compilation, yet its caller was told the body was absent.
+        // An A/B isolates it exactly: a local->local call proves, while the same
+        // sink reached through core's foreign body fails.
+        let caller_is_local = body.source.def_id().is_local();
+        if body_def_id != callee_def_id
+            && ((body_def_id.is_local() && caller_is_local)
+                || !matches!(
+                    tcx.crate_name(body_def_id.krate).as_str(),
+                    "std" | "core" | "alloc"
+                ))
+        {
+            continue;
+        }
+        if body_def_id != callee_def_id
+            && (item_has_trust_skip_attr(tcx, body_def_id)
+                || item_has_trust_attr(tcx, body_def_id, "assume_total"))
+        {
+            continue;
+        }
+        if !tcx.is_mir_available(body_def_id) {
+            continue;
+        }
+        // Not fully monomorphic — the CALLER is itself still generic, so there
+        // is no single body to bundle and an instantiated body would keep
+        // unresolved params. Fail closed.
+        if instance.args.has_non_region_param()
+            || instance.args.has_non_region_infer()
+            || instance.args.has_non_region_placeholders()
+        {
+            continue;
+        }
+        // A foreign body carrying its own contract bundle must not be extracted
+        // with `None` contracts — that silently erases its specification
+        // identity. Decline instead (mirrors the monomorphic dump lane).
+        if [callee_def_id, body_def_id].iter().any(|def_id| {
+            trust_contracts_if_any(tcx, *def_id)
+                .is_some_and(|bundle| !bundle.is_empty() || bundle.summary.total != 0)
+        }) {
+            continue;
+        }
+        // THE IDENTITY GATE. See this function's doc comment.
+        //
+        // The naming args are the SYNTACTIC ones only for a call that resolved
+        // THROUGH a trait to an impl — there `instance.args` are the IMPL's, and
+        // the call site renders the trait's. Everywhere else the args stay
+        // `instance.args`, byte-for-byte the pre-existing behavior: swapping in
+        // `gen_args` there admits callees this lane used to decline on a
+        // normalization difference, and that is a REGRESSION, not a widening —
+        // `a.wrapping_shl(b)` measurably went from passing to failing, because
+        // bundling `core::num::<impl u8>::wrapping_shl` drags in
+        // `unchecked_shl::precondition_check`, which has no body.
+        let name_args = if body_def_id == callee_def_id { instance.args } else { gen_args };
+        let bundled_name =
+            trust_mir_extract::exact_def_path_str_with_args(tcx, callee_def_id, name_args);
+        if trust_mir_extract::func_operand_name(tcx, func) != bundled_name {
+            continue;
+        }
+        if seen.insert(bundled_name.clone()) {
+            out.push((instance, bundled_name));
+        }
+    }
+
+    // DROP GLUE. Both lanes above walk only `Call`/`TailCall`, so a destructor
+    // reached through `TerminatorKind::Drop` was never OFFERED to the bundler —
+    // measured: a `let v: Vec<u8>` function's bundle contains `__rust_alloc`,
+    // `handle_alloc_error`, `box_new_uninit` and NO drop-related body at all.
+    //
+    // This is the lane that can monomorphize. The premise-query route cannot:
+    // `trust_proof_results` is keyed on `ty::InstanceKind`, and `InstanceKind::Item`
+    // carries no `GenericArgsRef`, so it can only ever ask about the GENERIC
+    // `<Vec<T, A> as Drop>::drop` — whose `Slice { elem: <T> }` pointee is
+    // Unsupported precisely BECAUSE `T` is symbolic. Here the instance keeps its
+    // args and `try_instantiate_mir_and_normalize_erasing_regions` yields the
+    // concrete body.
+    for block in body.basic_blocks.iter() {
+        let TerminatorKind::Drop { place, .. } = &block.terminator().kind else {
+            continue;
+        };
+        let drop_ty = place.ty(&body.local_decls, tcx).ty;
+        let drop_ty = tcx.normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(drop_ty));
+        // WALK THE FIELD CLOSURE, do not just look at the dropped place's own type.
+        // `fn len(h: Holder)` drops `h`, and `Holder` has NO destructor — the `Vec`
+        // it owns is dropped inside `Holder`'s synthesized glue, which never appears
+        // as its own terminator. Measured: the bundle dump for that function shows
+        // exactly one `Drop`, on `Holder`, so an own-type-only check finds nothing to
+        // admit. `collect_structural_drop_adts` already walks this same closure for
+        // the no-`Drop` case; this is its Drop-bearing counterpart.
+        let mut candidates: Vec<Ty<'tcx>> = Vec::new();
+        drive_structural_drop_closure(
+            drop_ty,
+            STRUCTURAL_DROP_CLOSURE_FUEL,
+            // Never cut: a Drop-bearing node is exactly what we want to collect, AND
+            // its fields still matter (a `Vec<Inner>` owns `Inner`'s destructor too).
+            |_ty| false,
+            |ty| {
+                if matches!(ty.kind(), ty::Adt(adt_def, _) if adt_def.has_dtor(tcx)) {
+                    candidates.push(*ty);
+                }
+            },
+            |ty| structural_drop_component_types(tcx, typing_env, *ty),
+        );
+        for cand in candidates {
+            admit_foreign_destructor(tcx, typing_env, cand, &mut seen, &mut out);
+        }
+    }
+
+    out
+}
+
+/// Admit one Drop-bearing ADT's destructor into the foreign bundle set, under the
+/// SAME admission bar as [`native_trust_ir_monomorphic_foreign_callees`]'s call arm.
+///
+/// Every decline leaves today's fail-closed drop-glue obligation exactly as it is.
+fn admit_foreign_destructor<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    ty: Ty<'tcx>,
+    seen: &mut FxHashSet<String>,
+    out: &mut Vec<(ty::Instance<'tcx>, String)>,
+) {
+    {
+        let ty::Adt(adt_def, adt_args) = ty.kind() else {
+            return;
+        };
+        let Some(destructor) = adt_def.destructor(tcx) else {
+            return;
+        };
+        // Complementary to the `DefId` lane, exactly like the call arm above: it
+        // walks local bodies, so widen only over foreign destructors.
+        if destructor.did.is_local() {
+            return;
+        }
+        if item_has_trust_skip_attr(tcx, destructor.did)
+            || item_has_trust_attr(tcx, destructor.did, "assume_total")
+        {
+            return;
+        }
+        let Ok(Some(instance)) =
+            ty::Instance::try_resolve(tcx, typing_env, destructor.did, adt_args)
+        else {
+            return;
+        };
+        // Same admission bar as the call arm: a resolved `Item` with fully
+        // monomorphic args and an available body. Anything else declines, so the
+        // fail-closed drop-glue obligation stays exactly as it is today.
+        if !matches!(instance.def, ty::InstanceKind::Item(_)) {
+            return;
+        }
+        if instance.args.has_non_region_param()
+            || instance.args.has_non_region_infer()
+            || instance.args.has_non_region_placeholders()
+        {
+            return;
+        }
+        if !tcx.is_mir_available(instance.def.def_id()) {
+            return;
+        }
+        let bundled_name =
+            trust_mir_extract::exact_def_path_str_with_args(tcx, destructor.did, instance.args);
+        if seen.insert(bundled_name.clone()) {
+            let adt_path = trust_mir_extract::safe_def_path_str(tcx, adt_def.did());
+            ADMITTED_DESTRUCTOR_ADTS.with(|set| set.borrow_mut().insert(adt_path));
+            out.push((instance, bundled_name));
+        }
+    }
+}
+
 /// Compact, stable adjacency provider for Trust's optimized-MIR cycle oracle.
 /// The full elaborated body is borrowed only long enough to extract direct
 /// local callees; the query result retains just `LocalDefId`s and is disk-cached.
@@ -24435,7 +27006,11 @@ pub(crate) fn trust_mir_direct_local_callees<'tcx>(
     let elaborated = tcx.mir_drops_elaborated_and_const_checked(def_id);
     let mut callees: Vec<LocalDefId> = {
         let body = elaborated.borrow();
-        native_trust_ir_direct_local_fn_callees(tcx, &body)
+        native_trust_ir_direct_local_fn_callees(
+            tcx,
+            &body,
+            ty::TypingEnv::post_analysis(tcx, body.source.def_id()),
+        )
             .into_iter()
             .filter_map(DefId::as_local)
             .filter(|&callee| !tcx.is_constructor(callee.to_def_id()))
@@ -25095,6 +27670,17 @@ fn append_verifier_api_obligations_to_native_trust_ir(
     // compiler-private VC. Duplicate rows make the index ambiguous and disable
     // the optimization for every copy.
     let planning_vc_indices = exact_native_planning_vc_indices(func, bundle, all_vcs);
+    // Trust: one CFG fact for the whole function, read before the loop so the
+    // per-obligation disclosure below costs nothing per row. A function we
+    // cannot find in the module is treated as acyclic, which only ever means
+    // "disclose less" — the pre-existing behaviour — never a new proof credit.
+    // Trust: the INPUT spellings this function's formulas may use, computed once.
+    // A free variable outside this set with no defining equality is an elided
+    // definition (see `typed_chc_return_depends_on_elided_definition`), which is
+    // what makes a typed-CHC refutation unrealizable. NOT a CFG fact: a
+    // whole-function back-edge test was tried and reverted for demoting genuine,
+    // realizable counterexamples.
+    let typed_chc_parameter_names = typed_chc_parameter_name_set(func);
 
     let mut bindings = Vec::new();
     for obligation_index in 0..bundle.obligations.len() {
@@ -25104,7 +27690,10 @@ fn append_verifier_api_obligations_to_native_trust_ir(
             continue;
         };
         if verifier_suite.eq_ignore_ascii_case("trust-mc") {
-            annotate_trust_mc_typed_chc_lowering_status(&mut bundle.obligations[obligation_index]);
+            annotate_trust_mc_typed_chc_lowering_status(
+                &mut bundle.obligations[obligation_index],
+                &typed_chc_parameter_names,
+            );
         }
 
         let proof_obligation_id = trust_ir::ProofId::new(next_proof_id);
@@ -25345,7 +27934,8 @@ fn trust_vc_native_trust_ir_certificate_import(
         trust_verifier_api::ObligationKind::MemorySafety
             | trust_verifier_api::ObligationKind::Ownership
             | trust_verifier_api::ObligationKind::BoundsCheck
-    ) {
+    ) && !trust_vc_bridge::is_trust_vc_unbounded_allocation_obligation_kind(&obligation.kind)
+    {
         return TrustVcNativeTrustIrCertificateImport::NotApplicable;
     }
 
@@ -25568,8 +28158,21 @@ fn annotate_unsupported_trust_vc_native_trust_ir_import(
 
 fn annotate_trust_mc_typed_chc_lowering_status(
     obligation: &mut trust_verifier_api::TrustObligation,
+    parameter_names: &trust_types::fx::FxHashSet<String>,
 ) {
     let lowering_for_debug = trust_mc_typed_chc_lowering_for_obligation(obligation);
+    // Read the predicate off the obligation itself. Deciding this from a
+    // planning-side VC index is what made the first attempt inert: that index is
+    // an exact-identity optimization and is absent for most rows.
+    let return_depends_on_elided_definition = trust_spec_predicate_of_obligation(obligation)
+        .is_some_and(|predicate| {
+            typed_chc_return_depends_on_elided_definition(&predicate, parameter_names)
+        });
+    annotate_trust_mc_typed_chc_encoding_fidelity(
+        obligation,
+        matches!(lowering_for_debug, TrustMcTypedChcLowering::Supported(_)),
+        return_depends_on_elided_definition,
+    );
     if env_flag_enabled("TRUST_NATIVE_DEBUG") {
         let summary = match &lowering_for_debug {
             TrustMcTypedChcLowering::Supported(_) => "SUPPORTED".to_string(),
@@ -25611,6 +28214,275 @@ fn annotate_trust_mc_typed_chc_lowering_status(
             );
         }
     }
+}
+
+/// Trust: disclose, on the obligation itself, that the typed CHC it will carry
+/// is a loop-elided OVER-APPROXIMATION of its body.
+///
+/// WHY THIS EXISTS. A postcondition VC on a body with a loop takes the flattened
+/// single-formula arm of `trust_mc_typed_chc_contract_for_native_trust_ir_
+/// obligation`: one nullary `error` relation, one constraint-only rule, no loop
+/// transition relation anywhere. The loop-carried local is then a free variable
+/// in that formula with no defining constraint, so a solver can satisfy the
+/// query by choosing a value the program cannot produce. Measured on
+/// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i = i + 1; } i }` with a
+/// TRUE `ensures(*ret >= 0)` and no `requires`: the formula reduces to
+/// `!(i < n) && _0 == i && !(_0 >= 0)` over a free `i`, which the direct-SMT
+/// route satisfies with `n = -1, i = -1` and published as
+/// `verified_counterexample = true` against correct code.
+///
+/// DIRECTION OF SOUNDNESS, and why this is a disclosure rather than a rejection:
+/// dropping the loop's constraints ADDS models, so the encoding
+/// over-approximates. UNSAT of a superset implies UNSAT of the real reachable
+/// set, so a PROOF from this encoding stays sound — which is exactly why the
+/// same loop WITH `requires(n >= 0)` legitimately proves: the precondition
+/// forces `i >= n >= 0` and the query is unsatisfiable for every value of the
+/// free variable, real or not. A REFUTATION does not survive the same
+/// reasoning. So this must not suppress the encoding, only its refutation
+/// authority; trust-bmc's `TrustMcChcRefutationAdmissibility` is the consumer.
+///
+/// SCOPE, stated plainly: this catches the case where the CFG has a back edge
+/// and the flattened formula is used. It does NOT catch the other producer-side
+/// over-approximations that can reach the same gate from an ACYCLIC body —
+/// unmodeled call results, deref-store invalidation, `&mut` argument havoc,
+/// opaque frames. Those still arrive unattested and still refute. Closing them
+/// needs the same disclosure emitted from wherever the VC generator introduces
+/// the free value; this is the seam for it, not the whole fix.
+/// The variable spellings a typed-CHC predicate reads.
+fn trust_spec_expr_variables(
+    expr: &trust_verifier_api::TrustSpecExpr,
+    out: &mut trust_types::fx::FxHashSet<String>,
+) {
+    match &expr.kind {
+        trust_verifier_api::TrustSpecExprKind::Variable { name } => {
+            out.insert(name.clone());
+        }
+        trust_verifier_api::TrustSpecExprKind::Result => {
+            out.insert(TYPED_CHC_RETURN_PLACE.to_string());
+        }
+        trust_verifier_api::TrustSpecExprKind::Unary { expr, .. }
+        | trust_verifier_api::TrustSpecExprKind::Old { expr } => {
+            trust_spec_expr_variables(expr, out);
+        }
+        trust_verifier_api::TrustSpecExprKind::Binary { lhs, rhs, .. } => {
+            trust_spec_expr_variables(lhs, out);
+            trust_spec_expr_variables(rhs, out);
+        }
+        trust_verifier_api::TrustSpecExprKind::Field { base, .. } => {
+            trust_spec_expr_variables(base, out);
+        }
+        trust_verifier_api::TrustSpecExprKind::Index { base, index } => {
+            trust_spec_expr_variables(base, out);
+            trust_spec_expr_variables(index, out);
+        }
+        _ => {}
+    }
+}
+
+/// The name an expression denotes when it is a bare variable (or `result`).
+fn trust_spec_expr_as_variable(expr: &trust_verifier_api::TrustSpecExpr) -> Option<String> {
+    match &expr.kind {
+        trust_verifier_api::TrustSpecExprKind::Variable { name } => Some(name.clone()),
+        trust_verifier_api::TrustSpecExprKind::Result => Some(TYPED_CHC_RETURN_PLACE.to_string()),
+        _ => None,
+    }
+}
+
+const TYPED_CHC_RETURN_PLACE: &str = "_0";
+
+/// Definition edges of the flattened typed-CHC predicate: `v` -> the variables
+/// its defining equality reads. Only `And` spines and `Eq` atoms contribute,
+/// which is exactly the shape the flattened arm emits; anything else contributes
+/// no definition and therefore only ever makes the caller disclose MORE.
+fn collect_trust_spec_definitions(
+    expr: &trust_verifier_api::TrustSpecExpr,
+    out: &mut trust_types::fx::FxHashMap<String, trust_types::fx::FxHashSet<String>>,
+) {
+    let trust_verifier_api::TrustSpecExprKind::Binary { op, lhs, rhs } = &expr.kind else {
+        if let trust_verifier_api::TrustSpecExprKind::Unary { expr, .. } = &expr.kind {
+            collect_trust_spec_definitions(expr, out);
+        }
+        return;
+    };
+    match op {
+        trust_verifier_api::TrustSpecBinaryOp::And
+        | trust_verifier_api::TrustSpecBinaryOp::Or
+        | trust_verifier_api::TrustSpecBinaryOp::Implies => {
+            collect_trust_spec_definitions(lhs, out);
+            collect_trust_spec_definitions(rhs, out);
+        }
+        trust_verifier_api::TrustSpecBinaryOp::Eq => {
+            if let Some(name) = trust_spec_expr_as_variable(lhs) {
+                let mut reads = trust_types::fx::FxHashSet::default();
+                trust_spec_expr_variables(rhs, &mut reads);
+                out.entry(name).or_default().extend(reads);
+            }
+            if let Some(name) = trust_spec_expr_as_variable(rhs) {
+                let mut reads = trust_types::fx::FxHashSet::default();
+                trust_spec_expr_variables(lhs, &mut reads);
+                out.entry(name).or_default().extend(reads);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the RETURN VALUE this obligation concludes about transitively depends
+/// on a variable the predicate never defines and that is not a function input.
+///
+/// THIS IS THE WHOLE POINT OF THE DISCLOSURE, and it is deliberately narrower
+/// than "the function has a loop". A first version keyed on a whole-function
+/// back edge and was reverted: it demotes counterexamples that are perfectly
+/// realizable. `fn f(n: i32) -> i32 { let mut i = 0; while i < 3 { i = i + 1; } n }`
+/// with `ensures(*ret >= 5)` IS defective at `n = 0`; its predicate contains the
+/// unconstrained loop local, but the return place is defined `_0 = n`, so the
+/// refutation never reads it and must keep its authority. Measured, the
+/// function-scoped version also stripped the only counterexample from >=16
+/// `tests/trust-falsification/mutant/` fixtures and flipped that gate RED.
+///
+///   * elided:     `_0 = i#s0_1_s3_0` with no init/transition for `i` -> the
+///                 model picks a value no execution reaches.
+///   * realizable: `_0 = n`, `n` a parameter -> an input a caller can supply.
+///   * exact:      every non-input defined -> discloses nothing, which preserves
+///                 this lane's entire bug-detection value.
+///
+/// Fails toward NOT disclosing: an unanchored return place, or a shape this
+/// walker does not read, leaves the refutation exactly as it is today.
+fn typed_chc_return_depends_on_elided_definition(
+    predicate: &trust_verifier_api::TrustSpecPredicate,
+    parameter_names: &trust_types::fx::FxHashSet<String>,
+) -> bool {
+    let mut definitions = trust_types::fx::FxHashMap::default();
+    collect_trust_spec_definitions(&predicate.root, &mut definitions);
+    if !definitions.contains_key(TYPED_CHC_RETURN_PLACE) {
+        return false;
+    }
+    // GROUNDEDNESS, computed as a least fixed point — NOT a reachability walk.
+    //
+    // The first version walked `_0`'s dependencies and disclosed on reaching a
+    // name with no definition entry. That can essentially never fire, because
+    // `collect_trust_spec_definitions` reads `Eq` SYMMETRICALLY: the conjunct
+    // `_5 = i#s0_1_s3_0` registers `i#…  -> {_5}` as well as `_5 -> {i#…}`, so
+    // the elided loop local HAS an entry and the walk never reaches its
+    // "undefined" arm. Measured: the predicate returned false on the exact F
+    // shape it was written for, which is why `f_loop` stayed `1 proved,
+    // 2 failed` and why `return_defined_by_an_undefined_loop_local_is_disclosed`
+    // was red.
+    //
+    // Symmetry is right for an equality and must stay. What has to change is the
+    // question. A name is GROUNDED when it is a function input, or when some
+    // definition of it reads only grounded names — the least fixed point of that
+    // rule. An equality cycle between two elided names (`i#… = _5`, `_5 = i#…`)
+    // grounds neither, while `_0 = n` with `n` a parameter grounds `_0` through
+    // the same symmetric edge. A definition with no reads (`_0 = 5`) is grounded
+    // vacuously, which is correct: a constant IS determined.
+    //
+    // Disclose iff the return place is defined but NOT grounded — i.e. its value
+    // is pinned only to things nothing determines.
+    let mut grounded: trust_types::fx::FxHashSet<String> = parameter_names.clone();
+    loop {
+        let mut changed = false;
+        for (name, reads) in &definitions {
+            if grounded.contains(name) {
+                continue;
+            }
+            if reads.iter().all(|read| grounded.contains(read)) {
+                grounded.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    !grounded.contains(TYPED_CHC_RETURN_PLACE)
+}
+
+/// The typed predicate this obligation carries in its own metadata — the exact
+/// payload `trust_mc_typed_chc_lowering_for_obligation` lowers into the CHC. Read
+/// from the obligation rather than from a planning-side VC index, because that
+/// index is an exact-identity optimization that is frequently absent (which is
+/// how the first attempt silently never fired).
+fn trust_spec_predicate_of_obligation(
+    obligation: &trust_verifier_api::TrustObligation,
+) -> Option<trust_verifier_api::TrustSpecPredicate> {
+    let payload = obligation
+        .metadata
+        .iter()
+        .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
+        .map(|entry| entry.value.as_str())?;
+    trust_types::json_depth::from_str_deep(payload).ok()
+}
+
+/// The spellings a predicate may use for this function's INPUTS: each parameter
+/// local's debug name and its positional `_N`. A free variable outside this set
+/// with no defining equality is an elided definition, not an input.
+fn typed_chc_parameter_name_set(
+    func: &trust_types::VerifiableFunction,
+) -> trust_types::fx::FxHashSet<String> {
+    let mut names = trust_types::fx::FxHashSet::default();
+    for local in &func.body.locals {
+        if local.index >= 1 && local.index <= func.body.arg_count {
+            names.insert(format!("_{}", local.index));
+            if let Some(name) = local.name.as_deref() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn annotate_trust_mc_typed_chc_encoding_fidelity(
+    obligation: &mut trust_verifier_api::TrustObligation,
+    lowering_supported: bool,
+    return_depends_on_elided_definition: bool,
+) {
+    if !return_depends_on_elided_definition {
+        return;
+    }
+    // Obligations that route to the structural whole-CFG reachability CHC (the
+    // default admission and the counted panic-freedom aggregate) do NOT take
+    // the flattened arm: they get real per-block relations and a genuine
+    // transition structure, so the disclosure would be false. Skipping them
+    // also keeps this key off the two whole-function panic-freedom shape gates,
+    // whose metadata allowlists deliberately stay closed — those gate a PROOF
+    // credit, and nothing here may widen one.
+    if trust_mc_routes_to_structural_default_function_chc(obligation, lowering_supported) {
+        return;
+    }
+    // Trust (fail-open removed, 2026-08-08): there used to be a second early
+    // return here, suppressing the disclosure whenever the env-gated data-flow
+    // CFG-CHC (`TRUST_MC_DATAFLOW_CHC`) was ON and the row was an
+    // ArithmeticSafety obligation, on the theory that such a row is redirected
+    // to an enriched encoding and is therefore not flattened. That test did not
+    // match the redirect it was standing in for, in TWO independent ways, and
+    // each one is fail-OPEN — it removed a disclosure from a row that really is
+    // flattened, handing refutation authority back to a loop-elided formula:
+    //
+    //   * The redirect (`redirect_safety_to_dataflow`) additionally requires the
+    //     function to have a CFG back edge. A STRAIGHT-LINE ArithmeticSafety row
+    //     keeps the flattened path but was silently undisclosed.
+    //   * The enriched builder is allowed to return `Ok(None)` — its own
+    //     coverage gate (`function_overflow_surface_fully_modeled`) rejects
+    //     div/rem, shifts, negation, lossy casts and float arithmetic, and the
+    //     anchoring gate below rejects a havoc-fed violation. Every one of those
+    //     rows falls back to the flattened formula, and every one of them was
+    //     going out undisclosed.
+    //
+    // A disclosure is one-directional — it only ever REMOVES refutation
+    // authority, never grants proof credit (see this function's doc comment and
+    // trust-bmc's `TrustMcChcRefutationAdmissibility`) — so the correct
+    // resolution of "we cannot tell here whether the enriched builder fired" is
+    // to disclose. Over-disclosing an actually-enriched row costs a
+    // counterexample; under-disclosing a flattened one is a false refutation
+    // against correct code, which is the exact defect this key exists to stop.
+    // With the env gate OFF (the shipped default) the removed branch was already
+    // dead, so this changes no default-lane behaviour.
+    set_obligation_metadata(
+        obligation,
+        TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY,
+        TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED.to_string(),
+    );
 }
 
 fn trust_vc_native_trust_ir_proof_unit_metadata_overrides(
@@ -25807,6 +28679,20 @@ fn native_trust_ir_route_for_api_obligation(
         kind @ (trust_verifier_api::ObligationKind::MemorySafety
         | trust_verifier_api::ObligationKind::Ownership
         | trust_verifier_api::ObligationKind::BoundsCheck) => {
+            trust_vc_bridge::trust_vc_native_trust_ir_kind_for_public_obligation(kind)
+                .map(|native_kind| ("trust-vc", native_kind))
+        }
+        // `trust.vc.unbounded_allocation` (#nia-oom) is trust-vc-owned via the
+        // SAME MIR-memory proof-unit + replayable-certificate transport as
+        // BoundsCheck: the unit's predicate is the negated guard-conjoined
+        // `count >= CEILING` capacity VC, so the imported proof ENCODES the
+        // allocation budget. NEVER route this namespace to trust-mc / the
+        // whole-function CHC — that proof does not model the budget and exactly
+        // that mapping false-proved unbounded allocations (the recorded P0 at
+        // trust-verifier-api's namespace constant). Routing is dispatch, never
+        // proof: a payload-less or unprovable obligation falls closed
+        // per-obligation in `trust_vc_native_trust_ir_certificate_import`.
+        kind if trust_vc_bridge::is_trust_vc_unbounded_allocation_obligation_kind(kind) => {
             trust_vc_bridge::trust_vc_native_trust_ir_kind_for_public_obligation(kind)
                 .map(|native_kind| ("trust-vc", native_kind))
         }
@@ -26083,9 +28969,37 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
             .module
             .function_by_id(request.function)
             .is_some_and(function_has_back_edge);
+    // Trust: redirect a LOOP-CARRIED POSTCONDITION obligation to the enriched
+    // whole-function CFG-CHC in `PostconditionGoal` mode.
+    //
+    // Restricted to functions with a CFG back edge because that is exactly where
+    // the flattened single-formula path is weak: it havocs loop-carried state, so
+    // `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i += 1; } i }` cannot
+    // prove `ensures(*ret >= 0)` — the returned value is a free existential. A
+    // straight-line postcondition keeps its untouched path and cannot regress.
+    //
+    // The redirect is MONOTONE in provability: the CHC edge carries the SAME VC
+    // and merely conjoins the block relation and fold, so anything the flattened
+    // formula refuted UNSAT stays UNSAT. What it can change is which ENGINE has to
+    // close it, so the encoder's own gates
+    // (`function_unbounded_int_arithmetic_is_faithful`, plus the no-goal-edge
+    // vacuity check) fail closed to `Ok(None)` and restore the flattened path.
+    // The loop-carried POSTCONDITION redirect. Computed by
+    // `trust_mc_postcondition_goal_typed_chc`, which the PUBLIC canonical
+    // contract builder calls too — see that function for why sharing it is
+    // mandatory rather than tidy: the two contracts are compared field-for-field
+    // and a divergence is a REJECTED binding, not a worse proof.
+    let postcondition_goal = trust_mc_postcondition_goal_typed_chc(
+        native_trust_ir_bundle.module.function_by_id(request.function),
+        obligation,
+        &chc_constraint,
+        unsupported_reason.is_none(),
+    );
     // Structural mode preserves the whole-function structural encoding's error
     // edges; ArithmeticSafetyOnly is used only for a redirected arithmetic
-    // obligation.
+    // obligation. `PostconditionGoal` does NOT appear here: that encoding is
+    // produced by the shared builder above, so by the time this runs the
+    // postcondition case has already been decided.
     let error_mode = if routed_to_structural_chc {
         ChcErrorMode::Structural
     } else {
@@ -26095,8 +29009,15 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
     // obligations OR a loop-carried arithmetic obligation.
     let dataflow_eligible = (trust_mc_dataflow_chc_enabled() && routed_to_structural_chc)
         || redirect_safety_to_dataflow;
-    let enriched = if dataflow_eligible {
-        trust_mc_dataflow_function_chc_from_trust_ir(native_trust_ir_bundle, request, error_mode)?
+    let enriched = if let Some(goal) = postcondition_goal {
+        Some(goal)
+    } else if dataflow_eligible {
+        trust_mc_dataflow_function_chc_from_trust_ir(
+            native_trust_ir_bundle,
+            request,
+            error_mode,
+            None,
+        )?
     } else {
         None
     };
@@ -26132,6 +29053,9 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
         "origin": "mir_derived",
         "function_name": function_name,
         "query": { "target": "error" },
+        // `enriched_vars` already carries the VC declarations for a
+        // postcondition goal (the shared builder merges them), so there is
+        // exactly one merge, in one place.
         "vars": enriched_vars.unwrap_or_else(|| chc_constraint.vars.clone()),
         "relations": relations,
         "rules": rules,
@@ -26621,6 +29545,30 @@ enum ChcErrorMode {
     /// an over-approximated reachable set with a faithful violation edge cannot
     /// miss a real overflow.
     ArithmeticSafetyOnly,
+    /// Only the POSTCONDITION goal reaches `error` — for a redirected
+    /// postcondition obligation. Per RETURN block we emit
+    /// `error :- bbRet(args), fold, VC, (_0 = returned)`, where `VC` is the
+    /// obligation's own flattened constraint (`path ∧ ¬Q`) verbatim; NO structural
+    /// edges are emitted. Proving `error` unreachable then proves EXACTLY "no
+    /// reachable return state satisfies `path ∧ ¬Q`", i.e. the postcondition holds
+    /// — undisturbed by unrelated panics, absent callees or closures.
+    ///
+    /// WHY THIS MODE EXISTS. The flattened single-formula path havocs loop-carried
+    /// state: for `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i += 1; } i }`
+    /// the VC is
+    /// `… ∧ _5 = i#s0_1_s3_0 ∧ ¬(_5 < n) ∧ _0 = i#s0_1_s3_0 ∧ ¬(_0 ≥ 0)`
+    /// in which `i#s0_1_s3_0` is FREE — satisfiable at `i# = -1`, so the TRUE
+    /// postcondition comes back `unknown`. Conjoining the same VC with the
+    /// enriched CFG-CHC's reachability facts, and binding `_0` to the value the
+    /// function actually returns, makes the loop variable a relation column PDR
+    /// can strengthen (`i ≥ 0`), and the system becomes UNSAT.
+    ///
+    /// SOUND because the added conjuncts are FACTS about every real execution: a
+    /// CHC relation over-approximates the reachable states of its block, so
+    /// `path ∧ ¬Q ∧ facts` unsatisfiable implies `path ∧ ¬Q` unsatisfiable on
+    /// real executions. Adding a true fact can only make a refutation harder to
+    /// find, never manufacture one.
+    PostconditionGoal,
 }
 
 /// Successor block ids of a block (empty for a return-like / divergent / missing
@@ -26711,6 +29659,140 @@ fn function_overflow_surface_fully_modeled(function: &trust_ir::Function) -> boo
         .blocks
         .iter()
         .all(|block| block.body.iter().all(|node| chc_inst_arithmetic_surface_modeled(&node.inst)))
+}
+
+/// Second SOUNDNESS-OF-VERDICT gate for `ArithmeticSafetyOnly` mode: every
+/// `Overflow` operand must be ANCHORED — either one of its own block relation's
+/// parameters, or transitively defined by that block's straight-line fold from
+/// such parameters and integer constants.
+///
+/// THIS GUARDS THE OPPOSITE DIRECTION FROM
+/// [`function_overflow_surface_fully_modeled`], and it is the one that bites on
+/// the real producer. That gate stops a false SAFE (an unmodeled hazard with no
+/// `error` edge). This one stops a false REFUTATION.
+///
+/// `ArithmeticSafetyOnly` emits `error :- bbB(params), fold, violation`. A CHC
+/// rule's variables are universally quantified per rule, so a violation operand
+/// that appears in NO relation argument and is constrained by NO fold equality
+/// is an unconstrained existential: the solver may choose any value for it, and
+/// `v + 1 > i32::MAX` is then satisfiable for free. `error` becomes reachable in
+/// a program where it is not, and the redirected obligation comes back REFUTED
+/// carrying a counterexample no execution realizes — a false FAILED on correct
+/// code, published against the same lane that publishes real ones.
+///
+/// This is not hypothetical; it is the shipped producer's ordinary shape.
+/// `crates/trust-ir-bridge/src/lower.rs` gives trust-ir block params ONLY to the
+/// entry block (`lower_block`), and `block_args_for` returns no args for any
+/// other target, because the bridge has no phi/block-param merge. Its cross-block
+/// merge is MEMORY: `multi_block_written_locals` promotes every local written in
+/// two or more reachable blocks — i.e. every loop accumulator — to an `Alloca`
+/// slot read back with `Load`, and [`chc_fold_block_body`] havocs `Load`. So for
+/// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i = i + 1; } i }` the
+/// operand of the checked `i + 1` is exactly such an unconstrained existential,
+/// and without this gate the enriched CHC refutes a correct loop.
+///
+/// Falling back to `Ok(None)` is the fail-closed direction: the row keeps its
+/// untouched flattened single-formula path and the elided-definition disclosure
+/// that `annotate_trust_mc_typed_chc_encoding_fidelity` stamps on it.
+fn function_overflow_violations_are_anchored(function: &trust_ir::Function) -> bool {
+    function.blocks.iter().all(block_overflow_violations_are_anchored)
+}
+
+/// Per-block half of [`function_overflow_violations_are_anchored`].
+///
+/// The anchored set is seeded with the block relation's own parameters (the only
+/// values a rule's relation premise binds) and then extended in program order,
+/// mirroring [`chc_fold_block_body`] case for case: a value is anchored only when
+/// that function emits a defining equality for it whose operands are themselves
+/// anchored. Anything the fold havocs stays unanchored, and so does anything
+/// derived from it. Mirroring is what makes this exact rather than optimistic —
+/// if a fold case is ever added, adding it here too is the deliberate step.
+///
+/// DELIBERATELY NOT MIRRORED (2026-08-08): the loop-carried columns
+/// [`ChcDataflowFrame`] added — threaded cross-block SSA values, promoted stack
+/// cells, and `ExtractField` resolved through an `InsertField` chain. Those DO
+/// anchor their results in the emitted CHC, so this predicate now
+/// UNDER-approximates the anchored set. That direction is the safe one and is
+/// the reason it was left alone: an under-approximation can only answer `false`
+/// where the truth is `true`, which makes `ArithmeticSafetyOnly` fall back to
+/// the untouched flattened path more often. It can never claim an operand is
+/// anchored when the fold left it free, which is the answer that would publish a
+/// false refutation.
+///
+/// The reason not to widen it here and now is the UNSIGNED `>= 0` DISCIPLINE in
+/// the module header: the `> 2^W-1` overflow test is faithful in mathematical
+/// `int` only for operands carrying their type invariant, which this encoder
+/// attaches to FREE unsigned ENTRY params only. A promoted unsigned cell is a
+/// threaded column, not an entry param, so admitting cell-fed `Overflow`
+/// operands to the anchored set needs that discipline extended first — a
+/// separate, deliberate change with its own soundness argument.
+fn block_overflow_violations_are_anchored(block: &trust_ir::Block) -> bool {
+    let mut anchored: BTreeSet<u32> =
+        chc_block_relation_params(block).into_iter().map(|(value, _)| value.index()).collect();
+    let is_anchored = |anchored: &BTreeSet<u32>, value: &trust_ir::ValueId| {
+        anchored.contains(&value.index())
+    };
+    for node in block.body.iter().filter(|node| !node.is_terminator()) {
+        match &node.inst {
+            trust_ir::Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
+                if chc_map_int_binop(*op).is_none() {
+                    continue;
+                }
+                let Some(dest) = node.results.first() else { continue };
+                if is_anchored(&anchored, lhs) && is_anchored(&anchored, rhs) {
+                    anchored.insert(dest.index());
+                }
+            }
+            trust_ir::Inst::Overflow { op, ty, lhs, rhs } => {
+                if !chc_overflow_width_modeled(ty) {
+                    continue;
+                }
+                let operands_anchored = is_anchored(&anchored, lhs) && is_anchored(&anchored, rhs);
+                // Whether this instruction contributes an `error` edge at all is
+                // decided by `chc_overflow_violation`, exactly as in
+                // `chc_fold_block_body`; a width with no violation predicate
+                // emits no edge and therefore cannot refute. The `sum` handed to
+                // it is only the expression the predicate is built over — the
+                // Some/None decision reads `op` and `ty` — so a placeholder of
+                // the same shape asks the same question.
+                let int = serde_json::json!({ "kind": "int" });
+                let sum = chc_binary("add", chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int));
+                if chc_overflow_violation(*op, ty, &sum).is_some() && !operands_anchored {
+                    return false;
+                }
+                if operands_anchored {
+                    if let Some(value) = node.results.first() {
+                        anchored.insert(value.index());
+                    }
+                    if let Some(overflow_bit) = node.results.get(1) {
+                        anchored.insert(overflow_bit.index());
+                    }
+                }
+            }
+            trust_ir::Inst::Const { ty, value } if ty.is_integer() => {
+                if !matches!(value, trust_ir::Constant::Int(_)) {
+                    continue;
+                }
+                let Some(dest) = node.results.first() else { continue };
+                anchored.insert(dest.index());
+            }
+            trust_ir::Inst::Copy { ty, operand } if ty.is_integer() => {
+                let Some(dest) = node.results.first() else { continue };
+                if is_anchored(&anchored, operand) {
+                    anchored.insert(dest.index());
+                }
+            }
+            trust_ir::Inst::ICmp { ty, lhs, rhs, .. } if ty.is_integer() => {
+                let Some(dest) = node.results.first() else { continue };
+                if is_anchored(&anchored, lhs) && is_anchored(&anchored, rhs) {
+                    anchored.insert(dest.index());
+                }
+            }
+            // Everything else is havoc'd by the fold, so it anchors nothing.
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Whether ONE instruction's arithmetic-safety surface is covered by the enriched
@@ -26809,7 +29891,13 @@ fn chc_scalar_sort_json(ty: &trust_ir::Ty) -> Option<serde_json::Value> {
 
 /// A `{kind:var}` expression referencing an SSA value at the given sort.
 fn chc_var_expr(value: trust_ir::ValueId, sort: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({ "kind": "var", "name": chc_value_var_name(value), "sort": sort })
+    chc_named_var_expr(&chc_value_var_name(value), sort)
+}
+
+/// A `{kind:var}` expression referencing a var by NAME. Used for the encoder's
+/// synthetic vars (the promoted-cell state columns), which have no `ValueId`.
+fn chc_named_var_expr(name: &str, sort: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "kind": "var", "name": name, "sort": sort })
 }
 
 /// An `{kind:int_const}` expression. The value is encoded as a decimal STRING so
@@ -26824,15 +29912,50 @@ fn chc_binary(op: &str, lhs: serde_json::Value, rhs: serde_json::Value) -> serde
     serde_json::json!({ "kind": "binary", "op": op, "lhs": lhs, "rhs": rhs })
 }
 
+/// The enriched encoder's `vars` declaration table.
+///
+/// Two namespaces, kept apart on purpose:
+///   * `ssa` — one `v{index}` entry per referenced trust-ir `ValueId`, keyed by
+///     the SSA index so a value threaded through several blocks is declared
+///     exactly once with a consistent sort;
+///   * `named` — the encoder's own synthetic vars (the promoted-cell state
+///     columns `bb{B}_cell_v{C}`), which have no `ValueId` at all.
+///
+/// Keeping them apart preserves the SSA half's historical NUMERIC ordering
+/// (`v2` before `v10`) that a single string-keyed map would have reshuffled, and
+/// emits the synthetic half deterministically after it. Every referenced var
+/// must appear in `vars` or ingestion rejects the system.
+#[derive(Default)]
+struct ChcVarDecls {
+    ssa: BTreeMap<u32, serde_json::Value>,
+    named: BTreeMap<String, serde_json::Value>,
+}
+
+impl ChcVarDecls {
+    /// Declare a synthetic (non-SSA) var once, by name.
+    fn declare_named(&mut self, name: &str, sort: &serde_json::Value) {
+        self.named
+            .entry(name.to_string())
+            .or_insert_with(|| serde_json::json!({ "name": name, "sort": sort }));
+    }
+
+    /// The flattened `vars` array: SSA declarations in SSA-index order, then the
+    /// synthetic declarations in name order.
+    fn into_vars(self) -> Vec<serde_json::Value> {
+        self.ssa.into_values().chain(self.named.into_values()).collect()
+    }
+}
+
 /// Declare a value's top-level `vars` entry once (keyed by SSA index so a value
 /// threaded through several blocks is declared exactly once, with a consistent
 /// sort — every referenced var must appear in `vars` or ingestion rejects it).
 fn chc_declare_var(
-    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+    var_decls: &mut ChcVarDecls,
     value: trust_ir::ValueId,
     sort: &serde_json::Value,
 ) {
     var_decls
+        .ssa
         .entry(value.index())
         .or_insert_with(|| serde_json::json!({ "name": chc_value_var_name(value), "sort": sort }));
 }
@@ -26850,6 +29973,784 @@ fn chc_block_relation_params(
         .iter()
         .filter_map(|(value, ty)| chc_scalar_sort_json(ty).map(|sort| (*value, sort)))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Loop-carried state: cross-block SSA threading + promoted stack cells.
+//
+// WHY THIS EXISTS. The producer this encoder consumes
+// (`crates/trust-ir-bridge/src/lower.rs`) gives trust-ir block params ONLY to
+// the entry block — it has no phi / block-param merge — and routes every
+// cross-block value through MEMORY: `multi_block_written_locals` promotes each
+// local written in >= 2 reachable blocks to an `Alloca` slot whose writes become
+// `Store` and whose joined reads become `Load`. Reading a block relation's arity
+// straight off `block.params` therefore makes EVERY non-entry relation NULLARY,
+// and `chc_fold_block_body` havocs `Load`. On
+// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i = i + 1; } i }` that
+// leaves the loop-carried `i` carried by no predicate at all: `i >= 0` is not
+// expressible as an invariant over any relation, so PDR has nothing to
+// strengthen and the returned value is a free variable a solver may pick
+// adversarially.
+//
+// The mechanism ported here is the one
+// `first-party/trust-mc/trust-mc-trust-bmc/src/translate_chc.rs` already uses.
+// Three independent pieces, each of which the shape above needs:
+//
+//   1. CROSS-BLOCK SSA THREADING. A scalar SSA value defined in one block and
+//      read in another becomes a relation COLUMN of every block where it is
+//      live-in, carried under its own `v{index}` name. Sound because SSA values
+//      are immutable: the same name in the head and the body premise denotes the
+//      same value, so the column is an identity, never an assumption. A value is
+//      never threaded into its own defining block (there the fold DEFINES it; a
+//      column of the same name would constrain the INCOMING value to the fold's
+//      result, which would remove real states).
+//
+//   2. PROMOTED STACK CELLS (mem2reg). A never-aliased scalar `Alloca` becomes a
+//      relation column whose value STORES UPDATE, so a `Load` is an equality to
+//      the current column instead of a havoc. See [`ChcPromotedCell`] for the
+//      promotion criterion and its soundness argument — this is the piece the
+//      loop accumulator needs, and it is sound ONLY because promotion is refused
+//      whenever the slot's address could escape.
+//
+//   3. AGGREGATE FIELD RESOLUTION BY SSA IDENTITY. The bridge lowers a checked
+//      `i + 1` to `Overflow` -> `Undef` -> `InsertField` -> `InsertField`, then
+//      reads the sum back in the NEXT block with `ExtractField(agg, 0)`. The
+//      aggregate is not a scalar and cannot be a relation column, but
+//      `ExtractField` of a field an `InsertField` chain defines is definitionally
+//      the inserted SSA value, whatever the control flow — so the encoder
+//      resolves it to that value and the SCALAR is threaded instead. Exact, not
+//      an approximation.
+//
+// SOUNDNESS DISCIPLINE IS UNCHANGED: every constraint emitted below must be
+// ENTAILED by the real semantics (havoc is always sound). These three pieces add
+// only entailed equalities, which TIGHTENS the modeled reachable set — the
+// direction that would produce a false SAFE if any one of them were not
+// entailed. That is why the promotion criterion fails closed.
+// ---------------------------------------------------------------------------
+
+/// A stack slot the encoder has proved UN-ALIASED and therefore models as a
+/// threaded relation column updated by its stores, instead of memory whose
+/// `Load` is havoc'd.
+///
+/// PROMOTION CRITERION (fail-closed; every clause must hold, or the slot keeps
+/// today's havoc):
+///
+///   C1. The slot is an `Alloca { count: None }` — exactly one element, so it
+///       holds exactly one value.
+///   C2. Its element type has a scalar CHC sort (`Bool`, or any integer). A
+///       non-scalar cannot be a relation column at all.
+///   C3. Its result value is used ONLY as the `ptr` operand of a `Load` or a
+///       `Store`. ANY other appearance is an address escape: as a `Store`
+///       VALUE (the address itself written to memory), a `GEP`/`Borrow` base, a
+///       call argument, a block argument on a terminator, a compare operand —
+///       each of them lets a later write reach the slot without a `Store` this
+///       encoder can see, which would make the threaded column disagree with the
+///       slot's real content.
+///   C4. Every such `Load`/`Store` names EXACTLY the slot's element type. A
+///       differently-typed access reinterprets the bytes, and the column would
+///       not correspond to what was read.
+///   C5. No access is `volatile`. A volatile access is an observable effect
+///       whose value the compiler may not assume it can reproduce.
+///   C6. The function contains NO instruction whose operands this encoder does
+///       not statically enumerate (`chc_collect_inst_value_uses` reports
+///       conservative). Such an instruction could read the address invisibly, so
+///       a single one disqualifies EVERY candidate in the function.
+///
+/// WHY C1–C6 MAKE THE THREADED VALUE THE SLOT'S ONLY VALUE. With the address
+/// never escaping, the only pointers that can carry provenance to this slot are
+/// the `Alloca` result itself and values derived from it — and C3 says there are
+/// none. A store through a pointer with no provenance for the slot is UB and
+/// realizes no defined execution, so it cannot be a reachable state this
+/// reachability proof must cover. Therefore the slot's content changes only at
+/// the `Store`s C3 admits, which is exactly what the column tracks; and two
+/// `Load`s with no intervening `Store` observe the same bytes, which is exactly
+/// what re-using the column asserts. This is the standard mem2reg argument, made
+/// explicit because tightening the modeled reachable set is the false-SAFE
+/// direction.
+///
+/// RE-EXECUTION IS NOT AN EXCEPTION. If the defining block runs again (an
+/// `Alloca` inside a loop), the slot is fresh and uninitialized. The cell is
+/// never a column of its own defining block, and the fold seeds it there with a
+/// FRESH unconstrained var, so each execution may take any value — a havoc, i.e.
+/// the sound direction.
+#[derive(Clone, Debug)]
+struct ChcPromotedCell {
+    /// The `Alloca` result: the slot's address.
+    ptr: trust_ir::ValueId,
+    /// The slot's element type. Every admitted access names exactly this type.
+    ty: trust_ir::Ty,
+    /// Scalar CHC sort of [`Self::ty`].
+    sort: serde_json::Value,
+    /// Block containing the `Alloca`. The cell is NEVER a column of this block's
+    /// relation — it is created here, not received.
+    def_block: trust_ir::BlockId,
+}
+
+/// A relation-column variable: either an SSA value (declared under `v{index}` in
+/// the SSA namespace) or one of the encoder's synthetic cell-state vars
+/// (declared by name). Keeping the two apart is what stops a stored SSA value
+/// forwarded as a cell column from being declared twice under one name.
+#[derive(Clone, Debug)]
+enum ChcArgVar {
+    Ssa(trust_ir::ValueId),
+    Named(String),
+}
+
+impl ChcArgVar {
+    /// Declare this var once at `sort` and return its `{kind:var}` expression.
+    fn declare_expr(
+        &self,
+        sort: &serde_json::Value,
+        var_decls: &mut ChcVarDecls,
+    ) -> serde_json::Value {
+        match self {
+            ChcArgVar::Ssa(value) => {
+                chc_declare_var(var_decls, *value, sort);
+                chc_var_expr(*value, sort)
+            }
+            ChcArgVar::Named(name) => {
+                var_decls.declare_named(name, sort);
+                chc_named_var_expr(name, sort)
+            }
+        }
+    }
+}
+
+/// Per-block incoming column name for a promoted cell. Block-scoped because the
+/// cell is STATE: `bb3`'s incoming value of the slot is a different variable
+/// from `bb1`'s, and a rule ties them through the transition it appears in.
+fn chc_cell_var_name(block: trust_ir::BlockId, ptr: trust_ir::ValueId) -> String {
+    format!("bb{}_cell_v{}", block.index(), ptr.index())
+}
+
+/// The fresh, unconstrained seed for a cell in its OWN defining block — the
+/// slot's uninitialized content. Referenced only if the defining block reads or
+/// forwards the slot before storing to it, which dominance normally forbids.
+fn chc_cell_undef_var_name(block: trust_ir::BlockId, ptr: trust_ir::ValueId) -> String {
+    format!("bb{}_cell_v{}_undef", block.index(), ptr.index())
+}
+
+/// Everything the enriched encoder needs to give a block relation real
+/// loop-carried state: which scalar SSA values are threaded into which block,
+/// which stack slots were promoted, and how an `ExtractField` resolves to the
+/// scalar an `InsertField` put there.
+///
+/// Built once per function, immutable thereafter, and the SINGLE source of truth
+/// for every relation's arity/sorts — the declaration, every head into a block
+/// and every body premise out of it all read it, so the reader's strict
+/// positional arity+sort match cannot diverge.
+struct ChcDataflowFrame {
+    /// Promoted cells, ordered by `Alloca` result index (deterministic).
+    cells: Vec<ChcPromotedCell>,
+    /// `Alloca` result index -> index into [`Self::cells`].
+    cell_slot: BTreeMap<u32, usize>,
+    /// SSA aggregate value -> field index -> the scalar value an `InsertField`
+    /// placed in that field.
+    agg_fields: BTreeMap<u32, BTreeMap<u32, trust_ir::ValueId>>,
+    /// Per block (by index): threaded scalar SSA columns, in signature order.
+    block_threaded: BTreeMap<u32, Vec<(trust_ir::ValueId, serde_json::Value)>>,
+    /// Per block (by index): promoted-cell columns (slots), in signature order.
+    block_cells: BTreeMap<u32, Vec<usize>>,
+}
+
+impl ChcDataflowFrame {
+    /// The promoted cell a pointer names, if any.
+    fn cell_for_ptr(&self, ptr: trust_ir::ValueId) -> Option<&ChcPromotedCell> {
+        self.cell_slot.get(&ptr.index()).map(|slot| &self.cells[*slot])
+    }
+
+    /// `ExtractField(aggregate, field)` resolved to the SSA value an
+    /// `InsertField` put there, if the chain is statically known.
+    fn resolve_field(
+        &self,
+        aggregate: trust_ir::ValueId,
+        field: u32,
+    ) -> Option<trust_ir::ValueId> {
+        self.agg_fields.get(&aggregate.index())?.get(&field).copied()
+    }
+
+    /// The FULL argument list of a block's relation, in signature order:
+    /// `[threaded SSA] ++ [promoted cells] ++ [the block's own params]`.
+    fn relation_args(&self, block: &trust_ir::Block) -> Vec<(ChcArgVar, serde_json::Value)> {
+        let mut args = Vec::new();
+        for (value, sort) in self.block_threaded.get(&block.id.index()).into_iter().flatten() {
+            args.push((ChcArgVar::Ssa(*value), sort.clone()));
+        }
+        for slot in self.block_cells.get(&block.id.index()).into_iter().flatten() {
+            let cell = &self.cells[*slot];
+            args.push((
+                ChcArgVar::Named(chc_cell_var_name(block.id, cell.ptr)),
+                cell.sort.clone(),
+            ));
+        }
+        for (value, sort) in chc_block_relation_params(block) {
+            args.push((ChcArgVar::Ssa(value), sort));
+        }
+        args
+    }
+
+    /// Declare and materialize a block's canonical relation-application args.
+    fn relation_arg_exprs(
+        &self,
+        block: &trust_ir::Block,
+        var_decls: &mut ChcVarDecls,
+    ) -> Vec<serde_json::Value> {
+        self.relation_args(block)
+            .iter()
+            .map(|(var, sort)| var.declare_expr(sort, var_decls))
+            .collect()
+    }
+
+    /// The relation's declared `arg_sorts`.
+    fn relation_arg_sorts(&self, block: &trust_ir::Block) -> Vec<serde_json::Value> {
+        self.relation_args(block).into_iter().map(|(_, sort)| sort).collect()
+    }
+
+    /// Analyze a function once: aggregate chains, promotable cells, cross-block
+    /// scalars, and the per-block liveness that decides which of them each
+    /// relation carries.
+    fn build(function: &trust_ir::Function) -> ChcDataflowFrame {
+        let agg_fields = chc_aggregate_field_map(function);
+        let (cells, cell_slot) = chc_promotable_cells(function);
+
+        // Scalar SORT of every value the encoder can name, and the block that
+        // DEFINES it (a block param counts as a definition of that block).
+        let mut value_sort: BTreeMap<u32, serde_json::Value> = BTreeMap::new();
+        let mut def_block: BTreeMap<u32, trust_ir::BlockId> = BTreeMap::new();
+        for block in &function.blocks {
+            for (value, ty) in &block.params {
+                if let Some(sort) = chc_scalar_sort_json(ty) {
+                    value_sort.insert(value.index(), sort);
+                }
+                def_block.insert(value.index(), block.id);
+            }
+            for node in &block.body {
+                for (position, result) in node.results.iter().enumerate() {
+                    def_block.insert(result.index(), block.id);
+                    if let Some(ty) = chc_result_scalar_ty(&node.inst, position)
+                        && let Some(sort) = chc_scalar_sort_json(&ty)
+                    {
+                        value_sort.insert(result.index(), sort);
+                    }
+                }
+            }
+        }
+
+        // Per-block value READS, over-approximated. An `ExtractField` whose
+        // chain resolves also reads the RESOLVED scalar, because that is the
+        // value the fold will equate the result to. Over-approximating reads only
+        // widens liveness (more columns, all of them identities), never narrows
+        // it — and the fixpoint below stays internally consistent for ANY read
+        // set, which is what makes the over-approximation safe here.
+        let mut block_uses: BTreeMap<u32, Vec<trust_ir::ValueId>> = BTreeMap::new();
+        let mut any_conservative = false;
+        for block in &function.blocks {
+            let mut uses = Vec::new();
+            for node in &block.body {
+                any_conservative |= chc_collect_inst_value_uses(&node.inst, &mut uses);
+                if let trust_ir::Inst::ExtractField { aggregate, field, .. } = &node.inst
+                    && let Some(source) = agg_fields
+                        .get(&aggregate.index())
+                        .and_then(|fields| fields.get(field))
+                {
+                    uses.push(*source);
+                }
+            }
+            block_uses.insert(block.id.index(), uses);
+        }
+
+        // The values worth threading: a SCALAR value read in a block other than
+        // the one that defines it, plus every promoted cell's pointer (whose
+        // `Load`/`Store` reads are collected exactly like any other use).
+        let mut carried: BTreeMap<u32, Option<serde_json::Value>> = BTreeMap::new();
+        for block in &function.blocks {
+            for used in block_uses.get(&block.id.index()).into_iter().flatten() {
+                let Some(sort) = value_sort.get(&used.index()) else { continue };
+                if def_block.get(&used.index()) != Some(&block.id) {
+                    carried.insert(used.index(), Some(sort.clone()));
+                }
+            }
+        }
+        for cell in &cells {
+            carried.insert(cell.ptr.index(), None);
+        }
+        // An unenumerated instruction may read anything, so treat every carried
+        // value as read in that block (and, through the fixpoint, in every block
+        // that reaches it).
+        if any_conservative {
+            let all: Vec<trust_ir::ValueId> =
+                carried.keys().map(|index| trust_ir::ValueId::new(*index)).collect();
+            for block in &function.blocks {
+                block_uses.entry(block.id.index()).or_default().extend(all.iter().copied());
+            }
+        }
+
+        let live = chc_live_in(function, &carried, &def_block, &block_uses);
+
+        let mut block_threaded = BTreeMap::new();
+        let mut block_cells = BTreeMap::new();
+        for block in &function.blocks {
+            let live_here = live.get(&block.id.index()).cloned().unwrap_or_default();
+            let mut threaded = Vec::new();
+            for (index, sort) in &carried {
+                let Some(sort) = sort else { continue };
+                if !live_here.contains(index) {
+                    continue;
+                }
+                threaded.push((trust_ir::ValueId::new(*index), sort.clone()));
+            }
+            let mut slots = Vec::new();
+            for (slot, cell) in cells.iter().enumerate() {
+                if cell.def_block == block.id || !live_here.contains(&cell.ptr.index()) {
+                    continue;
+                }
+                slots.push(slot);
+            }
+            block_threaded.insert(block.id.index(), threaded);
+            block_cells.insert(block.id.index(), slots);
+        }
+
+        ChcDataflowFrame { cells, cell_slot, agg_fields, block_threaded, block_cells }
+    }
+}
+
+/// The SCALAR result type of instruction result `position`, when this encoder
+/// knows it statically. Drives which SSA values may become relation columns.
+/// Deliberately narrow: an unlisted instruction's result is simply not threaded,
+/// which costs precision and never soundness (its cross-block use stays havoc'd).
+fn chc_result_scalar_ty(inst: &trust_ir::Inst, position: usize) -> Option<trust_ir::Ty> {
+    Some(match inst {
+        // `Overflow` results are (wrapped value : ty, overflow bit : Bool).
+        trust_ir::Inst::Overflow { ty, .. } => match position {
+            0 => ty.clone(),
+            1 => trust_ir::Ty::Bool,
+            _ => return None,
+        },
+        _ if position != 0 => return None,
+        trust_ir::Inst::BinOp { ty, .. }
+        | trust_ir::Inst::UnOp { ty, .. }
+        | trust_ir::Inst::Copy { ty, .. }
+        | trust_ir::Inst::Select { ty, .. }
+        | trust_ir::Inst::Const { ty, .. }
+        | trust_ir::Inst::Load { ty, .. }
+        | trust_ir::Inst::ExtractField { ty, .. }
+        | trust_ir::Inst::ExtractElement { ty, .. } => ty.clone(),
+        trust_ir::Inst::ICmp { .. } | trust_ir::Inst::FCmp { .. } => trust_ir::Ty::Bool,
+        trust_ir::Inst::Cast { dst_ty, .. } => dst_ty.clone(),
+        _ => return None,
+    })
+}
+
+/// Field-wise contents of every SSA aggregate built by an `Undef` /
+/// `InsertField` chain: `aggregate value -> field -> the inserted SSA value`.
+///
+/// EXACT, not an approximation. SSA values are immutable, so if `%a =
+/// InsertField(%b, f, %v)` then field `f` of `%a` IS `%v` in every execution
+/// that computes `%a`, whatever the control flow between the two. Resolving an
+/// `ExtractField` through this map therefore emits an equality the real
+/// semantics entails — and it is what lets the SCALAR be threaded when the
+/// aggregate itself cannot be a relation column.
+///
+/// Blocks are walked in REVERSE POSTORDER from the entry, so an `InsertField`'s
+/// `aggregate` operand — which by SSA dominance is defined in a block that
+/// dominates, hence precedes it in RPO — is always already mapped: one pass
+/// suffices for every dominance-respecting body. Blocks unreachable from the
+/// entry are appended in index order, and a small BOUNDED fixpoint (never a full
+/// quadratic re-scan, which would be a real cost inside a compiler pass) mops up
+/// any residual ordering. Stopping early can only leave a chain UNRESOLVED,
+/// which degrades to today's havoc — the sound direction.
+fn chc_aggregate_field_map(
+    function: &trust_ir::Function,
+) -> BTreeMap<u32, BTreeMap<u32, trust_ir::ValueId>> {
+    const EXTRA_PASSES: usize = 3;
+    let order = chc_reverse_postorder(function);
+    let mut fields: BTreeMap<u32, BTreeMap<u32, trust_ir::ValueId>> = BTreeMap::new();
+    let mut changed = true;
+    let mut passes = 0usize;
+    while changed && passes < EXTRA_PASSES {
+        changed = false;
+        passes += 1;
+        for block in order.iter().filter_map(|id| function.block(*id)) {
+            for node in &block.body {
+                match &node.inst {
+                    trust_ir::Inst::Undef { .. } => {
+                        let Some(result) = node.results.first() else { continue };
+                        if fields.insert(result.index(), BTreeMap::new()).is_none() {
+                            changed = true;
+                        }
+                    }
+                    trust_ir::Inst::InsertField { aggregate, field, value, .. } => {
+                        let Some(result) = node.results.first() else { continue };
+                        let Some(base) = fields.get(&aggregate.index()).cloned() else { continue };
+                        let mut updated = base;
+                        updated.insert(*field, *value);
+                        if fields.get(&result.index()) != Some(&updated) {
+                            fields.insert(result.index(), updated);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    fields
+}
+
+/// Blocks in reverse postorder from the entry, then any block unreachable from
+/// it in declaration order. Explicit stack, not recursion: this runs inside a
+/// compiler pass over arbitrary user CFGs, where a deep block chain would
+/// overflow the native stack.
+fn chc_reverse_postorder(function: &trust_ir::Function) -> Vec<trust_ir::BlockId> {
+    let mut visited: BTreeSet<u32> = BTreeSet::new();
+    let mut postorder: Vec<trust_ir::BlockId> = Vec::new();
+    if function.block(function.entry).is_some() {
+        visited.insert(function.entry.index());
+        let mut stack = vec![(function.entry, 0usize)];
+        while let Some((block_id, cursor)) = stack.pop() {
+            let successors =
+                function.block(block_id).map(chc_block_successors).unwrap_or_default();
+            if cursor >= successors.len() {
+                postorder.push(block_id);
+                continue;
+            }
+            let successor = successors[cursor];
+            stack.push((block_id, cursor + 1));
+            if visited.insert(successor.index()) {
+                stack.push((successor, 0));
+            }
+        }
+    }
+    postorder.reverse();
+    postorder.extend(
+        function.blocks.iter().map(|block| block.id).filter(|id| !visited.contains(&id.index())),
+    );
+    postorder
+}
+
+/// Stack slots this function may promote to threaded relation columns.
+///
+/// Returns the promoted cells (ordered by `Alloca` result index, deterministic)
+/// and a lookup from that index into the vector. Implements C1-C6 of
+/// [`ChcPromotedCell`]; every clause is a REFUSAL, so an unrecognized shape ends
+/// up un-promoted (today's havoc), never wrongly promoted.
+fn chc_promotable_cells(
+    function: &trust_ir::Function,
+) -> (Vec<ChcPromotedCell>, BTreeMap<u32, usize>) {
+    // C1 + C2: candidate slots.
+    let mut candidates: BTreeMap<u32, ChcPromotedCell> = BTreeMap::new();
+    for block in &function.blocks {
+        for node in &block.body {
+            if let trust_ir::Inst::Alloca { ty, count: None, .. } = &node.inst
+                && let Some(sort) = chc_scalar_sort_json(ty)
+                && let Some(result) = node.results.first()
+            {
+                candidates.insert(
+                    result.index(),
+                    ChcPromotedCell {
+                        ptr: *result,
+                        ty: ty.clone(),
+                        sort,
+                        def_block: block.id,
+                    },
+                );
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return (Vec::new(), BTreeMap::new());
+    }
+
+    // C3 + C4 + C5 + C6: any use that is not a same-typed, non-volatile
+    // `Load`/`Store` `ptr` operand disqualifies the slot.
+    let mut disqualified: BTreeSet<u32> = BTreeSet::new();
+    for block in &function.blocks {
+        for node in &block.body {
+            match &node.inst {
+                trust_ir::Inst::Load { ty, ptr, volatile, .. } => {
+                    if let Some(candidate) = candidates.get(&ptr.index())
+                        && (candidate.ty != *ty || *volatile)
+                    {
+                        disqualified.insert(ptr.index());
+                    }
+                }
+                trust_ir::Inst::Store { ty, ptr, value, volatile, .. } => {
+                    if let Some(candidate) = candidates.get(&ptr.index())
+                        && (candidate.ty != *ty || *volatile)
+                    {
+                        disqualified.insert(ptr.index());
+                    }
+                    // The slot's ADDRESS written into memory: an escape.
+                    if candidates.contains_key(&value.index()) {
+                        disqualified.insert(value.index());
+                    }
+                }
+                other => {
+                    let mut uses = Vec::new();
+                    if chc_collect_inst_value_uses(other, &mut uses) {
+                        // C6: an instruction whose reads we cannot enumerate
+                        // could read any address — refuse every candidate.
+                        return (Vec::new(), BTreeMap::new());
+                    }
+                    for used in uses {
+                        if candidates.contains_key(&used.index()) {
+                            disqualified.insert(used.index());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut cell_slot = BTreeMap::new();
+    for (index, cell) in candidates {
+        if disqualified.contains(&index) {
+            continue;
+        }
+        cell_slot.insert(index, cells.len());
+        cells.push(cell);
+    }
+    (cells, cell_slot)
+}
+
+/// Textbook backward liveness over the carried values, so a relation carries a
+/// column only where a downstream rule could observe it:
+///
+/// ```text
+/// live_in[B] = uses[B] \ defs[B]  ∪  ⋃_{S ∈ succ(B)} (live_in[S] \ defs[B])
+/// ```
+///
+/// `defs[B]` is the block's own params plus every value its instructions define
+/// — a value is never live-IN to the block that computes it.
+///
+/// The result is used ONLY to DROP columns, so its precision is a
+/// precision/verbosity question, not a soundness one. What the fixpoint does
+/// guarantee, for any `uses`, is the property the transition rules rely on: if a
+/// value is live-in at `T` and `T` is a successor of `S`, then it is live-in at
+/// `S` or defined by `S` — so the head of every edge into `T` has a real value
+/// (a column of `S`, or one the fold defines) to pass for that column.
+fn chc_live_in(
+    function: &trust_ir::Function,
+    carried: &BTreeMap<u32, Option<serde_json::Value>>,
+    def_block: &BTreeMap<u32, trust_ir::BlockId>,
+    block_uses: &BTreeMap<u32, Vec<trust_ir::ValueId>>,
+) -> BTreeMap<u32, BTreeSet<u32>> {
+    let mut defs: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for (value, block) in def_block {
+        if carried.contains_key(value) {
+            defs.entry(block.index()).or_default().insert(*value);
+        }
+    }
+    let mut direct: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for block in &function.blocks {
+        let own = defs.get(&block.id.index()).cloned().unwrap_or_default();
+        let uses: BTreeSet<u32> = block_uses
+            .get(&block.id.index())
+            .into_iter()
+            .flatten()
+            .map(|value| value.index())
+            .filter(|index| carried.contains_key(index) && !own.contains(index))
+            .collect();
+        direct.insert(block.id.index(), uses);
+    }
+
+    let mut live: BTreeMap<u32, BTreeSet<u32>> =
+        function.blocks.iter().map(|block| (block.id.index(), BTreeSet::new())).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &function.blocks {
+            let own = defs.get(&block.id.index()).cloned().unwrap_or_default();
+            let mut next = direct.get(&block.id.index()).cloned().unwrap_or_default();
+            for successor in chc_block_successors(block) {
+                if let Some(successor_live) = live.get(&successor.index()) {
+                    next.extend(successor_live.iter().copied().filter(|id| !own.contains(id)));
+                }
+            }
+            if let Some(current) = live.get_mut(&block.id.index())
+                && *current != next
+            {
+                *current = next;
+                changed = true;
+            }
+        }
+    }
+    live
+}
+
+/// Append every `ValueId` that `inst` READS into `uses`, returning `true` when
+/// this encoder does NOT statically enumerate the instruction's operands.
+///
+/// The return flag is load-bearing twice over, and in both places it must fail
+/// CLOSED: a `true` disqualifies every promotion candidate in the function
+/// (an unenumerated instruction could read a slot's address invisibly, breaking
+/// the non-aliasing premise) and marks every carried value live in that block.
+/// A new / dialect / future `Inst` variant therefore lands in the `_` arm and
+/// costs enrichment, never soundness.
+fn chc_collect_inst_value_uses(inst: &trust_ir::Inst, uses: &mut Vec<trust_ir::ValueId>) -> bool {
+    match inst {
+        trust_ir::Inst::BinOp { lhs, rhs, .. }
+        | trust_ir::Inst::Overflow { lhs, rhs, .. }
+        | trust_ir::Inst::ICmp { lhs, rhs, .. }
+        | trust_ir::Inst::FCmp { lhs, rhs, .. } => {
+            uses.push(*lhs);
+            uses.push(*rhs);
+            false
+        }
+        trust_ir::Inst::UnOp { operand, .. }
+        | trust_ir::Inst::Cast { operand, .. }
+        | trust_ir::Inst::Copy { operand, .. } => {
+            uses.push(*operand);
+            false
+        }
+        trust_ir::Inst::Load { ptr, .. }
+        | trust_ir::Inst::PtrData { ptr, .. }
+        | trust_ir::Inst::PtrMetadata { ptr, .. }
+        | trust_ir::Inst::AtomicLoad { ptr, .. }
+        | trust_ir::Inst::Borrow { ptr }
+        | trust_ir::Inst::BorrowMut { ptr }
+        | trust_ir::Inst::Retain { ptr }
+        | trust_ir::Inst::Release { ptr }
+        | trust_ir::Inst::IsUnique { ptr }
+        | trust_ir::Inst::Dealloc { ptr } => {
+            uses.push(*ptr);
+            false
+        }
+        trust_ir::Inst::EndBorrow { borrow_ptr } => {
+            uses.push(*borrow_ptr);
+            false
+        }
+        trust_ir::Inst::Store { ptr, value, .. }
+        | trust_ir::Inst::AtomicStore { ptr, value, .. }
+        | trust_ir::Inst::AtomicRMW { ptr, value, .. } => {
+            uses.push(*ptr);
+            uses.push(*value);
+            false
+        }
+        trust_ir::Inst::Alloca { count, .. } | trust_ir::Inst::HeapAlloc { count, .. } => {
+            uses.extend(count.iter().copied());
+            false
+        }
+        trust_ir::Inst::GEP { base, indices, .. } => {
+            uses.push(*base);
+            uses.extend(indices.iter().copied());
+            false
+        }
+        trust_ir::Inst::PtrFromParts { data, metadata, .. } => {
+            uses.push(*data);
+            uses.push(*metadata);
+            false
+        }
+        trust_ir::Inst::CmpXchg { ptr, expected, desired, .. } => {
+            uses.push(*ptr);
+            uses.push(*expected);
+            uses.push(*desired);
+            false
+        }
+        trust_ir::Inst::Br { args, .. } => {
+            uses.extend(args.iter().copied());
+            false
+        }
+        trust_ir::Inst::CondBr { cond, then_args, else_args, .. } => {
+            uses.push(*cond);
+            uses.extend(then_args.iter().copied());
+            uses.extend(else_args.iter().copied());
+            false
+        }
+        trust_ir::Inst::Switch { value, default_args, cases, .. } => {
+            uses.push(*value);
+            uses.extend(default_args.iter().copied());
+            for case in cases {
+                uses.extend(case.args.iter().copied());
+            }
+            false
+        }
+        trust_ir::Inst::Call { args, .. } => {
+            uses.extend(args.iter().copied());
+            false
+        }
+        trust_ir::Inst::CallIndirect { callee, args, .. } => {
+            uses.push(*callee);
+            uses.extend(args.iter().copied());
+            false
+        }
+        trust_ir::Inst::Invoke { args, normal_args, .. } => {
+            uses.extend(args.iter().copied());
+            uses.extend(normal_args.iter().copied());
+            false
+        }
+        trust_ir::Inst::Resume { exn } => {
+            uses.push(*exn);
+            false
+        }
+        trust_ir::Inst::CoroSuspend { frame, value, .. } => {
+            uses.push(*frame);
+            uses.push(*value);
+            false
+        }
+        trust_ir::Inst::Return { values } => {
+            uses.extend(values.iter().copied());
+            false
+        }
+        trust_ir::Inst::ExtractField { aggregate, .. } => {
+            uses.push(*aggregate);
+            false
+        }
+        trust_ir::Inst::InsertField { aggregate, value, .. } => {
+            uses.push(*aggregate);
+            uses.push(*value);
+            false
+        }
+        trust_ir::Inst::ExtractElement { array, index, .. } => {
+            uses.push(*array);
+            uses.push(*index);
+            false
+        }
+        trust_ir::Inst::InsertElement { array, index, value, .. } => {
+            uses.push(*array);
+            uses.push(*index);
+            uses.push(*value);
+            false
+        }
+        trust_ir::Inst::Assume { cond } | trust_ir::Inst::Assert { cond } => {
+            uses.push(*cond);
+            false
+        }
+        trust_ir::Inst::Select { cond, then_val, else_val, .. } => {
+            uses.push(*cond);
+            uses.push(*then_val);
+            uses.push(*else_val);
+            false
+        }
+        trust_ir::Inst::BindSlot { frame, value, .. } => {
+            uses.push(*frame);
+            uses.push(*value);
+            false
+        }
+        trust_ir::Inst::LoadSlot { frame, .. } | trust_ir::Inst::CloseFrame { frame } => {
+            uses.push(*frame);
+            false
+        }
+        trust_ir::Inst::SeqMapAddK { seq, .. }
+        | trust_ir::Inst::SeqMapNot { seq, .. }
+        | trust_ir::Inst::SeqMap { seq, .. } => {
+            uses.push(*seq);
+            false
+        }
+        // Operand-free instructions: no value reads.
+        trust_ir::Inst::Const { .. }
+        | trust_ir::Inst::NullPtr
+        | trust_ir::Inst::GlobalAddr { .. }
+        | trust_ir::Inst::Undef { .. }
+        | trust_ir::Inst::Unreachable
+        | trust_ir::Inst::Fence { .. }
+        | trust_ir::Inst::LandingPad { .. }
+        | trust_ir::Inst::OpenFrame { .. } => false,
+        // Unknown / opaque (`DialectOp`, or any variant a future trust-ir adds):
+        // we cannot enumerate its reads, so report it conservatively.
+        _ => true,
+    }
 }
 
 /// Map an integer `BinOp` to its CHC op string. Only `Add`/`Sub`/`Mul` are
@@ -26960,7 +30861,7 @@ fn chc_overflow_violation(
 fn chc_unsigned_range_facts(
     value: trust_ir::ValueId,
     ty: &trust_ir::Ty,
-    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+    var_decls: &mut ChcVarDecls,
 ) -> Vec<serde_json::Value> {
     let Some(max) = chc_unsigned_overflow_max(ty) else {
         return Vec::new();
@@ -26973,25 +30874,101 @@ fn chc_unsigned_range_facts(
     ]
 }
 
+/// What a block's straight-line fold produced.
+struct ChcBlockFold {
+    /// Bool-sorted equalities carried on the block's outgoing transitions.
+    constraints: Vec<serde_json::Value>,
+    /// Per-`Overflow` out-of-range Bool predicates, for the `ArithmeticSafetyOnly`
+    /// DIRECT `error` edges (unused by `Structural` mode).
+    overflow_violations: Vec<serde_json::Value>,
+    /// Promotion slot -> the var holding that cell's value at BLOCK EXIT, i.e.
+    /// after every `Store` on this straight-line path. This is what each
+    /// outgoing edge passes for the target's cell column.
+    cell_exit: BTreeMap<usize, ChcArgVar>,
+}
+
 /// Straight-line fold of a block body (everything before the terminator).
-/// Returns `(constraints, overflow_violations)`: `constraints` are the
-/// Bool-sorted equalities carried on the block's outgoing transitions;
-/// `overflow_violations` are the per-`Overflow` out-of-range Bool predicates used
-/// by `ArithmeticSafetyOnly` mode to build DIRECT `error` edges (unused by
-/// `Structural` mode). Every referenced value is declared. Unmodeled
-/// instructions are HAVOCed (emit nothing) — a sound over-approximation.
+/// Every referenced value is declared. Unmodeled instructions are HAVOCed (emit
+/// nothing) — a sound over-approximation.
 fn chc_fold_block_body(
     block: &trust_ir::Block,
-    var_decls: &mut BTreeMap<u32, serde_json::Value>,
-) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    frame: &ChcDataflowFrame,
+    var_decls: &mut ChcVarDecls,
+) -> ChcBlockFold {
     let int = serde_json::json!({ "kind": "int" });
     let boolean = serde_json::json!({ "kind": "bool" });
     let mut constraints = Vec::new();
     let mut overflow_violations = Vec::new();
+
+    // Seed every promoted cell's state for this block. A cell the block RECEIVES
+    // starts at its incoming relation column; a cell DEFINED here (the `Alloca`
+    // is in this block) starts at a fresh unconstrained var — the slot's
+    // uninitialized content, i.e. a havoc.
+    let mut cell_exit: BTreeMap<usize, ChcArgVar> = BTreeMap::new();
+    let carried: BTreeSet<usize> =
+        frame.block_cells.get(&block.id.index()).into_iter().flatten().copied().collect();
+    for (slot, cell) in frame.cells.iter().enumerate() {
+        let var = if carried.contains(&slot) {
+            ChcArgVar::Named(chc_cell_var_name(block.id, cell.ptr))
+        } else {
+            ChcArgVar::Named(chc_cell_undef_var_name(block.id, cell.ptr))
+        };
+        cell_exit.insert(slot, var);
+    }
+
     // `block.instructions()` / `block.body` INCLUDE the terminator node; the
     // straight-line fold must skip it.
     for node in block.body.iter().filter(|node| !node.is_terminator()) {
         match &node.inst {
+            // A `Load` from a PROMOTED slot is no longer a havoc: it reads the
+            // cell's current threaded value. Entailed by the promotion criterion
+            // (`ChcPromotedCell`) — that is the whole point of refusing promotion
+            // for any slot whose address could escape.
+            trust_ir::Inst::Load { ty, ptr, .. } => {
+                let Some(cell) = frame.cell_for_ptr(*ptr) else { continue };
+                // Type/volatile mismatches were already refused at promotion; the
+                // re-check keeps this arm correct on its own terms.
+                if cell.ty != *ty {
+                    continue;
+                }
+                let Some(slot) = frame.cell_slot.get(&ptr.index()) else { continue };
+                let Some(dest) = node.results.first() else { continue };
+                let Some(current) = cell_exit.get(slot).cloned() else { continue };
+                chc_declare_var(var_decls, *dest, &cell.sort);
+                let current_expr = current.declare_expr(&cell.sort, var_decls);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &cell.sort),
+                    current_expr,
+                ));
+            }
+            // A `Store` to a promoted slot UPDATES the cell's state. It emits no
+            // constraint of its own — the new value simply becomes what later
+            // `Load`s in this block, and the outgoing edges, read.
+            trust_ir::Inst::Store { ty, ptr, value, .. } => {
+                let Some(cell) = frame.cell_for_ptr(*ptr) else { continue };
+                if cell.ty != *ty {
+                    continue;
+                }
+                let Some(slot) = frame.cell_slot.get(&ptr.index()) else { continue };
+                chc_declare_var(var_decls, *value, &cell.sort);
+                cell_exit.insert(*slot, ChcArgVar::Ssa(*value));
+            }
+            // `ExtractField` of a field an `InsertField` chain defines IS the
+            // inserted SSA value (see `chc_aggregate_field_map`), so the scalar
+            // read is exact even when the aggregate was built in another block.
+            trust_ir::Inst::ExtractField { ty, aggregate, field } => {
+                let Some(sort) = chc_scalar_sort_json(ty) else { continue };
+                let Some(dest) = node.results.first() else { continue };
+                let Some(source) = frame.resolve_field(*aggregate, *field) else { continue };
+                chc_declare_var(var_decls, *dest, &sort);
+                chc_declare_var(var_decls, source, &sort);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &sort),
+                    chc_var_expr(source, &sort),
+                ));
+            }
             trust_ir::Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
                 let Some(mapped) = chc_map_int_binop(*op) else { continue };
                 let Some(dest) = node.results.first() else { continue };
@@ -27066,6 +31043,40 @@ fn chc_fold_block_body(
                     chc_var_expr(*operand, &int),
                 ));
             }
+            // BOOLEAN `ICmp`. This is the shape the bridge ACTUALLY emits, and the
+            // arm below (gated on `ty.is_integer()`) does not cover it, so before
+            // this every boolean comparison was havoc'd:
+            //
+            //   * a `switchInt` on a `bool` lowers to `icmp eq %cmp, false` +
+            //     `CondBr`, so the BRANCH GUARD was a free variable and both edges
+            //     were unconditionally enabled — the loop guard `i < n` was
+            //     computed, then dead;
+            //   * `Terminator::Assert { expected: false }` lowers to
+            //     `icmp eq %overflow_bit, false` + `Assert`, deliberately NOT
+            //     `UnOp::Not` (`lower.rs`: "TrustIr unary `not` is a bitwise
+            //     integer op"), so the overflow check was invisible too.
+            //
+            // Only `Eq`/`Ne` are meaningful on `Bool`; the ordering compares are
+            // left to the havoc arm.
+            trust_ir::Inst::ICmp { op, ty, lhs, rhs }
+                if matches!(ty, trust_ir::Ty::Bool)
+                    && matches!(op, trust_ir::ICmpOp::Eq | trust_ir::ICmpOp::Ne) =>
+            {
+                let Some(dest) = node.results.first() else { continue };
+                chc_declare_var(var_decls, *dest, &boolean);
+                chc_declare_var(var_decls, *lhs, &boolean);
+                chc_declare_var(var_decls, *rhs, &boolean);
+                let mapped = if matches!(op, trust_ir::ICmpOp::Eq) { "eq" } else { "ne" };
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &boolean),
+                    chc_binary(
+                        mapped,
+                        chc_var_expr(*lhs, &boolean),
+                        chc_var_expr(*rhs, &boolean),
+                    ),
+                ));
+            }
             trust_ir::Inst::ICmp { op, ty, lhs, rhs } if ty.is_integer() => {
                 let mapped = chc_map_icmp(*op);
                 let Some(dest) = node.results.first() else { continue };
@@ -27079,12 +31090,102 @@ fn chc_fold_block_body(
                     chc_binary(mapped, chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int)),
                 ));
             }
+            // ---- BOOLEAN VALUES ------------------------------------------------
+            //
+            // WHY THIS EXISTS. Without these arms the fold modeled no boolean
+            // instruction at all — `Copy` and `BinOp` above are both gated on
+            // `ty.is_integer()`, and there was no `UnOp` arm — so a boolean value
+            // produced by anything other than `ICmp` was HAVOCed. That is sound,
+            // but it silently discarded EVERY BRANCH CONDITION IN THE PROGRAM,
+            // because `CondBr`'s guard is exactly such a value. Measured on the
+            // `f(n) { let mut i = 0; while i < n { i += 1 } i }` fixture, the
+            // emitted system was
+            //
+            // ```text
+            //   bb4(c) :- bb1(v0, c), v9 = c, v8 = (v9 lt v0), v11        <- exit
+            //   bb2(v0, c) :- bb1(v0, c), v9 = c, v8 = (v9 lt v0), not(v11)  <- body
+            // ```
+            //
+            // The loop guard `v8` is computed and then DEAD; the branch turns on
+            // `v11`, which no rule ever defines. Both edges are therefore
+            // unconditionally enabled and `i < n` constrains nothing — the CFG is
+            // modeled as a nondeterministic choice. The bridge lowers the guard as
+            // `ICmp -> UnOp(Not) -> CondBr`, and the `Not` was the unmodeled link.
+            //
+            // Each arm below is an EXACT equality, never an approximation, so
+            // adding them can only shrink the modeled state space toward the real
+            // one. That direction matters: an over-approximation proved SAFE is
+            // still sound, so this is a PRECISION fix, not a soundness fix — but a
+            // model in which no conditional ever constrains anything cannot prove
+            // any property that depends on control flow, which is most of them.
+            trust_ir::Inst::UnOp { op: trust_ir::UnOp::Not, ty, operand }
+                if matches!(ty, trust_ir::Ty::Bool) =>
+            {
+                let Some(dest) = node.results.first() else { continue };
+                chc_declare_var(var_decls, *dest, &boolean);
+                chc_declare_var(var_decls, *operand, &boolean);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &boolean),
+                    serde_json::json!({
+                        "kind": "unary",
+                        "op": "not",
+                        "expr": chc_var_expr(*operand, &boolean),
+                    }),
+                ));
+            }
+            trust_ir::Inst::Copy { ty, operand } if matches!(ty, trust_ir::Ty::Bool) => {
+                let Some(dest) = node.results.first() else { continue };
+                chc_declare_var(var_decls, *dest, &boolean);
+                chc_declare_var(var_decls, *operand, &boolean);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &boolean),
+                    chc_var_expr(*operand, &boolean),
+                ));
+            }
+            // `And`/`Or` only. `Xor` is deliberately left to the havoc arm: it
+            // would need a disequality or an `xor` connective, and emitting an op
+            // string the CHC consumer does not model would be worse than the
+            // sound havoc it replaces. Widen only with a test that reads the
+            // emitted JSON back.
+            trust_ir::Inst::BinOp { op, ty, lhs, rhs }
+                if matches!(ty, trust_ir::Ty::Bool)
+                    && matches!(op, trust_ir::BinOp::And | trust_ir::BinOp::Or) =>
+            {
+                let connective =
+                    if matches!(op, trust_ir::BinOp::And) { "and" } else { "or" };
+                let Some(dest) = node.results.first() else { continue };
+                chc_declare_var(var_decls, *dest, &boolean);
+                chc_declare_var(var_decls, *lhs, &boolean);
+                chc_declare_var(var_decls, *rhs, &boolean);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &boolean),
+                    chc_binary(
+                        connective,
+                        chc_var_expr(*lhs, &boolean),
+                        chc_var_expr(*rhs, &boolean),
+                    ),
+                ));
+            }
+            trust_ir::Inst::Const { ty, value } if matches!(ty, trust_ir::Ty::Bool) => {
+                if let trust_ir::Constant::Bool(literal) = value {
+                    let Some(dest) = node.results.first() else { continue };
+                    chc_declare_var(var_decls, *dest, &boolean);
+                    constraints.push(chc_binary(
+                        "eq",
+                        chc_var_expr(*dest, &boolean),
+                        serde_json::json!({ "kind": "bool_const", "value": *literal }),
+                    ));
+                }
+            }
             // Everything else — including every `Call` result: havoc (emit
             // nothing). Sound over-approximation.
             _ => {}
         }
     }
-    (constraints, overflow_violations)
+    ChcBlockFold { constraints, overflow_violations, cell_exit }
 }
 
 /// Build one enriched transition rule `bb(target params) :- bb(source params),
@@ -27097,21 +31198,36 @@ fn chc_transition_rule(
     target: &trust_ir::Block,
     edge_args: &[trust_ir::ValueId],
     body_constraints: Vec<serde_json::Value>,
-    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+    fold: &ChcBlockFold,
+    frame: &ChcDataflowFrame,
+    var_decls: &mut ChcVarDecls,
 ) -> Option<serde_json::Value> {
     if edge_args.len() != target.params.len() {
         return None;
     }
-    // Body premise: the source block's canonical params.
-    let source_params = chc_block_relation_params(source);
-    for (value, sort) in &source_params {
-        chc_declare_var(var_decls, *value, sort);
-    }
-    let source_args: Vec<_> =
-        source_params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
-    // Head: for each surviving target param position, thread the edge actual
-    // (same sort by SSA well-typedness).
+    // Body premise: the source block's canonical relation args
+    // ([threaded] ++ [cells] ++ [own params]).
+    let source_args = frame.relation_arg_exprs(source, var_decls);
+    // Head, in the target relation's signature order:
+    //   * a threaded SSA column keeps its own `v{index}` name — the same value,
+    //     so the column is an identity across the edge;
+    //   * a promoted-cell column takes the SOURCE's exit value for that slot
+    //     (the incoming column when this block never stored, the stored SSA value
+    //     when it did) — this is the back-edge update that makes the cell
+    //     loop-carried;
+    //   * an own param takes the edge actual (same sort by SSA well-typedness).
     let mut head_args = Vec::new();
+    for (value, sort) in frame.block_threaded.get(&target.id.index()).into_iter().flatten() {
+        chc_declare_var(var_decls, *value, sort);
+        head_args.push(chc_var_expr(*value, sort));
+    }
+    for slot in frame.block_cells.get(&target.id.index()).into_iter().flatten() {
+        let cell = &frame.cells[*slot];
+        let exit = fold.cell_exit.get(slot).cloned().unwrap_or_else(|| {
+            ChcArgVar::Named(chc_cell_undef_var_name(source.id, cell.ptr))
+        });
+        head_args.push(exit.declare_expr(&cell.sort, var_decls));
+    }
     for (position, (_param, param_ty)) in target.params.iter().enumerate() {
         if let Some(sort) = chc_scalar_sort_json(param_ty) {
             let actual = edge_args[position];
@@ -27137,13 +31253,10 @@ fn chc_error_rule(
     source: &trust_ir::Block,
     reachable: bool,
     reason: String,
-    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+    frame: &ChcDataflowFrame,
+    var_decls: &mut ChcVarDecls,
 ) -> serde_json::Value {
-    let params = chc_block_relation_params(source);
-    for (value, sort) in &params {
-        chc_declare_var(var_decls, *value, sort);
-    }
-    let args: Vec<_> = params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+    let args = frame.relation_arg_exprs(source, var_decls);
     serde_json::json!({
         "head": { "name": "error" },
         "body": {
@@ -27165,17 +31278,514 @@ fn chc_error_rule(
 /// violation over free vars would be trivially satisfiable and prove nothing);
 /// `violation` is the out-of-range predicate. This is the genuine
 /// overflow-safety property — it is the ONLY error route in this mode.
+/// THE COVERAGE GATE FOR [`ChcErrorMode::PostconditionGoal`], and the reason a
+/// postcondition may draw a PROVED verdict from this encoder at all.
+///
+/// The encoder models every integer as a MATHEMATICAL `int` — deliberately, since
+/// `bit_vec` would block LIA invariant synthesis. That is only a sound
+/// OVER-approximation of the machine while the two agree on every execution the
+/// machine actually CONTINUES:
+///
+///   * **Checked arithmetic (`Inst::Overflow` + a trapping `Inst::Assert`) is
+///     fine.** On overflow the real program panics and never returns, so it has
+///     no return state for the postcondition to be false at; the model instead
+///     continues with an unbounded value, i.e. it explores a SUPERSET of the real
+///     return states. Proving the superset error-free proves the real one
+///     error-free.
+///   * **Wrapping arithmetic is NOT fine, and is the false-SAFE direction.** A
+///     plain integer `BinOp::{Add,Sub,Mul}` is trust-ir's unchecked/wrapping add
+///     (what `wrapping_add`, and `+` with overflow-checks off, lower to). Reality
+///     wraps to a NEGATIVE value and returns it; the model keeps counting upward
+///     and never represents that state. The model is then a strict
+///     UNDER-approximation, and `ensures(*ret >= 0)` would be "proved" for a
+///     function that demonstrably returns a negative number.
+///
+/// So: refuse whenever the function contains modeled unchecked integer
+/// arithmetic, and refuse whenever an `Inst::Overflow`'s overflow bit is not
+/// consumed by an `Inst::Assert` of its NEGATION — the latter is what makes
+/// "overflow ⇒ no continuation" true rather than assumed. `overflowing_add`
+/// produces exactly such an unasserted bit and CONTINUES with the wrapped value,
+/// which is the same hazard wearing a different shape.
+///
+/// The bit is followed through the aliases the bridge actually inserts between
+/// the `Overflow` and the `Assert` — `Copy`, and `ExtractField` off the
+/// `InsertField` chain that `Inst::Overflow` results are packed into. Anything
+/// this resolution cannot follow is a REFUSAL, not an assumption: an
+/// unresolvable alias means we cannot show the bit traps.
+///
+/// Only `Add`/`Sub`/`Mul` are checked here because [`chc_map_int_binop`] models
+/// only those; every other integer `BinOp` (`Div`, `Rem`, shifts, bitwise) is
+/// havoc'd by the fold, which is already the safe direction.
+fn function_unbounded_int_arithmetic_is_faithful(function: &trust_ir::Function) -> bool {
+    // Alias map: value -> the value it is definitionally equal to. Built over the
+    // whole function because the bridge's `ExtractField` read-back lands in a
+    // LATER block than the `Overflow` that produced the aggregate.
+    let mut alias: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut inserted_field: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+    for block in &function.blocks {
+        for node in block.body.iter() {
+            let Some(dest) = node.results.first() else { continue };
+            match &node.inst {
+                trust_ir::Inst::Copy { operand, .. } => {
+                    alias.insert(dest.index(), operand.index());
+                }
+                trust_ir::Inst::InsertField { aggregate, field, value, .. } => {
+                    // Keyed by the RESULT: `InsertField{aggregate: a, field: f,
+                    // value: v} -> d` means it is `d`, not `a`, whose field `f` is
+                    // `v`. The bridge builds the checked-arithmetic tuple as
+                    // `Undef -> InsertField(_,0,result) -> InsertField(_,1,flag)`,
+                    // so a later `ExtractField(tuple, 1)` must resolve to `flag`.
+                    inserted_field.insert((dest.index(), *field), value.index());
+                    // ... and `d` inherits every field `a` already had, so a lookup
+                    // that misses on `d` walks back through this alias.
+                    alias.insert(dest.index(), aggregate.index());
+                }
+                _ => {}
+            }
+        }
+    }
+    // Resolve `ExtractField` in a second pass, now that the whole chain is known.
+    for block in &function.blocks {
+        for node in block.body.iter() {
+            let Some(dest) = node.results.first() else { continue };
+            if let trust_ir::Inst::ExtractField { aggregate, field, .. } = &node.inst {
+                let mut base = aggregate.index();
+                let mut hops = 0u32;
+                loop {
+                    if let Some(value) = inserted_field.get(&(base, *field)) {
+                        alias.insert(dest.index(), *value);
+                        break;
+                    }
+                    let Some(next) = alias.get(&base).copied() else { break };
+                    if next == base || hops > 64 {
+                        break;
+                    }
+                    base = next;
+                    hops += 1;
+                }
+            }
+        }
+    }
+    let resolve = |mut value: u32| -> u32 {
+        for _ in 0..64 {
+            match alias.get(&value) {
+                Some(next) if *next != value => value = *next,
+                _ => break,
+            }
+        }
+        value
+    };
+
+    // Every value that DENOTES the negation of another boolean, so an `Assert` of
+    // it is an assert that the other is false. Two spellings, because the bridge
+    // uses the second one and only the second one for MIR asserts:
+    //   * `UnOp::Not b`;
+    //   * `ICmp::Eq(b, false)` — `Terminator::Assert { expected: false }` lowers to
+    //     exactly this (`lower.rs`, "TrustIr unary `not` is a bitwise integer
+    //     op"), and `assert(!overflow_bit)` is the canonical checked-arithmetic
+    //     shape. Missing it made this gate refuse every checked function.
+    let mut const_false: FxHashSet<u32> = FxHashSet::default();
+    for block in &function.blocks {
+        for node in block.body.iter() {
+            let Some(dest) = node.results.first() else { continue };
+            if let trust_ir::Inst::Const { value: trust_ir::Constant::Bool(false), .. } = &node.inst
+            {
+                const_false.insert(dest.index());
+            }
+        }
+    }
+    let mut not_operand: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &function.blocks {
+        for node in block.body.iter() {
+            let Some(dest) = node.results.first() else { continue };
+            match &node.inst {
+                trust_ir::Inst::UnOp { op: trust_ir::UnOp::Not, operand, .. } => {
+                    not_operand.insert(dest.index(), operand.index());
+                }
+                trust_ir::Inst::ICmp { op: trust_ir::ICmpOp::Eq, ty, lhs, rhs }
+                    if matches!(ty, trust_ir::Ty::Bool) =>
+                {
+                    if const_false.contains(&rhs.index()) {
+                        not_operand.insert(dest.index(), lhs.index());
+                    } else if const_false.contains(&lhs.index()) {
+                        not_operand.insert(dest.index(), rhs.index());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut asserted_false: FxHashSet<u32> = FxHashSet::default();
+    for block in &function.blocks {
+        for node in block.body.iter() {
+            if let trust_ir::Inst::Assert { cond } = &node.inst {
+                let mut probe = cond.index();
+                for _ in 0..64 {
+                    if let Some(inner) = not_operand.get(&probe) {
+                        asserted_false.insert(resolve(*inner));
+                        break;
+                    }
+                    match alias.get(&probe) {
+                        Some(next) if *next != probe => probe = *next,
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    for block in &function.blocks {
+        for node in block.body.iter().filter(|node| !node.is_terminator()) {
+            match &node.inst {
+                // Unchecked/wrapping integer arithmetic the fold models as
+                // unbounded `int`. The under-approximating direction — refuse.
+                trust_ir::Inst::BinOp { op, ty, .. }
+                    if ty.is_integer() && chc_map_int_binop(*op).is_some() =>
+                {
+                    return false;
+                }
+                // A checked op is admissible only if its overflow bit traps.
+                trust_ir::Inst::Overflow { .. } => {
+                    let Some(bit) = node.results.get(1) else { return false };
+                    if !asserted_false.contains(&resolve(bit.index())) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// The [`ChcErrorMode::PostconditionGoal`] `error` edge for one RETURN block:
+/// `error :- bbRet(args), fold, VC, (_0 = returned)`.
+///
+/// `vc` is the obligation's flattened constraint verbatim — `path ∧ ¬Q` — so this
+/// mode asks the SAME question the single-formula path asks, only with the
+/// block relation and the block fold conjoined so loop-carried state is no
+/// longer a free existential.
+///
+/// The ONLY binding added is the return place. That is deliberate: every other
+/// VC variable (parameters, body temporaries, the versioned loop local) stays
+/// free, which is the CONSERVATIVE direction — a free variable can only make
+/// `path ∧ ¬Q` easier to satisfy, i.e. make `error` easier to reach, i.e. make a
+/// proof harder. Binding `_0` is what ties the VC's conclusion to the value the
+/// CHC actually reasons about, and the VC's own equalities then pin whatever
+/// else it needs relative to it.
+/// Substitute away every VARIABLE-TO-VARIABLE equality in one emitted rule,
+/// rewriting the head args, the body relation args and the remaining
+/// constraints, then dropping the resulting `x = x`.
+///
+/// **This is what makes proof-grade PDR able to close the systems this encoder
+/// emits, and it is measured, not stylistic.** The fold names every intermediate
+/// SSA value, so a block that loads a promoted cell and compares it emits
+///
+/// ```text
+///   bb2(v1, bb1_cell_v10) :- bb1(v1, bb1_cell_v10),
+///                            v3 = bb1_cell_v10, v4 = (v3 < v1), v4
+/// ```
+///
+/// `v3` carries no information — it IS `bb1_cell_v10`. Chains of these defeat
+/// `ay-chc`'s proof-grade `solve_pdr_proof`, which (unlike the adaptive
+/// portfolio) runs no `ClauseInliner` preprocessing, because
+/// `preserve_original_clauses` is deliberately set so the invariant is built over
+/// the caller's exact clauses for the replay seal. Measured on the `f_loop`
+/// system: with the copies present PDR returns
+/// `Unknown(VerifiedUnknownMarker { reason: Inconclusive })`; with ONLY these
+/// var-to-var copies substituted — every other constraint left in place,
+/// including `v6 = 1` and the dead overflow predicate — PDR returns
+/// `Safe(VerifiedInvariant { .. })` carrying exactly the invariant `c >= 0`.
+///
+/// Fixing it HERE rather than in the solver is deliberate: it keeps the
+/// proof-grade path building its invariant over the clauses the caller supplied,
+/// so `PdrInvariant` evidence and its replay stay intact. Making the solver
+/// inline instead would rewrite the problem underneath the invariant and force a
+/// back-translation the seal would have to trust.
+///
+/// The substitution is equivalence-preserving — replacing equals by equals inside
+/// a conjunction that asserts the equality — so it changes nothing about what the
+/// rule means. The representative is a name the rule's relations actually carry
+/// whenever the class contains one, so the surviving constraints speak the
+/// relation's own namespace.
+fn chc_collapse_rule_copy_equalities(rule: serde_json::Value) -> serde_json::Value {
+    fn var_name(node: &serde_json::Value) -> Option<&str> {
+        (node.get("kind").and_then(|kind| kind.as_str()) == Some("var"))
+            .then(|| node.get("name").and_then(|name| name.as_str()))
+            .flatten()
+    }
+    fn collect_vars(node: &serde_json::Value, out: &mut FxHashSet<String>) {
+        if let Some(name) = var_name(node) {
+            out.insert(name.to_string());
+            return;
+        }
+        for key in ["lhs", "rhs", "expr"] {
+            if let Some(child) = node.get(key) {
+                collect_vars(child, out);
+            }
+        }
+    }
+    fn find(parent: &mut FxHashMap<String, String>, name: &str) -> String {
+        let mut current = name.to_string();
+        for _ in 0..64 {
+            match parent.get(&current) {
+                Some(next) if *next != current => current = next.clone(),
+                _ => break,
+            }
+        }
+        current
+    }
+    fn rewrite(
+        node: &serde_json::Value,
+        parent: &mut FxHashMap<String, String>,
+    ) -> serde_json::Value {
+        let mut out = node.clone();
+        if let Some(name) = var_name(node) {
+            let representative = find(parent, name);
+            if let serde_json::Value::Object(object) = &mut out {
+                object.insert("name".to_string(), serde_json::json!(representative));
+            }
+            return out;
+        }
+        for key in ["lhs", "rhs", "expr"] {
+            if let Some(child) = node.get(key) {
+                let replacement = rewrite(child, parent);
+                if let serde_json::Value::Object(object) = &mut out {
+                    object.insert(key.to_string(), replacement);
+                }
+            }
+        }
+        out
+    }
+
+    let head_args = rule["head"]["args"].as_array().cloned().unwrap_or_default();
+    let relation_args =
+        rule["body"]["relation"]["args"].as_array().cloned().unwrap_or_default();
+    let constraints = rule["body"]["constraints"].as_array().cloned().unwrap_or_default();
+
+    // Names the rule's relations carry. Preferred as class representatives so a
+    // surviving constraint speaks a name PDR sees as a predicate argument.
+    let mut anchored: FxHashSet<String> = FxHashSet::default();
+    for arg in head_args.iter().chain(relation_args.iter()) {
+        collect_vars(arg, &mut anchored);
+    }
+
+    let mut parent: FxHashMap<String, String> = FxHashMap::default();
+    for constraint in &constraints {
+        if constraint.get("op").and_then(|op| op.as_str()) != Some("eq") {
+            continue;
+        }
+        let (Some(lhs), Some(rhs)) = (constraint.get("lhs"), constraint.get("rhs")) else {
+            continue;
+        };
+        let (Some(a), Some(b)) = (var_name(lhs), var_name(rhs)) else { continue };
+        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+        if ra == rb {
+            continue;
+        }
+        let (keep, drop) = match (anchored.contains(&ra), anchored.contains(&rb)) {
+            (true, false) => (ra, rb),
+            (false, true) => (rb, ra),
+            _ if ra < rb => (ra, rb),
+            _ => (rb, ra),
+        };
+        parent.insert(drop, keep);
+    }
+    if parent.is_empty() {
+        return rule;
+    }
+
+    let mut out = rule.clone();
+    let new_head: Vec<serde_json::Value> =
+        head_args.iter().map(|arg| rewrite(arg, &mut parent)).collect();
+    let new_relation: Vec<serde_json::Value> =
+        relation_args.iter().map(|arg| rewrite(arg, &mut parent)).collect();
+    let mut new_constraints = Vec::with_capacity(constraints.len());
+    for constraint in &constraints {
+        let rewritten = rewrite(constraint, &mut parent);
+        // A var-to-var equality that survived rewriting is now `x = x`.
+        if rewritten.get("op").and_then(|op| op.as_str()) == Some("eq")
+            && let (Some(lhs), Some(rhs)) = (rewritten.get("lhs"), rewritten.get("rhs"))
+            && let (Some(a), Some(b)) = (var_name(lhs), var_name(rhs))
+            && a == b
+        {
+            continue;
+        }
+        new_constraints.push(rewritten);
+    }
+    if let Some(args) = out.pointer_mut("/head/args") {
+        *args = serde_json::Value::Array(new_head);
+    }
+    if let Some(args) = out.pointer_mut("/body/relation/args") {
+        *args = serde_json::Value::Array(new_relation);
+    }
+    if let Some(slot) = out.pointer_mut("/body/constraints") {
+        *slot = serde_json::Value::Array(new_constraints);
+    }
+    out
+}
+
+/// Flatten a VC into top-level conjuncts, COLLAPSE its variable-to-variable
+/// equality chains, and bind the return place to `returned`.
+///
+/// This is an equivalence-preserving rewrite — substituting equals for equals
+/// inside a conjunction that asserts the equality — but it is not cosmetic. It is
+/// what makes the goal edge SOLVABLE. Measured on the real `f_loop` VC, embedding
+/// it verbatim gives
+///
+/// ```text
+///   … ∧ _5 = i#s0_1_s3_0 ∧ _4 = (_5 < n) ∧ ¬(_5 < n)
+///     ∧ _5 = i#s0_1_s3_0 ∧ _0 = i#s0_1_s3_0 ∧ ¬(_0 ≥ 0) ∧ _0 = v11
+/// ```
+///
+/// and NEITHER single-engine PDR nor the adaptive portfolio converged on it in
+/// ~13 minutes. The obstacle is the chained copy equalities, which is a known
+/// weak spot: each chain alone is fine, several together defeat the engines.
+/// Collapsing `{_0, _5, i#s0_1_s3_0, v11}` into the encoder's own `v11` reduces
+/// the goal to `¬(v11 ≥ 0) ∧ ¬(v11 < n) ∧ n ∈ range` over the block relation,
+/// which is the shape the solver handles.
+///
+/// The representative is always the ENCODER's name when the class contains one,
+/// so the surviving constraints speak the namespace the CHC relations use.
+fn chc_collapse_goal_conjuncts(
+    vc: &serde_json::Value,
+    return_place_binding: &str,
+) -> Vec<serde_json::Value> {
+    fn flatten(node: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        if node.get("kind").and_then(|kind| kind.as_str()) == Some("binary")
+            && node.get("op").and_then(|op| op.as_str()) == Some("and")
+        {
+            if let (Some(lhs), Some(rhs)) = (node.get("lhs"), node.get("rhs")) {
+                flatten(lhs, out);
+                flatten(rhs, out);
+                return;
+            }
+        }
+        out.push(node.clone());
+    }
+    fn var_name(node: &serde_json::Value) -> Option<&str> {
+        (node.get("kind").and_then(|kind| kind.as_str()) == Some("var"))
+            .then(|| node.get("name").and_then(|name| name.as_str()))
+            .flatten()
+    }
+
+    let mut conjuncts = Vec::new();
+    flatten(vc, &mut conjuncts);
+
+    // Union-find over variable names, seeded with the return-place binding.
+    let mut parent: FxHashMap<String, String> = FxHashMap::default();
+    fn find(parent: &mut FxHashMap<String, String>, name: &str) -> String {
+        let mut current = name.to_string();
+        for _ in 0..64 {
+            match parent.get(&current) {
+                Some(next) if *next != current => current = next.clone(),
+                _ => break,
+            }
+        }
+        current
+    }
+    let union = |parent: &mut FxHashMap<String, String>, a: &str, b: &str| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra == rb {
+            return;
+        }
+        // Prefer the ENCODER's namespace (`v{index}` / `bb*_cell_v*`) as the
+        // representative so surviving constraints tie to the block relation.
+        let a_is_encoder = ra.starts_with('v') && ra[1..].chars().all(|c| c.is_ascii_digit());
+        let b_is_encoder = rb.starts_with('v') && rb[1..].chars().all(|c| c.is_ascii_digit());
+        if a_is_encoder && !b_is_encoder {
+            parent.insert(rb, ra);
+        } else if b_is_encoder && !a_is_encoder {
+            parent.insert(ra, rb);
+        } else if ra < rb {
+            parent.insert(rb, ra);
+        } else {
+            parent.insert(ra, rb);
+        }
+    };
+    union(&mut parent, TYPED_CHC_RETURN_PLACE, return_place_binding);
+    for conjunct in &conjuncts {
+        if conjunct.get("op").and_then(|op| op.as_str()) != Some("eq") {
+            continue;
+        }
+        let (Some(lhs), Some(rhs)) = (conjunct.get("lhs"), conjunct.get("rhs")) else { continue };
+        if let (Some(a), Some(b)) = (var_name(lhs), var_name(rhs)) {
+            union(&mut parent, a, b);
+        }
+    }
+
+    fn rewrite(node: &serde_json::Value, parent: &mut FxHashMap<String, String>) -> serde_json::Value {
+        let mut out = node.clone();
+        if let Some(name) = var_name(node) {
+            let representative = find(parent, name);
+            if let serde_json::Value::Object(object) = &mut out {
+                object.insert("name".to_string(), serde_json::json!(representative));
+            }
+            return out;
+        }
+        for key in ["lhs", "rhs", "expr"] {
+            if let Some(child) = node.get(key) {
+                let replacement = rewrite(child, parent);
+                if let serde_json::Value::Object(object) = &mut out {
+                    object.insert(key.to_string(), replacement);
+                }
+            }
+        }
+        out
+    }
+
+    let mut collapsed = Vec::new();
+    for conjunct in &conjuncts {
+        // `true` carries nothing; the VC is full of them.
+        if conjunct.get("kind").and_then(|kind| kind.as_str()) == Some("bool_const")
+            && conjunct.get("value").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let rewritten = rewrite(conjunct, &mut parent);
+        // A variable-to-variable equality that survived rewriting is now `x = x`.
+        if rewritten.get("op").and_then(|op| op.as_str()) == Some("eq")
+            && let (Some(lhs), Some(rhs)) = (rewritten.get("lhs"), rewritten.get("rhs"))
+            && let (Some(a), Some(b)) = (var_name(lhs), var_name(rhs))
+            && a == b
+        {
+            continue;
+        }
+        collapsed.push(rewritten);
+    }
+    collapsed
+}
+
+fn chc_postcondition_goal_error_rule(
+    source: &trust_ir::Block,
+    fold: &[serde_json::Value],
+    returned: trust_ir::ValueId,
+    vc: &serde_json::Value,
+    frame: &ChcDataflowFrame,
+    var_decls: &mut ChcVarDecls,
+) -> serde_json::Value {
+    let int = serde_json::json!({ "kind": "int" });
+    let args = frame.relation_arg_exprs(source, var_decls);
+    let mut constraints = fold.to_vec();
+    chc_declare_var(var_decls, returned, &int);
+    constraints.extend(chc_collapse_goal_conjuncts(vc, &chc_value_var_name(returned)));
+    serde_json::json!({
+        "head": { "name": "error" },
+        "body": {
+            "relation": { "name": trust_mc_default_block_relation(source.id), "args": args },
+            "constraints": constraints,
+        },
+    })
+}
+
 fn chc_overflow_error_rule(
     source: &trust_ir::Block,
     fold: &[serde_json::Value],
     violation: &serde_json::Value,
-    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+    frame: &ChcDataflowFrame,
+    var_decls: &mut ChcVarDecls,
 ) -> serde_json::Value {
-    let params = chc_block_relation_params(source);
-    for (value, sort) in &params {
-        chc_declare_var(var_decls, *value, sort);
-    }
-    let args: Vec<_> = params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+    let args = frame.relation_arg_exprs(source, var_decls);
     let mut constraints = fold.to_vec();
     constraints.push(violation.clone());
     serde_json::json!({
@@ -27199,6 +31809,7 @@ fn trust_mc_dataflow_function_chc_from_trust_ir(
     native_trust_ir_bundle: &trust_ir_bridge::NativeVerificationBundle,
     request: &trust_ir::TrustMcNativeRequest,
     error_mode: ChcErrorMode,
+    goal: Option<&serde_json::Value>,
 ) -> Result<Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)>, String> {
     let function =
         native_trust_ir_bundle.module.function_by_id(request.function).ok_or_else(|| {
@@ -27207,7 +31818,7 @@ fn trust_mc_dataflow_function_chc_from_trust_ir(
                 request.function.index()
             )
         })?;
-    trust_mc_dataflow_chc_for_function(function, error_mode)
+    trust_mc_dataflow_chc_for_function(function, error_mode, goal)
 }
 
 /// The `Function`-level core of the data-flow encoder, split out from the
@@ -27217,8 +31828,9 @@ fn trust_mc_dataflow_function_chc_from_trust_ir(
 fn trust_mc_dataflow_chc_for_function(
     function: &trust_ir::Function,
     error_mode: ChcErrorMode,
+    goal: Option<&serde_json::Value>,
 ) -> Result<Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)>, String> {
-    let outcome = trust_mc_dataflow_chc_for_function_impl(function, error_mode)?;
+    let outcome = trust_mc_dataflow_chc_for_function_impl(function, error_mode, goal)?;
     if trust_mc_dataflow_chc_debug_enabled() {
         match &outcome {
             Some((relations, rules, _)) => eprintln!(
@@ -27245,6 +31857,7 @@ fn trust_mc_dataflow_chc_for_function(
 fn trust_mc_dataflow_chc_for_function_impl(
     function: &trust_ir::Function,
     error_mode: ChcErrorMode,
+    goal: Option<&serde_json::Value>,
 ) -> Result<Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)>, String> {
     if function.blocks.is_empty() {
         return Err(format!(
@@ -27274,30 +31887,64 @@ fn trust_mc_dataflow_chc_for_function_impl(
         return Ok(None);
     }
 
+    // ArithmeticSafetyOnly false-REFUTATION gate: an overflow `error` edge whose
+    // operands are neither block-relation parameters nor fold-defined is an
+    // unconstrained existential, so `error` is reachable for free and the
+    // redirected obligation comes back refuted against correct code. Fall back
+    // to the untouched flattened path instead. See
+    // [`function_overflow_violations_are_anchored`] for why this is the ordinary
+    // shape of every loop the MIR->trust-ir bridge lowers.
+    if error_mode == ChcErrorMode::ArithmeticSafetyOnly
+        && !function_overflow_violations_are_anchored(function)
+    {
+        return Ok(None);
+    }
+
+    // PostconditionGoal coverage gate — see
+    // [`function_unbounded_int_arithmetic_is_faithful`]. Without it a wrapping
+    // accumulator's real (negative) return state is absent from the model and a
+    // false postcondition would be "proved". Fail closed to the untouched
+    // flattened path.
+    if error_mode == ChcErrorMode::PostconditionGoal
+        && (goal.is_none() || !function_unbounded_int_arithmetic_is_faithful(function))
+    {
+        return Ok(None);
+    }
+
     let bool_sort = serde_json::json!({ "kind": "bool" });
-    let mut var_decls: BTreeMap<u32, serde_json::Value> = BTreeMap::new();
+    let mut var_decls = ChcVarDecls::default();
+    // Set when a PostconditionGoal `error` edge is emitted. A function with no
+    // reachable `Return` would otherwise prove `error` unreachable vacuously.
+    let mut any_postcondition_error = false;
     // Set when an `ArithmeticSafetyOnly` overflow `error` edge is emitted; if none
     // are, the CHC would prove `error` unreachable vacuously (a false SAFE), so we
     // fall back below.
     let mut any_overflow_error = false;
 
-    // Relations: `error` + one relation per block carrying its canonical
-    // (int/bool) param projection as `arg_sorts`.
+    // Loop-carried state: which scalar SSA values are threaded into which block,
+    // and which stack slots are promoted to threaded columns. Without this every
+    // non-entry relation is nullary (the producer emits block params only for the
+    // entry block) and PDR has no predicate to strengthen.
+    let frame = ChcDataflowFrame::build(function);
+
+    // Relations: `error` + one relation per block carrying
+    // `[threaded SSA] ++ [promoted cells] ++ [own params]` as `arg_sorts`.
     let mut relations = Vec::with_capacity(function.blocks.len() + 1);
     relations.push(serde_json::json!({ "name": "error" }));
     for block in &function.blocks {
-        let arg_sorts: Vec<_> =
-            chc_block_relation_params(block).into_iter().map(|(_, sort)| sort).collect();
         relations.push(serde_json::json!({
             "name": trust_mc_default_block_relation(block.id),
-            "arg_sorts": arg_sorts,
+            "arg_sorts": frame.relation_arg_sorts(block),
         }));
     }
 
     let mut rules: Vec<serde_json::Value> = Vec::new();
 
-    // Entry fact: `bbEntry(params) :- (empty body)` — all params FREE (full input
-    // havoc). Constraining them would under-approximate the input space.
+    // Entry fact: `bbEntry(args) :- (empty body)` — all columns FREE (full input
+    // havoc). Constraining them would under-approximate the input space. A cell
+    // column at entry (a slot whose `Alloca` is in some later block) is free for
+    // the same reason: the slot does not exist yet, and dominance forbids any
+    // read of it before its `Alloca`.
     {
         let entry_block = function.block(function.entry).ok_or_else(|| {
             format!(
@@ -27306,12 +31953,7 @@ fn trust_mc_dataflow_chc_for_function_impl(
                 function.entry.index()
             )
         })?;
-        let entry_params = chc_block_relation_params(entry_block);
-        for (value, sort) in &entry_params {
-            chc_declare_var(&mut var_decls, *value, sort);
-        }
-        let entry_args: Vec<_> =
-            entry_params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+        let entry_args = frame.relation_arg_exprs(entry_block, &mut var_decls);
         // In ArithmeticSafetyOnly mode, constrain each unsigned ENTRY param (a
         // genuinely-free function input) with its type invariant `0 <= p <= 2^W-1`.
         // SOUND: it removes only NON-REAL negative/oversized model states of a free
@@ -27334,10 +31976,15 @@ fn trust_mc_dataflow_chc_for_function_impl(
         let Some(terminator) = block.terminator() else {
             return Ok(None);
         };
-        // `fold` (kept owned for the ArithmeticSafetyOnly error edges below) is
-        // CLONED into every outgoing transition; `overflow_violations` are the
-        // per-`Overflow` out-of-range predicates for the direct overflow edges.
-        let (fold, overflow_violations) = chc_fold_block_body(block, &mut var_decls);
+        // The block fold: its `constraints` (kept owned for the
+        // ArithmeticSafetyOnly error edges below) are CLONED into every outgoing
+        // transition; `overflow_violations` are the per-`Overflow` out-of-range
+        // predicates for the direct overflow edges; `cell_exit` is the
+        // post-store value of each promoted cell, which every outgoing edge
+        // passes for the target's cell column.
+        let block_fold = chc_fold_block_body(block, &frame, &mut var_decls);
+        let fold = block_fold.constraints.clone();
+        let overflow_violations = block_fold.overflow_violations.clone();
 
         // Tracks whether this block already routes to `error` (Structural mode
         // only), so the `reachable:false` placeholder is emitted only when it does
@@ -27349,7 +31996,15 @@ fn trust_mc_dataflow_chc_for_function_impl(
                     return Ok(None);
                 };
                 let Some(rule) =
-                    chc_transition_rule(block, target_block, args, fold.clone(), &mut var_decls)
+                    chc_transition_rule(
+                        block,
+                        target_block,
+                        args,
+                        fold.clone(),
+                        &block_fold,
+                        &frame,
+                        &mut var_decls,
+                    )
                 else {
                     return Ok(None);
                 };
@@ -27370,6 +32025,8 @@ fn trust_mc_dataflow_chc_for_function_impl(
                     then_block,
                     then_args,
                     then_constraints,
+                    &block_fold,
+                    &frame,
                     &mut var_decls,
                 ) else {
                     return Ok(None);
@@ -27387,6 +32044,8 @@ fn trust_mc_dataflow_chc_for_function_impl(
                     else_block,
                     else_args,
                     else_constraints,
+                    &block_fold,
+                    &frame,
                     &mut var_decls,
                 ) else {
                     return Ok(None);
@@ -27412,6 +32071,7 @@ fn trust_mc_dataflow_chc_for_function_impl(
                             "typed TrustIr block {} reaches an unreachable terminator",
                             block.id.index()
                         ),
+                        &frame,
                         &mut var_decls,
                     ));
                     emitted_error_rule = true;
@@ -27439,6 +32099,8 @@ fn trust_mc_dataflow_chc_for_function_impl(
                         default_block,
                         default_args,
                         fold.clone(),
+                        &block_fold,
+                        &frame,
                         &mut var_decls,
                     ) else {
                         return Ok(None);
@@ -27454,6 +32116,8 @@ fn trust_mc_dataflow_chc_for_function_impl(
                         case_block,
                         &case.args,
                         fold.clone(),
+                        &block_fold,
+                        &frame,
                         &mut var_decls,
                     ) else {
                         return Ok(None);
@@ -27476,6 +32140,8 @@ fn trust_mc_dataflow_chc_for_function_impl(
                     normal_block,
                     normal_args,
                     fold.clone(),
+                    &block_fold,
+                    &frame,
                     &mut var_decls,
                 ) else {
                     return Ok(None);
@@ -27485,7 +32151,15 @@ fn trust_mc_dataflow_chc_for_function_impl(
                     return Ok(None);
                 };
                 let Some(unwind_rule) =
-                    chc_transition_rule(block, unwind_block, &[], fold.clone(), &mut var_decls)
+                    chc_transition_rule(
+                        block,
+                        unwind_block,
+                        &[],
+                        fold.clone(),
+                        &block_fold,
+                        &frame,
+                        &mut var_decls,
+                    )
                 else {
                     return Ok(None);
                 };
@@ -27518,6 +32192,7 @@ fn trust_mc_dataflow_chc_for_function_impl(
                                 block.id.index(),
                                 instruction.inst
                             ),
+                            &frame,
                             &mut var_decls,
                         ));
                         emitted_error_rule = true;
@@ -27531,6 +32206,7 @@ fn trust_mc_dataflow_chc_for_function_impl(
                             "typed TrustIr block {} has no reachable native trust-mc admission error",
                             block.id.index()
                         ),
+                        &frame,
                         &mut var_decls,
                     ));
                 }
@@ -27542,8 +32218,34 @@ fn trust_mc_dataflow_chc_for_function_impl(
             // violation is tied to the block params.
             ChcErrorMode::ArithmeticSafetyOnly => {
                 for violation in &overflow_violations {
-                    rules.push(chc_overflow_error_rule(block, &fold, violation, &mut var_decls));
+                    rules.push(chc_overflow_error_rule(
+                        block,
+                        &fold,
+                        violation,
+                        &frame,
+                        &mut var_decls,
+                    ));
                     any_overflow_error = true;
+                }
+            }
+            // PostconditionGoal: the ONLY `error` edge is the obligation's own VC
+            // at a RETURN block. Emitted for EVERY return block, so a function
+            // with several returns is covered at all of them rather than at one.
+            ChcErrorMode::PostconditionGoal => {
+                if let Some(trust_ir::Inst::Return { values }) =
+                    block.terminator().map(|terminator| &terminator.inst)
+                    && let Some(returned) = values.first()
+                    && let Some(vc) = goal
+                {
+                    rules.push(chc_postcondition_goal_error_rule(
+                        block,
+                        &fold,
+                        *returned,
+                        vc,
+                        &frame,
+                        &mut var_decls,
+                    ));
+                    any_postcondition_error = true;
                 }
             }
         }
@@ -27556,8 +32258,94 @@ fn trust_mc_dataflow_chc_for_function_impl(
         return Ok(None);
     }
 
-    let vars: Vec<serde_json::Value> = var_decls.into_values().collect();
+    // Same discipline one mode over: a PostconditionGoal CHC with no goal edge
+    // (no `Return` terminator, or a `Return` with no value) proves `error`
+    // unreachable trivially, which would be a false SAFE for the redirected
+    // postcondition. Fall back to the single-formula path.
+    if error_mode == ChcErrorMode::PostconditionGoal && !any_postcondition_error {
+        return Ok(None);
+    }
+
+    // Substitute away the fold's var-to-var copy equalities in EVERY rule. See
+    // `chc_collapse_rule_copy_equalities`: without this, proof-grade PDR returns
+    // `Inconclusive` on the systems this encoder emits.
+    let rules: Vec<serde_json::Value> =
+        rules.into_iter().map(chc_collapse_rule_copy_equalities).collect();
+
+    let vars: Vec<serde_json::Value> = var_decls.into_vars();
     Ok(Some((serde_json::Value::Array(relations), serde_json::Value::Array(rules), vars)))
+}
+
+/// **THE SINGLE SOURCE OF TRUTH for a postcondition's enriched typed CHC.**
+///
+/// `validate_compiler_canonical_trust_mc_semantic_projection`
+/// (`crates/trust-bmc/src/verifier_api.rs`) compares the compiler's PUBLIC
+/// canonical typed trust_mc contract against the AUTHENTICATED NATIVE marker
+/// contract over every semantic field — `relations`, `rules` and `vars`
+/// included; only `obligation_id` and `native_metadata` are reconciled. The two
+/// contracts are built by two DIFFERENT functions
+/// (`trust_mc_public_typed_chc_contract_for_obligation` and
+/// `trust_mc_typed_chc_contract_for_native_trust_ir_obligation`), so anything
+/// that changes one must change the other in the same landing or the binding is
+/// REJECTED and the obligation never reaches the solver.
+///
+/// Enriching only the native side is exactly the mistake that produced
+///
+/// ```text
+///   native trust_mc public/TrustIr claim binding rejected: … semantic CHC
+///   fields differ from authenticated native marker contract
+/// ```
+///
+/// on `vc:f_loop:postcondition:1`. Rather than write the encoding twice and hope
+/// the two stay equal, BOTH builders call this function. Agreement is then by
+/// construction, and a future encoder change cannot silently break the binding.
+///
+/// Returns `None` — meaning "use the flattened single-clause form" — for every
+/// obligation that is not an enrichable loop-carried postcondition, and whenever
+/// the encoder's own fail-closed gates decline.
+fn trust_mc_postcondition_goal_typed_chc(
+    function: Option<&trust_ir::Function>,
+    obligation: &trust_verifier_api::TrustObligation,
+    chc_constraint: &TrustMcTypedChcConstraint,
+    lowering_supported: bool,
+) -> Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)> {
+    if !lowering_supported
+        || !matches!(obligation.kind, trust_verifier_api::ObligationKind::Postcondition)
+    {
+        return None;
+    }
+    // Restricted to functions with a CFG back edge: that is exactly where the
+    // flattened path is weak (it havocs loop-carried state), and a straight-line
+    // postcondition keeps its untouched path and cannot regress.
+    let function = function?;
+    if !function_has_back_edge(function) {
+        return None;
+    }
+    let (relations, rules, encoder_vars) = trust_mc_dataflow_chc_for_function(
+        function,
+        ChcErrorMode::PostconditionGoal,
+        Some(&chc_constraint.constraint),
+    )
+    .ok()
+    .flatten()?;
+    // The goal edge embeds the obligation's VC, so the VC's own declarations
+    // (`_0`, the parameters, the versioned body locals) ride along with the
+    // encoder's `v*` namespace. Encoder declarations win on a name clash. This
+    // merge is part of the shared output ON PURPOSE — `vars` is one of the
+    // compared fields.
+    let mut vars = encoder_vars;
+    let mut seen: FxHashSet<String> = vars
+        .iter()
+        .filter_map(|var| var.get("name").and_then(|name| name.as_str()))
+        .map(str::to_string)
+        .collect();
+    for var in &chc_constraint.vars {
+        let Some(name) = var.get("name").and_then(|name| name.as_str()) else { continue };
+        if seen.insert(name.to_string()) {
+            vars.push(var.clone());
+        }
+    }
+    Some((relations, rules, vars))
 }
 
 fn trust_mc_public_typed_chc_contract_for_obligation(
@@ -27565,6 +32353,7 @@ fn trust_mc_public_typed_chc_contract_for_obligation(
     func: &trust_types::VerifiableFunction,
     expected_crate_name: Option<&str>,
     obligation: &trust_verifier_api::TrustObligation,
+    native_function: Option<&trust_ir::Function>,
 ) -> Result<Option<trust_verifier_api::TrustContract>, String> {
     if obligation.is_default_admission()
         || obligation_is_synthesized_whole_function_panic_freedom(
@@ -27587,18 +32376,35 @@ fn trust_mc_public_typed_chc_contract_for_obligation(
             obligation.obligation_id.as_bytes(),
         )
     );
+    // Shared with the authenticated native marker contract — see
+    // `trust_mc_postcondition_goal_typed_chc`. These three fields are compared
+    // field-for-field against that contract, so they must come from ONE
+    // computation, never from two that are meant to coincide.
+    let (relations, rules, vars) = match trust_mc_postcondition_goal_typed_chc(
+        native_function,
+        obligation,
+        &chc_constraint,
+        true,
+    ) {
+        Some((relations, rules, vars)) => (relations, rules, vars),
+        None => (
+            serde_json::json!([{ "name": "error" }]),
+            serde_json::json!([{
+                "head": { "name": "error" },
+                "body": { "constraints": [chc_constraint.constraint] },
+            }]),
+            chc_constraint.vars.clone(),
+        ),
+    };
     let value = serde_json::json!({
         "schema_version": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA,
         "obligation_id": obligation.obligation_id,
         "origin": "mir_derived",
         "function_name": native_function_name,
         "query": { "target": "error" },
-        "vars": chc_constraint.vars,
-        "relations": [{ "name": "error" }],
-        "rules": [{
-            "head": { "name": "error" },
-            "body": { "constraints": [chc_constraint.constraint] },
-        }],
+        "vars": vars,
+        "relations": relations,
+        "rules": rules,
     });
     Ok(Some(trust_verifier_api::TrustContract {
         contract_id,
@@ -27752,6 +32558,7 @@ fn finalize_trust_mc_public_semantic_contracts(
     func: &trust_types::VerifiableFunction,
     bundle: &mut trust_verifier_api::TrustContractBundle,
     bindings: &[PendingNativeTrustIrBinding],
+    native_function: Option<&trust_ir::Function>,
 ) -> Result<(), String> {
     let expected_crate_name = match &bundle.subject {
         trust_verifier_api::BundleSubject::Function { crate_name, path }
@@ -27776,6 +32583,7 @@ fn finalize_trust_mc_public_semantic_contracts(
             func,
             expected_crate_name.as_deref(),
             obligation,
+            native_function,
         )?
         else {
             continue;
@@ -32748,227 +37556,11 @@ fn keep_exact_source_clause_markers_pending(
     reset
 }
 
-/// Trust: WHOLE-FUNCTION PANIC-FREEDOM BY STRUCTURAL SUBSUMPTION — the
-/// default-lane analogue of trust-mc's trivially-safe whole-function harness,
-/// generalized from "the CHC has no error rule" to "every error rule
-/// individually carries a private static proof".
-///
-/// The synthesized `assertion:panic-freedom:0` aggregate claims "no assertion,
-/// `unreachable!`, or panic is reachable" for the WHOLE function. Its native
-/// discharge (typed CHC/PDR) is blocked for every loop-bearing module by the
-/// proof-grade admission whitelist, so a function whose every per-site VC the
-/// formula lane PROVED (kernel-certified!) still failed strict verification —
-/// the measured residual on ~19 `tests/trust-falsification/proved/` fixtures
-/// (e.g. `foreach_range_safe`: "1 proved, 0 failed, 1 unknown" where the
-/// unknown is exactly this aggregate).
-///
-/// SOUNDNESS — the aggregate is ENTAILED by the conjunction of the other rows
-/// when all three hold:
-///  (1) `native_bundle_built`: typed-TrustIr lowering COMPLETED, so the row
-///      set enumerates every panic source (assert/panic sites, calls, drops).
-///      An unlowerable construct either hard-aborts (never reaches here with
-///      `Ok(Some)`) or folds into the aggregate's DESCRIPTION — excluded by
-///      (2). The bridge's own discipline mints a fail-closed row for every
-///      call it cannot prove total (absent-callee / expected-absent /
-///      drop-glue markers), and such a row is never `proved`, so it blocks
-///      (3).
-///  (2) the aggregate still carries the CANONICAL description — a folded
-///      extern-call / absent-callee / drop-glue gap replaces the text
-///      (`extern_call_description`) and is NEVER subsumed;
-///  (3) every OTHER row is `is_static_proof_for` under its own FINAL private
-///      authority (this pass runs LAST in the authority phase). Assumption
-///      bookkeeping (`DefinitionEntryAssumption`,
-///      `AssumedTotalCalleeAssumption`) is not a static proof and blocks the
-///      discharge. A `Failed`/`Timeout` row anywhere suppresses it entirely —
-///      a refutation or a coverage gap is never papered over.
-///
-/// MUTANT ARGUMENT (the falsification gate's 148 buggy twins): a mutant with a
-/// real panic mints a per-site row that is Failed/refuted (blocks via the
-/// any-Failed bail) or Unknown (blocks (3)); a mutant panicking through an
-/// absent callee mints the bridge's fail-closed assumption row (never proved —
-/// blocks (3)) or folds into the aggregate description (blocks (2)); a mutant
-/// whose construct cannot lower loses `native_bundle_built` (blocks (1)).
-/// Havoc-modeled values only ever make premises HARDER to prove. So the flip
-/// can never fire for a function with an unruled-out panic path.
-fn apply_whole_function_panic_freedom_subsumption(
-    sess: &Session,
-    native_bundle_built: bool,
-    results: &mut [(VerificationCondition, VerificationResult)],
-    result_bindings: &[Option<ResultObligationBinding>],
-    proof_authorities: &mut [Option<ResultProofAuthority>],
-) {
-    let dbg = env_flag_enabled("TRUST_ASSERT_DEBUG");
-    if !native_bundle_built || results.is_empty() {
-        if dbg {
-            eprintln!(
-                "[PF_SUBSUME] bail: native_bundle_built={native_bundle_built} results={}",
-                results.len()
-            );
-        }
-        return;
-    }
-    if results.len() != proof_authorities.len() {
-        if dbg {
-            eprintln!(
-                "[PF_SUBSUME] bail: len mismatch results={} authorities={}",
-                results.len(),
-                proof_authorities.len()
-            );
-        }
-        return;
-    }
-    let canonical = trust_types::assumption::PANIC_FREEDOM_AGGREGATE_DESCRIPTION_PREFIX;
-    let mut aggregates: Vec<usize> = Vec::new();
-    for (index, (vc, result)) in results.iter().enumerate() {
-        // A refuted or timed-out row ANYWHERE in the function suppresses the
-        // whole discharge: a refutation is never overridden, and a timeout is
-        // an unruled-out path, not a premise.
-        if matches!(result, VerificationResult::Failed { .. } | VerificationResult::Timeout { .. })
-        {
-            if dbg {
-                eprintln!("[PF_SUBSUME] bail: row {index} is Failed/Timeout kind={:?}", vc.kind);
-            }
-            return;
-        }
-        // The aggregate reaches this pipeline in one of TWO VC shapes:
-        //  * the fresh synthesis `Assertion { message }` with the canonical
-        //    text (`legacy_vc_from_api_obligation`'s recognized arm), or
-        //  * the legacy placeholder `UnsupportedMir { kind:
-        //    "FullVerification::Assertion", detail }` whose `detail` embeds the
-        //    obligation description verbatim (canonical text first, then the
-        //    `; metadata_keys=[…]` suffix) — the shape measured on
-        //    foreach_range_safe.
-        // In BOTH shapes a folded extern-call/absent-callee/drop-glue gap
-        // REPLACES the leading description, so the canonical-prefix test is the
-        // same exclusion in either spelling.
-        let described = match &vc.kind {
-            VcKind::Assertion { message } => message.as_str(),
-            VcKind::UnsupportedMir { kind, detail } if kind == "FullVerification::Assertion" => {
-                detail.as_str()
-            }
-            _ => continue,
-        };
-        if !described.starts_with(canonical) {
-            continue;
-        }
-        if result.is_proved() && proof_authorities.get(index).and_then(Option::as_ref).is_some() {
-            // Already discharged by a real engine WITH its own authority —
-            // nothing to derive.
-            continue;
-        }
-        // A Proved-but-AUTHORITYLESS aggregate (the native import path: the
-        // opaque `panic_reachable` formula can earn neither a kernel cert nor
-        // a revalidation receipt) still needs the subsumption token or the
-        // native proof-authority validation rejects it. The mint below never
-        // overwrites an existing authority and preserves an already-Proved
-        // result.
-        aggregates.push(index);
-    }
-    if aggregates.is_empty() {
-        if dbg {
-            eprintln!("[PF_SUBSUME] bail: no canonical aggregate among {} rows:", results.len());
-            for (i, (vc, r)) in results.iter().enumerate() {
-                eprintln!("[PF_SUBSUME]   row {i}: kind={:?} proved={} ", &vc.kind, r.is_proved());
-            }
-        }
-        return;
-    }
-    // Every NON-aggregate row must be a real static proof under its own final
-    // private authority (assumption bookkeeping is excluded by the predicate).
-    let premises_hold = results.iter().enumerate().all(|(index, (vc, result))| {
-        if aggregates.contains(&index) {
-            return true;
-        }
-        result.is_proved()
-            && proof_authorities.get(index).and_then(Option::as_ref).is_some_and(|authority| {
-                authority.is_static_proof_for(
-                    index,
-                    vc,
-                    result,
-                    result_bindings.get(index).and_then(Option::as_ref),
-                )
-            })
-    });
-    if !premises_hold {
-        if dbg {
-            for (index, (vc, result)) in results.iter().enumerate() {
-                if aggregates.contains(&index) {
-                    continue;
-                }
-                let ok = result.is_proved()
-                    && proof_authorities.get(index).and_then(Option::as_ref).is_some_and(
-                        |authority| {
-                            authority.is_static_proof_for(
-                                index,
-                                vc,
-                                result,
-                                result_bindings.get(index).and_then(Option::as_ref),
-                            )
-                        },
-                    );
-                if !ok {
-                    eprintln!(
-                        "[PF_SUBSUME] premise FAILS: row {index} kind={:?} proved={} authority={}",
-                        &vc.kind,
-                        result.is_proved(),
-                        proof_authorities
-                            .get(index)
-                            .and_then(Option::as_ref)
-                            .map_or("none", |_| "some(non-static?)")
-                    );
-                }
-            }
-        }
-        return;
-    }
-    for index in aggregates {
-        // The aggregate is a native-requested obligation; a missing or
-        // mismatched binding means this is not the exact bound row — bail
-        // fail-closed rather than mint on a moved identity.
-        let binding = result_bindings
-            .get(index)
-            .and_then(Option::as_ref)
-            .cloned()
-            .filter(|binding| binding.matches_row(index, &results[index].0));
-        if binding.is_none() && !row_was_compiler_grounded(sess, index, &results[index].0) {
-            // No binding AND no recorded compiler grounding: this row's public
-            // identity is simply absent, not deliberately retired. Fail closed.
-            if dbg {
-                eprintln!(
-                    "[PF_SUBSUME] bail: aggregate row {index} has no matching binding and was not compiler-grounded"
-                );
-            }
-            continue;
-        }
-        let Some(row) = exact_result_row_identity(index, &results[index].0) else {
-            if dbg {
-                eprintln!("[PF_SUBSUME] bail: aggregate row {index} has no exact identity");
-            }
-            continue;
-        };
-        if !results[index].1.is_proved() {
-            results[index].1 = VerificationResult::Proved {
-                solver: trust_types::Symbol::intern("trust-structural-subsumption"),
-                time_ms: 0,
-                // A deductive conjunction over sound premises; the row's
-                // REPORTED tier comes from `trust_disposition_for_authority`
-                // (Trusted/Deductive), never from this label.
-                strength: trust_types::ProofStrength::deductive(),
-                proof_certificate: None,
-                solver_warnings: None,
-                native_proof_envelope: None,
-            };
-        }
-        proof_authorities[index] =
-            Some(ResultProofAuthority::WholeFunctionPanicFreedomSubsumption { row, binding });
-        if env_flag_enabled("TRUST_ASSERT_DEBUG") {
-            eprintln!(
-                "[PANIC_FREEDOM_SUBSUMPTION] discharged aggregate row {index} for {}",
-                results[index].0.function.as_str()
-            );
-        }
-    }
-}
+// The whole-function panic-freedom STRUCTURAL SUBSUMPTION lane used to live
+// here. It was REMOVED on 2026-08-14 as a live false proof; see the tombstone
+// on `ResultProofAuthority` for the mechanism, and
+// `refute_full_assert_obligations` for the sound per-site lane that discharges
+// the same `assertion:panic-freedom:0` aggregate.
 
 /// Apply (or re-apply) exact source-clause derivations after the ordinary body
 /// authorities have been minted.
@@ -35248,20 +39840,10 @@ fn attach_full_verification_transport_evidence(
     }
     transport.obligation_id = Some(obligation.obligation_id.clone());
 
-    if matches!(
-        authority,
-        Some(
-            ResultProofAuthority::CallerPropagation { .. }
-                | ResultProofAuthority::WholeFunctionPanicFreedomSubsumption { .. }
-        )
-    ) {
+    if matches!(authority, Some(ResultProofAuthority::CallerPropagation { .. })) {
         // Preserve public traceability only. R1's proof is the private sealed
-        // certificate, and the panic-freedom subsumption's proof is the
-        // compiler-composed conjunction over its premise rows; neither native
-        // evidence nor a skipped native row is an honest public proof envelope
-        // for either closed-world derivation (the native lane returned
-        // Unsupported for the aggregate — attaching that envelope to a proved
-        // row would misattribute the proof).
+        // certificate; neither native evidence nor a skipped native row is an
+        // honest public proof envelope for that closed-world derivation.
         return;
     }
 
@@ -35306,9 +39888,8 @@ fn attach_full_verification_transport_evidence(
             | ResultProofAuthority::DefinitionEntryAssumption { .. }
             | ResultProofAuthority::AssumedTotalCalleeAssumption { .. }
             | ResultProofAuthority::SolverRevalidated { .. }
-            | ResultProofAuthority::CallerPropagation { .. }
-            // Unreachable: both closed-world derivations early-returned above.
-            | ResultProofAuthority::WholeFunctionPanicFreedomSubsumption { .. },
+            // Unreachable: the closed-world derivation early-returned above.
+            | ResultProofAuthority::CallerPropagation { .. },
         )
         | None => index.evidence_by_obligation_id.get(obligation.obligation_id.as_str()).copied(),
     };
@@ -36182,18 +40763,30 @@ const COROUTINE_PROTOCOL_ASSUMPTION_DETAIL: &str = "coroutine resume-state execu
 /// alignment, invalid-enum, and future assert kinds remain ordinary fail-closed
 /// safety obligations in vcgen.
 fn body_has_coroutine_protocol_assert(body: &Body<'_>) -> bool {
-    body.basic_blocks.iter().any(|block| {
-        matches!(
-            &block.terminator().kind,
-            TerminatorKind::Assert { msg, .. }
-                if matches!(
-                    msg.as_ref(),
-                    rustc_middle::mir::AssertKind::ResumedAfterReturn(_)
-                        | rustc_middle::mir::AssertKind::ResumedAfterPanic(_)
-                        | rustc_middle::mir::AssertKind::ResumedAfterDrop(_)
-                )
-        )
-    })
+    count_coroutine_protocol_asserts(body) != 0
+}
+
+/// Exact count of the coroutine executor-protocol sentinels in this optimized
+/// MIR body. The coroutine resume-state contract upgrade requires the bridge's
+/// evidence to account for EVERY one of them (a pruned or dropped sentinel
+/// withholds the contract row, fail-closed). Same exact allowlist as
+/// [`body_has_coroutine_protocol_assert`].
+fn count_coroutine_protocol_asserts(body: &Body<'_>) -> usize {
+    body.basic_blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                &block.terminator().kind,
+                TerminatorKind::Assert { msg, .. }
+                    if matches!(
+                        msg.as_ref(),
+                        rustc_middle::mir::AssertKind::ResumedAfterReturn(_)
+                            | rustc_middle::mir::AssertKind::ResumedAfterPanic(_)
+                            | rustc_middle::mir::AssertKind::ResumedAfterDrop(_)
+                    )
+            )
+        })
+        .count()
 }
 
 /// Add exactly one coroutine-protocol assumption while preserving all real
@@ -36204,11 +40797,7 @@ fn rows_with_coroutine_protocol_assumption(
     tcx: TyCtxt<'_>,
     body: &Body<'_>,
     rows: &[TransportObligationResult],
-) -> Option<Vec<TransportObligationResult>> {
-    if !body_has_coroutine_protocol_assert(body) {
-        return None;
-    }
-
+) -> Vec<TransportObligationResult> {
     let row_kind = format!("assumption:{COROUTINE_PROTOCOL_ASSUMPTION_TAG}");
     let mut out: Vec<_> = rows.iter().filter(|row| row.kind != row_kind).cloned().collect();
     let mut coroutine_row = transport_assumption_row(
@@ -36224,7 +40813,212 @@ fn rows_with_coroutine_protocol_assumption(
             .to_string(),
     );
     out.push(coroutine_row);
-    Some(out)
+    out
+}
+
+/// The PURE publish decision for a coroutine body's executor-protocol premise
+/// — the ONE seam that couples the bridge's entry resume-state `Assume`
+/// (witnessed by `evidence`, minted only from the live lowered module) to a
+/// published row. Structural invariant, enforced by this match shape rather
+/// than by distant agreement between the bridge and this file: once evidence
+/// exists for the function, `NotACoroutineResumeBody` (publish NOTHING) is
+/// unreachable — the premise publishes either as the contract row or as the
+/// assumption row (with the strict abort), EVEN IF the MIR sentinel count is
+/// zero. The D1 defect was exactly the unpaired state this rules out: an
+/// entry `Assume` narrowing the selector while no row (and no abort) ever
+/// surfaced the pruned premise.
+enum CoroutineProtocolPublishDecision {
+    /// No `ResumedAfter*` sentinel in the MIR body AND no bridge contract
+    /// engagement: not a coroutine resume body — publish nothing (nothing was
+    /// assumed).
+    NotACoroutineResumeBody,
+    /// The authenticated evidence accounts for every MIR sentinel and every
+    /// published row is statically proved with the sentinel proof visible:
+    /// publish the `contract:coroutine-resume-state` row.
+    PublishContractRow,
+    /// Every other engaged state: publish the fail-closed
+    /// `assumption:coroutine` row (strict / memory-safe lanes then reject the
+    /// unproved premise).
+    PublishAssumptionRow,
+}
+
+fn coroutine_protocol_publish_decision(
+    sentinel_count: usize,
+    evidence: Option<&trust_ir_bridge::CoroutineResumeContractModuleEvidence>,
+    rows_all_statically_proved: bool,
+    sentinel_proof_visible: bool,
+) -> CoroutineProtocolPublishDecision {
+    match evidence {
+        None if sentinel_count == 0 => CoroutineProtocolPublishDecision::NotACoroutineResumeBody,
+        Some(evidence)
+            if evidence.sentinel_obligation_count == sentinel_count
+                && rows_all_statically_proved
+                && sentinel_proof_visible =>
+        {
+            CoroutineProtocolPublishDecision::PublishContractRow
+        }
+        // Sentinels with no (or mismatched) evidence, unproved rows, invisible
+        // sentinel proofs — and the D1 arm: evidence with zero MIR sentinels.
+        _ => CoroutineProtocolPublishDecision::PublishAssumptionRow,
+    }
+}
+
+/// How a coroutine body's executor-protocol premise publishes.
+enum CoroutineProtocolDisposition {
+    /// The bridge converted EVERY sentinel to a refutable obligation under the
+    /// recognized resume-state contract AND every published row is statically
+    /// proved: the premise publishes as a `contract:coroutine-resume-state`
+    /// row (verified-modulo-callers) and strict does NOT abort.
+    ContractPublished(Vec<TransportObligationResult>),
+    /// Today's fail-closed path: exactly one additive `assumption:coroutine`
+    /// skipped row; strict and memory-safe lanes reject the unproved premise.
+    UnprovedAssumption(Vec<TransportObligationResult>),
+}
+
+/// Decide how this coroutine body's protocol premise publishes. `None` ONLY
+/// when the body carries no `ResumedAfter*` sentinel AND the bridge's contract
+/// lane never engaged (no authenticated evidence for this function) — i.e. not
+/// a coroutine resume body. Once evidence exists, the routing through
+/// [`coroutine_protocol_publish_decision`] structurally guarantees a published
+/// row: contract, or assumption + strict abort (the D1 coupling).
+///
+/// The upgrade to [`CoroutineProtocolDisposition::ContractPublished`] requires
+/// ALL of (fail-closed on each):
+///  1. the bridge's authenticated module evidence
+///     (`artifacts.coroutine_resume_contract`, minted only from the live native
+///     bundle — never transport text, never re-pattern-matched MIR);
+///  2. the evidence accounting for EXACTLY the MIR body's sentinel count (a
+///     pruned/dropped sentinel keeps the assumption + abort);
+///  3. every published row statically PROVED (post-demotion `Outcome::Proved`;
+///     design-mandate inventory rows excepted) — the sentinel obligations are
+///     real refutable rows now, so an unproved/refuted sentinel blocks here;
+///  4. the sentinel proof VISIBLE among the rows (per-sentinel marker rows
+///     matching the evidence count, or the whole-function panic-freedom
+///     aggregate row proved) — the anti-silent-drop belt: "all rows proved"
+///     must never be vacuously true because the solver never saw the
+///     sentinels (the R3 counted-carrier fail-open class).
+fn coroutine_protocol_disposition(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+    rows: &[TransportObligationResult],
+    artifacts: &VerificationArtifacts,
+    func_path: &str,
+) -> Option<CoroutineProtocolDisposition> {
+    let sentinel_count = count_coroutine_protocol_asserts(body);
+    // Evidence is only ever consulted for THIS function; another bundled
+    // coroutine's evidence neither publishes nor suppresses anything here.
+    let evidence = artifacts
+        .coroutine_resume_contract
+        .as_ref()
+        .filter(|evidence| evidence.function_def_path == func_path);
+    let decision = coroutine_protocol_publish_decision(
+        sentinel_count,
+        evidence,
+        coroutine_contract_rows_all_statically_proved(rows),
+        evidence
+            .is_some_and(|evidence| rows_exhibit_coroutine_sentinel_proof(rows, evidence, func_path)),
+    );
+    match decision {
+        CoroutineProtocolPublishDecision::NotACoroutineResumeBody => None,
+        CoroutineProtocolPublishDecision::PublishContractRow => {
+            let evidence =
+                evidence.expect("PublishContractRow is only reachable with evidence present");
+            // Strip any pre-existing row that CLAIMS the published kinds (only
+            // this seam may mint them), then publish the single contract row.
+            let contract_kind = trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND;
+            let assumption_kind = format!("assumption:{COROUTINE_PROTOCOL_ASSUMPTION_TAG}");
+            let mut out: Vec<TransportObligationResult> = rows
+                .iter()
+                .filter(|row| row.kind != contract_kind && row.kind != assumption_kind)
+                .cloned()
+                .collect();
+            out.push(coroutine_resume_contract_transport_row(tcx, body, evidence));
+            Some(CoroutineProtocolDisposition::ContractPublished(out))
+        }
+        CoroutineProtocolPublishDecision::PublishAssumptionRow => {
+            Some(CoroutineProtocolDisposition::UnprovedAssumption(
+                rows_with_coroutine_protocol_assumption(tcx, body, rows),
+            ))
+        }
+    }
+}
+
+/// Every row statically proved (post-demotion), so the coroutine body's whole
+/// obligation surface — including the now-refutable sentinel obligations —
+/// carries real proof. Design-mandate rows are inventory, not discharge
+/// targets (their violation formula is the tautology `true`), mirroring
+/// `extern_call_demotion_others_all_proved`. Empty row sets DECLINE: a
+/// zero-row coroutine body means the sentinel obligations never surfaced.
+fn coroutine_contract_rows_all_statically_proved(rows: &[TransportObligationResult]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| row.design_mandate || row.outcome == Outcome::Proved)
+}
+
+/// The anti-silent-drop belt for the contract upgrade: the sentinel proof must
+/// be VISIBLE in the published rows, in one of the two shapes the counted
+/// carrier machinery can surface it as — (a) every bridge-marked sentinel
+/// obligation as its own PROVED row (count must equal the evidence's), or
+/// (b) the whole-function panic-freedom AGGREGATE row proved (identified by
+/// its exact compiler-minted obligation id — it subsumes the per-site
+/// sentinel asserts, which the evidence certifies are refutable `Inst::Assert`s
+/// in the very module that aggregate was solved over).
+fn rows_exhibit_coroutine_sentinel_proof(
+    rows: &[TransportObligationResult],
+    evidence: &trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+    func_path: &str,
+) -> bool {
+    let marked_proved = rows
+        .iter()
+        .filter(|row| {
+            row.outcome == Outcome::Proved
+                && trust_types::assumption::parse_coroutine_resume_contract_obligation_description(
+                    &row.description,
+                )
+                .is_some_and(|(states, _)| states == evidence.live_states)
+        })
+        .count();
+    if marked_proved == evidence.sentinel_obligation_count {
+        return true;
+    }
+    let aggregate_id = format!(
+        "vc:{}:assertion:panic-freedom:0",
+        trust_types::canonical_artifact_id_component(func_path)
+    );
+    rows.iter().any(|row| {
+        row.outcome == Outcome::Proved
+            && row.obligation_id.as_deref() == Some(aggregate_id.as_str())
+    })
+}
+
+/// The published `contract:coroutine-resume-state` row. `Outcome::Skipped` on
+/// the wire — a published contract is conditional evidence, never solver proof
+/// credit — with the exact kind/solver/reason triple targo's fail-closed shape
+/// check requires (a hand-built row that merely claims the kind cannot green).
+fn coroutine_resume_contract_transport_row(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+    evidence: &trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+) -> TransportObligationResult {
+    TransportObligationResult {
+        monitor: None,
+        obligation_id: None,
+        claim_digest_sha256: None,
+        kind: trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND.to_string(),
+        typed_kind: None,
+        description: trust_types::assumption::coroutine_resume_contract_row_description(
+            &evidence.live_states,
+        ),
+        location: Some(source_span_from_rustc_span(tcx, body.span)),
+        outcome: Outcome::Skipped,
+        solver: trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_SOLVER.to_string(),
+        time_ms: 0,
+        counterexample: None,
+        counterexample_model: None,
+        reason: Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON.to_string()),
+        design_mandate: false,
+        native_trust_ir: None,
+        proof_evidence: None,
+    }
 }
 
 /// Reject the unproved coroutine executor-protocol premise in every fail-closed
@@ -36424,6 +41218,37 @@ fn transport_row_is_unproved_assumption_panic(row: &TransportObligationResult) -
     transport_row_is_unproved_absent_callee(row)
         || transport_row_is_unproved_expected_absent_callee(row)
         || transport_row_is_unproved_drop_glue(row)
+        || transport_row_is_fatal_unproved_extern_call(row)
+}
+
+/// Trust (fmt-frontier P0): the extern print/format/write DISPATCH rows that must
+/// keep the fail-closed lane FATAL — every leg except the one `fmt::format` leg
+/// that b59 deliberately made demotable under its own two gates.
+///
+/// This closes a MEASURED fail-open. `impl Display for S { fn fmt(&self, f) {
+/// write!(f, "S") } }` compiled with `-Ztrust-verify=on` returned rc=0 while the
+/// identical program PANICKED at runtime: `write!` lowers to `Formatter::write_fmt`,
+/// which `extern_fmt_dispatch_call` classes as an extern-call row, and that class
+/// was absent from this predicate — so the row was neither proved nor fatal.
+///
+/// The split was BACKWARDS. `write_fmt`/`fmt::write` drive ARBITRARY user
+/// `Display`/`Debug::fmt` impls (a `todo!()` in any one of them panics) and the
+/// `_print`/`_eprint` legs additionally hit a broken pipe / SIGPIPE, whereas the
+/// harsher-treated `Formatter::write_str` forwards a SINGLE vtable call. The more
+/// dangerous class was the tolerated one.
+///
+/// `alloc::fmt::format` is excluded because it is not tolerated here by accident:
+/// b59 gates it on the function being unsafe-free AND every other obligation being
+/// Proved, and routes it through `demote_fmt_format_extern_call_transport_rows`
+/// into a RECORDED `assumption:extern-call` ledger row. That is a carried
+/// condition, not a silent pass, so it keeps its existing path.
+///
+/// SOUNDNESS: an extern-call row is never `Proved` (the bridge lowers the site with
+/// a reachable `Assert(false)+NoPanic` marker), so making it fatal cannot
+/// false-refute provably-safe code.
+fn transport_row_is_fatal_unproved_extern_call(row: &TransportObligationResult) -> bool {
+    transport_row_is_unproved_extern_call(row)
+        && !transport_row_is_unproved_fmt_format_extern_call(row)
 }
 
 /// Trust: fail-closed on absent-callee / expected-absent / drop-glue panic. Does
@@ -36438,6 +41263,29 @@ fn transport_rows_have_unproved_assumption_panic(rows: &[TransportObligationResu
 
 fn artifacts_have_unproved_assumption_panic(artifacts: &VerificationArtifacts) -> bool {
     artifacts.transport_results.iter().any(transport_row_is_unproved_assumption_panic)
+}
+
+/// Trust (assumption-root gate), IN-BAND half: does this body's own ledger show a
+/// `#[trust::assume_total]` axiom being SPENT — either as a recorded
+/// `assumption:assumed-total-callee` row, or as the in-process
+/// `trust-assumed-total` discharge that mints one?
+///
+/// The out-of-band census (`verdict_rests_on_user_axiom`) is what closes the
+/// measured hole, because in the reduction case there is no row here at all. This
+/// predicate is the other direction: whenever the axiom DID leave a row, the
+/// refusal follows from the body's own ledger and does not depend on the census
+/// having been taken. Two independent witnesses of one fact, both fail-closed;
+/// neither is load-bearing alone.
+///
+/// `transport_row_is_unproved_assumed_total_callee` matches on a description
+/// substring, and that string is user-reachable (its own doc records the hazard).
+/// Used HERE it can only cost completeness: a forged marker declines a premise,
+/// never grants one.
+fn artifacts_spend_a_user_assumed_total_axiom(artifacts: &VerificationArtifacts) -> bool {
+    artifacts.transport_results.iter().any(|row| {
+        transport_row_is_assumed_total_assumption(row)
+            || transport_row_is_unproved_assumed_total_callee(row)
+    }) || artifacts.results.iter().any(|(_, result)| is_assumed_total_discharge(result))
 }
 
 /// Trust (assumption ledger, W3.6): does this transport row count as a REAL
@@ -38629,6 +43477,21 @@ fn encode_counterexample_value(value: &CounterexampleValue) -> i128 {
         _ => 0,
     }
 }
+
+/// Trust rung 1: `#[trust::panic_free]` on a trait method definition, inherited
+/// by every impl, discharged per impl. See the module docs for the soundness
+/// argument and the exact reliance gate.
+pub(crate) mod trait_panic_free;
+
+/// Trust rung 1, §(c) for `dyn` dispatch: the two completeness certificates that
+/// let an `InstanceKind::Virtual` call discharge its panic-freedom obligation.
+pub(crate) mod dyn_dispatch_reliance;
+
+/// Trust rung 1, §(c) for core's default `fmt::Write::write_fmt`: the audited
+/// reduction that transfers a `write!(w, "literal")` call's panic-freedom
+/// obligation onto the receiver's own `write_str` body, which must then discharge
+/// it on its own independent verdict.
+pub(crate) mod static_str_write_fmt;
 
 #[cfg(test)]
 #[allow(deprecated)]

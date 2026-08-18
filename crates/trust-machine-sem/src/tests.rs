@@ -1757,8 +1757,8 @@ fn test_adrp_x0_produces_reg_write() {
 
 #[test]
 fn test_aarch64_dmb_ish_produces_sync_boundary_and_pc_advance() {
-    // DMB ISH — encoding: 0xD5033B9F
-    let insn = decode_aarch64(&0xD5033B9Fu32.to_le_bytes(), 0x1000).expect("decode DMB");
+    // DMB ISH — encoding: 0xD5033BBF
+    let insn = decode_aarch64(&0xD5033BBFu32.to_le_bytes(), 0x1000).expect("decode DMB");
     let effects = sem().effects(&state(), &insn).expect("effects");
 
     assert_eq!(effects.len(), 2, "DMB should produce boundary + PC effects");
@@ -1882,4 +1882,347 @@ fn test_add_w0_w1_w2_32bit() {
     let has_reg_write =
         effects.iter().any(|e| matches!(e, Effect::RegWrite { index: 0, width: 32, .. }));
     assert!(has_reg_write, "ADD W0 should write 32-bit register");
+}
+
+// ===========================================================================
+// THE EFFECT-SURFACE CENSUS
+// ===========================================================================
+//
+// WHY THIS EXISTS. The output gate's real safety net is not any single match
+// arm; it is `MachineState::apply_effect`'s catch-all `Err(Unmodeled)`. A
+// consumer that FORWARDS an effect to that threader is protected for free. A
+// consumer that HANDLES the effect ITSELF is protected only by enumerating the
+// variants correctly — and enumeration is exactly what silently rots. That is
+// how `Effect::PcUpdate` came to be discarded by the gate's executor under a
+// comment claiming it was handled elsewhere, executing CBZ/CBNZ/TBZ/TBNZ as
+// NEVER TAKEN and certifying an infinite loop as the identity.
+//
+// So this file does not test a LIST of effects. It walks the whole surface and
+// requires a DECLARED, MEASURED disposition for every variant: modeled, or an
+// error. Neither consumer here is allowed a silent no-op.
+//
+// A fourteenth variant cannot slip past. `Effect::variant_name` is an
+// exhaustive match with no wildcard, in the crate that DEFINES `Effect`, so a
+// new variant is a `cargo build` failure (E0004) in the library itself — not a
+// test-only failure, and not a default silently taken. That match and
+// `Effect::VARIANT_NAMES` are expanded from one token list, so the only way to
+// resolve E0004 is to census the variant, and the only thing left for this file
+// to force is the MEASUREMENT below.
+
+/// What a consumer must do with an effect. There is no third option: a silent
+/// no-op is the failure mode this census exists to forbid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The consumer models the effect and returns `Ok`.
+    Modeled,
+    /// The consumer refuses the effect and returns `Err`.
+    Refused,
+}
+
+/// One census row: a sample effect plus the disposition each consumer owes it.
+struct EffectCensusRow {
+    /// What the row is, for the failure message.
+    label: &'static str,
+    effect: Effect,
+    /// `MachineState::apply_effect` — the symbolic state threader that is the
+    /// gate executor's fail-closed backstop.
+    symbolic: Disposition,
+    /// `ConcreteState::apply_effect` — the concrete ISA oracle.
+    concrete: Disposition,
+}
+
+fn census_bv(value: i128, width: u32) -> Formula {
+    Formula::BitVec { value, width }
+}
+
+/// Every `Effect` variant, with concrete (evaluable) operands so the CONCRETE
+/// oracle's verdict measures its effect handling rather than its evaluator.
+///
+/// Completeness is asserted, not assumed: `effect_variant_census` requires the
+/// set of variant names produced here to equal [`Effect::VARIANT_NAMES`].
+fn effect_census() -> Vec<EffectCensusRow> {
+    use trust_disasm::operand::Condition;
+
+    use crate::effect::{Aarch64AtomicAccessKind, Aarch64AtomicOrdering};
+
+    vec![
+        EffectCensusRow {
+            label: "RegWrite x3 = 7",
+            effect: Effect::RegWrite { index: 3, width: 64, value: census_bv(7, 64) },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "SpWrite",
+            effect: Effect::SpWrite { value: census_bv(0x1000, 64) },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "MemWrite 8 bytes",
+            effect: Effect::MemWrite {
+                address: census_bv(0x2000, 64),
+                value: census_bv(0xab, 64),
+                width_bytes: 8,
+            },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "MemRead 8 bytes",
+            effect: Effect::MemRead { address: census_bv(0x2000, 64), width_bytes: 8 },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "FlagUpdate",
+            effect: Effect::FlagUpdate {
+                n: Formula::Bool(false),
+                z: Formula::Bool(true),
+                c: Formula::Bool(false),
+                v: Formula::Bool(false),
+            },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "Branch",
+            effect: Effect::Branch { target: census_bv(0x100, 64) },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Refused,
+        },
+        EffectCensusRow {
+            label: "ConditionalBranch (EQ)",
+            effect: Effect::ConditionalBranch {
+                condition: Condition::Eq,
+                target: census_bv(0x100, 64),
+                fallthrough: census_bv(0x104, 64),
+            },
+            symbolic: Disposition::Refused,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "Call",
+            effect: Effect::Call {
+                target: census_bv(0x200, 64),
+                return_addr: census_bv(0x104, 64),
+            },
+            symbolic: Disposition::Refused,
+            concrete: Disposition::Refused,
+        },
+        EffectCensusRow {
+            label: "Return",
+            effect: Effect::Return { target: census_bv(0x300, 64) },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Refused,
+        },
+        EffectCensusRow {
+            label: "FpRegWrite",
+            effect: Effect::FpRegWrite { index: 0, width: 64, value: census_bv(1, 64) },
+            symbolic: Disposition::Modeled,
+            // MODELED since `ConcreteState` gained an FP register file. It was
+            // `Refused`, and the refusal was not free: with no V registers to
+            // read, every SIMD-operand word was excluded from concrete replay,
+            // so the native semantic differential could not see that `str
+            // d13,[x28,#0xa0]` was modeled as storing the GPR X13. The
+            // exclusion hid a real divergence for as long as it stood.
+            //
+            // What is modeled is the DATA MOVEMENT: a zero-extending write of
+            // the effect's `Formula` into a 128-bit lane. IEEE-754 arithmetic
+            // is still not modeled anywhere in this crate — where the semantics
+            // produced a bitvector approximation of an FP operation, the
+            // approximation is what this executes.
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "Aarch64SyncBoundary (DMB ISH)",
+            effect: Effect::Aarch64SyncBoundary {
+                kind: Aarch64SyncBoundaryKind::DataMemoryBarrier,
+                scope: Aarch64SyncScope::InnerShareable,
+                ordering: Aarch64SyncOrdering::LoadsAndStores,
+                clears_exclusive_monitor: false,
+                raw_option: Some(0b1011),
+            },
+            symbolic: Disposition::Refused,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "Aarch64AtomicAccess (non-exclusive, LDAR data plane)",
+            effect: Effect::Aarch64AtomicAccess {
+                kind: Aarch64AtomicAccessKind::Load,
+                ordering: Aarch64AtomicOrdering::Acquire,
+                address: census_bv(0x2000, 64),
+                width_bytes: 4,
+                exclusive: false,
+            },
+            symbolic: Disposition::Refused,
+            concrete: Disposition::Modeled,
+        },
+        EffectCensusRow {
+            label: "Aarch64AtomicAccess (EXCLUSIVE)",
+            effect: Effect::Aarch64AtomicAccess {
+                kind: Aarch64AtomicAccessKind::Store,
+                ordering: Aarch64AtomicOrdering::Release,
+                address: census_bv(0x2000, 64),
+                width_bytes: 4,
+                exclusive: true,
+            },
+            symbolic: Disposition::Refused,
+            concrete: Disposition::Refused,
+        },
+        EffectCensusRow {
+            label: "PcUpdate",
+            effect: Effect::PcUpdate { value: census_bv(0x104, 64) },
+            symbolic: Disposition::Modeled,
+            concrete: Disposition::Modeled,
+        },
+    ]
+}
+
+fn disposition_of<E>(result: Result<(), E>) -> Disposition {
+    match result {
+        Ok(()) => Disposition::Modeled,
+        Err(_) => Disposition::Refused,
+    }
+}
+
+/// EVERY `Effect` variant is either modeled or refused by BOTH state
+/// consumers in this crate — and the census covers every variant.
+///
+/// The completeness half is the point. Asserting dispositions for a hand-picked
+/// list would have passed with `PcUpdate` missing from the list, which is
+/// precisely the shape of the bug this guards.
+#[test]
+fn effect_variant_census() {
+    use std::collections::BTreeSet;
+
+    let rows = effect_census();
+
+    // (1) The census names no variant the enum does not have. `variant_name`
+    //     and `VARIANT_NAMES` are expanded from one token list, so this holds
+    //     by construction; it is kept as a cheap guard on that construction
+    //     rather than on the caller.
+    for row in &rows {
+        let name = row.effect.variant_name();
+        assert!(
+            Effect::VARIANT_NAMES.contains(&name),
+            "{}: variant_name() returned {name:?}, which is not in Effect::VARIANT_NAMES — \
+             a new variant took an index past the census list",
+            row.label
+        );
+    }
+
+    // (2) COMPLETENESS: the census covers every variant. A fourteenth variant
+    //     is already a build error in `Effect::variant_name`; once that is
+    //     resolved this is what forces it to be MEASURED rather than assumed.
+    let covered: BTreeSet<&str> = rows.iter().map(|r| r.effect.variant_name()).collect();
+    let declared: BTreeSet<&str> = Effect::VARIANT_NAMES.iter().copied().collect();
+    assert_eq!(
+        declared.len(),
+        Effect::VARIANT_NAMES.len(),
+        "Effect::VARIANT_NAMES contains a duplicate name"
+    );
+    assert_eq!(
+        covered,
+        declared,
+        "the effect census does not cover every Effect variant \
+         (missing: {:?}) — an uncensused variant is one no consumer was ever \
+         measured against",
+        declared.difference(&covered).collect::<Vec<_>>()
+    );
+
+    // (3) Each row's DECLARED disposition is the MEASURED one, for both
+    //     consumers. Neither is permitted a silent no-op: `Modeled` means the
+    //     consumer changed state and returned Ok, `Refused` means Err.
+    for row in &rows {
+        let mut sym = MachineState::symbolic();
+        assert_eq!(
+            disposition_of(sym.apply_effect(&row.effect)),
+            row.symbolic,
+            "{}: MachineState::apply_effect disposition changed (declared {:?})",
+            row.label,
+            row.symbolic
+        );
+
+        // The concrete oracle refuses a load from UNINITIALIZED memory, which
+        // is an evaluator verdict, not an effect-handling one. Seed the address
+        // the census rows use so what is measured below is the effect arm.
+        let mut conc = crate::concrete::ConcreteState::new();
+        conc.store_memory_le(0x2000, 8, 0).expect("seed census memory");
+        assert_eq!(
+            disposition_of(conc.apply_effect(&row.effect)),
+            row.concrete,
+            "{}: ConcreteState::apply_effect disposition changed (declared {:?})",
+            row.label,
+            row.concrete
+        );
+    }
+}
+
+/// The symbolic threader's REFUSAL must name the effect it refused.
+///
+/// `effect_name` was a four-arm match ending in `_ => "unmodeled effect"`, so
+/// every variant added after those four reported itself under a label that
+/// identified nothing. A refusal that cannot say what it refused is a refusal
+/// nobody can act on.
+#[test]
+fn unmodeled_effect_refusals_name_the_variant() {
+    for row in effect_census().into_iter().filter(|r| r.symbolic == Disposition::Refused) {
+        let want = row.effect.variant_name();
+        let mut sym = MachineState::symbolic();
+        match sym.apply_effect(&row.effect) {
+            Ok(()) => panic!("{}: expected a refusal", row.label),
+            Err(e) => {
+                let text = format!("{e:?}");
+                assert!(
+                    text.contains(want),
+                    "{}: refusal {text} does not name the effect variant {want}",
+                    row.label
+                );
+            }
+        }
+    }
+}
+
+/// The bitfield position guard must hold ON ITS OWN, not by virtue of the
+/// decoder refusing first.
+///
+/// `sem_ubfm`/`sem_sbfm`/`sem_bfm` compute `width - immr`, which underflows when
+/// `immr >= width`: a panic with debug assertions on, and — in the release build
+/// the shipped `trustc` uses — a silent wrap to a shift amount near 2^32, after
+/// which the gate reasons about a formula unrelated to any instruction.
+///
+/// `decode_bitfield` now rejects that encoding, so a test that goes through the
+/// decoder cannot reach this code and passes whether or not the guard exists.
+/// This one builds the `Instruction` DIRECTLY, so it fails if the semantics-side
+/// guard is removed — the layers are checked independently, which is the point
+/// of having two.
+#[test]
+fn bitfield_semantics_refuse_out_of_range_positions_without_the_decoder() {
+    use trust_disasm::instruction::Instruction;
+    use trust_disasm::opcode::Opcode;
+    use trust_disasm::operand::{Operand, Register};
+
+    for opcode in [Opcode::Ubfm, Opcode::Sbfm, Opcode::Bfm] {
+        // 32-bit destination with immr = 35: no legal encoding, and exactly the
+        // shape that makes `width - immr` wrap.
+        let insn = Instruction::for_test(
+            opcode,
+            vec![
+                Operand::Reg(Register::gpr(0, false)),
+                Operand::Reg(Register::gpr(1, false)),
+                Operand::Imm(35),
+                Operand::Imm(6),
+            ],
+        );
+
+        let result = sem().effects(&state(), &insn);
+        assert!(
+            result.is_err(),
+            "{opcode:?} with immr=35 on a 32-bit register must be REFUSED by the \
+             semantics themselves; got {result:?}. Relying on `decode_bitfield` to \
+             reject it leaves the subtraction protected only by the ordering of a \
+             check in another crate."
+        );
+    }
 }

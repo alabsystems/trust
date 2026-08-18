@@ -538,9 +538,39 @@ impl SepEngine {
 
     /// Interpret a MIR statement, updating heap state and emitting VCs.
     pub(crate) fn interpret_statement(&mut self, stmt: &Statement, span: &SourceSpan) {
-        if let Statement::Assign { place, rvalue, span: stmt_span } = stmt {
-            let sp = if stmt_span.line_start > 0 { stmt_span } else { span };
-            self.interpret_assign(place, rvalue, sp);
+        match stmt {
+            Statement::Assign { place, rvalue, span: stmt_span } => {
+                let sp = if stmt_span.line_start > 0 { stmt_span } else { span };
+                self.interpret_assign(place, rvalue, sp);
+            }
+            // rustc's `LowerIntrinsics` pass rewrites `copy_nonoverlapping` from a
+            // Call into a non-diverging intrinsic STATEMENT before Trust sees the
+            // body, so the call-spelling route (`interpret_call` -> pattern 5)
+            // never sees it. Route the statement into the SAME interpreter.
+            //
+            // REACHABILITY IS PART OF THE CONTRACT. This arm alone is not enough:
+            // `check_sep_unsafe_blocked` skips the whole engine unless
+            // `has_unsafe_patterns` fires, and (in the 810baa6c4c revert's
+            // measurement) a body whose only unsafe surface IS this statement
+            // tripped nothing — so the extractor flip verified an out-of-bounds
+            // copy silently. `has_unsafe_patterns` (and the outer
+            // `has_intrinsic_unsafe_surface` gate in generate/entry.rs) now match
+            // this statement directly; the unit tests below drive the PRODUCTION
+            // `check_sep_unsafe` entry, gates included, so a regression in either
+            // gate fails them, not only a regression in this arm.
+            //
+            // The callee string MUST contain "nonoverlapping" — that substring is
+            // what gates the overlap obligation inside `interpret_ptr_copy`.
+            Statement::CopyNonOverlapping { src, dst, count, span: stmt_span, .. } => {
+                let sp = if stmt_span.line_start > 0 { stmt_span } else { span };
+                self.interpret_ptr_copy(
+                    &[src.clone(), dst.clone(), count.clone()],
+                    &Place::local(0),
+                    sp,
+                    "core::intrinsics::copy_nonoverlapping",
+                );
+            }
+            _ => {}
         }
     }
 
@@ -3144,6 +3174,17 @@ fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usiz
 fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
     for block in &func.body.blocks {
         for stmt in &block.stmts {
+            // The `copy_nonoverlapping` STATEMENT is itself the unsafe pattern
+            // (pattern 5's `LowerIntrinsics` spelling): a body whose only unsafe
+            // surface is the copy has no unsafe call, no raw-deref assign and no
+            // `AddressOf` to trip this gate — `a.as_ptr()` is `Rvalue::Ref` +
+            // unsize-cast + a safe call. Without this arm the engine is skipped
+            // wholesale and the copy carries ZERO obligations (the 810baa6c4c
+            // silent-false-proof shape), so this match is load-bearing, not an
+            // optimization.
+            if let Statement::CopyNonOverlapping { .. } = stmt {
+                return true;
+            }
             if let Statement::Assign { place, rvalue, .. } = stmt {
                 // Deref on source or destination
                 if crate::place_has_raw_deref(func, place) {
@@ -3857,7 +3898,7 @@ mod tests {
             name: name.to_string(),
             def_path: format!("test::{name}"),
             span: empty_span(),
-            body: VerifiableBody { return_ty: Ty::Unit, locals, arg_count, blocks },
+            body: VerifiableBody { return_ty: Ty::Unit, locals, arg_count, blocks, datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -4347,6 +4388,215 @@ mod tests {
             dst.formula
         );
         assert_eq!(dst.kind.proof_level(), ProofLevel::L0Safety);
+    }
+
+    /// The STATEMENT spelling of `copy_nonoverlapping` — rustc's
+    /// `LowerIntrinsics` output, so there is NO call terminator anywhere in the
+    /// body — must mint rows through the PRODUCTION `check_sep_unsafe` entry,
+    /// reachability gates included. This is the exact shape whose silence
+    /// shipped the 810baa6c4c false proof: `interpret_statement` routed the
+    /// statement, but `has_unsafe_patterns` had no arm for it, so the engine
+    /// was skipped wholesale and the copy carried ZERO obligations. Driving the
+    /// production entry (not the engine directly) means a regression in EITHER
+    /// the gate or the routing fails this test.
+    #[test]
+    fn copy_statement_mints_rows_through_production_gates() {
+        let func = make_func(
+            "stmt_copy",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) },
+                    name: Some("dst".into()),
+                },
+            ],
+            2,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::CopyNonOverlapping {
+                    src: Operand::Copy(Place::local(1)),
+                    dst: Operand::Copy(Place::local(2)),
+                    count: Operand::Constant(ConstValue::Uint(1, 64)),
+                    elem_ty: Ty::u32(),
+                    span: empty_span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for direction in ["src", "dst"] {
+            assert!(
+                vcs.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::CopyBoundsViolation { direction: d, callee, .. }
+                        if d == direction && callee.contains("nonoverlapping")
+                )),
+                "the copy statement must mint a {direction} CopyBoundsViolation row, got {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::Assertion { message } if message.contains("[unsafe:sep:copy]")
+            )),
+            "the nonoverlapping statement must mint the [unsafe:sep:copy] overlap row"
+        );
+    }
+
+    /// The revert's acceptance shape: `copy_nonoverlapping(a.as_ptr(),
+    /// b.as_mut_ptr(), 64)` over two `[u8; 8]` arrays, spelled as the
+    /// statement. The pointers trace to CONCRETE 8-byte stack allocations
+    /// (`Rvalue::Ref` on a sized array → tracked provenance, carried through
+    /// the unsize cast and the `as_ptr` calls), so the engine must bind the
+    /// REAL sizes and the REAL count: the bounds rows must be the ground
+    /// violation `0 + 64 > 8` — refutable, not merely symbolic. This pins the
+    /// "destination allocation's size is known to the engine" half of the
+    /// tracked_oob refutation; the ui test pins the end-to-end diagnostic.
+    #[test]
+    fn copy_statement_oob_binds_concrete_allocation_sizes() {
+        let arr = || Ty::Array { elem: Box::new(Ty::u8()), len: 8 };
+        let slice_ref = |mutable| Ty::Ref {
+            mutable,
+            inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
+        };
+        let arr_ref = |mutable| Ty::Ref { mutable, inner: Box::new(arr()) };
+        let raw = |mutable| Ty::RawPtr { mutable, pointee: Box::new(Ty::u8()) };
+        let func = make_func(
+            "tracked_oob",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: arr(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: arr(), name: Some("b".into()) },
+                LocalDecl { index: 3, ty: raw(false), name: None },
+                LocalDecl { index: 4, ty: slice_ref(false), name: None },
+                LocalDecl { index: 5, ty: arr_ref(false), name: None },
+                LocalDecl { index: 6, ty: raw(true), name: None },
+                LocalDecl { index: 7, ty: slice_ref(true), name: None },
+                LocalDecl { index: 8, ty: arr_ref(true), name: None },
+            ],
+            0,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(5),
+                            rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
+                            span: empty_span(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::Cast(Operand::Move(Place::local(5)), slice_ref(false)),
+                            span: empty_span(),
+                        },
+                    ],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        func: "core::slice::<impl [u8]>::as_ptr".to_string(),
+                        args: vec![Operand::Move(Place::local(4))],
+                        dest: Place::local(3),
+                        target: Some(BlockId(1)),
+                        span: empty_span(),
+                        atomic: None,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(8),
+                            rvalue: Rvalue::Ref { mutable: true, place: Place::local(2) },
+                            span: empty_span(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(7),
+                            rvalue: Rvalue::Cast(Operand::Move(Place::local(8)), slice_ref(true)),
+                            span: empty_span(),
+                        },
+                    ],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        func: "core::slice::<impl [u8]>::as_mut_ptr".to_string(),
+                        args: vec![Operand::Move(Place::local(7))],
+                        dest: Place::local(6),
+                        target: Some(BlockId(2)),
+                        span: empty_span(),
+                        atomic: None,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::CopyNonOverlapping {
+                        src: Operand::Copy(Place::local(3)),
+                        dst: Operand::Copy(Place::local(6)),
+                        count: Operand::Constant(ConstValue::Uint(64, 64)),
+                        elem_ty: Ty::u8(),
+                        span: empty_span(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for direction in ["src", "dst"] {
+            let row = vcs
+                .iter()
+                .find(|vc| {
+                    matches!(
+                        &vc.kind,
+                        VcKind::CopyBoundsViolation { direction: d, callee, .. }
+                            if d == direction && callee.contains("nonoverlapping")
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tracked_oob must mint a {direction} CopyBoundsViolation row, got {:?}",
+                        vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+                    )
+                });
+            // The GROUND violation `offset + count > size` = `0 + 64 > 8`. A
+            // symbolic size here would mean the tracked allocation was lost and
+            // the obligation degraded to the fail-closed form — still an error,
+            // but no longer the refutation this fixture exists to pin.
+            let Formula::Gt(extent, size) = &row.formula else {
+                panic!("{direction} bounds row must be Gt(extent, size), got {:?}", row.formula);
+            };
+            assert!(
+                matches!(size.as_ref(), Formula::Int(8)),
+                "{direction} allocation size must be the CONCRETE 8 bytes, got {size:?}"
+            );
+            let Formula::Add(offset, count) = extent.as_ref() else {
+                panic!("{direction} extent must be offset + count, got {extent:?}");
+            };
+            assert!(
+                matches!(offset.as_ref(), Formula::Int(0)),
+                "{direction} base pointer sits at offset 0, got {offset:?}"
+            );
+            assert!(
+                matches!(count.as_ref(), Formula::Int(64)),
+                "{direction} count must be the REAL 64-byte extent, got {count:?}"
+            );
+        }
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::Assertion { message } if message.contains("[unsafe:sep:copy]")
+            )),
+            "tracked_oob must still mint the overlap row"
+        );
     }
 
     /// Trust: a memory map of an externally-mutable region (mmap of a file)

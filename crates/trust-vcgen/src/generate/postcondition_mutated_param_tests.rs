@@ -27,6 +27,7 @@ fn func_with(stmts: Vec<Statement>) -> VerifiableFunction {
             blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
             arg_count: 1,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

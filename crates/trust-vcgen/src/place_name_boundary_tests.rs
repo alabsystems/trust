@@ -63,6 +63,7 @@ fn two_asserts(second_param_name: &str) -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

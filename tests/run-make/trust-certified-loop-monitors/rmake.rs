@@ -14,6 +14,11 @@ fn main() {
     let trustc = if trustc.exists() { trustc } else { rustc };
 
     let report = cmd(&trustc)
+        // Compiletest intentionally runs upstream fixtures under the inherited
+        // vanilla transport. This Trust-specific run-make test explicitly
+        // exercises verification and must opt its nested compiler back in.
+        .env_remove("TRUST_NO_VERIFY")
+        .env("RUSTC_LOG", "rustc_mir_transform::trust_ir_flip=info")
         .env("TRUST_MONITOR_REPORT", "1")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
@@ -26,6 +31,13 @@ fn main() {
         .run()
         .stderr_utf8();
 
+    assert!(
+        report.lines().any(|line| {
+            line.contains("trust-ir-flip: compiled from trust-ir")
+                && line.contains("::monitored_loop)")
+        }),
+        "the default TrustIR codegen path did not flip the monitored function:\n{report}",
+    );
     assert_exactly_one(
         &report,
         "(LoopInvariant) is monitored: a kernel-certified runtime monitor exists",
@@ -50,6 +62,7 @@ fn main() {
     // prevents exact function-recursion topology, and an optimized-away loop
     // has no authenticated header. Neither may be reported as executable.
     let unavailable = cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .env("TRUST_MONITOR_REPORT", "1")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
@@ -78,6 +91,7 @@ fn main() {
     // natural header. The outer clauses retain their own exact authority while
     // the missing inner topology fails closed as an authored-spec error.
     let nested_unavailable = cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .env("TRUST_MONITOR_REPORT", "1")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
@@ -155,6 +169,17 @@ fn main() {
     compile_test(&trustc, "loop_multi_nested.rs", "loop-multi-nested");
     run(&bin_name("loop-multi-nested"));
 
+    // The positive above would also pass if the inner loop received no instrumentation at all.
+    // Keep the outer loop valid and stall only the supported inner loop's E5 measure: a crash is
+    // therefore a non-vacuous witness that the inner authenticated header has its own monitor.
+    compile_test(
+        &trustc,
+        "loop_nested_inner_decrease_fail.rs",
+        "loop-nested-inner-decrease-fail",
+    );
+    run_fail(&bin_name("loop-nested-inner-decrease-fail"))
+        .assert_stderr_contains("kernel-certified Trust monitor failed");
+
     // Every compile_test invocation uses -Cdebuginfo=0. Keep two same-named,
     // same-typed locals live across the monitored loop so only compiler-owned
     // HIR-local provenance can select the inner binding.
@@ -164,6 +189,7 @@ fn main() {
 
 fn compile_test(trustc: &PathBuf, input: &str, output: &str) {
     cmd(trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
         .arg("--test")

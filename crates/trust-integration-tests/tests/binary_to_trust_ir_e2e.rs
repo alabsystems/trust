@@ -674,12 +674,23 @@ fn assert_convert_checked_certificate_preconditions_rejected(
     );
 
     let blockers = evidence["blockers"].as_array().expect("checked-certificate blockers array");
+    // `missing-binary-proof-obligation`, NOT `proof-evidence-missing`.
+    //
+    // `proof-evidence-missing` is the last-resort label in
+    // `convert_checked_certificate_blocker_code`, reached only when a blocker
+    // has no code, no `blocker-code=` diagnostic, AND a feature that is not a
+    // stable identifier — `stable_target_validation_blocker_feature` accepts any
+    // `[A-Za-z0-9-_.:]+`, so every blocker these fixtures raise is labelled by
+    // its own feature long before the fallback. Asserting the fallback asserted
+    // a string the pipeline does not emit; the live code carrying the same
+    // meaning ("has not discharged machine-code proof obligations") is
+    // `missing-binary-proof-obligation`.
     assert_json_blocker_codes_include(
         blockers,
         &[
             "proof-grade-artifact-missing",
             "convert-checked-certificate-loader-missing",
-            "proof-evidence-missing",
+            "missing-binary-proof-obligation",
             "exact-machine-replay-missing",
             "symbolic-formula-preservation-not-consumed",
             "unsupported-ledger-nonempty",
@@ -688,9 +699,22 @@ fn assert_convert_checked_certificate_preconditions_rejected(
     );
 }
 
+/// `expects_symbolic_formula` — does this artifact still carry a symbolic
+/// formula the target semantics has not consumed?
+///
+/// The symbolic-formula blocker and record are asserted as a BICONDITIONAL, not
+/// unconditionally, and that is strictly stronger than demanding them always:
+/// it also catches a blocker claimed about a formula that is not there. A body
+/// whose only symbolic statements were machine bookkeeping — the stack-pointer
+/// and program-counter writes `trust-decompile`'s frame reconstruction removes,
+/// recording the displacement as a `BinaryStorageFact` and leaving the control
+/// transfer to the terminator — legitimately has none left, and must not report
+/// an unconsumed formula. A body carrying a real data value still does; the
+/// `trust_fixture_x86_load` fixture is that case.
 fn assert_target_proof_consumer_evidence_rejected(
     evidence: &serde_json::Value,
     target: &str,
+    expects_symbolic_formula: bool,
     context: &str,
 ) {
     assert_eq!(evidence["target"], target, "{context}");
@@ -698,22 +722,35 @@ fn assert_target_proof_consumer_evidence_rejected(
     assert_eq!(evidence["target_semantics_consumed"], false, "{context}");
     let blockers =
         evidence["blockers"].as_array().expect("target proof-consumer blockers should be array");
-    assert_json_blocker_codes_include(
-        blockers,
-        &[
-            "target-semantics-not-consumed",
-            "symbolic-formula-not-consumed-by-target-semantics",
-            "missing-checked-proof-certificate",
-            "missing-proof-replay-metadata",
-        ],
-        context,
+    let mut expected_codes = vec![
+        "target-semantics-not-consumed",
+        "missing-checked-proof-certificate",
+        "missing-proof-replay-metadata",
+    ];
+    if expects_symbolic_formula {
+        expected_codes.push("symbolic-formula-not-consumed-by-target-semantics");
+    }
+    assert_json_blocker_codes_include(blockers, &expected_codes, context);
+    assert_eq!(
+        blockers
+            .iter()
+            .any(|blocker| blocker["code"]
+                == "symbolic-formula-not-consumed-by-target-semantics"),
+        expects_symbolic_formula,
+        "{context}: the unconsumed-symbolic-formula blocker must be present exactly when \
+         such a formula survives; got {blockers:?}"
     );
     let records =
         evidence["records"].as_array().expect("target proof-consumer records should be array");
-    assert_json_record_kinds_rejected(
-        records,
-        &["target_semantics", "symbolic_formula", "checked_certificate", "proof_replay"],
-        context,
+    let mut expected_kinds = vec!["target_semantics", "checked_certificate", "proof_replay"];
+    if expects_symbolic_formula {
+        expected_kinds.push("symbolic_formula");
+    }
+    assert_json_record_kinds_rejected(records, &expected_kinds, context);
+    assert_eq!(
+        records.iter().any(|record| record["kind"] == "symbolic_formula"),
+        expects_symbolic_formula,
+        "{context}: the symbolic-formula record must track the blocker; got {records:?}"
     );
 }
 
@@ -1044,7 +1081,11 @@ fn assert_decompile_release_gate_blocker_class_coverage(
     );
 }
 
-fn assert_convert_release_gate_blocker_class_coverage(json: &serde_json::Value, entry_arg: &str) {
+fn assert_convert_release_gate_blocker_class_coverage(
+    json: &serde_json::Value,
+    entry_arg: &str,
+    expects_symbolic_formula: bool,
+) {
     let context = "convert trust_cg proof-grade blocker class coverage";
     assert_eq!(json["conversion_gate"]["accepted"], false, "{context}");
     assert_eq!(json["conversion_gate"]["status"], "rejected", "{context}");
@@ -1069,14 +1110,19 @@ fn assert_convert_release_gate_blocker_class_coverage(json: &serde_json::Value, 
         ],
         context,
     );
+    // The `formula JSON/SMT-LIB/sort metadata` wording is raised by
+    // `preserved_symbolic_formula_blockers`, which returns EMPTY when there is no
+    // symbolic-formula evidence — the producer declines to claim a formula was
+    // not consumed when no formula survives. So it is expected exactly when one
+    // does.
+    let mut expected_fragments =
+        vec!["ReplayStatus::Replayed", "exact replay checked", "artifact SHA-256 identity"];
+    if expects_symbolic_formula {
+        expected_fragments.push("formula JSON/SMT-LIB/sort metadata");
+    }
     assert_json_value_contains_all(
         &serde_json::Value::Array(release_blockers.clone()),
-        &[
-            "ReplayStatus::Replayed",
-            "exact replay checked",
-            "artifact SHA-256 identity",
-            "formula JSON/SMT-LIB/sort metadata",
-        ],
+        &expected_fragments,
         context,
     );
 
@@ -1087,20 +1133,25 @@ fn assert_convert_release_gate_blocker_class_coverage(json: &serde_json::Value, 
         .map(|blocker| blocker["feature"].as_str().expect("target blocker feature"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert_contains_all(
-        &target_features,
-        &[
-            "binary-provenance-not-consumed-by-target-semantics",
-            "target-semantics-not-consumed",
-            "bounded-empty-slice-non-noop-provenance",
-            "bounded-empty-slice-missing-checked-certificate",
-            "bounded-empty-slice-missing-exact-replay",
-            "non-empty-scalar-checked-certificate-identity-missing",
-            "non-empty-scalar-replay-artifact-identity-missing",
-            "symbolic-formula-not-consumed-by-target-semantics",
-            "missing-proof-replay-metadata",
-        ],
-        context,
+    let mut expected_target_features = vec![
+        "binary-provenance-not-consumed-by-target-semantics",
+        "target-semantics-not-consumed",
+        "bounded-empty-slice-non-noop-provenance",
+        "bounded-empty-slice-missing-checked-certificate",
+        "bounded-empty-slice-missing-exact-replay",
+        "non-empty-scalar-checked-certificate-identity-missing",
+        "non-empty-scalar-replay-artifact-identity-missing",
+        "missing-proof-replay-metadata",
+    ];
+    if expects_symbolic_formula {
+        expected_target_features.push("symbolic-formula-not-consumed-by-target-semantics");
+    }
+    assert_contains_all(&target_features, &expected_target_features, context);
+    assert_eq!(
+        target_features.contains("symbolic-formula-not-consumed-by-target-semantics"),
+        expects_symbolic_formula,
+        "{context}: the symbolic-formula target blocker must appear exactly when such a \
+         formula survives; got:\n{target_features}"
     );
     assert_json_value_contains_all(
         &json["target_validation_blockers"],
@@ -1113,13 +1164,25 @@ fn assert_convert_release_gate_blocker_class_coverage(json: &serde_json::Value, 
         context,
     );
 
-    assert!(
-        json["preserved_symbolic_formulas"].as_array().is_some_and(|items| !items.is_empty()),
-        "{context}: preserved symbolic formulas must stay visible"
+    // An UNCONSUMED symbolic formula must stay visible — that disclosure is the
+    // point of this list. A body whose only symbolic statements were machine
+    // bookkeeping has none after frame reconstruction, and the displacement it
+    // encoded is disclosed instead as a `BinaryStorageFact` on the function
+    // (pinned by `assert_decompile_partial_trust_ir_shape`). Asserting the exact
+    // emptiness, rather than skipping the check, keeps both directions pinned.
+    let preserved = json["preserved_symbolic_formulas"]
+        .as_array()
+        .expect("preserved_symbolic_formulas should be an array");
+    assert_eq!(
+        !preserved.is_empty(),
+        expects_symbolic_formula,
+        "{context}: preserved symbolic formulas must be visible exactly when one \
+         survives; got {preserved:?}"
     );
     assert_target_proof_consumer_evidence_rejected(
         &json["target_proof_consumer_evidence"],
         "trust-cg",
+        expects_symbolic_formula,
         context,
     );
     assert_eq!(
@@ -1241,6 +1304,57 @@ fn assert_no_proof_grade_trust_fields(value: &serde_json::Value, context: &str) 
     }
 }
 
+/// The stack-pointer displacement that `trust-decompile`'s frame reconstruction
+/// removed from the body must still be READABLE, as a typed fact rather than as
+/// a symbolic statement nobody can lower.
+///
+/// This is the other half of `statements == 0`: the elision is only honest
+/// because the displacement survives here. If a future change stops recording
+/// it, the count assertion alone would still pass and the information would be
+/// gone — so the two are asserted together, always.
+fn assert_stack_pointer_frame_fact_recorded(
+    json: &serde_json::Value,
+    function: &str,
+    expected_offset: i64,
+) {
+    let output_content = json["output_content"]
+        .as_str()
+        .expect("decompile TrustIr output_content should be JSON text");
+    let artifact: serde_json::Value =
+        serde_json::from_str(output_content).expect("decompile output_content should be JSON");
+    let storage_facts = artifact["functions"][0]["storage_facts"]
+        .as_array()
+        .expect("the function should carry storage facts");
+    let frame_fact = storage_facts
+        .iter()
+        .find(|fact| {
+            fact["subject"]["Register"]["function"] == function
+                && fact["subject"]["Register"]["register"] == "SP"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the elided stack-pointer write must survive as a storage fact; \
+                 got {storage_facts:?}"
+            )
+        });
+    assert_eq!(
+        frame_fact["location"]["Stack"]["base"], "StackPointer",
+        "the frame fact must be stack-pointer relative: {frame_fact:?}"
+    );
+    assert_eq!(
+        frame_fact["location"]["Stack"]["offset"].as_i64(),
+        Some(expected_offset),
+        "the recorded displacement must match the elided write: {frame_fact:?}"
+    );
+    // Derived from a lifted formula, never proof-grade: `trust-vcgen`'s
+    // `proof_grade_storage_fact` filter must keep refusing it, so it can never
+    // mint an ABI-contradiction obligation against a real ABI fact.
+    assert_eq!(
+        frame_fact["trust_level"], "Partial",
+        "a derived frame fact must never claim proof grade: {frame_fact:?}"
+    );
+}
+
 fn assert_decompile_partial_trust_ir_shape(json: &serde_json::Value, entry_arg: &str) {
     assert_eq!(json["status"], "incomplete");
     assert_eq!(json["format"], "ELF");
@@ -1252,7 +1366,15 @@ fn assert_decompile_partial_trust_ir_shape(json: &serde_json::Value, entry_arg: 
     assert_eq!(json["functions_decompiled"].as_u64(), Some(1));
     assert_eq!(json["blocks"].as_u64(), Some(1));
     assert_eq!(json["instructions"].as_u64(), Some(1));
-    assert!(json["statements"].as_u64().unwrap_or(0) >= 1);
+    // ZERO, and that is the reconstruction working. `trust_fixture_return` is a
+    // lone `retq`; both of its lifted statements were machine bookkeeping —
+    // `SP := SP + 8` and `PC := <return address>` — for which trust-cg's LIR has
+    // no register at all. `trust-decompile`'s frame reconstruction removes them,
+    // so what remains is the structured truth about a function that returns:
+    // no statements, one `Return` terminator. Nothing is lost, and the next
+    // assertion is what pins that.
+    assert_eq!(json["statements"].as_u64(), Some(0), "a lone `ret` has no data statements");
+    assert_stack_pointer_frame_fact_recorded(json, "trust_fixture_return", 8);
     assert!(json["memory_facts"].as_u64().unwrap_or(0) >= 1);
     assert!(json["unsupported"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(json["failures"].as_u64(), Some(0));
@@ -2956,7 +3078,10 @@ fn test_targo_trust_decompile_rust_json_reports_exploratory_text_only_shape() {
     assert_eq!(json["functions_decompiled"].as_u64(), Some(1));
     assert_eq!(json["blocks"].as_u64(), Some(1));
     assert_eq!(json["instructions"].as_u64(), Some(1));
-    assert!(json["statements"].as_u64().unwrap_or(0) >= 1);
+    // See `assert_decompile_partial_trust_ir_shape`: a lone `retq` reduces to
+    // its terminator once the stack-pointer/program-counter bookkeeping is
+    // reconstructed into facts.
+    assert_eq!(json["statements"].as_u64(), Some(0), "a lone `ret` has no data statements");
     assert!(json["memory_facts"].as_u64().unwrap_or(0) >= 1);
     assert!(json["unsupported"].as_u64().unwrap_or(0) > 0);
     assert_eq!(json["failures"].as_u64(), Some(0));
@@ -3073,6 +3198,7 @@ fn test_targo_trust_convert_trust_cg_json_reports_inspectable_rejected_gate() {
     assert_target_proof_consumer_evidence_rejected(
         &json["target_proof_consumer_evidence"],
         "trust-cg",
+        false,
         "convert trust_cg target proof-consumer evidence",
     );
     assert_eq!(
@@ -3250,13 +3376,16 @@ fn test_targo_trust_convert_trust_cg_rejects_after_partial_trust_ir_decompile_su
     assert_target_proof_consumer_evidence_rejected(
         &json["target_proof_consumer_evidence"],
         "trust-cg",
+        false,
         "convert trust_cg post-decompile target proof-consumer evidence",
     );
     assert_eq!(
         json["conversion_gate"]["target_proof_consumer_evidence"],
         json["target_proof_consumer_evidence"]
     );
-    assert_convert_release_gate_blocker_class_coverage(&json, &entry_arg);
+    // `trust_fixture_return` is a bare `retq`: every symbolic statement it had
+    // was stack-pointer / program-counter bookkeeping, so none survives.
+    assert_convert_release_gate_blocker_class_coverage(&json, &entry_arg, false);
     assert_json_string_items_contain_all(
         json["conversion_gate"]["blockers"]
             .as_array()

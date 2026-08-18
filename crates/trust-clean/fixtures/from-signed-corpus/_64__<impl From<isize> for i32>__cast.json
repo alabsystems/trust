@@ -1,6 +1,6 @@
 {
   "name": "cast",
-  "def_path": "_64::<impl From<isize> for i32>::cast",
+  "def_path": "lib::_64::<impl lib::From<isize> for i32>::cast",
   "span": {
     "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
     "line_start": 249,
@@ -38,7 +38,7 @@
                 "__v1_0",
                 {
                   "Adt": {
-                    "name": "Error",
+                    "name": "lib::Error",
                     "fields": [
                       [
                         "__tag",
@@ -71,11 +71,90 @@
                         "discriminant": 3,
                         "fields": []
                       }
-                    ]
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
                   }
                 }
               ]
-            ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "lib::Error",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Infinite",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "NaN",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "Overflow",
+                            "discriminant": 2,
+                            "fields": []
+                          },
+                          {
+                            "name": "Underflow",
+                            "discriminant": 3,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
           }
         },
         "name": null
@@ -94,7 +173,7 @@
         "index": 2,
         "ty": {
           "Adt": {
-            "name": "Error",
+            "name": "lib::Error",
             "fields": [
               [
                 "__tag",
@@ -127,7 +206,12 @@
                 "discriminant": 3,
                 "fields": []
               }
-            ]
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
           }
         },
         "name": null
@@ -279,9 +363,10 @@
                 "Aggregate": [
                   {
                     "Adt": {
-                      "name": "Error",
+                      "name": "lib::Error",
                       "variant": 3,
-                      "active_field": null
+                      "active_field": null,
+                      "args": "lib::Error"
                     }
                   },
                   []
@@ -406,9 +491,10 @@
                 "Aggregate": [
                   {
                     "Adt": {
-                      "name": "Error",
+                      "name": "lib::Error",
                       "variant": 2,
-                      "active_field": null
+                      "active_field": null,
+                      "args": "lib::Error"
                     }
                   },
                   []
@@ -474,7 +560,8 @@
                     "Adt": {
                       "name": "core::result::Result",
                       "variant": 0,
-                      "active_field": null
+                      "active_field": null,
+                      "args": "core::result::Result<i32, lib::Error>"
                     }
                   },
                   [
@@ -516,7 +603,8 @@
                     "Adt": {
                       "name": "core::result::Result",
                       "variant": 1,
-                      "active_field": null
+                      "active_field": null,
+                      "args": "core::result::Result<i32, lib::Error>"
                     }
                   },
                   [
@@ -576,7 +664,7 @@
             "__v1_0",
             {
               "Adt": {
-                "name": "Error",
+                "name": "lib::Error",
                 "fields": [
                   [
                     "__tag",
@@ -609,16 +697,126 @@
                     "discriminant": 3,
                     "fields": []
                   }
-                ]
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
               }
             }
           ]
-        ]
+        ],
+        "variants": [
+          {
+            "name": "Ok",
+            "discriminant": 0,
+            "fields": [
+              [
+                "0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              ]
+            ]
+          },
+          {
+            "name": "Err",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "lib::Error",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "Infinite",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "NaN",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "Overflow",
+                        "discriminant": 2,
+                        "fields": []
+                      },
+                      {
+                        "name": "Underflow",
+                        "discriminant": 3,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": true,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Enum"
       }
     }
   },
   "contracts": [],
-  "preconditions": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "src",
+                "Int"
+              ]
+            },
+            {
+              "Int": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "src",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9223372036854775807
+            }
+          ]
+        }
+      ]
+    }
+  ],
   "postconditions": [],
   "spec": {
     "requires": [],

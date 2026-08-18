@@ -116,6 +116,7 @@ fn field_vec_func(
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

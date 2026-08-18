@@ -126,6 +126,25 @@ pub fn trust_ir_crate_finalize(tcx: TyCtxt<'_>) {
             note = v.note.as_str(),
             "trust-ir-lower: differential"
         );
+        // Trust (A2-D): the THIRD disagreement channel. A DEFERRED (clean + call-bearing) body
+        // gets its one real interpretation verdict HERE, not at the per-body hook, so the hook's
+        // strict disagreement arm structurally cannot see it. Under `-Ztrust-ir-lower=strict` a
+        // seam `MirOracle` verdict is the same error for the same reason: the THIR-derived
+        // trust-ir the trust-ir codegen frontend would emit from means something other than the
+        // MIR the rest of the compiler uses. `NotRun` (every fail-closed seam gate) and `Agreed`
+        // are untouched.
+        if tcx.sess.trust_ir_lower_strict()
+            && v.mode == trust_thir_lower::differential::DiffMode::MirOracle
+        {
+            tcx.dcx().span_err(
+                tcx.def_span(def),
+                format!(
+                    "-Ztrust-ir-lower=strict: THIR-derived trust-ir DISAGREES with the built MIR \
+                     for this body at the crate-link seam after {} sampled input(s): {}",
+                    v.samples, v.note
+                ),
+            );
+        }
     }
     if let Some(summary) = summary.dump {
         if !summary.errors.is_empty() {

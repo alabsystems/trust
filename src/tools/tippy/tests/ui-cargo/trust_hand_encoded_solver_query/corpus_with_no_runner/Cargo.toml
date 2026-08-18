@@ -1,0 +1,6 @@
+[package]
+name = "corpus_with_no_runner"
+version = "0.1.0"
+publish = false
+
+[workspace]

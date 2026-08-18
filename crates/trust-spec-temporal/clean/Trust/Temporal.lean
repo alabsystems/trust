@@ -90,6 +90,77 @@ def SatisfiesUnderFairness {State Index : Type}
     (F : Formula State) : Prop :=
   ∀ b, Runs M b → FairFamily constraints b → F b
 
+-- A proof-carrying forward simulation connects an actual program transition
+-- system to an authored abstraction.  A concrete step may map either to an
+-- abstract step or to abstract stuttering, matching `Runs`' stutter-permissive
+-- semantics.  This is deliberately a proposition, not an unchecked adapter:
+-- every model/program pairing must provide a kernel-checked inhabitant.
+structure ForwardRefinement {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract) : Prop where
+  init : ∀ state : Concrete,
+    concrete.init state → abstractModel.init (project state)
+  next : ∀ before after : Concrete,
+    concrete.next before after →
+      abstractModel.next (project before) (project after) ∨
+        project after = project before
+
+theorem forwardRefinementRuns {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (refinement : ForwardRefinement concrete abstractModel project)
+    (behavior : Behavior Concrete)
+    (runs : Runs concrete behavior) :
+    Runs abstractModel (fun n => project (behavior n)) :=
+  And.intro
+    (refinement.init (behavior 0) runs.1)
+    (fun n =>
+      Or.elim (runs.2 n)
+        (fun step => refinement.next (behavior n) (behavior (Nat.succ n)) step)
+        (fun stutter => Or.inr (congrArg project stutter)))
+
+-- Pull an abstract temporal proposition back to concrete executions through
+-- the same projection used by the refinement proof.
+def Pullback {Concrete Abstract : Type}
+    (project : Concrete → Abstract) (F : Formula Abstract) : Formula Concrete :=
+  fun behavior => F (fun n => project (behavior n))
+
+theorem forwardRefinementSatisfies {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (refinement : ForwardRefinement concrete abstractModel project)
+    (F : Formula Abstract)
+    (holds : Satisfies abstractModel F) :
+    Satisfies concrete (Pullback project F) :=
+  fun behavior runs =>
+    holds (fun n => project (behavior n))
+      (forwardRefinementRuns concrete abstractModel project refinement behavior runs)
+
+-- Fairness does not automatically survive abstraction: a projection can hide
+-- the very non-stuttering step whose scheduling assumption matters.  Transport
+-- is therefore explicit about the honest premise—the projected concrete run
+-- must satisfy the abstract model's exact authored fairness family.
+theorem forwardRefinementSatisfiesUnderFairness
+    {Concrete Abstract Index : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (refinement : ForwardRefinement concrete abstractModel project)
+    (constraints : Index → FairnessConstraint Abstract)
+    (F : Formula Abstract)
+    (holds : SatisfiesUnderFairness abstractModel constraints F) :
+    ∀ behavior : Behavior Concrete,
+      Runs concrete behavior →
+      FairFamily constraints (fun n => project (behavior n)) →
+      Pullback project F behavior :=
+  fun behavior runs fair =>
+    holds (fun n => project (behavior n))
+      (forwardRefinementRuns concrete abstractModel project refinement behavior runs)
+      fair
+
 -- Notation expansion happens at the use site, so force every expansion target
 -- through Clean's root-namespace escape.  A merely dotted name such as
 -- `Trust.Temporal.Always` is still namespace-relative: inside `namespace N`,

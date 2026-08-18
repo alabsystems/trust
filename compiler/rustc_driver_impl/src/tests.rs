@@ -349,6 +349,14 @@ fn callback_injected_trust_option_domains_fail_closed() {
     invalid.unstable_opts.trust_cg_output_gate = "bogus".to_string();
     assert!(trust_option_domain_error(&invalid).is_some());
     invalid = valid.clone();
+    invalid.unstable_opts.trust_cg_frontend = "bogus".to_string();
+    assert!(trust_option_domain_error(&invalid).is_some());
+    invalid = valid.clone();
+    // The two admitted spellings must both survive the domain check; `mir` is
+    // also the declared default, which `valid` above already exercises.
+    invalid.unstable_opts.trust_cg_frontend = "trust-ir".to_string();
+    assert_eq!(trust_option_domain_error(&invalid), None);
+    invalid = valid.clone();
     invalid.unstable_opts.trust_verify_output = "jsonl".to_string();
     assert!(trust_option_domain_error(&invalid).is_some());
     invalid = valid.clone();
@@ -1036,6 +1044,11 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
         "enum-disc-index",
         "switch-map",
         "enum-payload",
+        "marker-order",
+        "marker-drop",
+        "agg-field-order",
+        "marker-arm",
+        "payload-tramp",
     ] {
         let mut valid_class = burn_in.clone();
         valid_class.unstable_opts.trust_sat_perturb = Some(class.to_string());
@@ -1048,7 +1061,9 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
         trust_option_domain_error(&unknown),
         Some(
             "invalid -Ztrust-sat-perturb value: expected enum-reshape, \
-             enum-case-value, enum-ctor, enum-disc-index, switch-map, or enum-payload"
+             enum-case-value, enum-ctor, enum-disc-index, switch-map, enum-payload, \
+             marker-order, marker-drop, agg-field-order, marker-arm, or \
+             payload-tramp"
         )
     );
 }

@@ -3,6 +3,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+#[cfg(test)]
+mod divergence_tests;
 mod fp;
 mod helpers;
 
@@ -21,7 +23,7 @@ use crate::error::SemError;
 use crate::semantics::Semantics;
 use crate::state::MachineState;
 
-use helpers::{compute_nzcv, operand_to_formula, resolve_mem_address};
+use helpers::{compute_nzcv, compute_nzcv_with_carry, operand_to_formula, resolve_mem_address};
 
 /// AArch64 instruction semantics.
 pub struct Aarch64Semantics;
@@ -96,6 +98,7 @@ impl Semantics for Aarch64Semantics {
             Opcode::Ldrsw => self.sem_ldr_variant(state, insn, 4, true),
             Opcode::LdrLiteral => Err(aarch64_proof_blocker_error(insn)),
             Opcode::Ldp => self.sem_ldp(state, insn),
+            Opcode::Ldpsw => self.sem_ldpsw(state, insn),
 
             // Stores
             Opcode::Str => self.sem_str(state, insn),
@@ -169,7 +172,18 @@ impl Semantics for Aarch64Semantics {
 
             // FP conditional select
             Opcode::Fcsel => self.sem_fcsel(state, insn),
-            Opcode::SimdMov => Err(aarch64_proof_blocker_error(insn)),
+            // `MOV Vd.<T>, Vn.<T>` is a bit-for-bit register copy at the
+            // decoded width, which is precisely what `sem_fmov_reg` already
+            // models: equal widths make the value pass through unchanged, and
+            // an `FpRegWrite` at width 64 zero-extends to 128, matching the
+            // architecture's rule that writing a 64-bit arrangement clears bits
+            // 127:64. This is the same effect as `FMOV Vd, Vn`, so sharing the
+            // handler is the semantics, not a shortcut.
+            //
+            // The decoder only ever mints `SimdMov` for the `Rn == Rm` ORR
+            // alias with two SIMD operands; a genuine two-register vector OR is
+            // still refused at decode.
+            Opcode::SimdMov => self.sem_fmov_reg(state, insn),
 
             other => Err(SemError::UnsupportedOpcode(other)),
         }
@@ -291,25 +305,37 @@ impl Aarch64Semantics {
             }
         };
 
+        // THE `hw` SHIFT IS PART OF THE VALUE, NOT DECORATION. `decode_move_wide`
+        // pushes the RAW 16-bit immediate as operand 1 and the shift amount as a
+        // SEPARATE operand 2 (so the printed form reads `movk w3, #0x8000, lsl
+        // #16`) — it does NOT pre-shift. Reading operand 1 alone therefore models
+        // `movz/movn/movk … lsl #N` as if N were 0.
+        //
+        // Measured consequence before this was fixed: `mov w3,#0; movk
+        // w3,#0x8000,lsl#16` — the canonical `i32::MIN` materialization the
+        // trust-cg backend emits for a signed-division overflow guard — was
+        // modeled as `w3 = 0x00008000` instead of `0x80000000`. The proven-output
+        // gate then reported a REFUTED verdict (a fabricated miscompile) for
+        // `fn v_div(a: i32, b: i32) -> i32 { a / b }`, whose bytes are correct.
+        // Every constant above 0xFFFF was affected; the bug was invisible until a
+        // gate ran over code that materializes one.
+        let shift = ((insn.encoding >> 21) & 0x3) * 16;
+        let width_mask: i128 = if width == 64 {
+            -1i128 // all ones in 64 bits (0xFFFFFFFFFFFFFFFF as i128)
+        } else {
+            (1i128 << width) - 1
+        };
+        let shifted_imm = ((imm_val as i128) << shift) & width_mask;
+
         let value = match insn.opcode {
-            Opcode::Movz => Formula::BitVec { value: imm_val as i128, width },
+            Opcode::Movz => Formula::BitVec { value: shifted_imm, width },
             Opcode::Movn => {
-                Formula::BvNot(Box::new(Formula::BitVec { value: imm_val as i128, width }), width)
+                Formula::BvNot(Box::new(Formula::BitVec { value: shifted_imm, width }), width)
             }
             Opcode::Movk => {
-                // Bit-field insert: clear the target 16-bit lane, then OR in
-                // the shifted immediate. The decoder pre-shifts the immediate.
-                // Extract hw (shift amount / 16) from encoding bits [22:21].
-                let hw = (insn.encoding >> 21) & 0x3;
-                let shift = hw * 16;
+                // Bit-field insert: clear the target 16-bit lane, then OR in the
+                // shifted immediate.
                 let existing = state.read_gpr(dst_idx, width);
-
-                // Build inverted mask to clear the 16-bit field.
-                let width_mask: i128 = if width == 64 {
-                    -1i128 // all ones in 64 bits (0xFFFFFFFFFFFFFFFF as i128)
-                } else {
-                    (1i128 << width) - 1
-                };
                 let field_mask = (0xFFFF_i128) << shift;
                 let inv_mask = (!field_mask) & width_mask;
 
@@ -320,7 +346,7 @@ impl Aarch64Semantics {
                 );
                 Formula::BvOr(
                     Box::new(cleared),
-                    Box::new(Formula::BitVec { value: imm_val as i128, width }),
+                    Box::new(Formula::BitVec { value: shifted_imm, width }),
                     width,
                 )
             }
@@ -344,8 +370,100 @@ impl Aarch64Semantics {
         Ok(effects)
     }
 
+    /// The SIMD&FP register of a `LDR`/`STR` whose transfer operand is one, or
+    /// `None` for the ordinary GPR forms.
+    ///
+    /// `decode_simd_fp_load_store_reg_unsigned_offset` builds these with
+    /// `Register::simd`, i.e. `RegKind::Simd` and widths 8/16/32/64/128 (B/H/S/
+    /// D/Q). Every other load/store form carries a GPR.
+    fn simd_transfer_reg(insn: &Instruction) -> Option<Register> {
+        match insn.operand(0) {
+            Some(Operand::Reg(r)) if r.kind == RegKind::Simd => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// LDR (SIMD&FP): `Vt = mem[addr]`, upper lanes ZEROED.
+    ///
+    /// SOUNDNESS: before this existed, `sem_ldr` sent the SIMD forms through
+    /// `extract_dst_reg` + `Effect::RegWrite`, so `ldr d11,[x11,#0x50]`
+    /// (fd40296b) was modeled as writing the GENERAL-PURPOSE register x11 — a
+    /// register the instruction does not touch — and leaving V11 alone.
+    /// Measured against the CPU by the native semantic differential; see
+    /// `divergence_tests`.
+    fn sem_ldr_simd(
+        &self,
+        state: &MachineState,
+        insn: &Instruction,
+        reg: Register,
+    ) -> Result<Vec<Effect>, SemError> {
+        let width = u32::from(reg.width);
+        let width_bytes = simd_transfer_width_bytes(insn, width)?;
+
+        let Some(Operand::Mem(mem_op)) = insn.operand(1) else {
+            return Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index: 1,
+                detail: "expected memory operand".into(),
+            });
+        };
+        let addr = resolve_mem_address(state, mem_op)?;
+        let loaded = load_le_bytes(state, &addr, width_bytes, width);
+
+        let mut effects = vec![
+            Effect::MemRead { address: addr.clone(), width_bytes },
+            // `FpRegWrite` zeroes the lanes above `width`, which is the
+            // architectural behaviour of every scalar SIMD&FP load.
+            Effect::FpRegWrite { index: reg.index, width, value: loaded },
+        ];
+        if let Some(wb) = writeback_effect(state, mem_op) {
+            effects.push(wb);
+        }
+        effects.push(pc_advance(state, insn));
+        Ok(effects)
+    }
+
+    /// STR (SIMD&FP): `mem[addr] = Vt`.
+    ///
+    /// SOUNDNESS: `str d13,[x28,#0xa0]` (fd00538d) used to store the GPR X13,
+    /// because `operand_to_formula` read `Reg { kind: Simd, index: 13 }` as
+    /// `read_gpr(13)`. That single discarded field is family 1 of the
+    /// differential's three, 5,721 disagreements.
+    fn sem_str_simd(
+        &self,
+        state: &MachineState,
+        insn: &Instruction,
+        reg: Register,
+    ) -> Result<Vec<Effect>, SemError> {
+        let width = u32::from(reg.width);
+        let width_bytes = simd_transfer_width_bytes(insn, width)?;
+
+        let Some(Operand::Mem(mem_op)) = insn.operand(1) else {
+            return Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index: 1,
+                detail: "expected memory operand".into(),
+            });
+        };
+        let addr = resolve_mem_address(state, mem_op)?;
+
+        // THE FIX, in one expression: the value stored is the FP register's low
+        // `width` bits — `read_fpr`, not `read_gpr`.
+        let value = state.read_fpr(reg.index, width);
+
+        let mut effects = vec![Effect::MemWrite { address: addr.clone(), value, width_bytes }];
+        if let Some(wb) = writeback_effect(state, mem_op) {
+            effects.push(wb);
+        }
+        effects.push(pc_advance(state, insn));
+        Ok(effects)
+    }
+
     /// LDR: Rd = mem[addr]. Load register from memory.
     fn sem_ldr(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
+        if let Some(reg) = Self::simd_transfer_reg(insn) {
+            return self.sem_ldr_simd(state, insn, reg);
+        }
         let (dst_idx, _dst_is_sp, width) = extract_dst_reg(insn)?;
         let width_bytes = width / 8;
 
@@ -383,6 +501,9 @@ impl Aarch64Semantics {
 
     /// STR: mem[addr] = Rt. Store register to memory.
     fn sem_str(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
+        if let Some(reg) = Self::simd_transfer_reg(insn) {
+            return self.sem_str_simd(state, insn, reg);
+        }
         let src = operand_to_formula(state, insn.operand(0), insn.opcode, 0, 64)?;
         let width = match insn.operand(0) {
             Some(Operand::Reg(r)) => u32::from(r.width),
@@ -467,6 +588,59 @@ impl Aarch64Semantics {
         let mut effects = vec![
             Effect::MemRead { address: addr0.clone(), width_bytes },
             Effect::MemRead { address: addr1.clone(), width_bytes },
+            Effect::RegWrite { index: rt.index, width, value: loaded0 },
+            Effect::RegWrite { index: rt2.index, width, value: loaded1 },
+        ];
+
+        if let Some(wb) = writeback_effect(state, mem_op) {
+            effects.push(wb);
+        }
+
+        effects.push(pc_advance(state, insn));
+        Ok(effects)
+    }
+
+    /// LDPSW: Xt, Xt2 = SignExtend(mem[addr], 64), SignExtend(mem[addr+4], 64).
+    ///
+    /// The element size (4 bytes) and the destination width (64) DIFFER — that
+    /// is the whole content of the instruction. Modeling it as a 32-bit LDP
+    /// (which is what `is_64 = opc == 0b10` in the decoder used to do) makes it
+    /// ZERO-extend, so every negative loaded word is wrong.
+    fn sem_ldpsw(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
+        const ELEM_BYTES: u32 = 4;
+        const ELEM_BITS: u32 = 32;
+
+        let (rt, rt2, width, mem_op) = extract_pair_regs_and_mem(insn)?;
+        if width != 64 {
+            return Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index: 0,
+                detail: "LDPSW destinations must be 64-bit X registers".into(),
+            });
+        }
+
+        let addr0 = resolve_pair_mem_address(state, insn, mem_op)?;
+        let addr1 = offset_addr(&addr0, ELEM_BYTES);
+
+        // `extend_bv_to_width` takes the SMT-LIB extension AMOUNT, not the
+        // target width; passing the width here is the bug fixed in
+        // `load_le_bytes`.
+        let loaded0 = extend_bv_to_width(
+            load_le_bytes(state, &addr0, ELEM_BYTES, ELEM_BITS),
+            ELEM_BITS,
+            width,
+            true,
+        );
+        let loaded1 = extend_bv_to_width(
+            load_le_bytes(state, &addr1, ELEM_BYTES, ELEM_BITS),
+            ELEM_BITS,
+            width,
+            true,
+        );
+
+        let mut effects = vec![
+            Effect::MemRead { address: addr0, width_bytes: ELEM_BYTES },
+            Effect::MemRead { address: addr1, width_bytes: ELEM_BYTES },
             Effect::RegWrite { index: rt.index, width, value: loaded0 },
             Effect::RegWrite { index: rt2.index, width, value: loaded1 },
         ];
@@ -585,7 +759,18 @@ impl Aarch64Semantics {
 
         let mut effects = vec![write_reg_or_sp(dst_idx, dst_is_sp, width, result.clone())];
         if sets_flags {
-            effects.push(compute_nzcv(&rn, &rm, &result, width, false));
+            // The carry-in must reach the FLAGS, not only the result. See
+            // `compute_nzcv_with_carry`: `compute_nzcv` computes the carry-out
+            // as though the carry-in were zero, and the differential caught it
+            // 456 times.
+            effects.push(compute_nzcv_with_carry(
+                &rn,
+                &rm,
+                &result,
+                width,
+                false,
+                &state.flags.c,
+            ));
         }
         effects.push(pc_advance(state, insn));
         Ok(effects)
@@ -609,7 +794,10 @@ impl Aarch64Semantics {
 
         let mut effects = vec![write_reg_or_sp(dst_idx, dst_is_sp, width, result.clone())];
         if sets_flags {
-            effects.push(compute_nzcv(&rn, &rm, &result, width, true));
+            // SBCS is `AddWithCarry(Rn, NOT(Rm), C)`; the carry-out is the
+            // carry-out of THAT addition, which the borrow-free
+            // `NOT(lhs <u rhs)` cannot express once C is symbolic.
+            effects.push(compute_nzcv_with_carry(&rn, &rm, &result, width, true, &state.flags.c));
         }
         effects.push(pc_advance(state, insn));
         Ok(effects)
@@ -874,8 +1062,7 @@ impl Aarch64Semantics {
     fn sem_ubfm(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
         let (dst_idx, dst_is_sp, width) = extract_dst_reg(insn)?;
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
-        let immr = extract_imm(insn, 2)? as u32;
-        let imms = extract_imm(insn, 3)? as u32;
+        let (immr, imms) = extract_bitfield_positions(insn, width)?;
 
         let result = if imms >= immr {
             // Extract bits [imms:immr] and zero-extend.
@@ -892,15 +1079,40 @@ impl Aarch64Semantics {
                 Formula::BvZeroExt(Box::new(extracted), width - field_width)
             }
         } else {
-            // LSL alias: imms < immr. Shift left by (width - immr), mask to imms+1 bits.
+            // UBFIZ (imms < immr): `Rd = ZeroExtend(Rn<imms:0>) << (width - immr)`.
+            //
+            // SOUNDNESS: this arm used to be a bare `BvShl(rn, width - immr)`
+            // with a comment claiming the source was "already correct ...
+            // since we shift from a clean source". IT IS NOT CLEAN. The
+            // architecture takes only bits `imms:0` of Rn; everything above
+            // `imms` belongs to no field and must never appear in the result.
+            // The native semantic differential measured 5,208 disagreements
+            // from this one missing mask, and confirmed the shape on silicon:
+            // `ubfiz w15,w4,#28,#1` (5304008f) with `w4 = 8` — bit 0 CLEAR —
+            // gave `0x80000000` in the model and `0` on the CPU, because bit 3
+            // was shifted into bit 31.
+            //
+            // The equivalence that hid it: the CANONICAL `LSL #n` alias encodes
+            // `immr - imms == 1`, i.e. the field reaches exactly to the top of
+            // the register, so the mask removes nothing. All 29 `imms < immr`
+            // words in the emitted corpus are that alias — which is why no
+            // shipped verdict was wrong and why counting `imms < immr` as the
+            // reachable population would have overstated the exposure 29-fold.
+            //
+            // The shape is `sem_bfm`'s, one file down: extract the field, then
+            // place it. `sem_bfm` masks AFTER shifting and `AND`s into the
+            // preserved destination; here the destination is zero, so the mask
+            // is the zero-extension of the extracted field and the two are the
+            // same computation written the shorter way. Using BvExtract +
+            // BvZeroExt also matches this function's own `imms >= immr` arm.
             let shift = width - immr;
-
-            // Mask to keep only the low (imms+1+shift) bits — but for UBFM the
-            // upper bits above position imms+shift are zeroed. Since we shift
-            // from a clean source, the result is already correct for the
-            // zero-extension semantics.
+            let field_width = imms + 1;
+            let field = Formula::BvExtract { inner: Box::new(rn), high: imms, low: 0 };
+            // `imms < immr <= width - 1` gives `field_width <= width - 1`, so
+            // the extension amount is at least 1 and never underflows.
+            let zero_extended = Formula::BvZeroExt(Box::new(field), width - field_width);
             Formula::BvShl(
-                Box::new(rn),
+                Box::new(zero_extended),
                 Box::new(Formula::BitVec { value: i128::from(shift), width }),
                 width,
             )
@@ -916,8 +1128,7 @@ impl Aarch64Semantics {
     fn sem_sbfm(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
         let (dst_idx, dst_is_sp, width) = extract_dst_reg(insn)?;
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
-        let immr = extract_imm(insn, 2)? as u32;
-        let imms = extract_imm(insn, 3)? as u32;
+        let (immr, imms) = extract_bitfield_positions(insn, width)?;
 
         let result = if imms >= immr {
             // Extract bits [imms:immr] and sign-extend.
@@ -934,11 +1145,29 @@ impl Aarch64Semantics {
                 Formula::BvSignExt(Box::new(extracted), width - field_width)
             }
         } else {
-            // ASR alias or shift-insert: shift left then arithmetic shift right.
+            // SBFIZ (imms < immr): `Rd = SignExtend(Rn<imms:0>) << (width - immr)`.
+            //
+            // SOUNDNESS: this arm had BOTH halves of the UBFM bug and one more.
+            // It shifted the whole register (no mask to `imms+1` bits) AND
+            // never sign-extended, despite being the SIGNED bitfield move — its
+            // own comment said "shift left then arithmetic shift right" while
+            // the code did only the left shift. Confirmed against the assembler
+            // and the CPU: `sbfiz w0,w1,#24,#4` (13080c20) with `w1 = 0x18`
+            // must give `0xf8000000` (field `0x8` is negative in 4 bits, so
+            // bits 31:28 fill with ones); the old arm gave `0x18000000` — bit 4
+            // leaked in and nothing extended.
+            //
+            // The sign bits are OBSERVABLE only when `imms + 1 < immr`: the
+            // field ends at bit `(width - immr) + imms`, so the extension
+            // occupies `[width - immr + imms + 1, width - 1]`, which is empty
+            // for the canonical `LSL` alias (`immr - imms == 1`). Same
+            // equivalence, same reason the corpus never noticed.
             let shift = width - immr;
-
+            let field_width = imms + 1;
+            let field = Formula::BvExtract { inner: Box::new(rn), high: imms, low: 0 };
+            let sign_extended = Formula::BvSignExt(Box::new(field), width - field_width);
             Formula::BvShl(
-                Box::new(rn),
+                Box::new(sign_extended),
                 Box::new(Formula::BitVec { value: i128::from(shift), width }),
                 width,
             )
@@ -954,8 +1183,7 @@ impl Aarch64Semantics {
     fn sem_bfm(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
         let (dst_idx, dst_is_sp, width) = extract_dst_reg(insn)?;
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
-        let immr = extract_imm(insn, 2)? as u32;
-        let imms = extract_imm(insn, 3)? as u32;
+        let (immr, imms) = extract_bitfield_positions(insn, width)?;
         let existing = state.read_gpr(dst_idx, width);
 
         // Simple model: extract the field from Rn, insert into Rd.
@@ -1011,6 +1239,21 @@ impl Aarch64Semantics {
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
         let rm = operand_to_formula(state, insn.operand(2), insn.opcode, 2, width)?;
         let lsb = extract_imm(insn, 3)? as u32;
+
+        // Same hazard as the bitfield trio: `width - lsb` below wraps once
+        // `lsb > width`, which a 32-bit EXTR with `imms<5>` set would produce.
+        // `decode_extract` now refuses that encoding; this refuses the value.
+        if lsb >= width {
+            return Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index: 3,
+                detail: format!(
+                    "EXTR lsb {lsb} is not a bit position in a {width}-bit register; \
+                     refusing rather than computing `width - lsb`, which wraps in a \
+                     release build"
+                ),
+            });
+        }
 
         if lsb == 0 {
             // Trivial case: result = Rm
@@ -1216,7 +1459,7 @@ impl Aarch64Semantics {
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
         let rm = operand_to_formula(state, insn.operand(2), insn.opcode, 2, width)?;
         let cond = extract_condition(insn, 3)?;
-        let cond_formula = condition_to_formula(state, cond);
+        let cond_formula = condition_to_formula(state, cond)?;
 
         let result = Formula::Ite(Box::new(cond_formula), Box::new(rn), Box::new(rm));
         let mut effects = vec![write_reg_or_sp(dst_idx, dst_is_sp, width, result)];
@@ -1230,7 +1473,7 @@ impl Aarch64Semantics {
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
         let rm = operand_to_formula(state, insn.operand(2), insn.opcode, 2, width)?;
         let cond = extract_condition(insn, 3)?;
-        let cond_formula = condition_to_formula(state, cond);
+        let cond_formula = condition_to_formula(state, cond)?;
 
         let rm_inc =
             Formula::BvAdd(Box::new(rm), Box::new(Formula::BitVec { value: 1, width }), width);
@@ -1246,7 +1489,7 @@ impl Aarch64Semantics {
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
         let rm = operand_to_formula(state, insn.operand(2), insn.opcode, 2, width)?;
         let cond = extract_condition(insn, 3)?;
-        let cond_formula = condition_to_formula(state, cond);
+        let cond_formula = condition_to_formula(state, cond)?;
 
         let rm_inv = Formula::BvNot(Box::new(rm), width);
         let result = Formula::Ite(Box::new(cond_formula), Box::new(rn), Box::new(rm_inv));
@@ -1261,7 +1504,7 @@ impl Aarch64Semantics {
         let rn = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
         let rm = operand_to_formula(state, insn.operand(2), insn.opcode, 2, width)?;
         let cond = extract_condition(insn, 3)?;
-        let cond_formula = condition_to_formula(state, cond);
+        let cond_formula = condition_to_formula(state, cond)?;
 
         // -Rm = ~Rm + 1 (two's complement negation)
         let rm_neg = Formula::BvAdd(
@@ -1312,7 +1555,7 @@ impl Aarch64Semantics {
         let op2 = operand_to_formula(state, insn.operand(1), insn.opcode, 1, width)?;
         let nzcv_imm = extract_imm(insn, 2)? as u8;
         let cond = extract_condition(insn, 3)?;
-        let cond_formula = condition_to_formula(state, cond);
+        let cond_formula = condition_to_formula(state, cond)?;
 
         // Compute comparison result.
         let result = if is_sub {
@@ -1413,14 +1656,14 @@ impl Aarch64Semantics {
         let load_width = load_bytes * 8;
         let loaded = load_le_bytes(state, &addr, load_bytes, load_width);
 
-        // Extend to destination width.
-        let extended = if load_width == width {
-            loaded
-        } else if sign_extend {
-            Formula::BvSignExt(Box::new(loaded), width)
-        } else {
-            Formula::BvZeroExt(Box::new(loaded), width)
-        };
+        // Extend to destination width. `BvSignExt`/`BvZeroExt` carry the
+        // SMT-LIB extension AMOUNT (bits added), not the target width — the
+        // same convention `load_le_bytes` documents. Passing `width` made
+        // `ldrsb x0,[x1]` an 8+64 = 72-bit term and `ldrsw x0,[x1]` a 96-bit
+        // one, sitting in a 64-bit register slot that nothing truncates on an
+        // X-width read; the gate's `try_eq(..).expect("eq")` then aborted with
+        // `SortMismatch`.
+        let extended = extend_bv_to_width(loaded, load_width, width, sign_extend);
 
         let mut effects = vec![
             Effect::MemRead { address: addr.clone(), width_bytes: load_bytes },
@@ -1566,13 +1809,53 @@ impl Aarch64Semantics {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// The byte width of a SIMD&FP load/store transfer, REFUSING anything the
+/// memory-effect vocabulary cannot express exactly.
+///
+/// `Effect::MemRead`/`MemWrite` carry a byte count that the concrete replayer
+/// and the lifter accept for 1, 2, 4, 8 and 16 — the whole B/H/S/D/Q ladder the
+/// decoder builds. A width outside that ladder would have to be rounded to a
+/// neighbour, and rounding is what this family of bugs is made of.
+fn simd_transfer_width_bytes(insn: &Instruction, width: u32) -> Result<u32, SemError> {
+    match width {
+        8 | 16 | 32 | 64 | 128 => Ok(width / 8),
+        other => Err(SemError::InvalidOperand {
+            opcode: insn.opcode,
+            index: 0,
+            detail: format!(
+                "SIMD&FP transfer width {other} is not one of the B/H/S/D/Q lane sizes; \
+                 refusing rather than rounding to a neighbouring access size"
+            ),
+        }),
+    }
+}
+
 /// Extract destination register info from the first operand.
+///
+/// SOUNDNESS: this used to accept ANY `Operand::Reg` and hand back
+/// `(index, is_sp, width)`, which every caller turns into an
+/// `Effect::RegWrite` — a GENERAL-PURPOSE register write. A `RegKind::Simd`
+/// operand therefore became a write to the GPR of the same number, which is the
+/// load half of the `Ldr`/`Str` SIMD divergence. The SIMD load/store forms now
+/// branch to `sem_ldr_simd` before reaching here; everything that still arrives
+/// is writing a GPR or SP, and anything else is refused rather than aimed at
+/// the wrong register file.
 fn extract_dst_reg(insn: &Instruction) -> Result<(u8, bool, u32), SemError> {
     match insn.operand(0) {
-        Some(Operand::Reg(r)) => {
-            let is_sp = r.kind == RegKind::Sp;
-            Ok((r.index, is_sp, u32::from(r.width)))
-        }
+        Some(Operand::Reg(r)) => match r.kind {
+            RegKind::Gpr | RegKind::Sp | RegKind::Zr => {
+                Ok((r.index, r.kind == RegKind::Sp, u32::from(r.width)))
+            }
+            other => Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index: 0,
+                detail: format!(
+                    "destination is a {other:?} register (number {}); writing it as the \
+                     GPR of the same number would model a DIFFERENT register file",
+                    r.index
+                ),
+            }),
+        },
         _ => Err(SemError::InvalidOperand {
             opcode: insn.opcode,
             index: 0,
@@ -1581,9 +1864,26 @@ fn extract_dst_reg(insn: &Instruction) -> Result<(u8, bool, u32), SemError> {
     }
 }
 
+/// SOUNDNESS: the register here is turned into an `Effect::RegWrite` (LDAR) or
+/// read as a GPR (STLR) by index alone, so it carried the SAME `r.kind` discard
+/// as `extract_dst_reg` — the fifth on this path. LDAR/STLR have no SIMD&FP form
+/// in this decoder, so the refusal is unreachable today; that is the reason to
+/// write it, not the reason to skip it. Every other site in this family was also
+/// "unreachable" until the SIMD load/store forms turned out to reach one.
 fn extract_atomic_reg_mem(insn: &Instruction) -> Result<(u8, u32, &MemoryOperand), SemError> {
     let reg = match insn.operand(0) {
-        Some(Operand::Reg(reg)) => reg,
+        Some(Operand::Reg(reg)) if matches!(reg.kind, RegKind::Gpr | RegKind::Zr) => reg,
+        Some(Operand::Reg(reg)) => {
+            return Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index: 0,
+                detail: format!(
+                    "atomic transfer register is a {:?} register (number {}); only a GPR \
+                     or ZR is modeled here",
+                    reg.kind, reg.index
+                ),
+            });
+        }
         _ => {
             return Err(SemError::InvalidOperand {
                 opcode: insn.opcode,
@@ -2180,6 +2480,46 @@ fn extract_imm(insn: &Instruction, index: usize) -> Result<u64, SemError> {
     }
 }
 
+/// Read the `(immr, imms)` pair of a bitfield instruction, REFUSING any value
+/// that does not name a bit position inside a `width`-bit register.
+///
+/// SOUNDNESS: `sem_ubfm`, `sem_sbfm` and `sem_bfm` all compute `width - immr` on
+/// the `imms < immr` path, and all three index `BvExtract { high: imms }` on the
+/// other. With `width == 32` and a 6-bit field whose top bit is set, the first
+/// UNDERFLOWS and the second runs off the end of the value.
+///
+/// The subtraction is the same shape as the `1u64 << 64` bug already fixed in
+/// `decode_bitmask_immediate`, and it has the same asymmetric consequences: with
+/// debug assertions ON it panics — aborting the compiler, which is not
+/// fail-closed — and with them OFF, which is how the shipped `trustc` is built,
+/// it WRAPS SILENTLY to a shift amount near 2^32 and the formula that comes out
+/// is unrelated to any instruction. The gate would then reason about that
+/// formula.
+///
+/// `decode_bitfield` now refuses `sf == 0` with `immr >= 32` or `imms >= 32`, so
+/// no legal decode reaches this. That is exactly why the check belongs here as
+/// well: an arithmetic hazard must not be protected only by the ordering of a
+/// check in another crate.
+fn extract_bitfield_positions(
+    insn: &Instruction,
+    width: u32,
+) -> Result<(u32, u32), SemError> {
+    let immr = extract_imm(insn, 2)? as u32;
+    let imms = extract_imm(insn, 3)? as u32;
+    if immr >= width || imms >= width {
+        return Err(SemError::InvalidOperand {
+            opcode: insn.opcode,
+            index: if immr >= width { 2 } else { 3 },
+            detail: format!(
+                "bitfield position out of range for a {width}-bit register \
+                 (immr={immr}, imms={imms}); refusing rather than computing \
+                 `width - immr`, which wraps in a release build"
+            ),
+        });
+    }
+    Ok((immr, imms))
+}
+
 /// Extract a condition code from an operand.
 fn extract_condition(insn: &Instruction, index: usize) -> Result<Condition, SemError> {
     match insn.operand(index) {
@@ -2194,12 +2534,34 @@ fn extract_condition(insn: &Instruction, index: usize) -> Result<Condition, SemE
 
 /// Convert a `Condition` to a boolean Formula based on the current flags.
 // Trust: #564 — made public so semantic_lift can build branch condition formulas.
-pub fn condition_to_formula(state: &MachineState, cond: Condition) -> Formula {
+///
+/// SOUNDNESS: this used to end in `_ => Formula::Bool(true), // future condition
+/// codes`, i.e. "a condition code I do not recognize is ALWAYS TAKEN". That is
+/// the strictly worst default available: it makes the taken edge
+/// unconditional, so the gate proves the target path and never considers the
+/// fallthrough — the same shape as the `Effect::PcUpdate` drop, where a branch
+/// the model could not evaluate silently became a straight line.
+///
+/// Measured: the arm is DEAD at HEAD. `Condition` has exactly 16 variants,
+/// `Condition::from_u8` masks with `& 0xF` and is total, and all 16 are
+/// enumerated above — no decode of a 4-bit `cond` field can reach the wildcard.
+/// It is nonetheless required, because `Condition` is `#[non_exhaustive]` and
+/// defined in `trust-disasm`, so this cross-crate match must carry a wildcard
+/// and the compiler will NEVER flag this site when a variant is added.
+/// Returning `Result` is the minimal way to give that wildcard somewhere honest
+/// to go; the x86_64 sibling `x86_condition_to_formula` has always had this
+/// signature and this fail-closed wildcard, so this makes the two agree rather
+/// than inventing a convention.
+///
+/// `Condition::Nv` mapping to `true` is NOT an approximation: in A64, unlike
+/// A32, `0b1111` reads as "always" (the ARM ARM gives `cond<3:1> == 0b111` the
+/// unconditional meaning), so `Al` and `Nv` genuinely share semantics.
+pub fn condition_to_formula(state: &MachineState, cond: Condition) -> Result<Formula, SemError> {
     let n = &state.flags.n;
     let z = &state.flags.z;
     let c = &state.flags.c;
     let v = &state.flags.v;
-    match cond {
+    Ok(match cond {
         Condition::Eq => z.clone(),                         // Z == 1
         Condition::Ne => Formula::Not(Box::new(z.clone())), // Z == 0
         Condition::Cs => c.clone(),                         // C == 1 (HS)
@@ -2238,9 +2600,17 @@ pub fn condition_to_formula(state: &MachineState, cond: Condition) -> Formula {
                 Formula::Not(Box::new(Formula::Eq(Box::new(n.clone()), Box::new(v.clone())))),
             ])
         }
+        // A64 `Nv` (0b1111) means "always", not "never" — see the doc comment.
         Condition::Al | Condition::Nv => Formula::Bool(true),
-        _ => Formula::Bool(true), // future condition codes
-    }
+        other => {
+            return Err(SemError::UnmodeledCondition {
+                detail: format!(
+                    "unmodeled AArch64 condition code {other:?}; refusing rather than \
+                     treating the branch as unconditionally taken"
+                ),
+            });
+        }
+    })
 }
 
 /// Reverse bytes within a value of the given width, producing a result of
@@ -2331,6 +2701,71 @@ mod tests {
 
     fn pc_plus_4(state: &MachineState) -> Formula {
         add64(state.pc.clone(), 4)
+    }
+
+    /// THE BITFIELD SUBTRACTION MUST NEVER RUN OUT OF RANGE.
+    ///
+    /// `sem_ubfm`, `sem_sbfm` and `sem_bfm` all compute `width - immr` on the
+    /// `imms < immr` path and `width - field_width` on the other, and `sem_extr`
+    /// computes `width - lsb`. Every one of those wraps once a 32-bit bitfield
+    /// names a position of 32 or more — which the 6-bit `immr`/`imms` fields can
+    /// encode. With debug assertions ON (this build) the subtraction PANICS,
+    /// aborting rather than failing closed; with them OFF, which is how the
+    /// shipped `trustc` is built, it wraps SILENTLY to a shift amount near 2^32
+    /// and the formula that comes out is unrelated to any instruction.
+    ///
+    /// The invariant asserted here is the COMPOSITION, because that is what
+    /// actually protects the gate: for a word whose bitfield positions are out
+    /// of range, EITHER the decoder refuses it (which it now does — the
+    /// architecture leaves `immr<5>`/`imms<5>` fixed at 0 when sf=0) OR the
+    /// semantics refuses it. What must never happen is that both accept it and
+    /// the subtraction runs.
+    ///
+    /// Words are assembler/objdump-derived: `ubfx w0,w1,#3,#4` = 53031820,
+    /// `sbfx w0,w1,#3,#4` = 13031820, `bfxil w0,w1,#3,#4` = 33031820 and
+    /// `extr w0,w1,w2,#31` = 13827c20, each with one named field rewritten and
+    /// fed back through `objdump`, which answers `<unknown>` for all five.
+    #[test]
+    fn out_of_range_bitfield_positions_never_reach_the_subtraction() {
+        for (enc, what) in [
+            (0x5323_1820u32, "ubfm w0,w1 with immr=35"),
+            (0x5303_9820, "ubfm w0,w1 with imms=38"),
+            (0x1300_8000, "sbfm w0,w1 with imms=32"),
+            (0x3303_9820, "bfm w0,w1 with imms=38"),
+            (0x1382_FC20, "extr w0,w1,w2 with lsb=63"),
+        ] {
+            let Ok(insn) = decode_aarch64(&enc.to_le_bytes(), 0x1000) else {
+                continue; // refused at decode: the subtraction is unreachable
+            };
+            let state = MachineState::symbolic();
+            let modeled = Aarch64Semantics.effects(&state, &insn);
+            assert!(
+                modeled.is_err(),
+                "{what} ({enc:08x}) decoded as {:?} and MODELED — \
+                 `width - immr` / `width - lsb` ran with the field out of range",
+                insn.opcode
+            );
+        }
+    }
+
+    /// The legal neighbours must still model. A guard that also refuses a real
+    /// bitfield is not a fix.
+    #[test]
+    fn in_range_bitfield_positions_still_model() {
+        for (enc, asm) in [
+            (0x5303_1820u32, "ubfx w0,w1,#3,#4"),
+            (0x1303_1820, "sbfx w0,w1,#3,#4"),
+            (0x331D_0C20, "bfi w0,w1,#3,#4"),
+            (0xD368_AC20, "ubfx x0,x1,#40,#4"),
+            (0x1382_7C20, "extr w0,w1,w2,#31"),
+            (0x93C2_A020, "extr x0,x1,x2,#40"),
+        ] {
+            let insn = decode(enc);
+            let state = MachineState::symbolic();
+            Aarch64Semantics
+                .effects(&state, &insn)
+                .unwrap_or_else(|e| panic!("{asm} ({enc:08x}) must still model: {e:?}"));
+        }
     }
 
     #[test]
@@ -2586,7 +3021,7 @@ mod tests {
     #[test]
     fn aarch64_dmb_emits_ordering_scope_boundary_effect() {
         let state = MachineState::symbolic();
-        let insn = decode(0xD503_3B9F); // DMB ISH
+        let insn = decode(0xD503_3BBF); // DMB ISH
 
         let effects = Aarch64Semantics.effects(&state, &insn).expect("DMB effects");
 
@@ -2608,7 +3043,7 @@ mod tests {
     #[test]
     fn aarch64_dsb_emits_data_synchronization_boundary_effect() {
         let state = MachineState::symbolic();
-        let insn = decode(0xD503_3F3F); // DSB SY
+        let insn = decode(0xD503_3F9F); // DSB SY
 
         let effects = Aarch64Semantics.effects(&state, &insn).expect("DSB effects");
 
@@ -2673,13 +3108,13 @@ mod tests {
         let state = MachineState::symbolic();
         let cases = [
             (
-                0xD503_3B9F,
+                0xD503_3BBF,
                 Opcode::Dmb,
                 "aarch64-data-barrier-not-proof-consumed",
                 DMB_DSB_MISSING_WITNESSES,
             ),
             (
-                0xD503_3F3F,
+                0xD503_3F9F,
                 Opcode::Dsb,
                 "aarch64-data-barrier-not-proof-consumed",
                 DMB_DSB_MISSING_WITNESSES,
@@ -3040,14 +3475,69 @@ mod tests {
             );
         }
 
-        let simd_insn = fallthrough_insn_with_opcode(0x0E20_1C00, Opcode::SimdMov);
-        assert_typed_aarch64_proof_blocker(
-            &state,
-            &simd_insn,
-            Opcode::SimdMov,
-            "FP/SIMD",
-            &["vector/FP architectural state", "lane layout", "proof-grade"],
+        // NOTE: `Opcode::SimdMov` used to be asserted here as a SIMD gap. It is
+        // now genuinely modeled (a full-width register copy), so it moved to the
+        // `modeled` list of the coverage audit below, and its real behaviour —
+        // together with the encodings that must still be REFUSED — is pinned by
+        // `simd_register_move_is_modeled_and_its_siblings_still_fail_closed`.
+    }
+
+    /// The SIMD register move is modeled — and, just as importantly, ONLY that
+    /// one form is. `MOV Vd.16B, Vn.16B` is architecturally `ORR Vd, Vn, Vn`;
+    /// the same three-same family with a different `size`, a different `U`, or
+    /// two DIFFERENT source registers is a genuinely different instruction, and
+    /// decoding any of those as a move would be a silent mistranslation.
+    #[test]
+    fn simd_register_move_is_modeled_and_its_siblings_still_fail_closed() {
+        // `mov v0.16b, v2.16b` (== `orr v0.16b, v2.16b, v2.16b`). Verified
+        // against the system assembler, which emits exactly this word.
+        let insn = decode(0x4EA2_1C40);
+        assert_eq!(insn.opcode, Opcode::SimdMov);
+        match (insn.operand(0), insn.operand(1)) {
+            (Some(Operand::Reg(d)), Some(Operand::Reg(n))) => {
+                assert_eq!((d.index, d.width), (0, 128), "Vd must be the full 128-bit register");
+                assert_eq!((n.index, n.width), (2, 128), "Vn must be the full 128-bit register");
+            }
+            other => panic!("expected two SIMD register operands, got {other:?}"),
+        }
+
+        // It must WRITE the destination with the SOURCE's value, unchanged.
+        let state = MachineState::symbolic();
+        let effects = Aarch64Semantics
+            .effects(&state, &insn)
+            .expect("a register move must be modeled, not a proof blocker");
+        let write = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::FpRegWrite { index, width, value } => Some((index, width, value)),
+                _ => None,
+            })
+            .expect("a register move must produce an FP register write");
+        assert_eq!(*write.0, 0, "the write must target Vd");
+        assert_eq!(*write.1, 128, "the write must be full width");
+        assert_eq!(
+            *write.2,
+            state.read_fpr(2, 128),
+            "the value written must be exactly the source register, unchanged"
         );
+
+        // ANTI-VACUITY. Each of these is a DIFFERENT instruction and must not
+        // be decoded at all, or the move above would be meaningless.
+        for (encoding, why) in [
+            // Rm lives in bits[20:16]: 0x4EA3_1C40 is `orr v0.16b, v2.16b, v3.16b`,
+            // a real two-register OR. (Perturbing bits[4:0] instead only renames
+            // Rd and would still be a valid move — which this control caught.)
+            (0x4EA3_1C40u32, "ORR with Rn != Rm is a real two-register vector OR"),
+            (0x4E22_1C40, "size=00 is AND, not ORR"),
+            (0x4E62_1C40, "size=01 is BIC"),
+            (0x4EE2_1C40, "size=11 is ORN"),
+            (0x6E22_1C40, "U=1 is EOR"),
+        ] {
+            assert!(
+                decode_aarch64(&encoding.to_le_bytes(), 0x1000).is_err(),
+                "{encoding:#010x} must still be refused: {why}"
+            );
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3118,6 +3608,7 @@ mod tests {
             Opcode::Ldrsh,
             Opcode::Ldrsw,
             Opcode::Ldp,
+            Opcode::Ldpsw,
             Opcode::Str,
             Opcode::Strb,
             Opcode::Strh,
@@ -3145,7 +3636,12 @@ mod tests {
             Opcode::Clrex,
             Opcode::Fadd,
             Opcode::Fsub,
-            Opcode::Fmul,
+Opcode::Fmul,
+            // `MOV Vd.<T>, Vn.<T>` — a full-width register copy, modeled since
+            // the ORR-alias decode landed. It was a typed proof blocker while
+            // the decoder could not produce it at all.
+            Opcode::SimdMov,
+            
             Opcode::Fdiv,
             Opcode::Fcmp,
             Opcode::FmovReg,
@@ -3175,7 +3671,6 @@ mod tests {
             Opcode::Msr,
             Opcode::Wfe,
             Opcode::Wfi,
-            Opcode::SimdMov,
         ];
         let generic_fallbacks: &[Opcode] = &[Opcode::Mov, Opcode::Syscall, Opcode::Unknown];
 
@@ -3211,9 +3706,13 @@ mod tests {
             | Err(SemError::UnsupportedAarch64ProofBlocker { .. }) => {
                 Aarch64OpcodeCoverage::TypedProofBlocker
             }
-            Ok(_) | Err(SemError::InvalidOperand { .. }) | Err(SemError::WidthMismatch { .. }) => {
-                Aarch64OpcodeCoverage::Modeled
-            }
+            // `UnmodeledCondition` says the OPCODE is modeled and only its
+            // condition field was not evaluated, so it classifies with
+            // `InvalidOperand`, not with the unsupported-opcode fallbacks.
+            Ok(_)
+            | Err(SemError::InvalidOperand { .. })
+            | Err(SemError::WidthMismatch { .. })
+            | Err(SemError::UnmodeledCondition { .. }) => Aarch64OpcodeCoverage::Modeled,
         }
     }
 
@@ -3271,6 +3770,387 @@ mod tests {
             other => panic!(
                 "expected typed AArch64 proof blocker for {expected_opcode:?}, got {other:?}"
             ),
+        }
+    }
+
+    // =======================================================================
+    // Register-offset addressing: the EXTEND must reach the address formula.
+    //
+    // Every encoding below was produced by `clang --target=aarch64` and read
+    // back with `objdump -d`; none is hand-encoded.
+    // =======================================================================
+
+    /// `ldr w0,[x1,x2,lsl#2]`
+    const LDR_LSL2: u32 = 0xB862_7820;
+    /// `ldr w0,[x1,w2,uxtw#2]`
+    const LDR_UXTW2: u32 = 0xB862_5820;
+    /// `ldr w0,[x1,w2,sxtw#2]`
+    const LDR_SXTW2: u32 = 0xB862_D820;
+    /// `ldr w0,[x1,x2,sxtx#2]`
+    const LDR_SXTX2: u32 = 0xB862_F820;
+
+    fn effects_of(enc: u32) -> Vec<Effect> {
+        let state = MachineState::symbolic();
+        Aarch64Semantics.effects(&state, &decode(enc)).expect("effects")
+    }
+
+    /// The four encodable register-offset forms must not all collapse to one
+    /// semantics.
+    ///
+    /// `resolve_mem_address` destructured the extend away and always read the
+    /// full 64-bit X register, so `lsl#2`, `uxtw#2`, `sxtw#2` and `sxtx#2`
+    /// produced BYTE-IDENTICAL `Effect` lists. Four architecturally distinct
+    /// words, one model: no spec could separate them, and a miscompile that
+    /// swapped one for another was invisible to the output gate.
+    ///
+    /// `lsl` and `sxtx` DO coincide — `ExtendReg` with a 64-bit source is the
+    /// identity for both signed and unsigned — so the honest count is three
+    /// semantic classes, not four. This asserts exactly that partition; before
+    /// the fix all four were one class and the first assertion failed.
+    #[test]
+    fn register_offset_extend_forms_are_semantically_distinct() {
+        let lsl = effects_of(LDR_LSL2);
+        let uxtw = effects_of(LDR_UXTW2);
+        let sxtw = effects_of(LDR_SXTW2);
+        let sxtx = effects_of(LDR_SXTX2);
+
+        assert_ne!(lsl, uxtw, "ldr [x1,x2,lsl#2] and [x1,w2,uxtw#2] model identically");
+        assert_ne!(lsl, sxtw, "ldr [x1,x2,lsl#2] and [x1,w2,sxtw#2] model identically");
+        assert_ne!(
+            uxtw, sxtw,
+            "uxtw#2 and sxtw#2 model identically — the SIGN of the 32-bit index is lost"
+        );
+
+        // LSL == SXTX is architectural, not an approximation: SXTX of a 64-bit
+        // register is the identity. Asserting it pins the claim.
+        assert_eq!(lsl, sxtx, "lsl#2 and sxtx#2 must coincide (SXTX of X is the identity)");
+    }
+
+    /// A `UXTW`/`SXTW` index must be read as the 32-bit W register and then
+    /// extended — not read as the full X.
+    #[test]
+    fn uxtw_and_sxtw_read_the_w_register_and_extend() {
+        let state = MachineState::symbolic();
+        let w2 = state.read_gpr(2, 32);
+        let shift = Formula::BitVec { value: 2, width: 64 };
+
+        let want = |ext: Formula| Effect::MemRead {
+            address: Formula::BvAdd(
+                Box::new(state.read_gpr(1, 64)),
+                Box::new(Formula::BvShl(Box::new(ext), Box::new(shift.clone()), 64)),
+                64,
+            ),
+            width_bytes: 4,
+        };
+
+        assert_eq!(
+            effects_of(LDR_UXTW2)[0],
+            want(Formula::BvZeroExt(Box::new(w2.clone()), 32)),
+            "uxtw#2 must zero-extend W2 to 64 bits BEFORE the shift"
+        );
+        assert_eq!(
+            effects_of(LDR_SXTW2)[0],
+            want(Formula::BvSignExt(Box::new(w2), 32)),
+            "sxtw#2 must sign-extend W2 to 64 bits BEFORE the shift"
+        );
+    }
+
+    /// The load/store register-offset form allocates only `option` ∈ {010, 011,
+    /// 110, 111}; `option<1> == 0` is UNDEFINED. All four reserved values must
+    /// be refused by the DECODER, not mapped onto LSL.
+    ///
+    /// Derived by mutating the `option` field of the assembler-derived
+    /// `ldr w0,[x1,x2,lsl#2]` = `0xB862_7820`; `objdump -d` renders all four as
+    /// `<unknown>`, which is the definition of unallocated here.
+    ///
+    /// Two of them used to be indistinguishable from a real instruction: 001 and
+    /// 101 also produced a 64-bit index (`option & 1 == 1`), giving byte-identical
+    /// effects to a genuine `lsl` form.
+    #[test]
+    fn reserved_register_offset_options_are_refused_by_the_decoder() {
+        for (enc, option) in [
+            (0xB862_1820u32, 0b000),
+            (0xB862_3820, 0b001),
+            (0xB862_9820, 0b100),
+            (0xB862_B820, 0b101),
+        ] {
+            let err = decode_aarch64(&enc.to_le_bytes(), 0x1000)
+                .expect_err("a reserved register-offset `option` must not decode");
+            assert!(
+                matches!(err, trust_disasm::DisasmError::UnallocatedEncoding { .. }),
+                "{enc:#010x} (option={option:03b}) should be UnallocatedEncoding, got {err:?}"
+            );
+        }
+
+        // The four ALLOCATED options must still decode.
+        for enc in [0xB862_5820u32, 0xB862_7820, 0xB862_D820, 0xB862_F820] {
+            decode_aarch64(&enc.to_le_bytes(), 0x1000).unwrap_or_else(|e| {
+                panic!("{enc:#010x} is an allocated form and must decode: {e:?}")
+            });
+        }
+    }
+
+    /// Defence in depth for the same hole, INDEPENDENT of the decoder: the
+    /// semantics must refuse an `extend`/index-width combination no
+    /// architectural form produces, even when handed one directly.
+    ///
+    /// The decoder can no longer construct this shape, so building the operand
+    /// by hand is the only way to reach the guard — and reaching it is the
+    /// point. A decoder fix and a semantics guard protect against different
+    /// futures, and this pins the one the decoder test cannot.
+    #[test]
+    fn semantics_refuses_an_unextended_32_bit_index_register() {
+        let state = MachineState::symbolic();
+        // `extend: None` means LSL, which names a 64-bit index; pairing it with
+        // a 32-bit index register is the exact shape the old `_ => None`
+        // reserved-option arm produced.
+        let mem = MemoryOperand::BaseRegister {
+            base: Register::gpr(1, true),
+            index: Register::gpr(2, false),
+            extend: None,
+            shift: 2,
+        };
+
+        let err = resolve_mem_address(&state, &mem)
+            .expect_err("an unextended 32-bit index must not be modeled");
+        match err {
+            SemError::InvalidOperand { detail, .. } => {
+                assert!(
+                    detail.contains("reserved"),
+                    "refusal should name the reserved encoding: {detail}"
+                );
+            }
+            other => panic!("expected InvalidOperand refusal, got {other:?}"),
+        }
+    }
+
+    // =======================================================================
+    // LDPSW — 4-byte elements SIGN-extended into 64-bit registers.
+    // =======================================================================
+
+    /// `ldp w0,w1,[x2]`
+    const LDP_W: u32 = 0x2940_0440;
+    /// `ldpsw x0,x1,[x2]`
+    const LDPSW: u32 = 0x6940_0440;
+    /// `ldp x0,x1,[x2]`
+    const LDP_X: u32 = 0xA940_0440;
+
+    /// LDPSW must not be a 32-bit LDP.
+    ///
+    /// The decoder's `is_64 = opc == 0b10` put `opc=0b01, L=1` on the 32-bit
+    /// path, so `ldpsw x0,x1,[x2]` decoded as `Opcode::Ldp` with W registers and
+    /// `sem_ldp` ZERO-extended it. Its effects were identical to `ldp w0,w1,[x2]`
+    /// — a load that sign-extends modeled as one that does not.
+    #[test]
+    fn ldpsw_is_not_a_32_bit_ldp() {
+        let insn = decode(LDPSW);
+        assert_eq!(insn.opcode, Opcode::Ldpsw, "LDPSW must decode as its own opcode");
+
+        let ldpsw = effects_of(LDPSW);
+        assert_ne!(ldpsw, effects_of(LDP_W), "LDPSW models identically to a 32-bit LDP");
+        assert_ne!(ldpsw, effects_of(LDP_X), "LDPSW models identically to a 64-bit LDP");
+    }
+
+    /// LDPSW's exact semantics: two 4-byte elements, each SIGN-extended into a
+    /// 64-bit register, at +0 and +4.
+    #[test]
+    fn ldpsw_sign_extends_four_byte_elements_into_x_registers() {
+        let state = MachineState::symbolic();
+        let addr0 = add64(state.read_gpr(2, 64), 0);
+        let addr1 = add64(addr0.clone(), 4);
+        let sx = |a: &Formula| Formula::BvSignExt(Box::new(load_le_bytes(&state, a, 4, 32)), 32);
+
+        assert_eq!(
+            effects_of(LDPSW),
+            vec![
+                Effect::MemRead { address: addr0.clone(), width_bytes: 4 },
+                Effect::MemRead { address: addr1.clone(), width_bytes: 4 },
+                Effect::RegWrite { index: 0, width: 64, value: sx(&addr0) },
+                Effect::RegWrite { index: 1, width: 64, value: sx(&addr1) },
+                Effect::PcUpdate { value: pc_plus_4(&state) },
+            ]
+        );
+    }
+
+    /// LDPSW scales its immediate by the ELEMENT size (4), not by the register
+    /// size. `0x6941_0440` is `ldpsw x0,x1,[x2,#8]` per the assembler.
+    #[test]
+    fn ldpsw_offset_scales_by_the_element_size() {
+        let state = MachineState::symbolic();
+        let effects = effects_of(0x6941_0440);
+        assert_eq!(
+            effects[0],
+            Effect::MemRead { address: add64(state.read_gpr(2, 64), 8), width_bytes: 4 },
+            "ldpsw [x2,#8] must address x2+8 with 4-byte elements"
+        );
+        assert!(
+            matches!(effects[2], Effect::RegWrite { width: 64, .. }),
+            "ldpsw destinations are 64-bit: {:?}",
+            effects[2]
+        );
+    }
+
+    /// The load/store-pair `opc` values with no A64 GPR encoding must be
+    /// REFUSED, not folded onto the 32-bit LDP/STP path.
+    ///
+    /// `0xE940_0440` is `opc=0b11` (unallocated) and `0x6900_0440` is
+    /// `opc=0b01, L=0` (STGP, FEAT_MTE — not modeled). `objdump -d` declines
+    /// both. Before the fix each decoded as a plain 32-bit LDP/STP and produced
+    /// effects identical to `ldp w0,w1,[x2]`.
+    #[test]
+    fn unallocated_load_store_pair_opc_values_are_refused() {
+        for enc in [0xE940_0440u32, 0x6900_0440] {
+            let err = decode_aarch64(&enc.to_le_bytes(), 0x1000)
+                .expect_err("an unallocated load/store-pair encoding must not decode");
+            assert!(
+                matches!(err, trust_disasm::DisasmError::UnallocatedEncoding { .. }),
+                "{enc:#010x} should be UnallocatedEncoding, got {err:?}"
+            );
+        }
+    }
+
+    // =======================================================================
+    // Extension AMOUNT vs TARGET WIDTH in the sign/zero-extending loads.
+    // =======================================================================
+
+    /// `BvSignExt`/`BvZeroExt` carry the SMT-LIB extension AMOUNT. Passing the
+    /// TARGET WIDTH made `ldrsb x0,[x1]` an 8+64 = 72-bit term sitting in a
+    /// 64-bit register slot; `ldrsw x0,[x1]` was 96 bits. Nothing truncates an
+    /// X-width read, so the over-wide term reached the solver and
+    /// `discharge_equal_pre`'s `try_eq(..).expect("eq")` PANICKED with
+    /// `SortMismatch { got: [BitVec(72), BitVec(64)] }` — a compiler crash, not
+    /// a verdict. (The W-forms were value-correct: the readout extracts
+    /// `[31:0]`, and the low bits of an over-wide extension are the right ones.)
+    ///
+    /// This is the same defect already fixed in `load_le_bytes`; the guard is
+    /// the same shape as `load_le_bytes_is_smt_width_consistent`.
+    #[test]
+    fn extending_loads_are_smt_width_consistent() {
+        // (encoding, destination width) — all assembler-derived.
+        let cases: &[(u32, u32, &str)] = &[
+            (0x3980_0020, 64, "ldrsb x0,[x1]"),
+            (0x7980_0020, 64, "ldrsh x0,[x1]"),
+            (0xB980_0020, 64, "ldrsw x0,[x1]"),
+            (0x3940_0020, 32, "ldrb  w0,[x1]"),
+            (0x39C0_0020, 32, "ldrsb w0,[x1]"),
+            (0x7940_0020, 32, "ldrh  w0,[x1]"),
+        ];
+        for (enc, want_width, label) in cases {
+            let effects = effects_of(*enc);
+            let value = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::RegWrite { value, .. } => Some(value),
+                    _ => None,
+                })
+                .expect("a load must write a register");
+            assert_eq!(
+                smt_bv_width(value),
+                Some(*want_width),
+                "{label}: loaded value is not a {want_width}-bit term: {value:?}"
+            );
+        }
+    }
+}
+
+/// The catch-alls that used to answer a question they could not answer.
+///
+/// Each of these arms is DEAD at HEAD — that is why they survived. They exist
+/// because the enums they match are `#[non_exhaustive]` and defined in
+/// `trust-disasm`, so every one of these matches is REQUIRED to carry a wildcard
+/// and the compiler can never point at the site when a variant is added. The
+/// tests below pin the behaviour the wildcards must have: refuse, not guess.
+#[cfg(test)]
+mod fail_closed_catch_all_tests {
+    use super::*;
+
+    /// `condition_to_formula` used to end in `_ => Formula::Bool(true)`, so an
+    /// unrecognized condition made a branch UNCONDITIONALLY TAKEN.
+    ///
+    /// The wildcard is unreachable today, and this measures exactly that claim:
+    /// all 16 four-bit condition codes are enumerated, and `Condition::from_u8`
+    /// masks with `& 0xF`, so decoding cannot produce anything else. Every one
+    /// must return a formula, and `Al`/`Nv` must be the ONLY two that are
+    /// literally `true` — if a future edit made some other condition fall
+    /// through to a `true` default, this catches it.
+    #[test]
+    fn every_architectural_condition_code_is_evaluated() {
+        let state = MachineState::symbolic();
+        for raw in 0u8..=15 {
+            let cond = Condition::from_u8(raw);
+            let formula = condition_to_formula(&state, cond)
+                .unwrap_or_else(|e| panic!("condition {raw:#06b} ({cond:?}) must evaluate: {e}"));
+
+            let is_unconditional = matches!(formula, Formula::Bool(true));
+            let should_be_unconditional = matches!(cond, Condition::Al | Condition::Nv);
+            assert_eq!(
+                is_unconditional, should_be_unconditional,
+                "condition {raw:#06b} ({cond:?}) evaluated to Bool(true)={is_unconditional}; \
+                 only Al and Nv are unconditional in A64"
+            );
+        }
+
+        // `from_u8` is total over the 4-bit field: nothing outside 0..=15 can
+        // reach the wildcard from a decoded instruction.
+        for raw in 0u8..=255 {
+            let cond = Condition::from_u8(raw);
+            assert_eq!(
+                cond,
+                Condition::from_u8(raw & 0xF),
+                "from_u8 must depend only on the low 4 bits"
+            );
+            condition_to_formula(&state, cond).expect("every from_u8 result must evaluate");
+        }
+    }
+
+    /// A conditional branch must produce a REAL path condition, not `true`.
+    ///
+    /// `b.eq` and `b.ne` over the same flags must disagree; if the wildcard
+    /// default ever came back both would be `Bool(true)` and identical.
+    #[test]
+    fn conditional_branch_conditions_are_not_all_true() {
+        let state = MachineState::symbolic();
+        // Assembler-derived: `b.eq .+8` = 54000040, `b.ne .+8` = 54000041.
+        let eq = condition_to_formula(&state, Condition::Eq).expect("eq");
+        let ne = condition_to_formula(&state, Condition::Ne).expect("ne");
+        assert_ne!(eq, ne, "b.eq and b.ne must not share a path condition");
+        assert_ne!(eq, Formula::Bool(true), "b.eq must not be unconditionally taken");
+        assert_ne!(ne, Formula::Bool(true), "b.ne must not be unconditionally taken");
+    }
+
+    /// `apply_shift` used to end in `_ => base, // future shift types`, i.e. a
+    /// shift type it did not recognize meant NO SHIFT.
+    ///
+    /// All four architectural types must produce a DISTINCT formula from the
+    /// unshifted base, so a silent "no shift" answer is detectable. The
+    /// unrecognized case cannot be constructed (there is no fifth variant), but
+    /// the guard is now a refusal and it runs BEFORE the `amount == 0`
+    /// short-circuit — which this pins by checking that a zero-amount shift of
+    /// each known type is still accepted.
+    #[test]
+    fn every_architectural_shift_type_shifts() {
+        use trust_disasm::operand::{Register, ShiftType};
+
+        let state = MachineState::symbolic();
+        let unshifted = state.read_gpr(1, 64);
+
+        for shift in [ShiftType::Lsl, ShiftType::Lsr, ShiftType::Asr, ShiftType::Ror] {
+            let op = Operand::ShiftedReg { reg: Register::gpr(1, true), shift, amount: 3 };
+            let shifted = operand_to_formula(&state, Some(&op), Opcode::Add, 2, 64)
+                .unwrap_or_else(|e| panic!("{shift:?} must be modeled: {e}"));
+            assert_ne!(
+                shifted, unshifted,
+                "{shift:?} #3 produced the unshifted register — a silent no-shift"
+            );
+
+            // Shift by 0 is the identity for all four, and must still be ACCEPTED.
+            let zero = Operand::ShiftedReg { reg: Register::gpr(1, true), shift, amount: 0 };
+            assert_eq!(
+                operand_to_formula(&state, Some(&zero), Opcode::Add, 2, 64)
+                    .unwrap_or_else(|e| panic!("{shift:?} #0 must be modeled: {e}")),
+                unshifted,
+                "{shift:?} #0 must be the identity"
+            );
         }
     }
 }

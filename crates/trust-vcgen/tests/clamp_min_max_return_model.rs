@@ -76,6 +76,7 @@ fn clamp_ret_fn(precond: bool) -> VerifiableFunction {
             ],
             arg_count: 3,
             return_ty: usize_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions,

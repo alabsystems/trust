@@ -127,7 +127,7 @@ pub fn canonicalize_spec_expr(expression: &str) -> Result<String, SpecRenderErro
 /// and function signature, while preserving the user's token spelling.
 ///
 /// This boundary deliberately validates the high-level [`SpecExpr`] before it
-/// is lowered to synthetic solver names.  Lowering `arr.len()` to `arr_len`,
+/// is lowered to synthetic solver names.  Lowering `arr.len()` to `arr__len`,
 /// `result` to `_0`, or `old(x)` to `old_x` first loses source scope and can
 /// collide with legitimate parameters carrying those names.  The returned text
 /// is therefore the trimmed original expression, not a re-rendered Formula.

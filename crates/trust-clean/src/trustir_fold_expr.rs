@@ -235,8 +235,9 @@ use clean_kernel::{
     InductiveType, Level, Name, TypeChecker,
 };
 use trust_types::{
-    AggregateKind, BasicBlock, BlockId, CallableDefPathHash, CallableKind, ConstValue, Operand,
-    Place, Projection, Rvalue, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    AggregateKind, BasicBlock, BlockId, CallableDefPathHash, CallableKind, ConstValue,
+    DatatypeDefs, Operand, Place, Projection, Rvalue, Statement, Terminator, Ty, VerifiableBody,
+    VerifiableFunction,
 };
 
 use crate::trustir_anchor::{RefinementVerdict, cst, int_ty};
@@ -856,8 +857,12 @@ pub struct DumpVariant {
 
 /// Classify one ExprKind/ZFCSetExpr field type: `Rec` iff it is
 /// `Arc<..pointee Expr..>` through the pinned P-ARC-DEREF path.
-fn classify_field(fty: &Ty) -> TField {
-    if crate::trustir_fold::arc_pointee_ty(fty)
+///
+/// `defs` is the OWNING body's R0 definition table — the Arc walk resolves a
+/// bare canonical-cut-point marker through it and through nothing else. An
+/// empty table is exactly the pre-R0 behaviour.
+fn classify_field(defs: &DatatypeDefs, fty: &Ty) -> TField {
+    if crate::trustir_fold::arc_pointee_ty(defs, fty)
         .is_some_and(|p| crate::trustir_fold::ty_names_enum(p, EXPR_NAME))
     {
         TField::Rec
@@ -869,7 +874,7 @@ fn classify_field(fty: &Ty) -> TField {
 /// Extract the full `ExprKind` variant table from a type that names it (the
 /// `&ExprKind` local's pointee in the generic dispatch bodies). Fail-closed
 /// `None` if the table is absent/unexpanded.
-fn expr_kind_table(ty: &Ty) -> Option<Vec<DumpVariant>> {
+fn expr_kind_table(defs: &DatatypeDefs, ty: &Ty) -> Option<Vec<DumpVariant>> {
     let Ty::Adt { name, variants, .. } = ty else { return None };
     if name != EXPR_KIND_NAME || variants.is_empty() {
         return None;
@@ -880,7 +885,7 @@ fn expr_kind_table(ty: &Ty) -> Option<Vec<DumpVariant>> {
             .map(|v| DumpVariant {
                 name: v.name.clone(),
                 discriminant: v.discriminant,
-                fields: v.fields.iter().map(|(_, fty)| classify_field(fty)).collect(),
+                fields: v.fields.iter().map(|(_, fty)| classify_field(defs, fty)).collect(),
             })
             .collect(),
     )
@@ -888,7 +893,7 @@ fn expr_kind_table(ty: &Ty) -> Option<Vec<DumpVariant>> {
 
 /// Extract the `ZFCSetExpr` variant table (from `fold_zfc_set_expr_opt`'s
 /// `&ZFCSetExpr` parameter).
-fn zfc_table(ty: &Ty) -> Option<Vec<DumpVariant>> {
+fn zfc_table(defs: &DatatypeDefs, ty: &Ty) -> Option<Vec<DumpVariant>> {
     let Ty::Adt { name, variants, .. } = ty else { return None };
     if name != ZFC_SET_EXPR_NAME || variants.is_empty() {
         return None;
@@ -899,7 +904,7 @@ fn zfc_table(ty: &Ty) -> Option<Vec<DumpVariant>> {
             .map(|v| DumpVariant {
                 name: v.name.clone(),
                 discriminant: v.discriminant,
-                fields: v.fields.iter().map(|(_, fty)| classify_field(fty)).collect(),
+                fields: v.fields.iter().map(|(_, fty)| classify_field(defs, fty)).collect(),
             })
             .collect(),
     )
@@ -983,7 +988,33 @@ fn p_acyc_pinned_payload_type(ty: &Ty) -> bool {
 /// generic container inspected logically: its pointee must resolve through the
 /// pinned representation, and an Expr pointee is legal only when the caller has
 /// already recognized the whole field as the direct `Arc<Expr>` recursive edge.
-fn check_p_acyc_payload(ty: &Ty, path: &str) -> R<()> {
+/// Depth budget for the acyclicity walk. Generous versus any real payload
+/// (the deepest shipped fixture tower is 15 nodes) and small enough that an
+/// unreachable cycle cannot burn the stack.
+const P_ACYC_WALK_FUEL: u32 = 256;
+
+fn check_p_acyc_payload(defs: &DatatypeDefs, ty: &Ty, path: &str) -> R<()> {
+    check_p_acyc_payload_fueled(defs, ty, path, P_ACYC_WALK_FUEL)
+}
+
+fn check_p_acyc_payload_fueled(
+    defs: &DatatypeDefs,
+    ty: &Ty,
+    path: &str,
+    fuel: u32,
+) -> R<()> {
+    let Some(fuel) = fuel.checked_sub(1) else {
+        // FAIL CLOSED. Before R0 this walk descended strict subterms, so it
+        // terminated structurally. `arc_pointee_ty` may now hand back a node
+        // BORROWED FROM `defs`, and a cut-point definition legitimately
+        // contains markers of names the table also defines — that is what a cut
+        // point IS — so the walk is no longer a tree walk and a table keyed at a
+        // pointer node can cycle it. Exhausting the budget is not a proof of
+        // acyclicity, so it declines.
+        return Err(ExprFoldDecline::AcyclicityPremiseDrift(format!(
+            "{path}: acyclicity walk exceeded its depth budget"
+        )));
+    };
     let bad = |detail: String| ExprFoldDecline::AcyclicityPremiseDrift(detail);
     match ty {
         Ty::Bool | Ty::Int { .. } | Ty::Float { .. } | Ty::Bv(_) | Ty::Unit | Ty::Never => {
@@ -992,12 +1023,22 @@ fn check_p_acyc_payload(ty: &Ty, path: &str) -> R<()> {
         Ty::Ref { mutable: true, .. } | Ty::RawPtr { mutable: true, .. } => {
             return Err(bad(format!("{path}: mutable reference/raw-pointer channel")));
         }
-        Ty::Ref { inner, .. } => return check_p_acyc_payload(inner, path),
+        Ty::Ref { inner, .. } => return check_p_acyc_payload_fueled(defs, inner, path, fuel),
         Ty::RawPtr { .. } => {
             return Err(bad(format!("{path}: raw-pointer channel")));
         }
+        // KNOWN NARROWNESS, pre-existing and deliberately NOT widened here. This
+        // is the pre-2026-07-13 VISIBLE-path spelling only; a dump from a
+        // current extractor renders the same type `alloc::sync::Arc` (see
+        // `crate::def_path_pins`) and therefore does not take this branch at all,
+        // falling into the generic field scan below. Widening it to the pin table
+        // is a real capability fix but it MOVES CORPUS OUTCOMES — the pinned
+        // `P_ACYC_EXPR_ARC_TYPE_HASHES` below were minted from the old spelling's
+        // shapes — so it belongs with a corpus regeneration, not with this
+        // change. The same narrowness exists at the `has_exposed_interior_
+        // mutability` Arc branch.
         Ty::Adt { name, .. } if name == "std::sync::Arc" => {
-            let pointee = crate::trustir_fold::arc_pointee_ty(ty).ok_or_else(|| {
+            let pointee = crate::trustir_fold::arc_pointee_ty(defs, ty).ok_or_else(|| {
                 bad(format!("{path}: Arc payload does not match the pinned pointee layout"))
             })?;
             if !p_acyc_type_hash(ty)
@@ -1005,7 +1046,7 @@ fn check_p_acyc_payload(ty: &Ty, path: &str) -> R<()> {
             {
                 return Err(bad(format!("{path}: unpinned full Arc payload layout")));
             }
-            return check_p_acyc_payload(pointee, &format!("{path}<Arc-pointee>"));
+            return check_p_acyc_payload_fueled(defs, pointee, &format!("{path}<Arc-pointee>"), fuel);
         }
         Ty::Adt { name, .. } | Ty::Datatype { name, .. } => {
             if name == EXPR_NAME {
@@ -1020,11 +1061,11 @@ fn check_p_acyc_payload(ty: &Ty, path: &str) -> R<()> {
             return Err(bad(format!("{path}: unpinned payload type {name}")));
         }
         Ty::Slice { elem } | Ty::Array { elem, .. } | Ty::SymArray { elem, .. } => {
-            return check_p_acyc_payload(elem, path);
+            return check_p_acyc_payload_fueled(defs, elem, path, fuel);
         }
         Ty::Tuple(fields) => {
             for (index, field) in fields.iter().enumerate() {
-                check_p_acyc_payload(field, &format!("{path}.{index}"))?;
+                check_p_acyc_payload_fueled(defs, field, &format!("{path}.{index}"), fuel)?;
             }
             return Ok(());
         }
@@ -1042,7 +1083,7 @@ fn check_p_acyc_payload(ty: &Ty, path: &str) -> R<()> {
     }
 }
 
-fn check_p_acyc_variant_table(ty: &Ty, owner: &str) -> R<()> {
+fn check_p_acyc_variant_table(defs: &DatatypeDefs, ty: &Ty, owner: &str) -> R<()> {
     let Ty::Adt { variants, .. } = ty else {
         return Err(ExprFoldDecline::AcyclicityPremiseDrift(format!(
             "{owner}: variant table is not an expanded ADT"
@@ -1051,7 +1092,7 @@ fn check_p_acyc_variant_table(ty: &Ty, owner: &str) -> R<()> {
     for variant in variants {
         for (field_name, field) in &variant.fields {
             // The only recursive edge admitted into the TExpr model.
-            if crate::trustir_fold::arc_pointee_ty(field)
+            if crate::trustir_fold::arc_pointee_ty(defs, field)
                 .is_some_and(|pointee| crate::trustir_fold::ty_names_enum(pointee, EXPR_NAME))
             {
                 if !p_acyc_type_hash(field)
@@ -1064,7 +1105,11 @@ fn check_p_acyc_variant_table(ty: &Ty, owner: &str) -> R<()> {
                 }
                 continue;
             }
-            check_p_acyc_payload(field, &format!("{owner}::{}.{}", variant.name, field_name))?;
+            check_p_acyc_payload(
+                defs,
+                field,
+                &format!("{owner}::{}.{}", variant.name, field_name),
+            )?;
         }
     }
     Ok(())
@@ -3143,7 +3188,7 @@ fn walk_arm(
                     let arg_ok =
                         op_local(a).and_then(|l| ctx.body.locals.get(l)).is_some_and(|l| {
                             matches!(&l.ty, Ty::Ref { mutable: false, inner }
-                            if crate::trustir_fold::arc_pointee_ty(inner)
+                            if crate::trustir_fold::arc_pointee_ty(&ctx.body.datatype_defs, inner)
                                 .is_some_and(|p| crate::trustir_fold::ty_names_enum(p, EXPR_NAME)))
                         });
                     let dest_ok = ctx.body.locals.get(dest.local).is_some_and(|l| {
@@ -3862,8 +3907,10 @@ fn match_ctor_closure(
             return Err(drift(m, "ctor closure parameter local missing"));
         };
         let ok = match wrap {
-            CtorWrap::MergeDirect => crate::trustir_fold::arc_pointee_ty(param_ty)
-                .is_some_and(|pointee| type_named(pointee, EXPR_NAME)),
+            CtorWrap::MergeDirect => {
+                crate::trustir_fold::arc_pointee_ty(&body.datatype_defs, param_ty)
+                    .is_some_and(|pointee| type_named(pointee, EXPR_NAME))
+            }
             CtorWrap::MapArcEk => type_named(param_ty, EXPR_NAME),
         };
         if !ok {
@@ -4850,8 +4897,9 @@ fn recognize_dispatch(
             .find(|(n, _)| n == "kind")
             .map(|(_, t)| t)
             .ok_or_else(|| drift(GEN_FOLD_EXPR_OPT_INNER_FULL, "Expr has no kind field"))?;
-        check_p_acyc_variant_table(kind_ty, EXPR_KIND_NAME)?;
-        expr_kind_table(kind_ty)
+        let defs = &inner_full.body.datatype_defs;
+        check_p_acyc_variant_table(defs, kind_ty, EXPR_KIND_NAME)?;
+        expr_kind_table(defs, kind_ty)
             .ok_or_else(|| drift(GEN_FOLD_EXPR_OPT_INNER_FULL, "ExprKind table unexpanded"))?
     };
     // The ZFCSetExpr table from fold_zfc's own parameter.
@@ -4865,8 +4913,9 @@ fn recognize_dispatch(
         let Ty::Ref { mutable: false, inner } = pty else {
             return Err(drift(GEN_FOLD_ZFC_SET_EXPR_OPT, "setexpr param is not a ref"));
         };
-        check_p_acyc_variant_table(inner, ZFC_SET_EXPR_NAME)?;
-        zfc_table(inner)
+        let defs = &fold_zfc.body.datatype_defs;
+        check_p_acyc_variant_table(defs, inner, ZFC_SET_EXPR_NAME)?;
+        zfc_table(defs, inner)
             .ok_or_else(|| drift(GEN_FOLD_ZFC_SET_EXPR_OPT, "ZFCSetExpr table unexpanded"))?
     };
 
@@ -5064,8 +5113,10 @@ fn match_zst_ctor_closure(
             return Err(drift(m, "non-capturing ctor parameter local is missing"));
         };
         let ok = match wrap {
-            CtorWrap2::ExprMergeDirect => crate::trustir_fold::arc_pointee_ty(param_ty)
-                .is_some_and(|pointee| type_named(pointee, EXPR_NAME)),
+            CtorWrap2::ExprMergeDirect => {
+                crate::trustir_fold::arc_pointee_ty(&body.datatype_defs, param_ty)
+                    .is_some_and(|pointee| type_named(pointee, EXPR_NAME))
+            }
             CtorWrap2::ExprMapArcEk | CtorWrap2::ZfcMapArcDirect => type_named(param_ty, EXPR_NAME),
             CtorWrap2::ZfcSetWrap => type_named(param_ty, ZFC_SET_EXPR_NAME),
         };
@@ -5304,7 +5355,15 @@ fn ty_can_carry_folder_alias(ty: &Ty) -> bool {
 /// reference. Runtime bookkeeping hidden inside immutable std containers
 /// (Arc refcounts, collection allocation state) is not a mutation of the
 /// logical payload; direct Cell/UnsafeCell/atomic/lock channels are.
-fn has_exposed_interior_mutability(ty: &Ty) -> bool {
+fn has_exposed_interior_mutability(defs: &DatatypeDefs, ty: &Ty) -> bool {
+    has_exposed_interior_mutability_fueled(defs, ty, P_ACYC_WALK_FUEL)
+}
+
+fn has_exposed_interior_mutability_fueled(defs: &DatatypeDefs, ty: &Ty, fuel: u32) -> bool {
+    // FAIL CLOSED (`true` = exposed). Same reason as the acyclicity walk: with
+    // R0 the Arc pointee can be borrowed from `defs`, so this is no longer a
+    // tree walk and cannot rely on structural descent to terminate.
+    let Some(fuel) = fuel.checked_sub(1) else { return true };
     fn suspicious_name(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         ["cell", "atomic", "mutex", "rwlock", "oncelock", "lazylock", "weak"]
@@ -5315,11 +5374,11 @@ fn has_exposed_interior_mutability(ty: &Ty) -> bool {
     match ty {
         Ty::Bool | Ty::Int { .. } | Ty::Float { .. } | Ty::Bv(_) | Ty::Unit | Ty::Never => false,
         Ty::Slice { elem } | Ty::Array { elem, .. } | Ty::SymArray { elem, .. } => {
-            has_exposed_interior_mutability(elem)
+            has_exposed_interior_mutability_fueled(defs, elem, fuel)
         }
-        Ty::Tuple(fields) => fields.iter().any(has_exposed_interior_mutability),
+        Ty::Tuple(fields) => fields.iter().any(|f| has_exposed_interior_mutability_fueled(defs, f, fuel)),
         Ty::Ref { mutable: true, .. } | Ty::RawPtr { .. } => true,
-        Ty::Ref { mutable: false, inner } => has_exposed_interior_mutability(inner),
+        Ty::Ref { mutable: false, inner } => has_exposed_interior_mutability_fueled(defs, inner, fuel),
         Ty::Adt { name, fields, variants, .. } => {
             if suspicious_name(name)
                 || matches!(
@@ -5353,14 +5412,14 @@ fn has_exposed_interior_mutability(ty: &Ty) -> bool {
                 // Ignore Arc's private refcounts, but never its logical
                 // pointee. A malformed/erased layout is not evidence of
                 // immutability and therefore fails closed.
-                return crate::trustir_fold::arc_pointee_ty(ty)
-                    .map_or(true, has_exposed_interior_mutability);
+                return crate::trustir_fold::arc_pointee_ty(defs, ty)
+                    .map_or(true, |pointee| has_exposed_interior_mutability_fueled(defs, pointee, fuel));
             }
-            fields.iter().any(|(_, field)| has_exposed_interior_mutability(field))
+            fields.iter().any(|(_, field)| has_exposed_interior_mutability_fueled(defs, field, fuel))
                 || variants
                     .iter()
                     .flat_map(|variant| &variant.fields)
-                    .any(|(_, field)| has_exposed_interior_mutability(field))
+                    .any(|(_, field)| has_exposed_interior_mutability_fueled(defs, field, fuel))
         }
         Ty::Datatype { name, .. } => {
             if suspicious_name(name) {
@@ -5381,7 +5440,9 @@ fn has_exposed_interior_mutability(ty: &Ty) -> bool {
                     | "expr::types::Literal"
             )
         }
-        Ty::Closure { upvars, .. } => upvars.iter().any(has_exposed_interior_mutability),
+        Ty::Closure { upvars, .. } => {
+            upvars.iter().any(|u| has_exposed_interior_mutability_fueled(defs, u, fuel))
+        }
         _ => true,
     }
 }
@@ -5424,7 +5485,7 @@ fn pinned_fixed_state_shared_payload(ty: &Ty) -> bool {
         .is_some_and(|hash| PINNED_FIXED_STATE_SHARED_PAYLOAD_HASHES.contains(&hash.as_str()))
 }
 
-fn is_detached_pinned_shared_field_copy(rv: &Rvalue, dest_ty: &Ty) -> bool {
+fn is_detached_pinned_shared_field_copy(defs: &DatatypeDefs, rv: &Rvalue, dest_ty: &Ty) -> bool {
     let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rv else {
         return false;
     };
@@ -5434,7 +5495,7 @@ fn is_detached_pinned_shared_field_copy(rv: &Rvalue, dest_ty: &Ty) -> bool {
     matches!(
         dest_ty,
         Ty::Ref { mutable: false, inner }
-            if !has_exposed_interior_mutability(inner)
+            if !has_exposed_interior_mutability(defs, inner)
                 || pinned_fixed_state_shared_payload(inner)
     )
 }
@@ -5534,7 +5595,11 @@ fn check_folder_purity_body(
                     if let Some(local) = func.body.locals.get(place.local) {
                         if ty_can_carry_folder_alias(&local.ty)
                             && rvalue_is_folder_derived(rvalue, &aliases)
-                            && !is_detached_pinned_shared_field_copy(rvalue, &local.ty)
+                            && !is_detached_pinned_shared_field_copy(
+                                &func.body.datatype_defs,
+                                rvalue,
+                                &local.ty,
+                            )
                         {
                             changed |= aliases.insert(place.local);
                         }

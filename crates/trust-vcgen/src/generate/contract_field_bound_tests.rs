@@ -87,6 +87,7 @@ fn dot_like(preconditions: Vec<Formula>, reassign_self: bool) -> VerifiableFunct
             blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
             arg_count: 3,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions,

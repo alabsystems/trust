@@ -1,0 +1,48 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-symbols — the ONE symbol-graph vocabulary shared by the Rust and Clean
+# producers. Decision of record:
+# docs/design/2026-08-04-two-language-compiler-architecture.md §3 ("Deps:
+# `trust-types` ONLY").
+#
+# THE DEPENDENCY LIST IS A SOUNDNESS MECHANISM, NOT A BUILD PREFERENCE.
+# `KernelStatus::KernelChecked` is the compiler's strongest claim about a Clean
+# declaration. This crate is where that claim is spelled, and it deliberately
+# CANNOT NAME the thing that would let it fabricate one: there is no
+# `clean-kernel`, no `clean-elab`, no `clean-parser`, and no `rustc_*` here, so
+# "a parse-time success implied a kernel-checked declaration" is not a review
+# failure in this crate — it does not compile. Adding any of those crates here
+# deletes that argument. Do not.
+#
+# The second reason for the short list (§8, "Build time ~ 0 marginal") is that
+# from I5 this crate sits under `rustc_resolve`; a heavy dep here would put a
+# theorem prover on the front of name resolution.
+#
+# `default-features = false` on trust-types drops the nightly `try_trait_v2`
+# requirement of its default `try-sugar` feature. Nothing here uses `?` over
+# `Discharge`, so the feature buys nothing and costs a nightly edge.
+
+[package]
+name = "trust-symbols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "The one hierarchical, multi-sorted symbol graph both the Rust and the Clean producer write headers into."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ONLY dependency. See the header above before adding a second one.
+#
+# Spelled as a path rather than `{ workspace = true }` for one reason: cargo
+# refuses `default-features = false` on an inherited dependency whose workspace
+# entry does not already say so ("`default-features = false` cannot override
+# workspace's `default-features`"), and dropping trust-types' default
+# `try-sugar` feature is the point — it is what keeps this crate off the
+# nightly `try_trait_v2` edge. The path resolves identically from the root
+# (compiler) workspace, which also names these crates by path.
+trust-types = { path = "../trust-types", default-features = false }

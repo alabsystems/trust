@@ -50,6 +50,7 @@ fn caller_with(pre_call_stmts: Vec<Statement>) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: I32,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

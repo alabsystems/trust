@@ -517,7 +517,8 @@ tag_for_expected_kind() {
         ArithmeticOverflow\(Add\)) echo "overflow:add" ;;
         ArithmeticOverflow\(Sub\)) echo "overflow:sub" ;;
         ArithmeticOverflow\(Mul\)) echo "overflow:mul" ;;
-        ArithmeticOverflow\(Div\)) echo "overflow" ;;
+        ArithmeticOverflow\(Div\)) echo "overflow:div" ;;
+        ArithmeticOverflow\(Rem\)) echo "overflow:rem" ;;
         ShiftOverflow\(Shl\)) echo "shift:left" ;;
         ShiftOverflow\(Shr\)) echo "shift:right" ;;
         *) echo "" ;;
@@ -530,6 +531,7 @@ op_for_expected_kind() {
         ArithmeticOverflow\(Sub\)) echo "Sub" ;;
         ArithmeticOverflow\(Mul\)) echo "Mul" ;;
         ArithmeticOverflow\(Div\)) echo "Div" ;;
+        ArithmeticOverflow\(Rem\)) echo "Rem" ;;
         ShiftOverflow\(Shl\)) echo "Shl" ;;
         ShiftOverflow\(Shr\)) echo "Shr" ;;
         *) echo "" ;;

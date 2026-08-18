@@ -218,6 +218,7 @@ impl Lifter {
             blocks: trust_ir_blocks,
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         Ok(LiftedFunction {
@@ -1457,7 +1458,7 @@ mod tests {
     fn test_lift_function_aarch64_system_barrier_records_partial_boundary() {
         let text_base: u64 = 0x1000;
         let mut text_section = Vec::new();
-        text_section.extend_from_slice(&0xD5033B9Fu32.to_le_bytes()); // DMB ISH
+        text_section.extend_from_slice(&0xD5033BBFu32.to_le_bytes()); // DMB ISH
         text_section.extend_from_slice(&0xD65F03C0u32.to_le_bytes()); // RET
 
         let lifter = Lifter::new(
@@ -1485,7 +1486,7 @@ mod tests {
         assert!(record.feature.contains("scope=InnerShareable"));
         assert!(record.feature.contains("ordering=LoadsAndStores"));
         assert!(record.feature.contains("not proof-grade"));
-        assert_eq!(record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033B9F));
+        assert_eq!(record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033BBF));
     }
 
     #[test]

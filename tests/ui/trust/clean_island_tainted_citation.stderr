@@ -1,13 +1,14 @@
-error: Clean island declaration `hole` uses explicit `sorry`; strict islands reject all trust debt
+error: error: the publish audit refused this batch; nothing was registered
+         - `hole` reaches the incomplete-proof marker `sorryAx`. Finish the proof, or state the missing step as an `axiom` so it is disclosed by name in the certification closure.
   --> $DIR/clean_island_tainted_citation.rs:10:5
    |
-LL |     theorem hole : True := sorry
-   |     ^^^^^^^
+LL |     theorem registered_before_failure : 0 = 0 := rfl
+   |     ^
    |
    = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
 
 error: citation `registered_before_failure` cannot be validated because an earlier Clean island was rejected and the crate-local environment is tainted
-  --> $DIR/clean_island_tainted_citation.rs:15:23
+  --> $DIR/clean_island_tainted_citation.rs:16:23
    |
 LL |     ensures 0 == 0 by registered_before_failure
    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^

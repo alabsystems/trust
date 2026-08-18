@@ -19,8 +19,25 @@ pub(crate) fn v2_build_assert_overflow_vc(
     }
 
     if matches!(op, BinOp::Div | BinOp::Rem) {
-        let (lhs, rhs) = v2_find_block_binary_operands(block, op)
-            .or_else(|| v2_find_target_binary_operands(func, target, op))?;
+        // SOUNDNESS (false proof, 2026-08): bind the GUARDED division ONLY from the
+        // assert's TARGET block. rustc emits the divisor/dividend test in the assert's
+        // own block and the division itself in the target:
+        //
+        //   bb2: _4 = Div(copy _1, const 2_i64);        // an UNRELATED earlier division
+        //        assert(!move _8, "… / … overflow", copy _2, copy _3) -> bb3;
+        //   bb3: _5 = Div(copy _2, copy _3);            // the division this assert guards
+        //
+        // Searching THIS block first bound the first unrelated `Div`/`Rem` statement that
+        // happened to precede the assert — reachable from idiomatic source whenever a
+        // divisor guard (`if e == 0 { return }`) lets rustc fold the zero-assert away and
+        // merge the blocks. The resulting VC was stamped with the GUARDED division's span
+        // but built from the WRONG operands; with a constant divisor it carries the
+        // constant-false conjunct `k == -1`, is UNSAT for every backend, and is therefore
+        // reported PROVED. That row then acts as the unique same-span `ArithmeticOverflow`
+        // sibling and subsumes (and elides) the `mir_assert::Overflow(Div)` hardened twin
+        // guarding a real `MIN / -1` panic. Fail closed when the target has no division:
+        // emitting no VC leaves the twin Unknown, which is safe; a mis-bound VC is not.
+        let (lhs, rhs) = v2_find_target_binary_operands(func, target, op)?;
         return v2_build_signed_div_overflow_vc(func, block, op, lhs, rhs, span, None);
     }
 
@@ -162,117 +179,6 @@ pub(super) fn v2_build_assert_negation_vc(
             width: Some(width),
         }),
     })
-}
-
-/// Whether this block's `BoundsCheck` assert provably CANNOT fire: the assert
-/// expects its condition TRUE, the condition is `Lt(index, len)`, and BOTH
-/// operands resolve to compile-time constants with `index < len` (a literal
-/// element access like `cols[0]` on `[Vec4; 4]`).
-///
-/// WHY suppress instead of emitting: the violation formula for two constants
-/// is the constant-false `Ge(k, L)`. The native lane happily proves it UNSAT —
-/// and then `trust_router::constant_folder::apply_vacuity_gate` strips the
-/// proof's authority, because a constant-false violation skeleton is
-/// indistinguishable from the legacy vacuous placeholder it exists to reject
-/// (observed: every literal-index bounds obligation of a matrix crate proved
-/// by PDR, then downgraded to "Proved without exact kernel/native proof
-/// authority"). An obligation that provably cannot fire is not minted — the
-/// same principle as `v2_build_float_overflow_vc` returning `None` and the
-/// Div/Rem nonzero-constant skip.
-///
-/// SOUNDNESS of the constant resolution: each side must be an operand-level
-/// integer constant, or a bare local EVERY def of which (Assign stmts AND call
-/// destinations — a call-written local fails, unlike `index_local_const`'s
-/// stmt-only scan) is the SAME non-negative constant or a `Len` of a place
-/// whose type is a fixed-length array (the length is a type-level constant).
-/// Differing defs, symbolic values, projections, or `expected == false` all
-/// return false — the obligation is kept (fail-closed). A genuinely
-/// out-of-range constant access (`k >= L`) is NOT suppressed: its violation is
-/// constant-TRUE and must surface as the refutation it is.
-pub(crate) fn v2_bounds_assert_const_index_in_range(
-    func: &VerifiableFunction,
-    block: &trust_types::BasicBlock,
-    cond: &Operand,
-    expected: bool,
-) -> bool {
-    if !expected {
-        return false;
-    }
-    let Some((BinOp::Lt, lhs, rhs)) = v2_find_condition_binary_operands(block, cond) else {
-        return false;
-    };
-    match (v2_const_unsigned_operand_value(func, lhs), v2_const_unsigned_operand_value(func, rhs)) {
-        (Some(index), Some(len)) => index < len,
-        _ => false,
-    }
-}
-
-/// Resolve an operand to a single compile-time non-negative integer value:
-/// a constant operand, or a bare local whose EVERY def (Assign rvalues and
-/// call destinations) yields the same value — a `Use` of an integer constant,
-/// or a `Len` of a fixed-length-array place (its length is the type-level
-/// constant). Any other def shape, a projected read, or disagreeing defs
-/// return `None`.
-pub(super) fn v2_const_unsigned_operand_value(func: &VerifiableFunction, op: &Operand) -> Option<u128> {
-    if let Some(v) = operand_const_int(op) {
-        return u128::try_from(v).ok();
-    }
-    let place = match op {
-        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p,
-        _ => return None,
-    };
-    let mut found: Option<u128> = None;
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
-                Statement::Assign { place: dest, rvalue, .. } => {
-                    // A `&mut`/`&raw mut` borrow of the local opens a write
-                    // channel the def scan cannot see (`*r = 9;` assigns
-                    // through `r`, not this local) — poison, mirroring
-                    // `float_whole_local_defs` (round-13).
-                    if let Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(true, borrowed) = rvalue
-                        && borrowed.local == place.local
-                    {
-                        return None;
-                    }
-                    if dest.local != place.local {
-                        continue;
-                    }
-                    if !dest.projections.is_empty() {
-                        return None;
-                    }
-                    let v = match rvalue {
-                        Rvalue::Use(inner) => u128::try_from(operand_const_int(inner)?).ok()?,
-                        Rvalue::Len(measured) => {
-                            match crate::place_ty_cow(func, measured)?.as_ref() {
-                                Ty::Array { len, .. } => u128::from(*len),
-                                _ => return None,
-                            }
-                        }
-                        _ => return None,
-                    };
-                    match found {
-                        Some(prev) if prev != v => return None,
-                        _ => found = Some(v),
-                    }
-                }
-                Statement::SetDiscriminant { place: dest, .. }
-                | Statement::Deinit { place: dest } => {
-                    if dest.local == place.local {
-                        return None;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == place.local
-        {
-            return None;
-        }
-    }
-    found
 }
 
 pub(super) fn v2_build_bounds_assert_vc(
@@ -742,6 +648,15 @@ pub(super) fn v2_build_cast_vc(
     };
 
     if matches!(&from_ty, Ty::Bool) && to_ty.is_integer() {
+        return None;
+    }
+
+    // Rust permits exactly one integer-to-char `as` cast: `u8 as char`.
+    // Every u8 value is a Unicode scalar (the surrogate interval starts at
+    // 0xD800), so this conversion cannot trap, overflow, or create an invalid
+    // char. Wider integer-to-char casts are rejected by rustc and every other
+    // non-integer destination still reaches the fail-closed arm below.
+    if matches!(&from_ty, Ty::Int { width: 8, signed: false }) && matches!(to_ty, Ty::Char) {
         return None;
     }
 

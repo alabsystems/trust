@@ -1751,18 +1751,70 @@ def check_git_pin_cascade(root: Path, workspaces: list[Path], rep: Report) -> No
 # `x.py build` (which runs --deep-if-cached) would have replayed it. The key now
 # covers every manifest in the resolver GRAPH, which is what the verdict is
 # actually about. Costs nothing: check 2a already memoized that walk this run.
-DEEP_CACHE_VERSION = 2
+#
+# v3: v2 fixed the MANIFEST half of that blind spot and left the LOCK half.
+# The key hashed `ws / "Cargo.lock"` - the lock sitting in the workspace's own
+# directory - but a workspace that is a MEMBER of a larger one is resolved by
+# cargo against its workspace ROOT's lock, and that is the file the verdict is
+# actually about. The failure text says so in as many words:
+#
+#     FAIL  src/tools/miri: resolver CONFIRMS the lock must change
+#           error: cannot update the lock file Cargo.lock
+#
+# Fixing the ROOT lock therefore left three cached FAILs fully "valid", and
+# --deep re-reported three already-fixed workspaces as blocking - sending the
+# reader to hunt a build breakage that no longer existed. (Observed 2026-08-08
+# after a 316-commit submodule pull; the three cleared instantly when probed by
+# hand.) The key now covers every lock from `ws` up to the repo root, so a
+# change to any lock the resolver could consult invalidates the verdict.
+#
+# The version bump is load-bearing: it retires every v2 entry, including the
+# stale ones this fixes.
+DEEP_CACHE_VERSION = 3
 
 
 def _deep_cache_path(root: Path) -> Path:
     return root / "build" / "preflight-deep-cache.json"
 
 
+def _resolver_locks(ws: Path) -> list[Path]:
+    """Every lockfile the resolver could consult when resolving `ws`.
+
+    `ws` upward to the repo root. A workspace that is a MEMBER of a larger one
+    has no lock of its own that cargo honours - it is resolved against its
+    workspace root's - so hashing only `ws / "Cargo.lock"` keys the verdict on
+    a file that had nothing to do with it. Walking up costs a handful of
+    stat(2)s and catches both: the workspace's own lock when it has one, and
+    the ancestor lock cargo actually used when it does not.
+    """
+    out: list[Path] = []
+    seen: set[Path] = set()
+    try:
+        d = ws.resolve()
+        root = Path(__file__).resolve().parent.parent
+    except OSError:
+        return out
+    while True:
+        lp = d / "Cargo.lock"
+        if lp.is_file() and lp not in seen:
+            seen.add(lp)
+            out.append(lp)
+        if d == root or d.parent == d:
+            break
+        d = d.parent
+    return sorted(out)
+
+
 def _deep_cache_key(ws: Path, targo: str) -> str:
     h = hashlib.sha256()
     h.update(f"v{DEEP_CACHE_VERSION}\0{targo}\0".encode())
     try:
-        h.update(hashlib.sha256((ws / "Cargo.lock").read_bytes()).digest())
+        locks = _resolver_locks(ws)
+        if not locks:
+            return ""
+        for lp in locks:
+            h.update(f"{lp}\0".encode())
+            h.update(hashlib.sha256(lp.read_bytes()).digest())
         if targo:
             st = Path(targo).stat()
             h.update(f"{st.st_size}:{st.st_mtime_ns}\0".encode())
@@ -2216,10 +2268,35 @@ def check_existing_sysroot(root: Path, cfg: dict, facts: BootstrapFacts, rep: Re
         if re.search(r"/stage0(-sysroot)?/bin$", str(stage_bin)):
             continue
         names = {p.name for p in stage_bin.iterdir()}
+        label = rel(root, stage_bin)
         if "trustc" not in names and "rustc" not in names:
+            # A sysroot bin/ that exists but carries NO COMPILER is an
+            # INTERRUPTED BUILD, not an absent one. `x.py build --stage 2`
+            # empties this directory and refills it at the end, so a crash or a
+            # ^C in between leaves exactly this shape.
+            #
+            # This used to `continue`, which made the most expensive failure in
+            # the tree invisible: every downstream gate resolves the toolchain
+            # through $TRUST_STAGE2_BIN (default build/host/stage2/bin), so an
+            # empty stage2 silently demotes them to stock cargo, which then dies
+            # at flag-parse on `-Ztrust-verify=*`. The consumer sees a wall of
+            # toolchain text listing several hypotheses; the one fact that
+            # settles it -- "your stage2 has no compiler in it" -- was known
+            # here and thrown away. (Cost a real incident on 2026-08-03: a crash
+            # mid-bootstrap emptied stage2/bin, and every aterm push was blocked
+            # with no single command that named the cause.)
+            rep.add(WARN, check,
+                    f"sysroot {label} exists but carries NO COMPILER - INTERRUPTED BUILD",
+                    [f"contains {len(names)} entr{'y' if len(names) == 1 else 'ies'}"
+                     + (f": {', '.join(sorted(names)[:6])}" if names else " (empty)"),
+                     "this is the shape a crashed/^C'd `x.py build` leaves behind",
+                     "anything resolving the toolchain through this path (push hooks,",
+                     "  targo, TRUST_STAGE2_BIN) silently falls back to stock cargo and",
+                     "  then fails at flag-parse on -Ztrust-verify - a confusing error",
+                     "  whose real cause is this directory"],
+                    ["python3 x.py build --stage 2   # finish the interrupted build"])
             continue
         missing = [b for b in backends if b not in names]
-        label = rel(root, stage_bin)
         if missing:
             rep.add(WARN, check,
                     f"existing sysroot {label} has NO {', '.join(missing)}",
@@ -2228,6 +2305,65 @@ def check_existing_sysroot(root: Path, cfg: dict, facts: BootstrapFacts, rep: Re
                     ["# rebuild after fixing [build] tools; then re-check this path"])
         else:
             rep.add(OK, check, f"existing sysroot {label} has all backends: {', '.join(backends)}")
+
+
+def check_config_drift(root: Path, cfg: dict, rep: Report) -> None:
+    """bootstrap.toml is gitignored, so it silently rots.
+
+    It CANNOT be committed: it carries absolute, machine-local paths (the
+    genesis-stage0 driver paths, [build] python, [install] prefix). Checking in
+    one developer's /Users/... would break every other clone, which is exactly
+    why upstream gitignores config.toml too.
+
+    But gitignored means no diff, no review, and no signal when the generator
+    moves — and `recreate_bootstrap.py` deliberately WILL NOT overwrite an
+    existing bootstrap.toml without --force-config. So a config written months
+    ago keeps being used forever while the canonical list gains entries. That is
+    not hypothetical: the 2026-07-31 commit that added `clean` and `ty` to the
+    generator never reached this machine's config, and the resulting toolchain
+    would have compiled but not verified (failure-mode 6) had the tools audit
+    above not caught it independently.
+
+    So: keep the file gitignored, and make the DRIFT visible instead. We compare
+    only [build] tools — the field whose omissions are load-bearing. Paths are
+    supposed to differ per machine and are not compared.
+    """
+    check = "3. TOOLS ALLOWLIST AUDIT"
+    gen = root / "scripts/recreate_bootstrap.py"
+    if not gen.exists():
+        return
+    try:
+        src = gen.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    m = re.search(r'^CONFIG_TEMPLATE = """\\\n(.*?)^"""', src, re.S | re.M)
+    if not m:
+        # Template moved or was restructured. Stay SILENT rather than guess:
+        # this file's own rule is that a checker which can lie is worse than no
+        # checker, and a bad regex here would report false drift on every run.
+        return
+    tm = re.search(r"^tools = \[(.*?)^\]", m.group(1), re.S | re.M)
+    if not tm:
+        return
+    canonical = [t for t in re.findall(r'"([^"]+)"', tm.group(1))]
+    live = (cfg.get("build") or {}).get("tools")
+    if not isinstance(live, list) or not canonical:
+        return
+    missing = [t for t in canonical if t not in live]
+    extra = [t for t in live if t not in canonical]
+    if not missing and not extra:
+        rep.add(OK, check, "bootstrap.toml [build] tools matches scripts/recreate_bootstrap.py")
+        return
+    detail = []
+    if missing:
+        detail.append(f"MISSING vs generator: {', '.join(missing)}")
+    if extra:
+        detail.append(f"present but NOT in generator: {', '.join(extra)}")
+    detail.append("bootstrap.toml is gitignored (machine-local paths), so this drift is")
+    detail.append("  invisible to git; the recreator will not overwrite it without --force-config")
+    rep.add(WARN, check, "bootstrap.toml [build] tools has DRIFTED from the generator", detail,
+            ["python3 scripts/recreate_bootstrap.py --force-config"
+             "   # regenerate (rewrites machine paths too - re-check them after)"])
 
 
 def check_misc(root: Path, cfg: dict, rep: Report) -> None:
@@ -2363,6 +2499,7 @@ def main() -> int:
         checks_run.append("4. BUILD ENVIRONMENT")
         check_concurrent_build(root, rep, args.for_build)
         check_existing_sysroot(root, cfg, facts, rep)
+        check_config_drift(root, cfg, rep)
         check_misc(root, cfg, rep)
 
     rc = rep.emit(time.time() - t0, checks_run)

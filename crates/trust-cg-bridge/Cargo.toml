@@ -30,6 +30,16 @@ ay-proofs = ["dep:ay", "dep:ay-proof", "dep:trust-disasm", "dep:trust-machine-se
 # trust-clean). Behind a feature so default builds don't pull the clean kernel.
 kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel"]
 
+# Trust: `ccc_probe` imports `verify_output_trust_ir`, which is itself
+# `#[cfg(feature = "ay-proofs")]`. Without this declaration cargo auto-discovers
+# the example and builds it under `--all-targets` with default features, where
+# that module does not exist — so the crate reported E0432/E0433 on a target
+# that was never buildable in that configuration. Declaring the requirement is
+# what makes `--all-targets` mean "every target that applies here".
+[[example]]
+name = "ccc_probe"
+required-features = ["ay-proofs"]
+
 [dependencies]
 trust-types = { workspace = true }
 # Trust: the "trust-ir first" codegen seam consumes trust_ir::Module

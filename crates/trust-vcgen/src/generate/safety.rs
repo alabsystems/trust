@@ -347,20 +347,41 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                         )
                     })
                 }
-                AssertMessage::Overflow(op) => Some(
-                    v2_build_assert_overflow_vc(func, block, *target, *op, cond, *expected, span)
-                        .unwrap_or_else(|| {
-                            v2_recognized_assert_proof_gap_vc(
-                                func,
-                                block,
-                                *target,
-                                format!("Overflow({op:?})"),
-                                cond,
-                                *expected,
-                                span,
+                AssertMessage::Overflow(op) => {
+                    // A signed 128-bit multiply whose operands both carry finite
+                    // constant boxes on every reaching path provably cannot
+                    // overflow (all four corner products fit i128) — emit
+                    // nothing, exactly as the BoundsCheck arm below does for a
+                    // literal in-range index.
+                    //
+                    // This gate is what makes suppression EXPRESSIBLE here. The
+                    // builder's `None` means "could not analyse" and falls to
+                    // `RecognizedSafetyAssertProofGap`, so without a pre-check
+                    // the provably-safe case had no way to say so and was
+                    // encoded as a constant-false violation formula instead —
+                    // which `apply_vacuity_gate` then rejected as vacuous, and
+                    // which could carry no proof authority in any case.
+                    if v2_overflow_assert_provably_cannot_fire(func, block, *op) {
+                        None
+                    } else {
+                        Some(
+                            v2_build_assert_overflow_vc(
+                                func, block, *target, *op, cond, *expected, span,
                             )
-                        }),
-                ),
+                            .unwrap_or_else(|| {
+                                v2_recognized_assert_proof_gap_vc(
+                                    func,
+                                    block,
+                                    *target,
+                                    format!("Overflow({op:?})"),
+                                    cond,
+                                    *expected,
+                                    span,
+                                )
+                            }),
+                        )
+                    }
+                }
                 AssertMessage::OverflowNeg => Some(
                     v2_build_assert_negation_vc(func, block, *target, cond, *expected, span)
                         .unwrap_or_else(|| {
@@ -375,32 +396,57 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                             )
                         }),
                 ),
-                AssertMessage::BoundsCheck => {
-                    // A literal in-range element access (`cols[0]` on
-                    // `[Vec4; 4]`) provably cannot fire — emit nothing rather
-                    // than a constant-false violation the vacuity gate later
-                    // strips proof authority from. See
-                    // `v2_bounds_assert_const_index_in_range`; the hardened
-                    // panic-boundary twin applies the identical skip.
-                    if v2_bounds_assert_const_index_in_range(func, block, cond, *expected) {
-                        None
-                    } else {
-                        Some(
-                            v2_build_bounds_assert_vc(func, block, *target, cond, *expected, span)
-                                .unwrap_or_else(|| {
-                                    v2_recognized_assert_proof_gap_vc(
-                                        func,
-                                        block,
-                                        *target,
-                                        "BoundsCheck".to_string(),
-                                        cond,
-                                        *expected,
-                                        span,
-                                    )
-                                }),
-                        )
-                    }
-                }
+                // EVERY `BoundsCheck` assert mints an obligation — including the
+                // literal in-range element access (`arr[0]` on `[i64; 3]`,
+                // `cols[0]` on `[Vec4; 4]`).
+                //
+                // Trust (#57 follow-up): this arm USED TO suppress that case
+                // (`v2_bounds_assert_const_index_in_range`, now deleted) on the
+                // theory that a provably-safe access needs no obligation. It is
+                // provably safe — and that is exactly why the obligation must be
+                // EMITTED. An obligation that is never emitted is SILENT, and
+                // silence is indistinguishable from success at every layer below,
+                // including the Clean kernel, which can only re-check propositions
+                // it is handed. The trust-ir spine derives the obligation from the
+                // same assert, so suppressing it here also manufactured a
+                // producer disagreement (`ObligationSetDiff::native_only`) — the
+                // fail-closed alarm 92b7a1fc52 added. On a3d's dependency-free
+                // verified kernel that alarm fired 190 times, all of it this shape.
+                //
+                // The old suppression's stated cost does not apply to this arm and
+                // was measured not to: the violation it builds is an ARITHMETIC
+                // core (`Ge(_i, LEN)` conjoined with the index def `_i = k`), not
+                // a `Bool` literal, so `apply_vacuity_gate` — which folds only the
+                // BOOLEAN-literal skeleton — leaves it alone; and it carries a real
+                // `ObligationRecord`, so `trust_certify::certify_vc` mints a
+                // CleanCic interval-refutation certificate for it (`Int.lt_irrefl`)
+                // and it acquires row-bound proof authority. That is the same lane
+                // the constant SHIFT-amount check (`Or([1 < 0, 1 >= 8])`) already
+                // proves through. Measured: all 95 of a3d's literal-index bounds
+                // obligations PROVE and CERTIFY; `tests/trust-falsification/proved/
+                // const_array_index.rs` — a fixture whose entire subject is this
+                // obligation — goes from red back to proved.
+                //
+                // The genuinely-safe-but-unemittable shapes stay suppressed at
+                // their own arms (Div/Rem's constant divisor via the shared
+                // `static_truth` fold, signed-128 Mul via
+                // `v2_overflow_assert_provably_cannot_fire`); those emit a bare
+                // `Bool(false)` with `obligation: None`, which can acquire no
+                // authority at all. This one is not that.
+                AssertMessage::BoundsCheck => Some(
+                    v2_build_bounds_assert_vc(func, block, *target, cond, *expected, span)
+                        .unwrap_or_else(|| {
+                            v2_recognized_assert_proof_gap_vc(
+                                func,
+                                block,
+                                *target,
+                                "BoundsCheck".to_string(),
+                                cond,
+                                *expected,
+                                span,
+                            )
+                        }),
+                ),
                 AssertMessage::Custom(message) => Some(VerificationCondition {
                     kind: VcKind::Assertion { message: message.clone() },
                     function: func.name.clone().into(),

@@ -730,8 +730,11 @@ pub(super) fn recognize_drop_ladder_epilogue(
         return None;
     }
     let self_local = self_place.local;
-    if crate::assignment_types::modeled_enum_variant_count(&body.locals.get(self_local)?.ty)
-        .is_none()
+    if crate::assignment_types::modeled_enum_variant_count(
+        &body.datatype_defs,
+        &body.locals.get(self_local)?.ty,
+    )
+    .is_none()
     {
         return None;
     }

@@ -1603,6 +1603,24 @@ fn extract_block_definitions_until_impl(
                 if let Some(range) = shift_result_range(func, op, lhs, rhs, &dest_name) {
                     defs.push(range);
                 }
+                // ...and an unsigned floor-division is additionally bounded by its own
+                // dividend (`x >> k <= x`, `x / c <= x`). The constant bound above
+                // cannot discharge the safe-midpoint `low + ((high - low) >> 1)`;
+                // this relational one can, in either spelling.
+                // Rendered through the same operand path as the `dest == lhs >> rhs`
+                // equality below so both facts name the identical LHS symbol.
+                if matches!(op, BinOp::Shr | BinOp::Div)
+                    && let Some(rel) = unsigned_floor_div_le_lhs(
+                        func,
+                        op,
+                        lhs,
+                        rhs,
+                        &dest_name,
+                        operand_to_formula_with_array_ctx(func, lhs, Some(&read_ctx)),
+                    )
+                {
+                    defs.push(rel);
+                }
                 let lhs_ty = crate::operand_ty_cow(func, lhs);
                 if lhs_ty.as_deref().is_some_and(|ty| matches!(ty, Ty::Bool)) {
                     let l = operand_to_formula_with_array_ctx(func, lhs, Some(&read_ctx));
@@ -2969,14 +2987,13 @@ pub(crate) fn slice_last_some_nonempty_definitions(
             // CRATE-ANCHOR (round-5 false-proof close): only a GENUINE std container
             // `len` mints the `_len == coll_len(base)` tie. A user free fn
             // `fn len(v:&Vec<i32>)->usize{1_000_000}` renders `mycrate::len` and is
-            // DECLINED by the shared `total_summary_len_bound` matcher — else the tie ties
+            // DECLINED by the shared `total_summary_len_call` matcher — else the tie ties
             // the container's abstract length var to a forged huge value → discharges
-            // `v[k]` for a large `k` (OOB). `total_summary_len_bound` is the same
-            // doctrine matcher the VC len-bound producer uses (generate.rs), so mint and
-            // recovery cannot drift; it rejects the same-prefixed impostors
+            // `v[k]` for a large `k` (OOB). `total_summary_len_call` is the shared
+            // canonical-call matcher; it rejects the same-prefixed impostors
             // (`std::vec::VecEvil::len`, `core::slice::Iter::len`) too.
             "len"
-                if trust_types::total_call_summaries::total_summary_len_bound(callee)
+                if trust_types::total_call_summaries::total_summary_len_call(callee)
                     && coll_base_len_stable(func, &base) =>
             {
                 let Some(tgt) = target else { continue };
@@ -3960,6 +3977,77 @@ fn shift_lhs_unsigned_max(func: &VerifiableFunction, lhs: &Operand) -> Option<u1
     }
 }
 
+/// An UNSIGNED floor-division is bounded by its own dividend: `x >> k` is
+/// `floor(x / 2^k)` and `x / c` is `floor(x / c)`, and `floor(x / d) <= x` holds for
+/// every unsigned `x` and every divisor `d >= 1`.
+///
+/// This is the RELATIONAL companion to `shift_result_range`, which bounds the
+/// result only by the CONSTANT `MAX(W) >> k`. That constant bound is useless for
+/// the safe-midpoint idiom, the canonical unsigned-shift consumer:
+///
+/// ```ignore
+/// if low <= high { low + ((high - low) >> 1) }   // can this Add overflow?
+/// ```
+///
+/// From `h <= MAX>>1` and `low <= MAX` nothing follows — `low` could be `MAX`.
+/// From `h <= d` and `d == high - low` we get `low + h <= low + d == high <= MAX`,
+/// and the Add discharges. Emitting BOTH facts is what makes the idiom provable.
+///
+/// SOUNDNESS: unsigned `>>` bridges to the integer domain through the unsigned
+/// `bv2nat` (`BvToInt signed=false`), so `dest` and `lhs` inhabit the same
+/// nonnegative value-space and `floor(x / 2^k) <= x` is an unconditional truth
+/// there — for a constant OR a variable shift amount, and even when the amount is
+/// out of range (a masked `x >> (k mod w)` is still `<= x`; the out-of-range case
+/// is separately caught by the `ShiftOverflow` VC). Monotone-safe: adding a true
+/// fact can only turn a false-FAIL into a PROVE, never an overflow into a
+/// false-PROVE.
+///
+/// SIGNED shifts are EXCLUDED and must stay excluded: arithmetic `>>` rounds
+/// toward -inf, so `-8 >> 1 == -4`, and `-4 <= -8` is FALSE. Emitting this fact
+/// for a signed shift would be unsound.
+fn unsigned_floor_div_le_lhs(
+    func: &VerifiableFunction,
+    op: &BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    dest_name: &str,
+    lhs_formula: Formula,
+) -> Option<Formula> {
+    // Both spellings of the idiom reduce to `floor(x / d) <= x` for some `d >= 1`:
+    // `x >> k` is `floor(x / 2^k)`, and `x / c` is `floor(x / c)` directly. Cover
+    // both, or the fix would discharge `low + ((high - low) >> 1)` while leaving the
+    // equivalent `low + (high - low) / 2` unprovable.
+    match op {
+        // The shift AMOUNT needs no constraint: `floor(x / 2^k) <= x` for every k.
+        BinOp::Shr => {}
+        // The DIVISOR must be a constant `>= 1`. A zero divisor leaves the quotient
+        // unconstrained in the model (its panic is carried by the separate
+        // divide-by-zero VC), and a variable divisor could be zero.
+        BinOp::Div => {
+            let c = match rhs {
+                Operand::Constant(ConstValue::Uint(v, _)) => *v,
+                Operand::Constant(ConstValue::Int(v)) if *v >= 0 => *v as u128,
+                _ => return None,
+            };
+            if c < 1 {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let lhs_ty = crate::operand_ty_cow(func, lhs);
+    // Unsigned integers only — see the SIGNED note above.
+    if !matches!(lhs_ty.as_deref(), Some(Ty::Int { signed: false, .. })) {
+        return None;
+    }
+    let dest = Formula::Var(dest_name.to_string(), Sort::Int);
+    // `x = x >> k` in a non-renamed frame would render as the vacuous `x <= x`.
+    if lhs_formula == dest {
+        return None;
+    }
+    Some(Formula::Le(Box::new(dest), Box::new(lhs_formula)))
+}
+
 fn shift_result_range(
     func: &VerifiableFunction,
     op: &BinOp,
@@ -4311,6 +4399,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 2,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -4358,6 +4447,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: value_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -4453,6 +4543,76 @@ mod tests {
         assert!(
             constrains_downcast_payload,
             "enum payload write must constrain `o@1.0 == 7`, got: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn unsigned_shr_is_bounded_by_its_own_lhs() {
+        // `x >> k <= x` for unsigned `x` — the RELATIONAL fact that makes the
+        // safe-midpoint `low + ((high - low) >> 1)` Add provable, which the
+        // constant `MAX >> k` bound cannot do. The fact is independent of the
+        // shift AMOUNT (hence no `rhs` parameter): `floor(x / 2^k) <= x` for
+        // every `k >= 0`. SIGNED shifts must decline — `-8 >> 1 == -4` and
+        // `-4 <= -8` is false.
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::u32(), name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".into()) },
+            LocalDecl { index: 2, ty: Ty::i32(), name: Some("sx".into()) },
+        ];
+        func.body.arg_count = 2;
+
+        let x = Operand::Copy(Place::local(1));
+        let sx = Operand::Copy(Place::local(2));
+        let xf = operand_to_formula(&func, &x);
+        let k = Operand::Constant(ConstValue::Uint(1, 32));
+        let two = Operand::Constant(ConstValue::Uint(2, 32));
+        let zero = Operand::Constant(ConstValue::Uint(0, 32));
+
+        // Unsigned Shr → `dest <= x`.
+        let rel = unsigned_floor_div_le_lhs(&func, &BinOp::Shr, &x, &k, "dest", xf.clone())
+            .expect("unsigned Shr should be bounded by its LHS");
+        assert!(
+            matches!(&rel, Formula::Le(l, r)
+                if l.var_name() == Some("dest") && r.var_name() == Some("x")),
+            "got {rel:?}"
+        );
+
+        // Unsigned Div by a constant >= 1 is the SAME lemma (`x / 2 <= x`), so the
+        // `/ 2` spelling of the safe-midpoint idiom proves too.
+        let drel = unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &two, "dest", xf.clone())
+            .expect("unsigned Div by a positive constant should be bounded by its LHS");
+        assert!(
+            matches!(&drel, Formula::Le(l, r)
+                if l.var_name() == Some("dest") && r.var_name() == Some("x")),
+            "got {drel:?}"
+        );
+
+        // Div by a ZERO constant declines: the quotient is unconstrained in the model.
+        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &zero, "dest", xf.clone()).is_none());
+        // Div by a VARIABLE divisor declines: it could be zero.
+        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &x, "dest", xf.clone()).is_none());
+
+        // SIGNED declines for both ops — the fact is FALSE for negative values
+        // (`-8 >> 1 == -4`, `-8 / 2 == -4`), so emitting it would be unsound.
+        let sxf = operand_to_formula(&func, &sx);
+        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Shr, &sx, &k, "dest", sxf.clone()).is_none());
+        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Div, &sx, &two, "dest", sxf).is_none());
+
+        // Shl declines: `x << k` is not bounded above by `x`.
+        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Shl, &x, &k, "dest", xf).is_none());
+
+        // A self-assigning `x = x >> k` frame would render the vacuous `x <= x`.
+        assert!(
+            unsigned_floor_div_le_lhs(
+                &func,
+                &BinOp::Shr,
+                &x,
+                &k,
+                "x",
+                Formula::Var("x".into(), Sort::Int),
+            )
+            .is_none()
         );
     }
 

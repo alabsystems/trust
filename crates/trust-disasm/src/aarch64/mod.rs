@@ -10,6 +10,10 @@
 mod decode;
 
 #[cfg(test)]
+mod constrained_unpredictable_tests;
+#[cfg(test)]
+mod reserved_field_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::arch::{Arch, Decoder};

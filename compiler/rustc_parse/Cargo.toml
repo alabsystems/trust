@@ -6,6 +6,15 @@ edition = "2024"
 [dependencies]
 # tidy-alphabetical-start
 bitflags = "2.4.1"
+# Trust: the `clean { … }` parser island is a REAL parser island (v3(4),
+# ruling v7/D1) — rustc's parser runs the actual Clean parser on the island
+# body, so a Clean parse error is an ordinary rustc parse-time diagnostic.
+# Acyclic: clean-parser -> clean-kernel -> {thiserror, hashbrown, ahash,
+# smallvec, serde, serde_json, bincode, lz4_flex, zstd, rayon, stacker, sha2,
+# num-bigint, num-rational, num-traits}; nothing in that closure names a
+# rustc_* crate. This buys PARSING only — elaboration and CIC kernel checking
+# stay in the verify pass and are NOT reachable from here.
+clean-parser = { workspace = true }
 rustc-literal-escaper = "0.0.8"
 rustc_ast = { path = "../rustc_ast" }
 rustc_ast_pretty = { path = "../rustc_ast_pretty" }

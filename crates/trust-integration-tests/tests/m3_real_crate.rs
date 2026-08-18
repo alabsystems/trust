@@ -426,6 +426,7 @@ fn real_checked_add_function(name: &str) -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -469,6 +470,7 @@ fn real_division_function(name: &str) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Requires,
@@ -533,6 +535,7 @@ fn real_contract_function(name: &str) -> VerifiableFunction {
             ],
             arg_count: 3,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![
             Contract {
@@ -607,6 +610,7 @@ fn real_array_index_function(name: &str) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -637,6 +641,7 @@ fn real_noop_function(name: &str) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

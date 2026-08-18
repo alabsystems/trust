@@ -1103,6 +1103,67 @@ pub(crate) fn sem_nested_branch_shape_of(
     Some(t)
 }
 
+/// Trust (#49): the OR-CHAIN shape — a left-nested `BitOr` spine over a chain of
+/// guarded regions (`is_ascii_hexdigit`-class). NON-OVERLAP: declines whenever
+/// either pre-existing recognizer accepts, so at most one tree exists per
+/// function and no currently-certifying body changes lane.
+#[must_use]
+pub(crate) fn sem_or_chain_shape_of(
+    func: &trust_types::VerifiableFunction,
+) -> Option<SemBranchTree> {
+    let arg_count = func.body.arg_count;
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+    if sem_cf_return_of_mir(func, &param_index).is_some()
+        || sem_nested_branch_of_mir(func, &param_index, None).is_some()
+    {
+        return None;
+    }
+    super::return_lift::sem_or_chain_of_mir(func, &param_index)
+}
+
+/// Trust (#53, 2026-08-14) — the BOOL-JOIN shape-only recognizer: a short-circuit
+/// `&&` settling a Bool convergence temp that then feeds a deterministic tail
+/// (`to_ascii_lowercase` / `to_ascii_uppercase`'s branchless case conversion).
+///
+/// Same non-overlap gate as its siblings: a body either pre-existing recognizer
+/// accepts declines here, so this lane can only ever mint a verdict for a shape
+/// nothing else covers and no standing certificate can change underneath it.
+#[must_use]
+pub(crate) fn sem_bool_join_tail_shape_of(
+    func: &trust_types::VerifiableFunction,
+) -> Option<SemBranchTree> {
+    let arg_count = func.body.arg_count;
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+    if sem_cf_return_of_mir(func, &param_index).is_some()
+        || sem_nested_branch_of_mir(func, &param_index, None).is_some()
+    {
+        return None;
+    }
+    super::return_lift::sem_bool_join_tail_of_mir(func, &param_index)
+}
+
+/// Trust (#53): the BOOL-JOIN CHAIN shape-only recognizer — two folds compared
+/// (`eq_ignore_ascii_case`). Same non-overlap gate as its siblings.
+#[must_use]
+pub(crate) fn sem_bool_join_chain_shape_of(
+    func: &trust_types::VerifiableFunction,
+) -> Option<SemBranchTree> {
+    let arg_count = func.body.arg_count;
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+    if sem_cf_return_of_mir(func, &param_index).is_some()
+        || sem_nested_branch_of_mir(func, &param_index, None).is_some()
+    {
+        return None;
+    }
+    super::return_lift::sem_bool_join_chain_of_mir(func, &param_index)
+}
+
 /// Trust: BRANCHY call-arm sub-axis — the shape-only recognizer for a call-armed
 /// branch (`if c { g(a) } else { h(b) }`, or a MIX of a call arm and a plain
 /// scalar arm): [`sem_nested_branch_of_mir`] WITH the certified-callee registry

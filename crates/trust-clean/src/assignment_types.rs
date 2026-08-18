@@ -6,8 +6,8 @@
 //! rvalue types themselves; shape recognition and safety VCs are not a type checker.
 
 use trust_types::{
-    AggregateKind, BinOp, CallableKind, ConstValue, Operand, Place, Projection, Rvalue, Statement,
-    Ty, UnOp, VerifiableBody,
+    AggregateKind, BinOp, CallableKind, ConstValue, DatatypeDefs, Operand, Place, Projection,
+    Rvalue, Statement, Ty, UnOp, VerifiableBody,
 };
 
 fn ty_eq(a: &Ty, b: &Ty) -> bool {
@@ -67,7 +67,24 @@ fn legacy_flattened_variant_count(fields: &[(String, Ty)]) -> Option<usize> {
 /// exact historical flattened layout accepted by the projection type checker.
 /// Empty-variant structs, tag-only ADTs, and malformed flattened payload names
 /// deliberately return `None`.
-pub(crate) fn modeled_enum_variant_count(ty: &Ty) -> Option<usize> {
+///
+/// R0: `defs` is the body's out-of-band datatype table. A bare
+/// `Ty::Datatype { variants: [] }` marker carries no structure INLINE, so it is
+/// resolved through that table — and through nothing else. A marker with no
+/// entry declines exactly as it did before the table existed.
+pub(crate) fn modeled_enum_variant_count(defs: &DatatypeDefs, ty: &Ty) -> Option<usize> {
+    inline_modeled_enum_variant_count(ty).or_else(|| {
+        // Additive order: the inline reading above is tried FIRST, so only a
+        // marker with no inline structure reaches here. The recorded definition
+        // is a WHOLE `Ty` — almost always the flattened `Ty::Adt` — so it is read
+        // with the SAME function, one level down. Shallow by construction: the
+        // definition's own nested markers are not re-resolved here.
+        inline_modeled_enum_variant_count(trust_types::datatype_marker_definition(defs, ty)?)
+    })
+}
+
+/// [`modeled_enum_variant_count`] against the type's own INLINE structure only.
+fn inline_modeled_enum_variant_count(ty: &Ty) -> Option<usize> {
     match ty {
         Ty::Adt { variants, .. } if !variants.is_empty() => Some(variants.len()),
         Ty::Adt { fields, variants, faithful_enum_repr: None, .. } if variants.is_empty() => {
@@ -159,7 +176,13 @@ fn byte_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Int { width: 8, signed: false })
 }
 
-fn field_ty(ty: &Ty, variant: Option<usize>, field: usize) -> Option<Ty> {
+fn field_ty(defs: &DatatypeDefs, ty: &Ty, variant: Option<usize>, field: usize) -> Option<Ty> {
+    // R0: a bare datatype marker carries no field structure inline. Widen it
+    // through the body's explicit table first, then run the UNCHANGED match on
+    // the result. `resolved_datatype` is the identity on every other shape (and
+    // on a marker the table does not define), so no case below can see a value
+    // it could not see before.
+    let ty = &*trust_types::resolved_datatype(defs, ty);
     match ty {
         Ty::Tuple(fields) => variant.is_none().then(|| fields.get(field).cloned()).flatten(),
         Ty::Adt { fields, variants, faithful_enum_repr, .. } => match variant {
@@ -217,7 +240,17 @@ pub(crate) fn place_type(body: &VerifiableBody, place: &Place) -> Option<Ty> {
                 if downcast.is_some() {
                     return None;
                 }
-                let count = match &ty {
+                // R0, THE DECISIVE SITE. Under markers-everywhere the enum a
+                // `Downcast` names is spelled bare EVEN AT THE WALK ROOT, so
+                // resolving here is what stops `_6 = &((*_1) as Two).0` becoming
+                // untypeable — and the recorded definition is a whole `Ty::Adt`,
+                // which the unchanged reading below then handles exactly as it
+                // handles an inline one. `resolved_datatype` is the identity on
+                // everything that is not a bare marker (and on a marker the table
+                // does not define), so no case here can see a value it could not
+                // see before.
+                let resolved = body.resolved_datatype(&ty);
+                let count = match resolved.as_ref() {
                     Ty::Adt { variants, .. } if !variants.is_empty() => variants.len(),
                     Ty::Adt { fields, variants, faithful_enum_repr: None, .. }
                         if variants.is_empty() =>
@@ -233,7 +266,7 @@ pub(crate) fn place_type(body: &VerifiableBody, place: &Place) -> Option<Ty> {
                 downcast = Some(*variant);
             }
             Projection::Field(field) => {
-                ty = field_ty(&ty, downcast.take(), *field)?;
+                ty = field_ty(&body.datatype_defs, &ty, downcast.take(), *field)?;
             }
             Projection::Index(index_local) => {
                 if downcast.is_some()
@@ -847,14 +880,24 @@ pub(crate) fn rvalue_matches_type(body: &VerifiableBody, rvalue: &Rvalue, expect
         Rvalue::Aggregate(kind, operands) => aggregate_matches_type(body, kind, operands, expected),
         Rvalue::Discriminant(place) => {
             int_like(expected).is_some()
-                && place_type(body, place).is_some_and(|ty| match ty {
-                    Ty::Adt { fields, variants, faithful_enum_repr, .. } => {
-                        !variants.is_empty()
-                            || (faithful_enum_repr.is_none()
-                                && legacy_discriminant_tag_matches(&fields, expected))
+                && place_type(body, place).is_some_and(|ty| {
+                    // R0: a discriminant read names the enum by its cut-point
+                    // marker under markers-everywhere (in the shipped
+                    // `xor_all.json` this is `_2 = Discriminant((*_1))`, on the
+                    // ROOT parameter), so widen through the body's EXPLICIT table
+                    // before reading the structure. `resolved_datatype` is the
+                    // identity on an inline definition and on a marker the table
+                    // does not define, so a body that already typed keeps its
+                    // exact answer and an unlisted marker still declines.
+                    match body.resolved_datatype(&ty).as_ref() {
+                        Ty::Adt { fields, variants, faithful_enum_repr, .. } => {
+                            !variants.is_empty()
+                                || (faithful_enum_repr.is_none()
+                                    && legacy_discriminant_tag_matches(fields, expected))
+                        }
+                        Ty::Datatype { variants, .. } => !variants.is_empty(),
+                        _ => false,
                     }
-                    Ty::Datatype { variants, .. } => !variants.is_empty(),
-                    _ => false,
                 })
         }
         Rvalue::Len(place) => {
@@ -955,6 +998,7 @@ mod tests {
             blocks: vec![],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         }
     }
 
@@ -1674,5 +1718,606 @@ mod tests {
         let mut missing_return_slot = canonical;
         missing_return_slot.locals.clear();
         assert!(!all_assignments_match(&missing_return_slot));
+    }
+
+    /// R0 CRUX — the "identity-bearing marker everywhere" repair for the
+    /// canonical-cut root dependence is refuted HERE, by a consumer, not by the
+    /// cost of a carrier.
+    ///
+    /// R0 (`trust-mir-extract::ty_convert`, the `TyKind::Adt` arm) is that a
+    /// canonical cut point `C` is emitted as its FULL DEFINITION at the outermost
+    /// nominal position of a `convert_ty` walk — the `!ctx.adt_stack.is_empty()`
+    /// conjunct — and as a bare `Ty::Datatype { name, variants: [] }` marker
+    /// everywhere else, so one rustc type reaches a dump as several `ty_eq`-
+    /// unequal values and `all_assignments_match` declines a well-typed body.
+    ///
+    /// The proposed repair is to DELETE that conjunct so `C` is a marker at every
+    /// occurrence, on the theory that if the marker's name is identity-bearing
+    /// then equality is exact and nothing ever needs to resolve a marker back to
+    /// its variants. Something does need to: `place_type` below.
+    /// `Projection::Downcast(v)` has no interpretation without a variant list, so
+    /// a markers-everywhere body cannot type `((*_1) as Two).0` — the very
+    /// statement R0 makes decline. The deletion trades a decline-because-two-
+    /// spellings-disagree for a decline-because-there-is-no-structure-anywhere,
+    /// which removes the capability instead of restoring it. Identity is not
+    /// enough: the definition has to live SOMEWHERE, so the out-of-band carrier
+    /// question the repair was meant to avoid is unavoidable.
+    #[test]
+    fn a_canonical_cut_marker_at_the_walk_root_cannot_type_a_downcast() {
+        let i64_ty = || Ty::Int { width: 64, signed: true };
+        // `Tree`'s recursive children are `Arc<Tree>`; the Arc subtree's exact
+        // shape is irrelevant here, only that the variant list exists at all.
+        let arc = || Ty::Datatype { name: "std::sync::Arc".into(), variants: vec![] };
+        let variant = |name: &str, discriminant: i128, fields: Vec<(String, Ty)>| VariantDef {
+            name: name.into(),
+            discriminant,
+            fields,
+        };
+
+        // `Tree` as the producer lowers it at a walk's outermost nominal position
+        // today: the flattened `__tag` / `__v{v}_{f}` view plus first-class
+        // variants. Shape taken from the shipped
+        // `fixtures/structural-fold-corpus/xor_all.json`, `locals[1].ty`.
+        let tree_definition = Ty::Adt {
+            name: "Tree".into(),
+            fields: vec![
+                ("__tag".into(), i64_ty()),
+                ("__v0_0".into(), i64_ty()),
+                ("__v1_0".into(), arc()),
+                ("__v2_0".into(), arc()),
+                ("__v2_1".into(), arc()),
+            ],
+            variants: vec![
+                variant("Leaf", 0, vec![("0".into(), i64_ty())]),
+                variant("One", 1, vec![("0".into(), arc())]),
+                variant("Two", 2, vec![("0".into(), arc()), ("1".into(), arc())]),
+            ],
+            disc_index_safe: true,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
+        // The identity-bearing marker `canonical_cut_ref` emits for the SAME rustc
+        // type. `Tree` takes no non-lifetime generic argument, so the marker
+        // carries the erased def path — already the most identity it can carry.
+        let tree_marker = Ty::Datatype { name: "Tree".into(), variants: vec![] };
+
+        // `_6 = &((*_1) as Two).0`, the shipped declining statement.
+        let two_field_0 = Place {
+            local: 1,
+            projections: vec![Projection::Deref, Projection::Downcast(2), Projection::Field(0)],
+        };
+
+        let with_root_definition =
+            body(vec![Ty::Unit, Ty::Ref { mutable: false, inner: Box::new(tree_definition) }]);
+        assert_eq!(
+            place_type(&with_root_definition, &two_field_0),
+            Some(arc()),
+            "a cut point that keeps its definition at the walk root types the downcast",
+        );
+
+        let markers_everywhere =
+            body(vec![Ty::Unit, Ty::Ref { mutable: false, inner: Box::new(tree_marker.clone()) }]);
+        assert_eq!(
+            place_type(&markers_everywhere, &two_field_0),
+            None,
+            "deleting the root conjunct leaves `Downcast(2)` no variant list to \
+             resolve, so the identity-marker design cannot stand alone — it needs \
+             an out-of-band definition carrier",
+        );
+        assert_eq!(
+            modeled_enum_variant_count(&DatatypeDefs::new(), &tree_marker),
+            None,
+            "a bare marker carries no variant count, however identity-bearing its name",
+        );
+    }
+
+    /// The companion no-over-merge pins for the same design. Over-merging two
+    /// distinct types is worse than R0's fail-closed decline, so a marker must
+    /// stay UNEQUAL to a marker for any other type, and — because the canonical
+    /// cut is only ONE of three producers of the `Ty::Datatype { name, variants:
+    /// [] }` shape — no consumer may resolve a marker by name at all.
+    ///
+    /// The other two producers, both in `trust-mir-extract::ty_convert`:
+    ///   * the legacy `adt_stack` back-edge guard (`recursive_datatype_ref(&name)`
+    ///     in the struct arm, `datatype_child_field_ty`, `lower_adt_as_datatype`
+    ///     and `lower_enum_adt`), which uses the GENERICS-ERASED def path; and
+    ///   * `compact_oversized_field`, which emits the same shape for ANY oversized
+    ///     nested ADT field purely to bound tree size — also erased, and not a
+    ///     back-edge at all.
+    /// `canonical_cut_ref` renders the instantiated path only when the type has a
+    /// non-lifetime generic argument, so for a NON-generic cut point its marker is
+    /// byte-identical to both of the others. Name resolution therefore cannot tell
+    /// a real cut from a compacted `Big<u8>` field, which is exactly how the
+    /// withdrawn consumer-side repair failed open.
+    #[test]
+    fn cut_point_markers_stay_distinct_and_are_never_resolved_by_name() {
+        let marker = |name: &str| Ty::Datatype { name: name.into(), variants: vec![] };
+
+        // Two instantiations of one generic cut point stay distinct: a generic cut
+        // point's marker carries the fully-instantiated def path.
+        assert!(
+            !ty_eq(
+                &marker("krate::Foo<std::vec::Vec<u8>>"),
+                &marker("krate::Foo<std::vec::Vec<i32>>"),
+            ),
+            "`Foo<Vec<u8>>` and `Foo<Vec<i32>>` are two cut points and must not merge",
+        );
+
+        // Two distinct cycles whose types share a leaf name stay distinct: the def
+        // path is rendered untrimmed, so the module prefix survives.
+        assert!(
+            !ty_eq(&marker("krate::alpha::Node"), &marker("krate::beta::Node")),
+            "two same-named recursive types in different modules must not merge",
+        );
+
+        // A cut point and an unrelated compacted aggregate stay distinct.
+        assert!(!ty_eq(&marker("krate::Big"), &marker("__trust_compacted_aggregate")));
+
+        // The fail-CLOSED half. For a non-generic name the three producers are
+        // byte-identical, so every consumer must decline on a bare marker rather
+        // than bind it to a definition found elsewhere. Pin that both variant
+        // readers in this module do decline, for a real cut name, a generic cut
+        // name, and `compact_oversized_field`'s fallback name alike.
+        for name in ["krate::Big", "krate::Foo<std::vec::Vec<u8>>", "__trust_compacted_aggregate"] {
+            assert_eq!(
+                modeled_enum_variant_count(&DatatypeDefs::new(), &marker(name)),
+                None,
+                "a bare `{name}` marker must not yield a variant count",
+            );
+            assert_eq!(
+                place_type(
+                    &body(vec![Ty::Unit, marker(name)]),
+                    &Place { local: 1, projections: vec![Projection::Downcast(0)] },
+                ),
+                None,
+                "a bare `{name}` marker must not admit a downcast",
+            );
+        }
+    }
+
+    /// R0 REPAIR — the consumer half. The two tests above pin that a bare marker
+    /// carries no structure and that no consumer may go LOOKING for it. This one
+    /// pins the sanctioned way the structure comes back: an EXPLICIT out-of-band
+    /// entry on the body itself (`VerifiableBody::datatype_defs`).
+    ///
+    /// All four halves are asserted together, in one test, on purpose — each is
+    /// the failure mode of the other three, so splitting them would let a future
+    /// edit "fix" one by breaking one of the others:
+    ///
+    ///   1. a marker WITH a matching entry resolves — the capability restored;
+    ///   2. a marker with NO entry still declines — fail-closed preserved, and
+    ///      this is what makes the widening additive rather than a rewrite;
+    ///   3. an entry under a DIFFERENT name does not bind — resolution is a keyed
+    ///      lookup, never a scan of whatever definitions happen to be in scope;
+    ///   4. `Foo<Vec<u8>>` and `Foo<Vec<i32>>` stay unequal AND stay unresolvable
+    ///      from each other's entry — the exact fail-OPEN that sank the withdrawn
+    ///      by-name-body-search repair is a failing assertion here.
+    #[test]
+    fn a_bare_cut_marker_resolves_only_through_an_explicit_table_entry() {
+        let i64_ty = || Ty::Int { width: 64, signed: true };
+        let arc = || Ty::Datatype { name: "std::sync::Arc".into(), variants: vec![] };
+        let marker = |name: &str| Ty::Datatype { name: name.into(), variants: vec![] };
+
+        // `Tree`'s definition as the TABLE carries it. TWO shapes are pinned,
+        // because the widened carrier holds a whole `Ty` and the producer emits
+        // BOTH: `lower_adt_as_datatype` yields a `Ty::Datatype` (the Lever A
+        // `Level`/`Expr`/`ExprKind` cluster) while every other recursive ADT —
+        // `Tree` included — goes through `lower_enum_adt` and yields a `Ty::Adt`
+        // with real discriminants and the flat `__v{v}_{f}` view. The `Ty::Adt`
+        // shape is the one that occurs 7855 times in the shipped corpus and 0
+        // times in the narrow carrier's value type.
+        let tree_variants: trust_types::DatatypeVariants = vec![
+            ("Leaf".into(), vec![("0".into(), i64_ty())]),
+            ("One".into(), vec![("0".into(), arc())]),
+            ("Two".into(), vec![("0".into(), arc()), ("1".into(), arc())]),
+        ];
+        let tree_datatype_def =
+            Ty::Datatype { name: "Tree".into(), variants: tree_variants.clone() };
+        // The `lower_enum_adt` spelling of the SAME type, taken from the shipped
+        // `fixtures/structural-fold-corpus/xor_all.json` `locals[1].ty`.
+        let tree_adt_def = Ty::Adt {
+            name: "Tree".into(),
+            fields: vec![
+                ("__tag".into(), i64_ty()),
+                ("__v0_0".into(), i64_ty()),
+                ("__v1_0".into(), arc()),
+                ("__v2_0".into(), arc()),
+                ("__v2_1".into(), arc()),
+            ],
+            variants: vec![
+                VariantDef { name: "Leaf".into(), discriminant: 0, fields: vec![("0".into(), i64_ty())] },
+                VariantDef { name: "One".into(), discriminant: 1, fields: vec![("0".into(), arc())] },
+                VariantDef {
+                    name: "Two".into(),
+                    discriminant: 2,
+                    fields: vec![("0".into(), arc()), ("1".into(), arc())],
+                },
+            ],
+            disc_index_safe: true,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
+
+        // The shipped declining statement, `_6 = &((*_1) as Two).0`, on a
+        // markers-everywhere body: the ROOT parameter is a bare marker too.
+        let two_field_0 = Place {
+            local: 1,
+            projections: vec![Projection::Deref, Projection::Downcast(2), Projection::Field(0)],
+        };
+        let markers_everywhere = || {
+            body(vec![Ty::Unit, Ty::Ref { mutable: false, inner: Box::new(marker("Tree")) }])
+        };
+        let with_table = |defs: DatatypeDefs| {
+            let mut b = markers_everywhere();
+            b.datatype_defs = defs;
+            b
+        };
+
+        // 1. WITH the entry, the downcast types — the R0 decline is repaired, and
+        //    to exactly the type the inline definition produced (see the sibling
+        //    test's `with_root_definition` assertion, also `Some(arc())`). BOTH
+        //    definitional shapes must do it: the ADT one is what the producer
+        //    actually files for `Tree`, and it is the shape the narrow carrier
+        //    could not hold at all.
+        for (label, def) in
+            [("Ty::Datatype", &tree_datatype_def), ("Ty::Adt", &tree_adt_def)]
+        {
+            let defs = DatatypeDefs::from([("Tree".to_string(), def.clone())]);
+            assert_eq!(
+                place_type(&with_table(defs.clone()), &two_field_0),
+                Some(arc()),
+                "{label}: a bare root marker plus its explicit table entry must type \
+                 `_6 = &((*_1) as Two).0`",
+            );
+            assert_eq!(
+                modeled_enum_variant_count(&defs, &marker("Tree")),
+                Some(3),
+                "{label}: the variant count comes back through the table",
+            );
+        }
+        // The ADT entry additionally carries what the narrow value type had
+        // nowhere to put: the per-variant DISCRIMINANTS a `SwitchInt` compares
+        // against. Losing them would be a WRONG fact, not a lossy one.
+        let Some(Ty::Adt { variants, .. }) = trust_types::resolve_datatype_marker(
+            &DatatypeDefs::from([("Tree".to_string(), tree_adt_def.clone())]),
+            &marker("Tree"),
+        ) else {
+            panic!("the ADT definition resolves as an ADT");
+        };
+        assert_eq!(variants.iter().map(|v| v.discriminant).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        // 2. WITHOUT an entry, everything declines exactly as before the table
+        //    existed. (A STRUCTURELESS entry is not an entry: honouring it would
+        //    resolve the marker to itself and hand back a zero-variant enum. Nor
+        //    is an entry that names something OTHER than its key.)
+        for defs in [
+            DatatypeDefs::new(),
+            DatatypeDefs::from([(
+                "Tree".to_string(),
+                Ty::Datatype {
+                    name: "Tree".into(),
+                    variants: trust_types::DatatypeVariants::new(),
+                },
+            )]),
+            DatatypeDefs::from([(
+                "Tree".to_string(),
+                Ty::Datatype { name: "NotTree".into(), variants: tree_variants.clone() },
+            )]),
+        ] {
+            assert_eq!(
+                place_type(&with_table(defs.clone()), &two_field_0),
+                None,
+                "an unlisted (or vacuously listed) marker must decline exactly as today",
+            );
+            assert_eq!(modeled_enum_variant_count(&defs, &marker("Tree")), None);
+        }
+
+        // 3. An entry for a DIFFERENT name does not bind. Resolution is a lookup
+        //    keyed by the marker's OWN name; a table that happens to define some
+        //    other datatype tells us nothing about this one.
+        let other_name = DatatypeDefs::from([(
+            "NotTree".to_string(),
+            Ty::Datatype { name: "NotTree".into(), variants: tree_variants.clone() },
+        )]);
+        assert_eq!(
+            place_type(&with_table(other_name.clone()), &two_field_0),
+            None,
+            "a definition filed under another name must not bind this marker",
+        );
+        assert_eq!(modeled_enum_variant_count(&other_name, &marker("Tree")), None);
+
+        // 4. The withdrawn fail-open design, as a failing assertion. Two
+        //    instantiations of one generic cut point are DIFFERENT types; they
+        //    stay unequal, and — the part a body-wide by-name search got wrong —
+        //    an entry for one must not answer for the other.
+        let u8_name = "krate::Foo<std::vec::Vec<u8>>";
+        let i32_name = "krate::Foo<std::vec::Vec<i32>>";
+        assert!(!ty_eq(&marker(u8_name), &marker(i32_name)));
+        let u8_only = DatatypeDefs::from([(
+            u8_name.to_string(),
+            Ty::Datatype {
+                name: u8_name.into(),
+                variants: vec![("Mk".to_string(), vec![("0".to_string(), i64_ty())])],
+            },
+        )]);
+        assert_eq!(
+            modeled_enum_variant_count(&u8_only, &marker(u8_name)),
+            Some(1),
+            "the listed instantiation resolves",
+        );
+        assert_eq!(
+            modeled_enum_variant_count(&u8_only, &marker(i32_name)),
+            None,
+            "`Foo<Vec<i32>>` must NOT pick up `Foo<Vec<u8>>`'s definition — this is the \
+             fail-open that sank the by-name body-search repair",
+        );
+        // The same, one layer down, where the withdrawn design actually failed:
+        // `compact_oversized_field`'s generics-ERASED fallback name must not
+        // acquire either instantiation's structure.
+        assert_eq!(
+            modeled_enum_variant_count(&u8_only, &marker("krate::Foo")),
+            None,
+            "a generics-erased marker must not bind an instantiated definition",
+        );
+    }
+
+    /// The rewrite `trust_mir_extract::ty_convert` now performs: every occurrence
+    /// of the canonical cut point `name` becomes its bare by-name marker.
+    ///
+    /// This is a MODEL of the producer, written here because no `cargo test` in
+    /// this repo can run the producer (the fold corpora are checked-in JSON from
+    /// a prebuilt `trustc`; exercising a `ty_convert` change needs a full
+    /// bootstrap). It is a faithful model for `Tree` specifically, and the test
+    /// below proves that rather than assuming it: `Def1(Tree)` computed this way
+    /// is BYTE-IDENTICAL to the definition the shipped dump already carries at
+    /// its walk root, so the table entry is transcribed from the producer's own
+    /// output and not invented here.
+    fn flip_cut_point(ty: &Ty, name: &str) -> Ty {
+        let go = |t: &Ty| flip_cut_point(t, name);
+        match ty {
+            Ty::Adt { name: n, .. } if n == name => {
+                Ty::Datatype { name: name.to_string(), variants: vec![] }
+            }
+            Ty::Adt {
+                name: n,
+                fields,
+                variants,
+                disc_index_safe,
+                faithful_enum_repr,
+                layout,
+                enum_layout,
+                adt_kind,
+            } => Ty::Adt {
+                name: n.clone(),
+                fields: fields.iter().map(|(f, t)| (f.clone(), go(t))).collect(),
+                variants: variants
+                    .iter()
+                    .map(|v| VariantDef {
+                        name: v.name.clone(),
+                        discriminant: v.discriminant,
+                        fields: v.fields.iter().map(|(f, t)| (f.clone(), go(t))).collect(),
+                    })
+                    .collect(),
+                disc_index_safe: *disc_index_safe,
+                faithful_enum_repr: *faithful_enum_repr,
+                layout: layout.clone(),
+                enum_layout: enum_layout.clone(),
+                adt_kind: *adt_kind,
+            },
+            Ty::Datatype { name: n, variants } => Ty::Datatype {
+                name: n.clone(),
+                variants: variants
+                    .iter()
+                    .map(|(c, fs)| {
+                        (c.clone(), fs.iter().map(|(f, t)| (f.clone(), go(t))).collect())
+                    })
+                    .collect(),
+            },
+            Ty::Ref { mutable, inner } => {
+                Ty::Ref { mutable: *mutable, inner: Box::new(go(inner)) }
+            }
+            Ty::RawPtr { mutable, pointee } => {
+                Ty::RawPtr { mutable: *mutable, pointee: Box::new(go(pointee)) }
+            }
+            Ty::Slice { elem } => Ty::Slice { elem: Box::new(go(elem)) },
+            Ty::Array { elem, len } => Ty::Array { elem: Box::new(go(elem)), len: *len },
+            Ty::SymArray { elem, len_sym } => {
+                Ty::SymArray { elem: Box::new(go(elem)), len_sym: len_sym.clone() }
+            }
+            Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(go).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// R0 is gone in the bytes a real `trustc` wrote — one rustc type, one `Ty`.
+    ///
+    /// R0 was: a canonical cut point is emitted as its FULL DEFINITION at the
+    /// outermost nominal position of a `convert_ty` walk and as a bare marker
+    /// everywhere else, so ONE rustc type reaches the dump as SEVERAL `ty_eq`-
+    /// unequal `Ty` values and `all_assignments_match` declines a well-typed body.
+    ///
+    /// This test used to prove that by REWRITING the shipped fixture in-process
+    /// (the producer had not shipped yet, so the "after" state did not exist on
+    /// disk). That is deleted: a test that flips the body itself passes just as
+    /// well against a producer that never emits a marker, which is exactly what
+    /// happened between 2026-07-13 and 2026-08-04 — `nominal_frontier` had no
+    /// `TyKind::Pat` arm, `NonNull`'s only field IS a pattern type, so the cut set
+    /// was empty on every real body and this test was green over bytes that
+    /// carried `SOURCE::Tree` as 7 structured `Ty::Adt`s and 24 bare markers.
+    ///
+    /// It now reads the shipped bytes and asserts the END STATE directly. The
+    /// witness is `fixtures/structural-fold-corpus/xor_all.json`, whose cycle
+    /// `Tree -> Arc -> NonNull -> ArcInner -> Tree` is cut at `Tree` (the
+    /// shallowest def path in the cycle — `canonical_cut_key`'s first component).
+    /// The statement that used to pay for R0 is `_6 = &((*_1) as Two).0`: the
+    /// rvalue typed to one spelling while local 6 was declared with the other, so
+    /// `assignment_types_match` declined a perfectly well-typed body. It now
+    /// matches, and it matches THROUGH THE TABLE — the last assertion strips the
+    /// table and requires the decline to come back, so nothing here is resolving
+    /// a marker by name against whatever definitions are in scope.
+    #[test]
+    fn r0_is_gone_on_the_shipped_bytes_one_rustc_type_now_yields_one_ty() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/structural-fold-corpus/xor_all.json");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let shipped: VerifiableFunction = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+
+        // `_6 = &((*_1) as Two).0` — located by shape, not by index, so a fixture
+        // regeneration that renumbers blocks cannot silently make this vacuous.
+        let two_field_0 = Place {
+            local: 1,
+            projections: vec![Projection::Deref, Projection::Downcast(2), Projection::Field(0)],
+        };
+        let (dest, rvalue) = shipped
+            .body
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .find_map(|s| match s {
+                Statement::Assign { place, rvalue: rv @ Rvalue::Ref { place: p, .. }, .. }
+                    if *p == two_field_0 =>
+                {
+                    Some((place.clone(), rv.clone()))
+                }
+                _ => None,
+            })
+            .expect("the shipped fixture carries `_6 = &((*_1) as Two).0`");
+        assert_eq!(dest.local, 6, "the shipped destination is local 6");
+
+        // ── The cut point is a MARKER at the walk root, not a definition ─────
+        // This is the half that could not be asserted before the producer fix,
+        // and it is the whole of R0: the root is spelled exactly as every nested
+        // occurrence is.
+        let Ty::Ref { inner: shipped_tree, .. } = &shipped.body.locals[1].ty else {
+            panic!("local 1 is `&Tree`");
+        };
+        let Ty::Datatype { name: cut_name, variants } = shipped_tree.as_ref() else {
+            panic!(
+                "R0: the SHIPPED root spelling of `Tree` must be a bare `Ty::Datatype` \
+                 marker — a full `Ty::Adt` here means the producer regressed to the \
+                 root-relative lowering",
+            );
+        };
+        assert!(variants.is_empty(), "a cut-point marker carries NO structure");
+        // EXACT, not a suffix test: the identity policy is "the crate-qualified
+        // definition-site path" (`with_resolve_crate_name!` in
+        // `safe_def_path_str`, `bd2d6ed1fc`), and that is one string, not a
+        // family.
+        assert_eq!(cut_name, "SOURCE::Tree");
+
+        // ── …and its structure lives ONCE, out of band ──────────────────────
+        let definition = trust_types::datatype_definition(&shipped.body.datatype_defs, cut_name)
+            .expect("the producer filed `SOURCE::Tree`'s definition in the table");
+        let Ty::Adt { name: def_name, variants: def_variants, .. } = definition else {
+            panic!("the recorded definition is a full `Ty::Adt`");
+        };
+        assert_eq!(def_name, cut_name, "a definition is filed under the name it claims");
+        assert_eq!(def_variants.len(), 3, "`Tree` is the 3-constructor tree enum");
+
+        // ── ONE rustc type, ONE `Ty` value ──────────────────────────────────
+        // `Arc<Tree>` as `Tree`'s own field and `Arc<Tree>` as local 6's pointee
+        // are the two positions that disagreed under R0. They are now equal, and
+        // the assignment that used to decline now types.
+        let field_arc = place_type(&shipped.body, &two_field_0)
+            .expect("the downcast types through the table");
+        let Ty::Ref { inner: local6_arc, .. } = &shipped.body.locals[6].ty else {
+            panic!("local 6 is `&Arc<Tree>`");
+        };
+        assert!(
+            ty_eq(&field_arc, local6_arc),
+            "one rustc type, one `Ty`: `Arc<Tree>` as `Tree`'s field and as local 6's \
+             pointee must be EQUAL",
+        );
+        assert!(
+            assignment_types_match(&shipped.body, &dest, &rvalue),
+            "`_6 = &((*_1) as Two).0` types on the shipped bytes",
+        );
+
+        // ── …and the repair is the TABLE, never a by-name search ────────────
+        // Withdrawn design: searching the body for a same-name definition is
+        // fail-OPEN, because `compact_oversized_field` emits the IDENTICAL bare
+        // shape for a SIZE BOUND rather than a back-edge.
+        let mut no_table = shipped.clone();
+        no_table.body.datatype_defs = DatatypeDefs::new();
+        assert!(
+            place_type(&no_table.body, &two_field_0).is_none()
+                || !assignment_types_match(&no_table.body, &dest, &rvalue),
+            "with the table stripped the downcast must stop typing — a consumer may \
+             never resolve a marker by name",
+        );
+    }
+
+    /// NO OVER-MERGE, with the widened carrier in play.
+    ///
+    /// An over-merging canonicalization is strictly worse than R0's fail-closed
+    /// decline, so the three pairs that could plausibly collapse are pinned to
+    /// stay UNEQUAL — and, now that entries are whole `Ty` values, to stay
+    /// mutually unresolvable through the table as well. A marker-inequality
+    /// assertion alone would not catch a table that answers for both.
+    #[test]
+    fn the_widened_table_never_merges_two_distinct_types() {
+        let marker = |name: &str| Ty::Datatype { name: name.into(), variants: vec![] };
+        let def = |name: &str, field: Ty| Ty::Datatype {
+            name: name.into(),
+            variants: vec![("Mk".to_string(), vec![("0".to_string(), field)])],
+        };
+        let u8_ty = || Ty::Int { width: 8, signed: false };
+        let i32_ty = || Ty::Int { width: 32, signed: true };
+
+        // PAIR 1 — two instantiations of one generic cut point. `canonical_cut_ref`
+        // renders the INSTANTIATED path, so they are two keys with two entries.
+        let foo_u8 = "krate::Foo<std::vec::Vec<u8>>";
+        let foo_i32 = "krate::Foo<std::vec::Vec<i32>>";
+        // PAIR 2 — two distinct cycles whose types share a leaf name. The def path
+        // is rendered untrimmed, so the module prefix survives.
+        let alpha = "krate::alpha::Node";
+        let beta = "krate::beta::Node";
+        // PAIR 3 — a REAL cut point and a `compact_oversized_field` marker of the
+        // same generics-erased name. Only the cut point is ever written to the
+        // table (`record_cut_definition` is the sole writer), so the compacted one
+        // resolves to nothing. This is the withdrawn by-name search's fail-open.
+        let cut = "krate::Big<u8>";
+        let compacted = "krate::Big";
+
+        let mut defs = DatatypeDefs::new();
+        for (name, field) in [
+            (foo_u8, u8_ty()),
+            (foo_i32, i32_ty()),
+            (alpha, u8_ty()),
+            (beta, i32_ty()),
+            (cut, u8_ty()),
+        ] {
+            assert!(trust_types::insert_datatype_def(&mut defs, def(name, field)));
+        }
+
+        for (a, b) in [(foo_u8, foo_i32), (alpha, beta), (cut, compacted)] {
+            assert!(!ty_eq(&marker(a), &marker(b)), "`{a}` and `{b}` must stay UNEQUAL");
+            let ra = trust_types::resolve_datatype_marker(&defs, &marker(a));
+            let rb = trust_types::resolve_datatype_marker(&defs, &marker(b));
+            assert_ne!(ra, rb, "`{a}` and `{b}` must not resolve to the same definition");
+        }
+
+        // The compacted marker resolves to NOTHING at all — it is a SIZE BOUND,
+        // never a cut point, and nothing may bind it.
+        assert_eq!(trust_types::resolve_datatype_marker(&defs, &marker(compacted)), None);
+        assert_eq!(
+            trust_types::resolve_datatype_marker(&defs, &marker("__trust_compacted_aggregate")),
+            None,
+        );
+        // Each real entry answers for its OWN key and no other.
+        assert_eq!(modeled_enum_variant_count(&defs, &marker(foo_u8)), Some(1));
+        assert_eq!(
+            trust_types::resolve_datatype_marker(&defs, &marker(foo_u8)),
+            Some(def(foo_u8, u8_ty())),
+        );
+        assert_eq!(
+            trust_types::resolve_datatype_marker(&defs, &marker(alpha)),
+            Some(def(alpha, u8_ty())),
+        );
     }
 }

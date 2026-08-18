@@ -47,8 +47,12 @@ contract_ensures { move |result| *result >= 0 }
 }
 
 fn main() {
-    //~^ WARN Trust Level 0 safety verification incomplete for `trust_sealed_dyn_summary::main`
-    //~| ERROR Trust strict verification failed for `trust_sealed_dyn_summary::main`
+    // NOTE: `main` carries no unproved row. Its receiver is concretely
+    // `Button`, so the dyn-dispatch C-FLOW analysis enumerates exactly one
+    // target and DISCHARGES the call (probe: "C-FLOW admitted 1 target(s)
+    // => DISCHARGED"). Inside `use_widget` the receiver is an opaque
+    // `&dyn Widget`, the trait is poisoned, and the row is KEPT — which is
+    // this fixture's actual thesis and is still asserted above.
     let b = Button;
     let _ = use_widget(&b);
 }

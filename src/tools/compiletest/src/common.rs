@@ -13,6 +13,11 @@ use crate::fatal;
 use crate::util::{Utf8PathBufExt, add_dylib_path, string_enum};
 
 pub(crate) const TRUST_VANILLA_RUSTC_FLAG: &str = "-Ztrust-verify=off";
+/// Trust (loud-when-off): diagnostic-only marker telling the compiler that the
+/// harness's `-Ztrust-verify=off` is ANNOUNCED policy, quieting the
+/// once-per-crate `compiled WITHOUT Trust verification` note. A test observes
+/// the note with `//@ unset-rustc-env:TRUST_VANILLA_ANNOUNCED`.
+pub(crate) const TRUST_VANILLA_ANNOUNCED_ENV: &str = "TRUST_VANILLA_ANNOUNCED";
 pub(crate) const TRUST_VANILLA_SENTINEL: &str = "--compiletest-trust-vanilla";
 
 string_enum! {
@@ -973,12 +978,42 @@ impl Config {
 }
 
 fn configure_trust_verification_isolation(command: &mut Command, supported: bool) {
+    // Trust: an INHERITED `TRUST_NO_VERIFY` must never reach a test compilation.
+    // The driver applies that variable as a post-parse override
+    // (`rustc_driver_impl::apply_trust_verify_override`, run AFTER
+    // `build_session_options`), so it BEATS a test's explicit `-Ztrust-verify=on`
+    // no matter where the flag sits in argv — argv last-wins does not apply.
+    //
+    // It is legitimately set for the BOOTSTRAP/stage0 build when the seed driver
+    // is a batteries-on Trust compiler older than the flag-surface rename, and
+    // bootstrap plants it in the environment of the whole driver process
+    // (`bootstrap.py::bootstrap_runtime_env`), from which compiletest and every
+    // stage1 `trustc` it spawns inherit it. Measured: that leak ran the entire
+    // tests/ui/trust suite with verification silently OFF -- 145 of 304 failing,
+    // 127 of them "an expected failure signal was not produced" (certified
+    // monitors not aborting, expected verification errors not emitted). A suite
+    // that cannot fail is worse than a suite that fails.
+    //
+    // Stripped UNCONDITIONALLY, and that is deliberate: a test's verification
+    // state must be a function of its own directives and argv, never of what the
+    // build system happened to export. The `--trust-vanilla` lane is unaffected —
+    // it disables verification through the TRACKED `TRUST_VANILLA_RUSTC_FLAG`
+    // argument below, and its separate `cmd.env("TRUST_NO_VERIFY", "1")` in
+    // `runtest.rs` applies to the test binary's RUN environment (for nested
+    // compilations with fixed argv), not to this compile command.
+    command.env_remove("TRUST_NO_VERIFY");
     if supported {
         // Compiletest's inherited Rust corpus tests compiler behavior, not the
         // batteries-on Trust verifier. Per-test compile flags are appended later,
         // so Trust-specific tests can deliberately opt back in with
         // `-Ztrust-verify=on` while auxiliary crates remain isolated by default.
         command.arg(TRUST_VANILLA_RUSTC_FLAG);
+        // The isolation flag above is compiletest's own announced policy, not
+        // a user's silent vanilla build: quiet the compiler's once-per-crate
+        // vanilla note. A test re-exposes the note with
+        // `//@ unset-rustc-env:TRUST_VANILLA_ANNOUNCED` (applied after this
+        // env, so the per-test directive wins).
+        command.env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
     }
 }
 

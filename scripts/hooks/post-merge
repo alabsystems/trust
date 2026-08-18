@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Advisory: announce submodule pin drift after `git pull` (merge path).
+# Never blocks. See scripts/hooks/_submodule_drift_notice.sh.
+exec bash "$(dirname "${BASH_SOURCE[0]}")/_submodule_drift_notice.sh"

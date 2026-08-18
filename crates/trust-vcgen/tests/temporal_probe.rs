@@ -35,6 +35,7 @@ fn probe_func() -> VerifiableFunction {
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
             ],
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

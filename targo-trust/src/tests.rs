@@ -3195,6 +3195,7 @@ fn replay_test_lifted_function(
             }],
             arg_count: 0,
             return_ty: trust_types::Ty::unit_ty(),
+            datatype_defs: Default::default(),
         },
         ssa: None,
         annotations,
@@ -15222,6 +15223,72 @@ fn violated_library_clause_aborts() {{
     );
 
     std::fs::remove_dir_all(root).expect("remove certified monitor Cargo fixture");
+}
+
+/// Evidence-grade Cargo integration for the E4 monitor placement itself. The
+/// invariant holds on the function-entry edge and fails only after the first
+/// taken backedge, so this cannot pass through an entry-only monitor. The two
+/// sentinels distinguish an executed monitor abort from a static compile error
+/// and from an uninstrumented library returning normally.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_executes_loop_invariant_violation() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("certified-monitor-loop-invariant-cargo-test");
+    std::fs::create_dir_all(root.join("src")).expect("create library source directory");
+    std::fs::create_dir_all(root.join("tests")).expect("create integration-test directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='certified-monitor-loop-fixture'\nversion='0.1.0'\nedition='2021'\n\n[lib]\ncrate-type=['rlib']\n",
+    )
+    .expect("write loop monitor fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"pub fn violates_after_one_backedge(mut n: u8) -> u8 {
+    while n > 0 invariant n == 2 {
+        n -= 1;
+    }
+    n
+}
+"#,
+    )
+    .expect("write loop-monitored library");
+    let started = root.join("test-started");
+    let returned = root.join("loop-monitor-returned");
+    std::fs::write(
+        root.join("tests/violation.rs"),
+        format!(
+            r#"#[test]
+fn violated_loop_invariant_aborts_on_backedge() {{
+    std::fs::write({started:?}, b"started").unwrap();
+    let _ = certified_monitor_loop_fixture::violates_after_one_backedge(2);
+    std::fs::write({returned:?}, b"returned").unwrap();
+}}
+"#
+        ),
+    )
+    .expect("write loop monitor integration test");
+
+    let args = vec![
+        "--allow-l0-gaps".to_string(),
+        "--manifest-path".to_string(),
+        root.join("Cargo.toml").display().to_string(),
+        "--target-dir".to_string(),
+        root.join("target").display().to_string(),
+    ];
+    let status = run_subcommand(Subcommand::Test, &args);
+    assert_ne!(status, ExitCode::SUCCESS, "the violated E4 monitor must fail Cargo test");
+    assert!(started.is_file(), "integration test did not execute; this was only a compile failure");
+    assert!(
+        !returned.exists(),
+        "violated loop invariant returned normally; the E4 monitor was not executed"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove loop monitor Cargo fixture");
 }
 
 /// Positive companion to the violated-monitor fixture above.  This proves

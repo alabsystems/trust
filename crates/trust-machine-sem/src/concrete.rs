@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use trust_disasm::operand::Condition;
-use trust_types::Formula;
+use trust_types::{Formula, RoundingMode};
 
 use crate::effect::Effect;
 
@@ -75,6 +75,16 @@ pub struct ConcreteState {
     pub pc: u64,
     /// NZCV flags.
     pub flags: ConcreteFlags,
+    /// SIMD/FP registers V0-V31, each a full 128-bit Q register.
+    ///
+    /// This file used to be ABSENT, and its absence was not neutral. With no
+    /// V registers to read, `Effect::FpRegWrite` had to be refused and a
+    /// `Formula::Var("V13")` had nowhere to resolve — so every SIMD-operand
+    /// word was excluded from concrete replay, and the native semantic
+    /// differential could not see that `str d13,[x28,#0xa0]` was modeled as
+    /// storing the GPR X13. An oracle that cannot look at a register file
+    /// cannot report a bug in it.
+    pub fpr: [u128; 32],
     /// Initialized byte-addressed memory.
     pub memory: BTreeMap<u64, u8>,
 }
@@ -100,8 +110,33 @@ impl ConcreteState {
             sp: 0,
             pc: 0,
             flags: ConcreteFlags::default(),
+            fpr: [0; 32],
             memory: BTreeMap::new(),
         }
+    }
+
+    /// Read a concrete SIMD/FP register's low `width` bits.
+    #[must_use]
+    pub fn read_fpr(&self, index: u8, width: u32) -> u128 {
+        if index >= 32 {
+            return 0;
+        }
+        truncate(self.fpr[index as usize], width)
+    }
+
+    /// Write a concrete SIMD/FP register.
+    ///
+    /// A write of fewer than 128 bits ZEROES the upper lanes, which is the
+    /// architectural behaviour of every scalar FP write in AArch64 and is what
+    /// [`Effect::FpRegWrite`] documents. Preserving them would be the quiet
+    /// version of the same bug this file exists to catch.
+    pub fn write_fpr(&mut self, index: u8, width: u32, value: u128) -> Result<(), ConcreteError> {
+        check_width(width)?;
+        if index >= 32 {
+            return Err(ConcreteError::InvalidWidth(u32::from(index)));
+        }
+        self.fpr[index as usize] = truncate(value, width);
+        Ok(())
     }
 
     /// Read a concrete general-purpose register. Index 31 is the zero register.
@@ -178,9 +213,52 @@ impl ConcreteState {
             Effect::Branch { .. } | Effect::Call { .. } | Effect::Return { .. } => {
                 Err(ConcreteError::UnsupportedEffect("control flow"))
             }
-            Effect::FpRegWrite { .. } => Err(ConcreteError::UnsupportedEffect("floating point")),
+            // MODELED, not refused. The value is a bit-pattern move into a
+            // 128-bit lane with the upper bits zeroed — the same arithmetic
+            // `write_gpr` does, over a different file. Refusing it was what
+            // made every SIMD-operand word invisible to the concrete oracle.
+            // IEEE-754 ARITHMETIC IS STILL NOT MODELED HERE: this executes the
+            // `Formula` the semantics produced, and where that formula is a
+            // bitvector approximation of an FP operation (FADD and friends in
+            // `aarch64/fp.rs`) the approximation is what runs. What is now
+            // exact is the DATA MOVEMENT class — FMOV between files, and the
+            // SIMD&FP load/store forms — which is where the register-file
+            // confusion lived.
+            Effect::FpRegWrite { index, width, value } => {
+                let value = self.eval_bv(value, *width)?;
+                self.write_fpr(*index, *width, value)
+            }
+            // A barrier has no architectural SCALAR state consequence, and this
+            // oracle is a single-threaded, in-order, sequentially-consistent
+            // interpreter over `gpr`/`sp`/`pc`/`flags`/`memory` — it has no
+            // reordering to constrain and no second observer to become visible
+            // to. So `Ok(())` here is the barrier's real concrete semantics, not
+            // a gap: the ONLY producers of this effect are DMB/DSB/ISB/CLREX
+            // (`Aarch64Semantics::sem_barrier`), all of which emit exactly
+            // `[Aarch64SyncBoundary, pc_advance]` — there is no data plane to
+            // drop. CLREX's `clears_exclusive_monitor: true` is likewise inert
+            // here because this state has no exclusive monitor to clear, and it
+            // cannot acquire one: every exclusive instruction is refused
+            // upstream (see the atomic arm below).
             Effect::Aarch64SyncBoundary { .. } => Ok(()),
-            Effect::Aarch64AtomicAccess { .. } => Ok(()),
+            // Per-access ordering metadata whose DATA plane is carried by the
+            // adjacent MemRead/RegWrite or MemWrite effect, so ignoring the
+            // metadata loses nothing a scalar oracle could observe.
+            //
+            // That reasoning holds ONLY for the non-exclusive forms. An
+            // exclusive access additionally reserves/checks the monitor and
+            // (for STXR) writes a STATUS register that no adjacent effect
+            // carries, so treating it as a no-op would silently invent success.
+            // Measured: unreachable today — `Aarch64AtomicAccess` is produced
+            // only by `sem_ldar`/`sem_stlr`, both hard-coding `exclusive:
+            // false`, while LDXR/STXR/LDAXR/STLXR are refused with
+            // `SemError::UnsupportedAtomic` before any effect is built. This
+            // arm keeps that a CHECKED precondition rather than an assumption
+            // the oracle silently depends on.
+            Effect::Aarch64AtomicAccess { exclusive: false, .. } => Ok(()),
+            Effect::Aarch64AtomicAccess { .. } => {
+                Err(ConcreteError::UnsupportedEffect("exclusive atomic access"))
+            }
         }
     }
 
@@ -234,9 +312,42 @@ impl ConcreteState {
             Effect::Branch { .. } | Effect::Call { .. } | Effect::Return { .. } => {
                 Err(ConcreteError::UnsupportedEffect("control flow"))
             }
-            Effect::FpRegWrite { .. } => Err(ConcreteError::UnsupportedEffect("floating point")),
+            // See `apply_effect`: modeled as a zero-extending lane write.
+            Effect::FpRegWrite { index, width, value } => {
+                let value = eval_state.eval_bv(value, *width)?;
+                self.write_fpr(*index, *width, value)
+            }
+            // A barrier has no architectural SCALAR state consequence, and this
+            // oracle is a single-threaded, in-order, sequentially-consistent
+            // interpreter over `gpr`/`sp`/`pc`/`flags`/`memory` — it has no
+            // reordering to constrain and no second observer to become visible
+            // to. So `Ok(())` here is the barrier's real concrete semantics, not
+            // a gap: the ONLY producers of this effect are DMB/DSB/ISB/CLREX
+            // (`Aarch64Semantics::sem_barrier`), all of which emit exactly
+            // `[Aarch64SyncBoundary, pc_advance]` — there is no data plane to
+            // drop. CLREX's `clears_exclusive_monitor: true` is likewise inert
+            // here because this state has no exclusive monitor to clear, and it
+            // cannot acquire one: every exclusive instruction is refused
+            // upstream (see the atomic arm below).
             Effect::Aarch64SyncBoundary { .. } => Ok(()),
-            Effect::Aarch64AtomicAccess { .. } => Ok(()),
+            // Per-access ordering metadata whose DATA plane is carried by the
+            // adjacent MemRead/RegWrite or MemWrite effect, so ignoring the
+            // metadata loses nothing a scalar oracle could observe.
+            //
+            // That reasoning holds ONLY for the non-exclusive forms. An
+            // exclusive access additionally reserves/checks the monitor and
+            // (for STXR) writes a STATUS register that no adjacent effect
+            // carries, so treating it as a no-op would silently invent success.
+            // Measured: unreachable today — `Aarch64AtomicAccess` is produced
+            // only by `sem_ldar`/`sem_stlr`, both hard-coding `exclusive:
+            // false`, while LDXR/STXR/LDAXR/STLXR are refused with
+            // `SemError::UnsupportedAtomic` before any effect is built. This
+            // arm keeps that a CHECKED precondition rather than an assumption
+            // the oracle silently depends on.
+            Effect::Aarch64AtomicAccess { exclusive: false, .. } => Ok(()),
+            Effect::Aarch64AtomicAccess { .. } => {
+                Err(ConcreteError::UnsupportedEffect("exclusive atomic access"))
+            }
         }
     }
 
@@ -441,6 +552,9 @@ impl ConcreteState {
             Formula::Select(..) | Formula::Store(..) => {
                 Err(ConcreteError::UnsupportedFormula("memory array"))
             }
+            // The ONE FP shape the AArch64 semantics emit. See
+            // `eval_fp_binop_round_trip` for what this does and does not settle.
+            Formula::FpToIeeeBv(inner) => self.eval_fp_binop_round_trip(inner),
             Formula::Int(_)
             | Formula::UInt(_)
             | Formula::Implies(..)
@@ -469,15 +583,140 @@ impl ConcreteState {
             return Ok(ConcreteValue::Bv { value: u128::from(self.gpr[index]), width: 64 });
         }
 
+        // THE FLAG NAMES ARE MATCHED FIRST, DELIBERATELY. `V` is the overflow
+        // flag AND the prefix of every SIMD register name, so the order here is
+        // load-bearing: a `Vn` arm placed above this match would still not
+        // capture bare `V` (the empty suffix does not parse as a number), but
+        // relying on that is relying on an accident of `str::parse`. Matching
+        // the four flag names exactly, first, makes the split explicit.
         match name {
-            "SP" => Ok(ConcreteValue::Bv { value: u128::from(self.sp), width: 64 }),
-            "PC" => Ok(ConcreteValue::Bv { value: u128::from(self.pc), width: 64 }),
-            "N" | "_N" => Ok(ConcreteValue::Bool(self.flags.n)),
-            "Z" | "_Z" => Ok(ConcreteValue::Bool(self.flags.z)),
-            "C" | "_C" => Ok(ConcreteValue::Bool(self.flags.c)),
-            "V" | "_V" => Ok(ConcreteValue::Bool(self.flags.v)),
-            _ => Err(ConcreteError::UnknownVariable(name.to_owned())),
+            "SP" => return Ok(ConcreteValue::Bv { value: u128::from(self.sp), width: 64 }),
+            "PC" => return Ok(ConcreteValue::Bv { value: u128::from(self.pc), width: 64 }),
+            "N" | "_N" => return Ok(ConcreteValue::Bool(self.flags.n)),
+            "Z" | "_Z" => return Ok(ConcreteValue::Bool(self.flags.z)),
+            "C" | "_C" => return Ok(ConcreteValue::Bool(self.flags.c)),
+            "V" | "_V" => return Ok(ConcreteValue::Bool(self.flags.v)),
+            _ => {}
         }
+
+        // `MachineState::symbolic` names the SIMD/FP file `V0`..`V31` at 128
+        // bits; `read_fpr` narrows with a `BvExtract`, so the variable itself is
+        // always the full Q register.
+        if let Some(index) = name.strip_prefix('V').and_then(|suffix| suffix.parse::<usize>().ok())
+            && index < self.fpr.len()
+        {
+            return Ok(ConcreteValue::Bv { value: self.fpr[index], width: 128 });
+        }
+
+        Err(ConcreteError::UnknownVariable(name.to_owned()))
+    }
+
+    /// Evaluate the ONE FP formula shape `aarch64/fp.rs` emits:
+    ///
+    /// ```text
+    /// FpToIeeeBv( Fp{Add,Sub,Mul,Div}( FpRoundingMode(RNE),
+    ///                                  FpFromBits{a, eb, sb},
+    ///                                  FpFromBits{b, eb, sb} ) )
+    /// ```
+    ///
+    /// WHY THIS EXISTS. Before it, every FP `Formula` node fell through to
+    /// `UnsupportedFormula`, so `FADD`/`FSUB`/`FMUL`/`FDIV` could not be
+    /// replayed — and the native semantic differential reported them as
+    /// `unchecked`, not as agreeing. They are not a small class: the
+    /// stratified full-tier population carries 3,000 words of EACH, all four
+    /// accepted by `Aarch64Semantics` and therefore all four reachable by the
+    /// output gate, with nothing anywhere having compared one against a CPU.
+    /// The crate header calls them "BIT-EXACT IEEE-754"; that claim had never
+    /// been measured.
+    ///
+    /// WHAT IT SETTLES, AND WHAT IT DOES NOT. Rust's `f32`/`f64` `+ - * /`
+    /// compile to the host's `fadd`/`fsub`/`fmul`/`fdiv` under the default
+    /// rounding mode, which is exactly the operation being modeled — so this
+    /// evaluator does NOT independently verify IEEE arithmetic, and a
+    /// differential built on it cannot. What it DOES check is everything
+    /// around the arithmetic, which is where every bug in this program has
+    /// actually lived: which register file each operand comes from, which lane
+    /// and how wide, whether the upper lanes of the destination are zeroed,
+    /// whether the destination is the register the instruction names, and
+    /// whether any flag or memory effect was invented or lost. That is the
+    /// `str d13` class, and it was reachable.
+    ///
+    /// SHAPE-RESTRICTED ON PURPOSE. Anything that is not this exact tree — a
+    /// non-RNE rounding mode, mismatched formats, an `FpSqrt`, an `FpFma`, a
+    /// bare `FpFromBits` — is REFUSED and reported unchecked, rather than
+    /// approximated onto the nearest thing this function can compute. A widened
+    /// evaluator that quietly answered for a shape the semantics do not emit
+    /// would make the differential agree with itself.
+    fn eval_fp_binop_round_trip(&self, inner: &Formula) -> Result<ConcreteValue, ConcreteError> {
+        #[derive(Clone, Copy)]
+        enum Op {
+            Add,
+            Sub,
+            Mul,
+            Div,
+        }
+        let (op, rm, a, b) = match inner {
+            Formula::FpAdd(rm, a, b) => (Op::Add, rm, a, b),
+            Formula::FpSub(rm, a, b) => (Op::Sub, rm, a, b),
+            Formula::FpMul(rm, a, b) => (Op::Mul, rm, a, b),
+            Formula::FpDiv(rm, a, b) => (Op::Div, rm, a, b),
+            _ => return Err(ConcreteError::UnsupportedFormula("FP op outside the modeled set")),
+        };
+        if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RNE)) {
+            // Rust's float operators are RNE and nothing here can change the
+            // host's FPCR, so any other mode would be evaluated WRONG rather
+            // than not at all.
+            return Err(ConcreteError::UnsupportedFormula("FP rounding mode other than RNE"));
+        }
+        let (a_bits, a_fmt) = self.eval_fp_from_bits(a)?;
+        let (b_bits, b_fmt) = self.eval_fp_from_bits(b)?;
+        if a_fmt != b_fmt {
+            return Err(ConcreteError::UnsupportedFormula("mixed FP formats in one operation"));
+        }
+        let (value, width) = match a_fmt {
+            (8, 24) => {
+                let x = f32::from_bits(a_bits as u32);
+                let y = f32::from_bits(b_bits as u32);
+                let r = match op {
+                    Op::Add => x + y,
+                    Op::Sub => x - y,
+                    Op::Mul => x * y,
+                    Op::Div => x / y,
+                };
+                (u128::from(r.to_bits()), 32)
+            }
+            (11, 53) => {
+                let x = f64::from_bits(a_bits as u64);
+                let y = f64::from_bits(b_bits as u64);
+                let r = match op {
+                    Op::Add => x + y,
+                    Op::Sub => x - y,
+                    Op::Mul => x * y,
+                    Op::Div => x / y,
+                };
+                (u128::from(r.to_bits()), 64)
+            }
+            _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+        };
+        Ok(ConcreteValue::Bv { value, width })
+    }
+
+    /// Evaluate an `FpFromBits` operand, returning `(bits, (eb, sb))`.
+    ///
+    /// The bit pattern must be exactly `eb + sb` bits wide — the format's own
+    /// width. A mismatch means the semantics built a lane of the wrong size,
+    /// which is a finding, so it is REFUSED here rather than truncated into
+    /// agreement.
+    fn eval_fp_from_bits(&self, formula: &Formula) -> Result<(u128, (u32, u32)), ConcreteError> {
+        let Formula::FpFromBits { bits, eb, sb } = formula else {
+            return Err(ConcreteError::UnsupportedFormula("FP operand is not FpFromBits"));
+        };
+        let width = eb + sb;
+        let (value, got) = self.eval_bv_any(bits)?;
+        if got != width {
+            return Err(ConcreteError::SortMismatch("FpFromBits operand width"));
+        }
+        Ok((value, (*eb, *sb)))
     }
 
     fn eval_bv_any(&self, formula: &Formula) -> Result<(u128, u32), ConcreteError> {
@@ -902,5 +1141,98 @@ mod tests {
             .expect_err("branches are outside straight-line replay");
 
         assert_eq!(err, ConcreteError::UnsupportedEffect("control flow"));
+    }
+}
+
+/// The concrete ISA oracle treats `Aarch64SyncBoundary` and a NON-exclusive
+/// `Aarch64AtomicAccess` as no-ops. That is a claim about what those effects
+/// mean for a single-threaded scalar interpreter, and it depends on a
+/// precondition — that no EXCLUSIVE access ever reaches the oracle — which these
+/// tests measure rather than assume.
+#[cfg(test)]
+mod sync_and_atomic_oracle_contract_tests {
+    use trust_disasm::decode_aarch64;
+
+    use crate::aarch64::Aarch64Semantics;
+    use crate::effect::Effect;
+    use crate::semantics::Semantics;
+    use crate::state::MachineState;
+
+    fn effects_of(enc: u32) -> Result<Vec<Effect>, crate::error::SemError> {
+        let insn = decode_aarch64(&enc.to_le_bytes(), 0x1000).expect("decode");
+        Aarch64Semantics.effects(&MachineState::symbolic(), &insn)
+    }
+
+    /// The precondition behind the no-op: `Aarch64AtomicAccess` is only ever
+    /// produced with `exclusive: false`, because every exclusive instruction is
+    /// refused before any effect is built.
+    ///
+    /// If this ever fails, the no-op in `ConcreteState::apply_effect` is no
+    /// longer sound — an exclusive access reserves/checks the monitor and STXR
+    /// writes a status register that no adjacent effect carries.
+    #[test]
+    fn no_exclusive_atomic_access_effect_is_reachable() {
+        // Assembler-derived (`clang --target=aarch64-none-elf` + `objdump -d`):
+        //   885f7c20  ldxr  w0, [x1]        8800fc21  stlxr w0, w1, [x1]
+        //   885ffc20  ldaxr w0, [x1]        88007c21  stxr  w0, w1, [x1]
+        for enc in [0x885F_7C20u32, 0x885F_FC20, 0x8800_FC21, 0x8800_7C21] {
+            let err = effects_of(enc)
+                .expect_err("an exclusive access must fail closed before producing effects");
+            assert!(
+                matches!(err, crate::error::SemError::UnsupportedAtomic { .. }),
+                "{enc:#010x} should be UnsupportedAtomic, got {err:?}"
+            );
+        }
+
+        // And the two opcodes that DO produce the effect produce the
+        // non-exclusive form. ldar w0,[x1] = 88dffc20, stlr w0,[x1] = 889ffc20.
+        for enc in [0x88DF_FC20u32, 0x889F_FC20] {
+            let effects = effects_of(enc).unwrap_or_else(|e| panic!("{enc:#010x}: {e:?}"));
+            let atomic = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Aarch64AtomicAccess { exclusive, .. } => Some(*exclusive),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{enc:#010x} produced no atomic-access effect"));
+            assert!(!atomic, "{enc:#010x} produced an EXCLUSIVE atomic access");
+        }
+    }
+
+    /// The other half of the no-op's justification: the acquire/release
+    /// instructions carry their DATA plane in separate effects, so ignoring the
+    /// ordering metadata drops nothing a scalar oracle could observe.
+    #[test]
+    fn acquire_release_carry_their_data_plane_in_separate_effects() {
+        let ldar = effects_of(0x88DF_FC20).expect("ldar");
+        assert!(
+            ldar.iter().any(|e| matches!(e, Effect::MemRead { .. }))
+                && ldar.iter().any(|e| matches!(e, Effect::RegWrite { .. })),
+            "LDAR must emit its load data plane as MemRead + RegWrite: {ldar:?}"
+        );
+
+        let stlr = effects_of(0x889F_FC20).expect("stlr");
+        assert!(
+            stlr.iter().any(|e| matches!(e, Effect::MemWrite { .. })),
+            "STLR must emit its store data plane as MemWrite: {stlr:?}"
+        );
+    }
+
+    /// A barrier's producers emit ONLY the boundary plus the PC advance — there
+    /// is no data plane for the oracle's `Ok(())` to be dropping.
+    #[test]
+    fn barriers_have_no_data_plane() {
+        // Assembler-derived: dmb ish = d5033bbf, dsb ish = d5033b9f,
+        // isb = d5033fdf, clrex = d5033f5f.
+        for enc in [0xD503_3BBFu32, 0xD503_3B9F, 0xD503_3FDF, 0xD503_3F5F] {
+            let effects = effects_of(enc).unwrap_or_else(|e| panic!("{enc:#010x}: {e:?}"));
+            assert!(
+                effects.iter().all(|e| matches!(
+                    e,
+                    Effect::Aarch64SyncBoundary { .. } | Effect::PcUpdate { .. }
+                )),
+                "{enc:#010x} emitted more than a boundary and a PC advance: {effects:?}"
+            );
+        }
     }
 }

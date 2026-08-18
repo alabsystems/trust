@@ -2223,18 +2223,134 @@ fn proof_results_full_verification_accepts_accounted_static_obligations() {
 #[test]
 fn dyn_summary_proof_gate_requires_nonzero_accounted_static_obligations() {
     let zero = proof_results_with_statuses(&[]);
-    assert!(!has_nonzero_accounted_static_proof(&zero));
+    assert!(!results_are_nonzero_accounted_static_proof(&zero));
 
     let mut unaccounted = proof_results_with_statuses(&[TrustStatus::Trusted]);
     unaccounted.summary.total = 2;
-    assert!(!has_nonzero_accounted_static_proof(&unaccounted));
+    assert!(!results_are_nonzero_accounted_static_proof(&unaccounted));
 
     let mut misaligned = proof_results_with_statuses(&[TrustStatus::Trusted]);
     misaligned.fingerprints = IndexVec::new();
-    assert!(!has_nonzero_accounted_static_proof(&misaligned));
+    assert!(!results_are_nonzero_accounted_static_proof(&misaligned));
 
     let verified = proof_results_with_statuses(&[TrustStatus::Trusted]);
-    assert!(has_nonzero_accounted_static_proof(&verified));
+    assert!(results_are_nonzero_accounted_static_proof(&verified));
+}
+
+/// Trust (assumption-root gate): the three-way census answer, INCLUDING the
+/// absent case — a verdict whose axiom inputs were never inspected is unanswered,
+/// not clean. Nothing else in the tree pins that direction, and it is the conjunct
+/// a "simplification" to `unwrap_or(true)` would delete.
+#[test]
+fn axiom_census_decline_is_fail_closed_on_an_absent_record() {
+    assert!(
+        verdict_axiom_decline_for_census(Some(true)).is_none(),
+        "a census that saw no user axiom is spendable"
+    );
+    let rests = verdict_axiom_decline_for_census(Some(false))
+        .expect("an axiom-bearing census must decline");
+    assert!(rests.contains("RESTS ON a user-written axiom"));
+    let unanswered = verdict_axiom_decline_for_census(None)
+        .expect("NO census at all must decline, not default to clean");
+    assert!(unanswered.contains("no user-axiom census was recorded"));
+}
+
+/// Trust (assumption-root gate): the census is taken over KEYS so the publish
+/// point can cross-check it against the set the bridge actually receives. Pins
+/// all four refusals of [`bundle_census_is_axiom_free`], each with the planted
+/// violation that makes it fire.
+///
+/// Conjunct 2 is the one that has no other cover anywhere in the tree: today
+/// `insert_user_axiom_absent_call_identity` is the ONLY writer of `assumed_total`,
+/// so the subset check can never fail in production — which is precisely why it
+/// must be tested against a PLANTED second writer. If it were only asserted in a
+/// comment, a future second writer would hand the bridge a user axiom no census
+/// saw and the bundle would publish `axiom_free` while resting on it.
+#[test]
+fn bundle_census_fails_closed_on_an_axiom_key_the_census_never_recorded() {
+    let none: FxHashSet<String> = FxHashSet::default();
+    assert!(
+        bundle_census_is_axiom_free(&none, &none, true, true),
+        "a bundle with no user axiom and a complete walk is spendable"
+    );
+
+    // (1) the census itself saw a user axiom.
+    let censused = FxHashSet::from_iter(["mycrate::boom".to_string()]);
+    let assumed = FxHashSet::from_iter(["mycrate::boom".to_string()]);
+    assert!(
+        !bundle_census_is_axiom_free(&censused, &assumed, true, true),
+        "a censused user axiom must make the verdict unspendable"
+    );
+
+    // (2) PLANTED SECOND WRITER: the bridge is handed a user-axiom key that the
+    // census never recorded. This is what a future `assumed_total.insert(...)`
+    // written outside `insert_user_axiom_absent_call_identity` would look like.
+    let smuggled = FxHashSet::from_iter(["mycrate::smuggled".to_string()]);
+    assert!(
+        !bundle_census_is_axiom_free(&none, &smuggled, true, true),
+        "an `assumed_total` key with no census record must fail CLOSED, not read as clean"
+    );
+
+    // (3) a member of the DefId walk could not be read at all.
+    assert!(
+        !bundle_census_is_axiom_free(&none, &none, false, true),
+        "an incomplete DefId walk must make the verdict unspendable"
+    );
+
+    // (4) MENTION-ONLY — the census recorded a user axiom that reached NO bridge
+    // set. This is the shape `collect_user_axiom_value_mentions` produces for a
+    // reified `fn` pointer (`let f: fn() = boom; f();`): the axiom changed no
+    // call's lowering, so `assumed_total` is empty, and conjunct 1 is the only
+    // thing refusing. Keying conjunct 1 on `assumed_total` instead of on the
+    // census would read this bundle as clean — MEASURED as rc=0 with
+    // `axiom_free=true` on the compiler that had only the call-operand census.
+    let mentioned_only = FxHashSet::from_iter(["mycrate::boom".to_string()]);
+    assert!(
+        !bundle_census_is_axiom_free(&mentioned_only, &none, true, true),
+        "a censused user axiom that reached no bridge set must STILL be unspendable"
+    );
+
+    // (5) THE CONSTANT-MEMORY WALK COULD NOT DECIDE. Distinct from (1) in the only
+    // way that matters: the census set is EMPTY and every bridge set is empty, so
+    // conjuncts 1-3 all read clean, and the verdict must still be unspendable.
+    // This is the shape `census_user_axioms_in_constant_memory` produces for a
+    // foreign static, an unevaluable static, a vtable allocation that does not come
+    // back as memory, or its step budget — cases where memory that could name an
+    // axiom exists and was not read. Treating an unread region as an axiom-free one
+    // is the same mistake in kind that let the round-3 compiler credit `static
+    // TABLE: [fn(); 1] = [boom]` (there it never looked at the region at all).
+    assert!(
+        !bundle_census_is_axiom_free(&none, &none, true, false),
+        "a constant-memory region the census could not read must fail CLOSED"
+    );
+}
+
+/// Trust (assumption-root gate): the DECISION the gated
+/// `has_nonzero_accounted_static_proof` makes — both conjuncts, with only the
+/// Session lookup factored out. The pure row-only core is tested above; this is
+/// the half that guards the two premise seams that spend another body's verdict
+/// (the `dyn` contract summary and rung 2's sealed dispatch).
+///
+/// Restores the coverage `contract_assumed_disposition_cannot_seed_dynamic_static_summary`
+/// lost when it was repointed at the row-only core: that fixture's whole point is
+/// the dynamic-summary seam, and the seam is this function, not the core.
+#[test]
+fn dyn_summary_gate_decision_refuses_an_axiom_rooted_verdict_and_assumed_bookkeeping() {
+    let verified = proof_results_with_statuses(&[TrustStatus::Trusted]);
+    assert!(
+        nonzero_accounted_static_proof_decision(None, &verified),
+        "a clean census over accounted rows is the ONLY accepting case"
+    );
+    assert!(
+        !nonzero_accounted_static_proof_decision(Some("rests on a user axiom"), &verified),
+        "a census decline must veto rows that would otherwise seed the summary"
+    );
+
+    let zero = proof_results_with_statuses(&[]);
+    assert!(
+        !nonzero_accounted_static_proof_decision(None, &zero),
+        "a clean census must not rescue a zero-obligation row set"
+    );
 }
 
 #[test]
@@ -3259,6 +3375,10 @@ fn native_trust_ir_compiler_function() -> (
             }],
             arg_count: 1,
             return_ty: trust_types::Ty::Bool,
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: vec![contract.clone()],
         preconditions: Vec::new(),
@@ -3525,6 +3645,7 @@ fn fresh_rekey_requires_exact_compiler_crate_instance_and_rejects_replay() {
         &vcs,
         "demo",
         FIRST_STABLE_ID,
+        None,
     );
     let second = trust_mir_extract::function_to_verifier_api_bundle_with_compiler_identity(
         &function,
@@ -3532,6 +3653,7 @@ fn fresh_rekey_requires_exact_compiler_crate_instance_and_rejects_replay() {
         &vcs,
         "demo",
         SECOND_STABLE_ID,
+        None,
     );
     let first_authority = CompilerFunctionAuthority::exact(
         trust_verifier_api::FunctionContext {
@@ -5076,6 +5198,10 @@ fn native_trust_ir_panic_function(panic_reachable: bool) -> trust_types::Verifia
             ],
             arg_count: 0,
             return_ty: trust_types::Ty::Unit,
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: Vec::new(),
         preconditions: Vec::new(),
@@ -6298,6 +6424,81 @@ fn synthesized_panic_source_inventory_and_identity_collisions_fail_closed() {
     );
 }
 
+/// FALSE PROOF regression (closed 2026-08-14). The removed
+/// `apply_whole_function_panic_freedom_subsumption` derived the synthesized
+/// `assertion:panic-freedom:0` aggregate from "every OTHER published row is a
+/// static proof". This test pins the fact that makes that derivation unsound
+/// for every function it could ever fire on: the diverging panic `Call` the
+/// aggregate exists for contributes NO other public obligation, so the sibling
+/// conjunction is never about the panic site.
+///
+/// Measured on the compiler at c989862a8f:
+/// `while i < 4 { assert!(n != i); t ^= i; i += 1; }` verified rc=0
+/// ("2 proved") — the `i += 1` overflow row (interval, kernel-certified) plus
+/// the aggregate "proved" by `trust-structural-subsumption` — and panics for
+/// every `n` in 0..4. Fixture:
+/// `tests/trust-falsification/mutant/pf_subsume_loop_assert_sibling.rs`.
+///
+/// If a future change publishes a per-site row for each diverging-panic site,
+/// this assertion is the thing that must be revisited BEFORE any subsumption
+/// lane is reintroduced — and it must then be replaced by a real per-site
+/// coverage check, not by an existence check on sibling rows.
+#[test]
+fn panic_freedom_aggregate_is_the_sole_public_carrier_of_its_panic_site() {
+    let function = native_trust_ir_panic_function(true);
+    let module = trust_ir_bridge::lower_mir_compat_to_trust_ir(&function)
+        .expect("panic fixture lowers to TrustIr");
+    let inventory: FxHashSet<String> = [function.def_path.clone()].into_iter().collect();
+    let mut bundle = trust_verifier_api::TrustContractBundle::empty(
+        "panic-sole-carrier",
+        trust_verifier_api::BundleSubject::Function {
+            crate_name: "demo".to_string(),
+            path: function.def_path.clone(),
+        },
+    );
+    synthesize_native_panic_freedom_to_verifier_api_obligations(
+        &function,
+        &mut bundle,
+        &module,
+        &inventory,
+    )
+    .expect("compiler aggregate synthesizes");
+
+    assert_eq!(
+        bundle.obligations.len(),
+        1,
+        "the whole panic surface of a diverging-panic function must publish exactly one \
+         public obligation; got {:?}",
+        bundle.obligations.iter().map(|o| o.obligation_id.as_str()).collect::<Vec<_>>()
+    );
+    let aggregate = &bundle.obligations[0];
+    assert_eq!(
+        aggregate.obligation_id,
+        format!(
+            "vc:{}:assertion:panic-freedom:0",
+            trust_types::canonical_artifact_id_component(&function.def_path)
+        ),
+    );
+    assert!(
+        aggregate
+            .description
+            .starts_with(trust_types::assumption::PANIC_FREEDOM_AGGREGATE_DESCRIPTION_PREFIX),
+        "the canonical aggregate description identifies the sole carrier: {}",
+        aggregate.description
+    );
+    // The bridge DID mint a per-site row for the panic block, but it is
+    // bridge-local: `reset_native_trust_ir_proof_inventory_to_public_bundle`
+    // clears `module.proof_obligations` before the public bundle is bound, so it
+    // never becomes a published row with its own verdict.
+    assert!(
+        module.proof_obligations.iter().any(|obligation| {
+            obligation.kind == trust_ir::ObligationKind::PanicFreedom
+                && obligation.description.contains("must be unreachable")
+        }),
+        "the per-site panic row exists only bridge-locally",
+    );
+}
+
 #[test]
 fn trust_mc_default_function_chc_routing_rejects_marker_lookalikes_and_duplicates() {
     let (mut function, _, _) = native_trust_ir_compiler_function();
@@ -6945,7 +7146,8 @@ fn full_verification_compiler_input_defers_direct_trust_vc_proof_unit() {
     assert_eq!(
         result.status,
         trust_verifier_api::VerificationRunStatus::Proved,
-        "the release-admissible direct TrustVC unit must be accepted by the public verifier run: {result:#?}"
+        "the release-admissible direct TrustVC unit must be accepted by the public verifier run: \
+         {result:#?}{DIRECT_TRUST_VC_LANE_IS_INERT}"
     );
     // The trivially-true `ensures "true"` row remains an admission. All three
     // requested rows are release-grade public evidence; the compiler still
@@ -7368,6 +7570,48 @@ fn direct_trust_vc_live_fixture(run_id: &str) -> DirectTrustVcCompilerFixture {
     }
 }
 
+/// Why the five direct-TrustVC receipt tests below are RED, measured 2026-08-12
+/// (task #42). TWO STACKED FAIL-CLOSED BLOCKERS — neither is unsoundness, and
+/// both make the lane claim LESS than the tests assert, never more.
+///
+/// 1. THE LANE IS COMPILED OUT OF THIS BUILD. `rustc_mir_transform` enables
+///    `trust-router/{ay-backend, ay-certify, trust-build, trust-cg-output-gate}`
+///    and NOT `trust-vc-native`, and `git log -S` finds no commit that ever put
+///    it there. Without it `has_exact_deferred_direct_trust_vc_transport` is the
+///    `#[cfg(not(feature = "trust-vc-native"))]` arm — a literal `false` — so
+///    `direct_eligible` is false for every obligation and no receipt is ever
+///    minted. These tests therefore cannot have passed here at any commit.
+///    The feature is enabled only by `targo-trust/trust-vc-in-process`.
+///
+/// 2. WITH THE FEATURE FORCE-ENABLED AS A CONTROL, ROUTING IS CORRECT AND THE
+///    VERIFIER STILL DECLINES. Instrumented in `bundle_evidence.rs`, the
+///    Ownership row reports `req=false src=false eligible=true cand=true`, so
+///    it does reach the direct lane; the direct verifier then returns ONE
+///    evidence with status `Unsupported`:
+///
+///      trust-vc-trust-engine rejected direct MIR memory proof-unit payload
+///      ... cannot satisfy proof policy RequireReleaseAdmissibleCertificate:
+///      TrustVc verified the unit but did not return a proof certificate for
+///      every verified assertion
+///
+///    i.e. TrustVc VERIFIES the unit but emits no per-assertion certificate,
+///    so `mint` declines. Certificate extraction is on (`trust-vc-bridge/
+///    trust-build` turns on `trust-vc-trust-engine/proof-certificates`), so
+///    this is an empty extraction, not a disabled one — suspect the ay 0.8.0
+///    pin (ee596079d6), the same class as the `v1_bridge` test that the ay
+///    re-pin to d58d6280 turned GREEN.
+///
+/// Do NOT "fix" these by relaxing an assertion: each one pins that a proved
+/// transport outcome requires a live affine receipt, which is the seal
+/// `37e4acb125` added. Fixing them means making the lane real (owner call:
+/// enable the feature in the compiler + close the certificate gap), not making
+/// the test agree with an inert lane.
+const DIRECT_TRUST_VC_LANE_IS_INERT: &str = "\n\nSEE `DIRECT_TRUST_VC_LANE_IS_INERT` (task #42): \
+this build does not enable `trust-router/trust-vc-native`, so the direct TrustVC lane is \
+compiled out and mints no receipt; with the feature force-enabled the lane routes correctly \
+but trust-vc returns Unsupported (RequireReleaseAdmissibleCertificate: verified the unit but \
+returned no per-assertion proof certificate). Two stacked fail-closed blockers, no unsoundness.";
+
 fn direct_trust_vc_fixture_row(
     fixture: &DirectTrustVcCompilerFixture,
     public_obligation_id: &str,
@@ -7397,7 +7641,7 @@ fn direct_trust_vc_live_receipt_is_exact_ownership_authority_and_public_run_is_n
     assert_eq!(
         live_receipts.direct_trust_vc_receipts().len(),
         1,
-        "one Ownership row must retain a live receipt: {final_run:#?}"
+        "one Ownership row must retain a live receipt: {final_run:#?}{DIRECT_TRUST_VC_LANE_IS_INERT}"
     );
     let receipt_id =
         live_receipts.direct_trust_vc_receipts().keys().next().expect("one direct receipt").clone();
@@ -7714,7 +7958,11 @@ fn direct_trust_vc_live_receipt_is_exact_ownership_authority_and_public_run_is_n
 #[test]
 fn direct_trust_vc_final_install_rejects_mutated_evidence_deadline_and_precedence() {
     let mut evidence_fixture = direct_trust_vc_live_fixture("compiler-direct-mint-evidence");
-    assert_eq!(evidence_fixture.live_receipts.direct_trust_vc_receipts().len(), 1);
+    assert_eq!(
+        evidence_fixture.live_receipts.direct_trust_vc_receipts().len(),
+        1,
+        "{DIRECT_TRUST_VC_LANE_IS_INERT}"
+    );
     let evidence_id = evidence_fixture
         .live_receipts
         .direct_trust_vc_receipts()
@@ -7850,7 +8098,10 @@ fn direct_trust_vc_receipt_survives_exact_unrelated_bridge_publication() {
         SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     let mut live_receipts = live.live_receipts.expect("live receipt package");
-    assert!(!live_receipts.direct_trust_vc_receipts().is_empty(), "direct sibling receipt");
+    assert!(
+        !live_receipts.direct_trust_vc_receipts().is_empty(),
+        "direct sibling receipt{DIRECT_TRUST_VC_LANE_IS_INERT}"
+    );
     let source_run = live.result;
     let snapshot = exact_fresh_vc_rekey_snapshot(
         &function,
@@ -9342,6 +9593,7 @@ fn kernel_certified_trust_vc_fixture(
         std::slice::from_ref(&vc),
         "demo",
         0xd3_0000_0000_0001,
+        None,
     );
     (function, bundle, vec![vc])
 }
@@ -9903,6 +10155,10 @@ fn body_bound_identity_function_ensuring(
             }],
             arg_count: 1,
             return_ty: int_ty,
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: vec![contract.clone()],
         preconditions: Vec::new(),
@@ -12033,7 +12289,7 @@ fn full_verification_compiler_input_classifies_missing_native_bundle_and_direct_
     );
 
     assert_eq!(result.status, trust_verifier_api::VerificationRunStatus::Inconclusive);
-    assert_eq!(result.summary.proved, 1);
+    assert_eq!(result.summary.proved, 1, "{DIRECT_TRUST_VC_LANE_IS_INERT}");
     // The compiler-authored default TrustMC function row is the one exact
     // admission. Of the three real proof requests, trust-wp and trust-mc lack
     // their typed native bundle while the release-admissible structured
@@ -13012,6 +13268,10 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
             }],
             arg_count: 0,
             return_ty: trust_types::Ty::Bool,
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: contracts.clone(),
         preconditions: vec![],
@@ -13761,6 +14021,10 @@ fn proof_feedback_loop_function() -> trust_types::VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: trust_types::Ty::Unit,
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: vec![
             trust_types::Contract {
@@ -14330,7 +14594,7 @@ fn strict_l0_verification_reports_raw_solver_proved_without_full_evidence() {
         native_proof_envelope: None,
     };
     assert_eq!(
-        strict_l0_verification_failure(true, &[(overflow.clone(), proved)], &[], &[], None),
+        strict_l0_verification_failure(true, &[(overflow.clone(), proved)], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 }),
     );
 
@@ -14340,7 +14604,7 @@ fn strict_l0_verification_reports_raw_solver_proved_without_full_evidence() {
         reason: "incomplete".to_string(),
     };
     assert_eq!(
-        strict_l0_verification_failure(true, &[(overflow, unknown)], &[], &[], None),
+        strict_l0_verification_failure(true, &[(overflow, unknown)], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 }),
     );
 }
@@ -14606,7 +14870,7 @@ fn full_run_presence_and_public_strength_do_not_authorize_a_row() {
         None
     );
     assert_eq!(
-        strict_l0_verification_failure(true, &results, &[None], &authorities, Some(&run)),
+        strict_l0_verification_failure(true, &results, &[None], &authorities, Some(&run), &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 }),
         "a run-wide artifact bit and forged Sound/complete label must not discharge this row",
     );
@@ -15220,7 +15484,7 @@ fn same_span_public_native_rows_cannot_mint_or_cross_transport_authority() {
     assert!(authorities.iter().all(Option::is_none));
 
     assert_eq!(
-        strict_l0_verification_failure(true, &results, &bindings, &authorities, Some(&run)),
+        strict_l0_verification_failure(true, &results, &bindings, &authorities, Some(&run), &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 2, skipped: 0 }),
         "neither serializable public row may become compiler authority",
     );
@@ -15343,7 +15607,7 @@ fn strict_l0_verification_ignores_non_l0_unknowns() {
     };
 
     assert_eq!(
-        strict_l0_verification_failure(true, &[(postcondition, unknown)], &[], &[], None),
+        strict_l0_verification_failure(true, &[(postcondition, unknown)], &[], &[], None, &FxHashSet::default()),
         None
     );
 }
@@ -15374,7 +15638,7 @@ fn strict_l0_verification_refutes_known_panicking_unsupported_call() {
     // The known-panicking unsupported call is counted as `failed` so reports
     // preserve the concrete refutation classification.
     assert_eq!(
-        strict_l0_verification_failure(true, &[(unwrap_vc, unknown.clone())], &[], &[], None),
+        strict_l0_verification_failure(true, &[(unwrap_vc, unknown.clone())], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
 
@@ -15385,7 +15649,7 @@ fn strict_l0_verification_refutes_known_panicking_unsupported_call() {
         detail: "bb0: `expect` panics on None/Err".to_string(),
     };
     assert_eq!(
-        strict_l0_verification_failure(true, &[(direct_vc, unknown.clone())], &[], &[], None),
+        strict_l0_verification_failure(true, &[(direct_vc, unknown.clone())], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
 }
@@ -15407,7 +15671,7 @@ fn strict_l0_verification_keeps_generic_unsupported_mir_as_unknown() {
         reason: "unsupported".to_string(),
     };
     assert_eq!(
-        strict_l0_verification_failure(true, &[(generic_vc, unknown)], &[], &[], None),
+        strict_l0_verification_failure(true, &[(generic_vc, unknown)], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
     );
 }
@@ -15438,7 +15702,7 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
         detail: "arithmetic overflow (Mul)".to_string(),
     };
     assert_eq!(
-        strict_l0_verification_failure(true, &[(pow_vc, unknown.clone())], &[], &[], None),
+        strict_l0_verification_failure(true, &[(pow_vc, unknown.clone())], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
 
@@ -15450,7 +15714,7 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
         detail: "slice index out of bounds".to_string(),
     };
     assert_eq!(
-        strict_l0_verification_failure(true, &[(bounds_vc, unknown.clone())], &[], &[], None),
+        strict_l0_verification_failure(true, &[(bounds_vc, unknown.clone())], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
 
@@ -15469,7 +15733,7 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
         solver_warnings: None,
         native_proof_envelope: None,
     };
-    let failure = strict_l0_verification_failure(true, &[(proved_pow, proved)], &[], &[], None);
+    let failure = strict_l0_verification_failure(true, &[(proved_pow, proved)], &[], &[], None, &FxHashSet::default());
     // Not full-verifier-backed + Proved on an UnsupportedMir VC → counted `unknown`
     // (no runtime fallback), NEVER `failed`. The key assertion is `failed == 0`.
     assert_eq!(failure.map(|f| f.failed), Some(0));
@@ -16245,7 +16509,7 @@ fn strict_l0_verification_does_not_refute_proved_known_panicking_call() {
     // Not full-verifier-backed (None), Proved + no runtime fallback for UnsupportedMir →
     // counted `unknown`, NOT `failed`. The key assertion is `failed == 0`.
     assert_eq!(
-        strict_l0_verification_failure(true, &[(unwrap_vc, proved)], &[], &[], None),
+        strict_l0_verification_failure(true, &[(unwrap_vc, proved)], &[], &[], None, &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
     );
 }
@@ -16296,7 +16560,7 @@ fn strict_l0_verification_rejects_public_l0_api_obligations_not_compiler_proved(
     );
 
     assert_eq!(
-        strict_l0_verification_failure(true, &[], &[], &[], Some(&full_result)),
+        strict_l0_verification_failure(true, &[], &[], &[], Some(&full_result), &FxHashSet::default()),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
     );
 }
@@ -17381,6 +17645,13 @@ fn transport_rows_carry_compiler_design_mandate_bit() {
 /// panic-freedom row (as it appears after `legacy_vc_from_api_obligation` folds the
 /// marked obligation description into `VcKind::Assertion { message }`).
 fn extern_call_transport_row(outcome: Outcome) -> TransportObligationResult {
+    extern_call_transport_row_for("alloc::fmt::format", outcome)
+}
+
+/// An extern print/format/write dispatch row for a NAMED callee. The callee is
+/// carried between the first backtick pair exactly as the bridge writes it, which
+/// is where `extern_call_row_callee` reads it back from.
+fn extern_call_transport_row_for(callee: &str, outcome: Outcome) -> TransportObligationResult {
     TransportObligationResult {
         monitor: None,
         obligation_id: None,
@@ -17388,7 +17659,7 @@ fn extern_call_transport_row(outcome: Outcome) -> TransportObligationResult {
         kind: "assert".to_string(),
         typed_kind: None,
         description: format!(
-            "assertion: {}extern print/format/write dispatch `alloc::fmt::format` runs a user Display/Debug impl that may panic",
+            "assertion: {}extern print/format/write dispatch `{callee}` runs a user Display/Debug impl that may panic",
             trust_types::assumption::EXTERN_CALL_ASSUMPTION_PREFIX
         ),
         location: None,
@@ -17496,6 +17767,7 @@ fn memory_safe_gate_artifacts(
         result_bindings: Vec::new(),
         proof_authorities: Vec::new(),
         overflow_check_origins: OverflowCheckOrigins::default(),
+        coroutine_resume_contract: None,
     }
 }
 
@@ -17641,6 +17913,168 @@ fn memory_safe_gate_accepts_only_authenticated_lowering_gap() {
     assert!(memory_safe_artifacts_have_non_demotable_failure(&artifacts, &[unmarked]));
 }
 
+// Trust (coroutine resume-state contract): the pure gates of the contract-row
+// upgrade. The full `coroutine_protocol_disposition` needs a TyCtxt/Body; the
+// two row-level predicates it composes are pinned here directly.
+#[test]
+fn coroutine_contract_upgrade_row_gates_fail_closed() {
+    let evidence = trust_ir_bridge::CoroutineResumeContractModuleEvidence {
+        function_def_path: "crate::f::{closure#0}".to_string(),
+        live_states: vec![0],
+        sentinel_obligation_count: 2,
+    };
+
+    // (a) all-rows-proved: an empty row set DECLINES (the sentinel obligations
+    // never surfaced), any non-proved row blocks, design-mandate inventory
+    // rows are excepted.
+    assert!(!coroutine_contract_rows_all_statically_proved(&[]));
+    let proved = plain_transport_row(Outcome::Proved, false);
+    let unknown = plain_transport_row(Outcome::Unknown, false);
+    let mandate = plain_transport_row(Outcome::Unknown, true);
+    assert!(coroutine_contract_rows_all_statically_proved(&[proved.clone()]));
+    assert!(coroutine_contract_rows_all_statically_proved(&[proved.clone(), mandate.clone()]));
+    assert!(!coroutine_contract_rows_all_statically_proved(&[proved.clone(), unknown.clone()]));
+
+    // (b) sentinel-proof visibility: per-sentinel marker rows must be PROVED,
+    // must parse to the evidence's exact state set, and must match its COUNT.
+    let sentinel_row = |outcome: Outcome, states: &[u128]| {
+        let mut row = plain_transport_row(outcome, false);
+        row.description =
+            trust_types::assumption::coroutine_resume_contract_obligation_description(
+                states,
+                "resumed after return",
+            );
+        row
+    };
+    let two_proved = [sentinel_row(Outcome::Proved, &[0]), sentinel_row(Outcome::Proved, &[0])];
+    assert!(rows_exhibit_coroutine_sentinel_proof(&two_proved, &evidence, "crate::f::{closure#0}"));
+    // Count mismatch (one of the two sentinels vanished): decline.
+    assert!(!rows_exhibit_coroutine_sentinel_proof(
+        &two_proved[..1],
+        &evidence,
+        "crate::f::{closure#0}"
+    ));
+    // Unproved sentinel: decline.
+    let one_unknown = [sentinel_row(Outcome::Proved, &[0]), sentinel_row(Outcome::Unknown, &[0])];
+    assert!(!rows_exhibit_coroutine_sentinel_proof(
+        &one_unknown,
+        &evidence,
+        "crate::f::{closure#0}"
+    ));
+    // State-set drift between the marker rows and the evidence: decline.
+    let drifted = [sentinel_row(Outcome::Proved, &[0, 3]), sentinel_row(Outcome::Proved, &[0, 3])];
+    assert!(!rows_exhibit_coroutine_sentinel_proof(&drifted, &evidence, "crate::f::{closure#0}"));
+
+    // (c) the aggregate fallback: the whole-function panic-freedom row counts
+    // only via its EXACT compiler-minted obligation id, and only when PROVED.
+    let mut aggregate = plain_transport_row(Outcome::Proved, false);
+    aggregate.obligation_id = Some(format!(
+        "vc:{}:assertion:panic-freedom:0",
+        trust_types::canonical_artifact_id_component("crate::f::{closure#0}")
+    ));
+    assert!(rows_exhibit_coroutine_sentinel_proof(
+        std::slice::from_ref(&aggregate),
+        &evidence,
+        "crate::f::{closure#0}"
+    ));
+    let mut unproved_aggregate = aggregate.clone();
+    unproved_aggregate.outcome = Outcome::Unknown;
+    assert!(!rows_exhibit_coroutine_sentinel_proof(
+        std::slice::from_ref(&unproved_aggregate),
+        &evidence,
+        "crate::f::{closure#0}"
+    ));
+    // A proved row with a DIFFERENT function's aggregate id must not count.
+    let mut foreign_aggregate = aggregate.clone();
+    foreign_aggregate.obligation_id = Some(format!(
+        "vc:{}:assertion:panic-freedom:0",
+        trust_types::canonical_artifact_id_component("crate::other")
+    ));
+    assert!(!rows_exhibit_coroutine_sentinel_proof(
+        std::slice::from_ref(&foreign_aggregate),
+        &evidence,
+        "crate::f::{closure#0}"
+    ));
+}
+
+// Trust (coroutine resume-state contract, D1 publish coupling): the pure
+// publish decision is the ONE seam pairing the bridge's entry Assume
+// (witnessed by evidence) with a published row. The load-bearing pin is the
+// third case: EVIDENCE PRESENT + ZERO MIR SENTINELS must publish the
+// assumption row (strict abort), never "not a coroutine" (no row) — the exact
+// unpaired state of the D1 defect, where a narrowing Assume shipped with no
+// row, no assumption, and no abort.
+#[test]
+fn coroutine_publish_decision_pairs_every_assume_with_a_row() {
+    let evidence = |count: usize| trust_ir_bridge::CoroutineResumeContractModuleEvidence {
+        function_def_path: "crate::f::{closure#0}".to_string(),
+        live_states: vec![0],
+        sentinel_obligation_count: count,
+    };
+
+    // Not a coroutine resume body: no sentinels, no evidence — publish nothing.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(0, None, true, false),
+        CoroutineProtocolPublishDecision::NotACoroutineResumeBody
+    ));
+    // Sentinels without evidence: the pre-lane fail-closed assumption row.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, None, true, false),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    // THE D1 PIN: evidence (the module carries the entry Assume) with zero
+    // MIR sentinels must still publish — assumption row + strict abort.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(0, Some(&evidence(2)), true, true),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    // Sentinel-count mismatch (a pruned/dropped sentinel): assumption row.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(1, Some(&evidence(2)), true, true),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    // Unproved rows / invisible sentinel proof: assumption row.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, Some(&evidence(2)), false, true),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, Some(&evidence(2)), true, false),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    // The full upgrade: exact count + all rows proved + sentinel proof visible.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, Some(&evidence(2)), true, true),
+        CoroutineProtocolPublishDecision::PublishContractRow
+    ));
+}
+
+// The published contract row is Skipped/conditional on the wire: the
+// memory-safe lane must keep REJECTING it (it is not an authenticated
+// memory-safe assumption), and it must never read as the old assumption row.
+#[test]
+fn coroutine_contract_row_is_not_an_assumption_row_and_memory_safe_still_rejects() {
+    let evidence = trust_ir_bridge::CoroutineResumeContractModuleEvidence {
+        function_def_path: "crate::f::{closure#0}".to_string(),
+        live_states: vec![0],
+        sentinel_obligation_count: 2,
+    };
+    let mut row = plain_transport_row(Outcome::Skipped, false);
+    row.kind = trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND.to_string();
+    row.solver = trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_SOLVER.to_string();
+    row.description =
+        trust_types::assumption::coroutine_resume_contract_row_description(&evidence.live_states);
+    row.reason = Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON.to_string());
+    assert!(
+        !transport_row_is_coroutine_protocol_assumption(&row),
+        "the contract row must never be mistaken for the assumption row"
+    );
+    assert!(
+        !transport_row_is_authenticated_memory_safe_assumption(&row),
+        "the contract row grants nothing in the memory-safe lane"
+    );
+}
+
 #[test]
 fn memory_safe_zero_data_obligations_still_rejects_coroutine_protocol_premise() {
     let dispositions: IndexVec<ObligationId, TrustDisposition> = IndexVec::new();
@@ -17654,6 +18088,7 @@ fn memory_safe_zero_data_obligations_still_rejects_coroutine_protocol_premise() 
         result_bindings: Vec::new(),
         proof_authorities: Vec::new(),
         overflow_check_origins: OverflowCheckOrigins::default(),
+        coroutine_resume_contract: None,
     };
     assert!(
         !memory_safe_artifacts_have_non_demotable_failure(&artifacts, &[]),
@@ -18128,6 +18563,52 @@ fn absent_expected_absent_and_drop_glue_unproved_rows_are_fatal() {
     ]));
 }
 
+/// An extern print/format/write DISPATCH row for a leg OTHER than the b59-demotable
+/// `alloc::fmt::format` one is a fatal fail-closed panic gap.
+///
+/// Regression for a MEASURED fail-open: `impl Display for S { fn fmt(&self, f) {
+/// write!(f, "S") } }` returned rc=0 under `-Ztrust-verify=on` (strict, no policy
+/// downgrade) while the identical program PANICKED at runtime. `write!` lowers to
+/// `Formatter::write_fmt`, an extern-call row, and extern-call was missing from
+/// `transport_row_is_unproved_assumption_panic` — so the row was neither proved nor
+/// fatal. BEFORE this fix every assertion in this test fails; the `fmt::format`
+/// assertions below pin that b59's gated demotion leg is NOT swept up with it.
+#[test]
+fn extern_call_dispatch_rows_are_fatal_except_the_gated_fmt_format_leg() {
+    for callee in [
+        "core::fmt::Formatter::<'_>::write_fmt",
+        "core::fmt::write",
+        "std::io::_print",
+        "std::io::_eprint",
+    ] {
+        let row = extern_call_transport_row_for(callee, Outcome::Unknown);
+        assert!(
+            transport_row_is_unproved_assumption_panic(&row),
+            "`{callee}` drives arbitrary user Display/Debug code and must fail closed"
+        );
+        assert!(transport_rows_have_unproved_assumption_panic(&[
+            plain_transport_row(Outcome::Proved, false),
+            row,
+        ]));
+    }
+
+    // A PROVED row is never a gap, in any leg.
+    assert!(!transport_row_is_unproved_assumption_panic(&extern_call_transport_row_for(
+        "core::fmt::Formatter::<'_>::write_fmt",
+        Outcome::Proved,
+    )));
+
+    // b59's `alloc::fmt::format` leg keeps its own two-gate demotion path and is
+    // NOT made fatal here.
+    assert!(!transport_row_is_unproved_assumption_panic(&extern_call_transport_row_for(
+        "alloc::fmt::format",
+        Outcome::Unknown,
+    )));
+    assert!(!transport_row_is_unproved_assumption_panic(&extern_call_transport_row(
+        Outcome::Unknown
+    )));
+}
+
 #[test]
 fn expected_absent_callee_demotes_only_in_survey() {
     let rows = [expected_absent_callee_transport_row(Outcome::Unknown)];
@@ -18517,6 +18998,10 @@ fn requires_marker_function()
             }],
             arg_count: 2,
             return_ty: trust_types::Ty::Int { width: 64, signed: false },
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: vec![contract.clone()],
         preconditions: Vec::new(),
@@ -18941,7 +19426,7 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
         "an authenticated catalog assumption is not a skipped proof obligation",
     );
     assert_eq!(
-        strict_l0_verification_failure(true, &results, &bindings, &authorities, Some(&full_result),),
+        strict_l0_verification_failure(true, &results, &bindings, &authorities, Some(&full_result), &FxHashSet::default(),),
         None,
         "the authenticated entry marker must be excluded before UnsupportedMir is classified L0",
     );
@@ -18965,6 +19450,7 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
             &bindings,
             &no_authorities,
             Some(&full_result),
+            &FxHashSet::default(),
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
         "the same UnsupportedMir row and entry solver label remain fatal without private authority",
@@ -19238,9 +19724,17 @@ fn contract_assumed_disposition_cannot_seed_dynamic_static_summary() {
     let summary = TrustFunctionSummary::from_dispositions(&dispositions);
     let proof_results = TrustProofResults { dispositions, fingerprints, summary };
     assert!(proof_results.is_fully_verified(), "modular contract result remains valid");
+    // The SEAM this test exists for is the gated decision, not the row-only core:
+    // `has_nonzero_accounted_static_proof` is what the dynamic-summary and rung-2
+    // callers reach, and a clean census (`None`) is the input that makes the row
+    // check the only thing standing between this bookkeeping row and a summary.
     assert!(
-        !has_nonzero_accounted_static_proof(&proof_results),
+        !nonzero_accounted_static_proof_decision(None, &proof_results),
         "contract-assumed bookkeeping must not become a dynamic-dispatch proof summary"
+    );
+    assert!(
+        !results_are_nonzero_accounted_static_proof(&proof_results),
+        "and its row-only core must refuse it for the same reason"
     );
 }
 
@@ -19315,7 +19809,7 @@ fn dataflow_encoder_fires_on_invoke_function() {
     function.blocks = vec![bb0, bb1, bb2];
 
     let (relations, rules, vars) =
-        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural)
+        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural, None)
             .expect("encoder must not error on a well-formed function")
             .expect("encoder MUST fire (Ok(Some)) for a function whose terminator is an Invoke");
 
@@ -19382,6 +19876,7 @@ fn dataflow_arithmetic_safety_only_models_unsigned_overflow_with_range_facts() {
     let (_relations, rules, _vars) = super::trust_mc_dataflow_chc_for_function(
         &function,
         super::ChcErrorMode::ArithmeticSafetyOnly,
+        None,
     )
     .expect("no error on a well-formed function")
     .expect("unsigned u64 overflow IS modeled -> Ok(Some)");
@@ -19552,7 +20047,8 @@ fn dataflow_arithmetic_safety_only_gates_out_unmodeled_arithmetic() {
         assert!(
             super::trust_mc_dataflow_chc_for_function(
                 &unmodeled,
-                super::ChcErrorMode::ArithmeticSafetyOnly
+                super::ChcErrorMode::ArithmeticSafetyOnly,
+                None,
             )
             .expect("no error")
             .is_none(),
@@ -19622,7 +20118,7 @@ fn dataflow_chc_is_env_gated_and_structural_mode_keeps_the_structural_error_edge
     function.blocks = vec![bb0, bb1, bb2];
 
     let (_relations, rules, _vars) =
-        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural)
+        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural, None)
             .expect("no error on a well-formed function")
             .expect("structural mode fires for a fully-modeled function");
     let rules = rules.as_array().expect("rules array");
@@ -22131,4 +22627,1575 @@ mod runtime_config_tests {
             .validate_derived_state()
             .expect("compiler-generated impl run IDs must form canonical verifier envelopes");
     }
+}
+
+/// Trust: the producer half of the loop-elided-refutation fix.
+///
+/// The defect these pin: a TRUE `ensures(*ret >= 0)` on
+/// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i = i + 1; } i }` was
+/// published as `verified_counterexample = true`. The postcondition VC took the
+/// flattened single-formula typed-CHC arm — one nullary `error` relation, one
+/// constraint-only rule, no loop transition relation — so the loop-carried `i`
+/// was a free variable and the solver satisfied the query by choosing a value
+/// the program cannot produce. These tests fix WHEN the compiler discloses that,
+/// because the consumer gate in trust-bmc can only act on rows that carry it.
+mod trust_mc_typed_chc_encoding_fidelity {
+    use super::*;
+
+    fn obligation_with_metadata(
+        kind: trust_verifier_api::ObligationKind,
+        metadata: Vec<trust_verifier_api::MetadataEntry>,
+    ) -> trust_verifier_api::TrustObligation {
+        trust_verifier_api::TrustObligation {
+            obligation_id: "vc:demo__f:postcondition:1".to_string(),
+            kind,
+            contract_id: None,
+            proof_item_id: None,
+            source: trust_verifier_api::SourceLocation::default(),
+            description: "postcondition".to_string(),
+            required_strength: None,
+            summary_facts: Vec::new(),
+            metadata,
+        }
+    }
+
+    fn fidelity_of(
+        obligation: &trust_verifier_api::TrustObligation,
+    ) -> Option<&str> {
+        api_obligation_metadata_value(
+            obligation,
+            TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY,
+        )
+    }
+
+    fn spec_var(name: &str) -> trust_verifier_api::TrustSpecExpr {
+        trust_verifier_api::TrustSpecExpr {
+            sort: trust_verifier_api::TrustSpecSort::Int,
+            kind: trust_verifier_api::TrustSpecExprKind::Variable { name: name.to_string() },
+        }
+    }
+    fn spec_int(value: i64) -> trust_verifier_api::TrustSpecExpr {
+        trust_verifier_api::TrustSpecExpr {
+            sort: trust_verifier_api::TrustSpecSort::Int,
+            kind: trust_verifier_api::TrustSpecExprKind::IntLiteral { value: value.to_string() },
+        }
+    }
+    fn spec_bin(
+        op: trust_verifier_api::TrustSpecBinaryOp,
+        lhs: trust_verifier_api::TrustSpecExpr,
+        rhs: trust_verifier_api::TrustSpecExpr,
+    ) -> trust_verifier_api::TrustSpecExpr {
+        trust_verifier_api::TrustSpecExpr {
+            sort: trust_verifier_api::TrustSpecSort::Bool,
+            kind: trust_verifier_api::TrustSpecExprKind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+        }
+    }
+    fn spec_eq(
+        lhs: trust_verifier_api::TrustSpecExpr,
+        rhs: trust_verifier_api::TrustSpecExpr,
+    ) -> trust_verifier_api::TrustSpecExpr {
+        spec_bin(trust_verifier_api::TrustSpecBinaryOp::Eq, lhs, rhs)
+    }
+    fn spec_and(
+        lhs: trust_verifier_api::TrustSpecExpr,
+        rhs: trust_verifier_api::TrustSpecExpr,
+    ) -> trust_verifier_api::TrustSpecExpr {
+        spec_bin(trust_verifier_api::TrustSpecBinaryOp::And, lhs, rhs)
+    }
+    fn predicate_of(
+        root: trust_verifier_api::TrustSpecExpr,
+    ) -> trust_verifier_api::TrustSpecPredicate {
+        trust_verifier_api::TrustSpecPredicate::new(root, Vec::new())
+    }
+    fn params(names: &[&str]) -> trust_types::fx::FxHashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// The measured F shape: the return place is defined by the loop-carried
+    /// local, and NOTHING defines that local, so the refutation picks a value no
+    /// execution reaches.
+    #[test]
+    fn return_defined_by_an_undefined_loop_local_is_disclosed() {
+        let root = spec_and(
+            spec_eq(spec_var("_5"), spec_var("i#s0_1_s3_0")),
+            spec_eq(spec_var("_0"), spec_var("i#s0_1_s3_0")),
+        );
+        assert!(
+            typed_chc_return_depends_on_elided_definition(
+                &predicate_of(root),
+                &params(&["n", "_1"])
+            ),
+            "`_0 = i#…` with no defining equality for `i#…` is an elided definition"
+        );
+    }
+
+    /// THE REGRESSION THE FUNCTION-SCOPED VERSION CAUSED. A loop local IS
+    /// unconstrained, but the return place is defined by a PARAMETER, so the
+    /// counterexample is one a caller can actually supply.
+    /// `{ let mut i = 0; while i < 3 { i = i + 1; } n }` with `ensures(*ret >= 5)`
+    /// really is defective at `n = 0` and must keep refuting; keying on the
+    /// function's back edge demoted it and took >=16 falsification mutants along.
+    #[test]
+    fn return_defined_by_a_parameter_keeps_its_refutation_despite_a_loop_local() {
+        let root = spec_and(
+            spec_eq(spec_var("_5"), spec_var("i#s0_1_s3_0")),
+            spec_eq(spec_var("_0"), spec_var("n")),
+        );
+        assert!(
+            !typed_chc_return_depends_on_elided_definition(
+                &predicate_of(root),
+                &params(&["n", "_1"])
+            ),
+            "an unconstrained loop local the RETURN VALUE never reads must not cost \
+             this refutation its authority"
+        );
+    }
+
+    /// The exact acyclic encoding — every non-input defined. This lane's entire
+    /// bug-detection value lives here and must be untouched.
+    #[test]
+    fn exact_acyclic_encoding_is_not_disclosed() {
+        let root = spec_and(
+            spec_eq(spec_var("_0"), spec_var("n")),
+            spec_bin(
+                trust_verifier_api::TrustSpecBinaryOp::Ge,
+                spec_var("_0"),
+                spec_int(5),
+            ),
+        );
+        assert!(!typed_chc_return_depends_on_elided_definition(
+            &predicate_of(root),
+            &params(&["n", "_1"])
+        ));
+    }
+
+    /// Fails toward NOT disclosing: no anchor for the conclusion, no claim.
+    #[test]
+    fn an_unanchored_return_place_discloses_nothing() {
+        let root = spec_eq(spec_var("_7"), spec_var("i#s0_1_s3_0"));
+        assert!(!typed_chc_return_depends_on_elided_definition(
+            &predicate_of(root),
+            &params(&["n"])
+        ));
+    }
+
+    #[test]
+    fn loopy_body_on_the_flattened_arm_is_disclosed_as_over_approximation() {
+        let mut obligation = obligation_with_metadata(
+            trust_verifier_api::ObligationKind::Postcondition,
+            Vec::new(),
+        );
+        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, true, true);
+
+        assert_eq!(
+            fidelity_of(&obligation),
+            Some(TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED),
+            "a loop-carrying body on the flattened single-formula CHC must disclose that its \
+             encoding over-approximates; without the disclosure trust-bmc credits the \
+             refutation and a true postcondition is reported false"
+        );
+    }
+
+    #[test]
+    fn acyclic_body_is_not_disclosed_and_keeps_its_refutation_authority() {
+        // The cost control. The flattened single-formula CHC is EXACT for an
+        // acyclic body — every non-input variable is defined by the path
+        // constraints — and it is the whole bug-detection value of this lane.
+        // Disclosing it too would turn every genuine straight-line contract
+        // violation into `unknown`.
+        let mut obligation = obligation_with_metadata(
+            trust_verifier_api::ObligationKind::Postcondition,
+            Vec::new(),
+        );
+        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, true, false);
+
+        assert_eq!(fidelity_of(&obligation), None);
+    }
+
+    #[test]
+    fn whole_function_panic_freedom_aggregate_is_never_stamped() {
+        // Two reasons, both load-bearing. It routes to the STRUCTURAL whole-CFG
+        // CHC, which carries real per-block relations, so the disclosure would
+        // be false. And its identity is fixed by exact-shape gates
+        // (`obligation_is_synthesized_whole_function_panic_freedom` here,
+        // `obligation_is_whole_function_panic_freedom` in trust-bmc) whose
+        // metadata allowlists do NOT include this key and must stay closed —
+        // they gate a PROOF credit, and nothing in this fix may widen one.
+        let mut obligation = obligation_with_metadata(
+            trust_verifier_api::ObligationKind::Assertion,
+            vec![trust_verifier_api::MetadataEntry {
+                key: TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY.to_string(),
+                value: "true".to_string(),
+            }],
+        );
+        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, false, true);
+
+        assert_eq!(fidelity_of(&obligation), None);
+        assert!(
+            obligation.metadata.iter().all(|entry| {
+                entry.key != TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY
+            }),
+            "stamping this key on the panic-freedom aggregate would break its exact-shape gate"
+        );
+    }
+}
+
+/// Trust (measurement, 2026-08-08): what the enriched data-flow CFG-CHC actually
+/// produces for the SHAPE THE COMPILER'S OWN PRODUCER EMITS.
+///
+/// The existing `dataflow_*` tests above hand-build functions whose NON-ENTRY
+/// blocks carry SSA block params (`bb1` in `dataflow_encoder_fires_on_invoke_
+/// function` declares one, and the `Invoke` threads an arg into it). No function
+/// the compiler lowers has that shape. `crates/trust-ir-bridge/src/lower.rs`
+/// gives block params ONLY to the entry block, and `block_args_for` returns an
+/// empty arg list for every non-entry target, because the bridge has no
+/// phi/block-param merge at all. Its cross-block merge is MEMORY:
+/// `multi_block_written_locals` promotes any local written in two or more
+/// reachable blocks — every loop accumulator — into an `Alloca` read back with
+/// `Load`, and trust-ir's own `mem2reg` is documented as "the conservative no-phi
+/// subset" that declines exactly the multi-block case.
+///
+/// So this module builds `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i =
+/// i + 1; } i }` the way the bridge really lowers it, and pins the consequence:
+/// the enriched encoder DOES fire and DOES emit many relations and rules, but
+/// every relation except the entry block's is NULLARY, and no value is threaded
+/// across any edge. There is no loop-carried state for PDR to infer `i >= 0`
+/// over — the enrichment is structural, not data-flow, on real input.
+#[cfg(test)]
+mod dataflow_chc_on_the_real_bridge_lowering_shape {
+    use super::*;
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, OverflowOp,
+        Ty, ValueId,
+    };
+
+    /// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i = i + 1; } i }`,
+    /// lowered the way `trust-ir-bridge` lowers it: `n` is the entry block's only
+    /// param, `i` is a memory-promoted `Alloca` slot (written in bb0 and bb3 —
+    /// two distinct blocks), every read of `i` is a `Load`, and NO non-entry
+    /// block has params or receives edge args.
+    fn bridge_shaped_counting_loop() -> Function {
+        let n = ValueId::new(1);
+        let slot = ValueId::new(10);
+        let zero = ValueId::new(2);
+        let load_guard = ValueId::new(3);
+        let guard = ValueId::new(4);
+        let load_body = ValueId::new(5);
+        let one = ValueId::new(6);
+        let sum = ValueId::new(7);
+        let overflow_bit = ValueId::new(8);
+        let load_exit = ValueId::new(9);
+
+        let load = |dest: ValueId| {
+            InstrNode::new(Inst::Load { ty: Ty::I32, ptr: slot, volatile: false, align: None })
+                .with_result(dest)
+        };
+        let store = |value: ValueId| {
+            InstrNode::new(Inst::Store {
+                ty: Ty::I32,
+                ptr: slot,
+                value,
+                volatile: false,
+                align: None,
+            })
+        };
+
+        // bb0(n: i32): %10 = alloca i32 ; %2 = 0 ; store %10 <- %2 ; br bb1
+        let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32);
+        bb0.body.push(
+            InstrNode::new(Inst::Alloca { ty: Ty::I32, count: None, align: None })
+                .with_result(slot),
+        );
+        bb0.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(0) }).with_result(zero),
+        );
+        bb0.body.push(store(zero));
+        bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+        // bb1(): %3 = load %10 ; %4 = slt %3, %1 ; condbr %4 -> bb2, bb4
+        let mut bb1 = Block::new(BlockId::new(1));
+        bb1.body.push(load(load_guard));
+        bb1.body.push(
+            InstrNode::new(Inst::ICmp { op: ICmpOp::Slt, ty: Ty::I32, lhs: load_guard, rhs: n })
+                .with_result(guard),
+        );
+        bb1.body.push(InstrNode::new(Inst::CondBr {
+            cond: guard,
+            then_target: BlockId::new(2),
+            then_args: vec![],
+            else_target: BlockId::new(4),
+            else_args: vec![],
+        }));
+
+        // bb2(): %5 = load %10 ; %6 = 1 ; %7,%8 = add.overflow i32 %5,%6 ;
+        //        condbr %8 -> bb5 (panic), bb3
+        let mut bb2 = Block::new(BlockId::new(2));
+        bb2.body.push(load(load_body));
+        bb2.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) }).with_result(one),
+        );
+        bb2.body.push(
+            InstrNode::new(Inst::Overflow {
+                op: OverflowOp::AddOverflow,
+                ty: Ty::I32,
+                lhs: load_body,
+                rhs: one,
+            })
+            .with_results([sum, overflow_bit]),
+        );
+        bb2.body.push(InstrNode::new(Inst::CondBr {
+            cond: overflow_bit,
+            then_target: BlockId::new(5),
+            then_args: vec![],
+            else_target: BlockId::new(3),
+            else_args: vec![],
+        }));
+
+        // bb3(): store %10 <- %7 ; br bb1     (the BACK EDGE)
+        let mut bb3 = Block::new(BlockId::new(3));
+        bb3.body.push(store(sum));
+        bb3.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+        // bb4(): %9 = load %10 ; return %9
+        let mut bb4 = Block::new(BlockId::new(4));
+        bb4.body.push(load(load_exit));
+        bb4.body.push(InstrNode::new(Inst::Return { values: vec![load_exit] }));
+
+        // bb5(): unreachable   (the checked-arithmetic panic sink)
+        let mut bb5 = Block::new(BlockId::new(5));
+        bb5.body.push(InstrNode::new(Inst::Unreachable));
+
+        let mut function =
+            Function::new(FuncId::new(0), "demo::f", FuncTyId::new(0), BlockId::new(0));
+        function.blocks = vec![bb0, bb1, bb2, bb3, bb4, bb5];
+        function
+    }
+
+    /// Every SSA value that any rule threads through a RELATION ARGUMENT
+    /// (in a head application or a body premise). This is exactly the set of
+    /// values that can appear in a PDR invariant — anything outside it is
+    /// rule-local and existentially quantified.
+    fn values_carried_in_relation_arguments(rules: &serde_json::Value) -> BTreeSet<String> {
+        fn note(args: Option<&Vec<serde_json::Value>>, carried: &mut BTreeSet<String>) {
+            for arg in args.into_iter().flatten() {
+                if let Some(name) = arg.get("name").and_then(|name| name.as_str()) {
+                    carried.insert(name.to_string());
+                }
+            }
+        }
+        let mut carried = BTreeSet::new();
+        for rule in rules.as_array().into_iter().flatten() {
+            note(rule["head"].get("args").and_then(|args| args.as_array()), &mut carried);
+            note(
+                rule["body"]["relation"].get("args").and_then(|args| args.as_array()),
+                &mut carried,
+            );
+        }
+        carried
+    }
+
+    /// SUPERSEDES `the_lever_fires_but_carries_no_loop_state` (2026-08-08).
+    ///
+    /// That test recorded a DEFECT as a measurement: on this exact fixture every
+    /// relation except the entry block's was nullary and the only value any
+    /// relation carried was the entry parameter `v1`, so `i >= 0` was not
+    /// expressible over any predicate and PDR had nothing to strengthen. The
+    /// defect is fixed (`ChcDataflowFrame`), so its assertions are now FALSE and
+    /// keeping them would pin the bug. They are replaced here by the inverted
+    /// claims, over the same fixture and the same measurement helper — strictly
+    /// stronger: the accumulator is now a relation column, not absent from every
+    /// relation.
+    #[test]
+    fn the_lever_now_carries_the_loop_accumulator() {
+        let function = bridge_shaped_counting_loop();
+        assert!(
+            super::super::function_has_back_edge(&function),
+            "the redirect's own loop gate must see this function as loopy"
+        );
+
+        let (relations, rules, _vars) =
+            super::super::trust_mc_dataflow_chc_for_function(
+                &function,
+                super::super::ChcErrorMode::Structural,
+                None,
+            )
+            .expect("well-formed function")
+            .expect("the enriched encoder DOES fire on this shape");
+
+        // Unchanged: it is a transition system by the counts the redirect is
+        // judged on.
+        let relations = relations.as_array().expect("relations array");
+        assert_eq!(relations.len(), 7, "error + one relation per block: {relations:?}");
+        assert!(
+            rules.as_array().expect("rules array").len() > 1,
+            "many rules, not the single flattened constraint-only rule"
+        );
+
+        // CHANGED: bb1..bb4 all sit on the loop and must now carry the promoted
+        // `i` slot; bb0 still carries `n`. bb5 — the `Unreachable` panic sink —
+        // stays nullary on purpose: nothing downstream of it can read anything,
+        // so backward liveness drops every column there. That is a dropped dead
+        // column, not a dropped fact.
+        for relation in relations {
+            let name = relation["name"].as_str().unwrap_or_default();
+            if name == "error" || name == "bb5" {
+                continue;
+            }
+            assert!(
+                relation["arg_sorts"].as_array().is_some_and(|args| !args.is_empty()),
+                "{name} must carry loop-carried state, not be nullary: {relation:?}"
+            );
+        }
+        assert_eq!(
+            relations
+                .iter()
+                .find(|relation| relation["name"] == "bb5")
+                .expect("bb5 relation")["arg_sorts"],
+            serde_json::json!([]),
+            "the panic sink observes nothing, so it carries nothing"
+        );
+
+        // RESTORED PIN (collateral of the supersession, not part of it). The test
+        // this one replaced asserted the ENTRY relation's exact arity and sort,
+        // `bb0 == [int]`. Only the loop-state claim was inverted by the change;
+        // the entry relation still carries exactly `n` and nothing else, and
+        // relaxing that to "non-empty" above would let a bug that gave bb0
+        // spurious extra columns, or that dropped `n`'s sort, pass unnoticed.
+        assert_eq!(
+            relations
+                .iter()
+                .find(|relation| relation["name"] == "bb0")
+                .expect("bb0 relation")["arg_sorts"],
+            serde_json::json!([{ "kind": "int" }]),
+            "the entry block carries exactly the entry parameter `n`, as an Int"
+        );
+
+        // CHANGED, and this is the decisive one. The loop-carried `i` is now a
+        // RELATION ARGUMENT — a per-block cell column the back edge updates — so
+        // `i >= 0` is expressible as an invariant over bb1/bb2/bb3/bb4 and PDR
+        // has something to strengthen. `v1` (the entry param) is still threaded.
+        let carried = values_carried_in_relation_arguments(&rules);
+        assert!(carried.contains("v1"), "the entry parameter stays threaded: {carried:?}");
+        let cell_columns: BTreeSet<&String> =
+            carried.iter().filter(|name| name.contains("_cell_v10")).collect();
+        assert!(
+            cell_columns.len() >= 4,
+            "the `i` slot (%10) must be a relation column on every block that is not its \
+             defining block: {carried:?}"
+        );
+        // The increment crosses bb2 -> bb3 as an SSA value, so it is threaded too;
+        // without that the back edge would pass a FREE value and the cell column
+        // would be havoc'd again one edge later.
+        assert!(
+            carried.contains("v7"),
+            "the incremented value must be threaded from the block that computes it to the \
+             block that stores it: {carried:?}"
+        );
+
+        // RESTORED PIN, second half. The superseded test pinned the carried set by
+        // EQUALITY (`{"v1"}`); `contains` alone would not notice a value threaded
+        // that has no business being threaded. Equality on the new set would be
+        // brittle — the cell columns are named after a slot index — so the
+        // characterization is closed instead. Every carried name must be one of:
+        //   * `v1` — the entry parameter `n`;
+        //   * `v2` — the `Const 0` bb0 stores into the slot, which the bb0 -> bb1
+        //     edge passes as bb1's cell column, i.e. `i`'s INITIAL value;
+        //   * `v7` — the increment, crossing bb2 -> bb3 (the block that computes
+        //     it to the block that stores it);
+        //   * a column of the ONE promoted slot, `%10`.
+        // In particular no SECOND slot may be promoted, and no unrelated value may
+        // acquire a relation column.
+        for name in &carried {
+            assert!(
+                name == "v1" || name == "v2" || name == "v7" || name.contains("_cell_v10"),
+                "unexpected value threaded into a relation argument: {name} in {carried:?}"
+            );
+        }
+        // The set is exactly those, so a DROPPED thread is caught too, not only an
+        // added one — this is the equality the superseded test had.
+        assert_eq!(
+            carried,
+            ["bb1_cell_v10", "bb2_cell_v10", "bb3_cell_v10", "bb4_cell_v10", "v1", "v2", "v7"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>(),
+            "the carried set is pinned exactly: entry param, initial value, increment, cells"
+        );
+    }
+
+    #[test]
+    fn the_arithmetic_safety_redirect_would_refute_a_correct_loop_and_now_falls_back() {
+        let function = bridge_shaped_counting_loop();
+
+        // The pre-existing coverage gate PASSES — nothing about this function's
+        // arithmetic surface is unmodeled — so it is not what protects us here.
+        assert!(
+            super::super::function_overflow_surface_fully_modeled(&function),
+            "checked i32 add + loads/stores are all inside the modeled surface"
+        );
+
+        // What is wrong is the other direction. The `Overflow`'s left operand is
+        // a havoc'd `Load` result: it is in no relation argument and no fold
+        // equality defines it. `error :- bb2(), fold, v5 + 1 > i32::MAX` is then
+        // satisfiable by choosing v5 = i32::MAX, so the enriched CHC reports a
+        // counterexample for a loop that provably never overflows.
+        let loop_body = function.block(trust_ir::BlockId::new(2)).expect("bb2");
+        assert!(
+            !super::super::block_overflow_violations_are_anchored(loop_body),
+            "the checked add's operand is an unconstrained existential"
+        );
+
+        // So the redirect must fail CLOSED to the untouched flattened path
+        // rather than publish that counterexample.
+        assert!(
+            super::super::trust_mc_dataflow_chc_for_function(
+                &function,
+                super::super::ChcErrorMode::ArithmeticSafetyOnly,
+                None,
+            )
+            .expect("well-formed function")
+            .is_none(),
+            "an unanchored overflow violation must fall back, not refute"
+        );
+    }
+
+    #[test]
+    fn an_anchored_overflow_still_encodes() {
+        // Regression guard for the gate above: when the operands ARE anchored
+        // (here, the entry block's own param), the enriched encoding is
+        // unchanged and still emits its violation edge.
+        let a = ValueId::new(0);
+        let value = ValueId::new(2);
+        let bit = ValueId::new(3);
+        let mut bb0 = Block::new(BlockId::new(0)).with_param(a, Ty::I32);
+        bb0.body.push(
+            InstrNode::new(Inst::Overflow {
+                op: OverflowOp::AddOverflow,
+                ty: Ty::I32,
+                lhs: a,
+                rhs: a,
+            })
+            .with_results([value, bit]),
+        );
+        bb0.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+        let mut function =
+            Function::new(FuncId::new(0), "demo::anchored", FuncTyId::new(0), BlockId::new(0));
+        function.blocks = vec![bb0];
+
+        assert!(super::super::function_overflow_violations_are_anchored(&function));
+        let (_relations, rules, _vars) = super::super::trust_mc_dataflow_chc_for_function(
+            &function,
+            super::super::ChcErrorMode::ArithmeticSafetyOnly,
+            None,
+        )
+        .expect("well-formed function")
+        .expect("an anchored overflow keeps its enriched encoding");
+        assert!(
+            rules
+                .as_array()
+                .expect("rules array")
+                .iter()
+                .any(|rule| rule["head"]["name"] == "error"),
+            "the overflow violation edge is still emitted: {rules:?}"
+        );
+    }
+}
+
+/// Trust (2026-08-08): the elided-definition disclosure must not be suppressed
+/// by an env flag that does not decide whether the row is actually flattened.
+#[cfg(test)]
+mod dataflow_redirect_never_suppresses_the_elided_definition_disclosure {
+    use super::*;
+
+    #[test]
+    fn an_arithmetic_safety_row_is_disclosed_regardless_of_the_dataflow_gate() {
+        // The suppression that used to live in
+        // `annotate_trust_mc_typed_chc_encoding_fidelity` fired on
+        // (env gate ON && kind == ArithmeticSafety) alone. It matched neither of
+        // the redirect's two remaining preconditions — the function must have a
+        // back edge, and the enriched builder must not have returned `Ok(None)` —
+        // so a straight-line row, or any row the coverage/anchoring gates reject,
+        // fell back to the flattened formula with its disclosure stripped and its
+        // refutation authority restored. The annotation no longer reads the
+        // environment at all: whether it discloses is decided solely by whether
+        // the return place depends on an elided definition.
+        let mut obligation = trust_verifier_api::TrustObligation {
+            obligation_id: "vc:demo__f:arithmetic_safety:1".to_string(),
+            kind: trust_verifier_api::ObligationKind::ArithmeticSafety,
+            contract_id: None,
+            proof_item_id: None,
+            source: trust_verifier_api::SourceLocation::default(),
+            description: "arithmetic safety".to_string(),
+            required_strength: None,
+            summary_facts: Vec::new(),
+            metadata: Vec::new(),
+        };
+        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, true, true);
+        assert_eq!(
+            api_obligation_metadata_value(
+                &obligation,
+                TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY,
+            ),
+            Some(TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED),
+            "a flattened loop-elided ArithmeticSafety row must keep its disclosure"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LOOP-CARRIED STATE in the enriched CFG-CHC.
+//
+// The subject is F:
+//
+//     #[ensures(move |ret: &i32| *ret >= 0)]
+//     pub fn f(n: i32) -> i32 { let mut i: i32 = 0; while i < n { i = i + 1; } i }
+//
+// which is TRUE and which the encoder could not express before: the producer
+// (`trust-ir-bridge`) gives block params only to the entry block and routes `i`
+// through an `Alloca`/`Store`/`Load` memory merge, so every non-entry relation
+// was NULLARY and `_0` came out of a havoc'd `Load` — a free variable a solver
+// may pick adversarially.
+//
+// These fixtures deliberately go through the REAL producer
+// (`trust_ir_bridge::lower_mir_compat_to_trust_ir`) rather than hand-building a
+// `trust_ir::Function`: the earlier `dataflow_*` tests hand-built functions whose
+// NON-ENTRY blocks carry params, a shape the compiler never emits, which is
+// exactly why the nullary-relation defect went unnoticed.
+// ---------------------------------------------------------------------------
+
+/// F's body in the compiler's own MIR model, in the shape rustc actually emits
+/// for a checked `i = i + 1` inside a `while`:
+///
+/// ```text
+/// bb0: _2 = const 0                       ; goto bb1
+/// bb1: _3 = Lt(_2, _1)                    ; switchInt(_3) -> [0: bb4, else: bb2]
+/// bb2: _4 = CheckedAdd(_2, const 1)       ; assert(!(_4.1)) -> bb3
+/// bb3: _2 = move (_4.0)                   ; goto bb1
+/// bb4: _0 = copy _2                       ; return
+/// ```
+///
+/// `_2` is written in bb0 AND bb3, so `multi_block_written_locals` promotes it to
+/// an `Alloca` slot — the loop-carried cell this encoding has to thread. The
+/// checked add is what splits the increment (bb2) from the write-back (bb3), so
+/// the sum ALSO has to cross a block boundary; it does so inside a tuple built by
+/// `Undef`/`InsertField` and read back by `ExtractField`.
+fn dataflow_loop_accumulator_function() -> trust_types::VerifiableFunction {
+    let span = trust_types::SourceSpan::default();
+    trust_types::VerifiableFunction {
+        name: "f".to_string(),
+        def_path: "demo::f".to_string(),
+        span: span.clone(),
+        body: trust_types::VerifiableBody {
+            locals: vec![
+                trust_types::LocalDecl { index: 0, ty: trust_types::Ty::i32(), name: None },
+                trust_types::LocalDecl {
+                    index: 1,
+                    ty: trust_types::Ty::i32(),
+                    name: Some("n".to_string()),
+                },
+                trust_types::LocalDecl {
+                    index: 2,
+                    ty: trust_types::Ty::i32(),
+                    name: Some("i".to_string()),
+                },
+                trust_types::LocalDecl { index: 3, ty: trust_types::Ty::Bool, name: None },
+                trust_types::LocalDecl {
+                    index: 4,
+                    ty: trust_types::Ty::Tuple(vec![
+                        trust_types::Ty::i32(),
+                        trust_types::Ty::Bool,
+                    ]),
+                    name: None,
+                },
+            ],
+            blocks: vec![
+                trust_types::BasicBlock {
+                    id: trust_types::BlockId(0),
+                    stmts: vec![trust_types::Statement::Assign {
+                        place: trust_types::Place::local(2),
+                        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
+                            trust_types::ConstValue::Int(0),
+                        )),
+                        span: span.clone(),
+                    }],
+                    terminator: trust_types::Terminator::Goto(trust_types::BlockId(1)),
+                },
+                trust_types::BasicBlock {
+                    id: trust_types::BlockId(1),
+                    stmts: vec![trust_types::Statement::Assign {
+                        place: trust_types::Place::local(3),
+                        rvalue: trust_types::Rvalue::BinaryOp(
+                            trust_types::BinOp::Lt,
+                            trust_types::Operand::Copy(trust_types::Place::local(2)),
+                            trust_types::Operand::Copy(trust_types::Place::local(1)),
+                        ),
+                        span: span.clone(),
+                    }],
+                    terminator: trust_types::Terminator::SwitchInt {
+                        discr: trust_types::Operand::Copy(trust_types::Place::local(3)),
+                        targets: vec![(0, trust_types::BlockId(4))],
+                        otherwise: trust_types::BlockId(2),
+                        exhaustive_enum_unreachable: false,
+                        span: span.clone(),
+                    },
+                },
+                trust_types::BasicBlock {
+                    id: trust_types::BlockId(2),
+                    stmts: vec![trust_types::Statement::Assign {
+                        place: trust_types::Place::local(4),
+                        rvalue: trust_types::Rvalue::CheckedBinaryOp(
+                            trust_types::BinOp::Add,
+                            trust_types::Operand::Copy(trust_types::Place::local(2)),
+                            trust_types::Operand::Constant(trust_types::ConstValue::Int(1)),
+                        ),
+                        span: span.clone(),
+                    }],
+                    terminator: trust_types::Terminator::Assert {
+                        cond: trust_types::Operand::Copy(trust_types::Place::field(4, 1)),
+                        expected: false,
+                        msg: trust_types::AssertMessage::Overflow(trust_types::BinOp::Add),
+                        target: trust_types::BlockId(3),
+                        span: span.clone(),
+                        unwind: trust_types::UnwindEdge::Unreachable,
+                    },
+                },
+                trust_types::BasicBlock {
+                    id: trust_types::BlockId(3),
+                    stmts: vec![trust_types::Statement::Assign {
+                        place: trust_types::Place::local(2),
+                        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Move(
+                            trust_types::Place::field(4, 0),
+                        )),
+                        span: span.clone(),
+                    }],
+                    terminator: trust_types::Terminator::Goto(trust_types::BlockId(1)),
+                },
+                trust_types::BasicBlock {
+                    id: trust_types::BlockId(4),
+                    stmts: vec![trust_types::Statement::Assign {
+                        place: trust_types::Place::local(0),
+                        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Copy(
+                            trust_types::Place::local(2),
+                        )),
+                        span: span.clone(),
+                    }],
+                    terminator: trust_types::Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: trust_types::Ty::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        spec: Default::default(),
+    }
+}
+
+/// Lower [`dataflow_loop_accumulator_function`] with the real producer and
+/// return its single trust-ir function.
+fn dataflow_loop_accumulator_trust_ir() -> trust_ir::Function {
+    let module = trust_ir_bridge::lower_mir_compat_to_trust_ir(
+        &dataflow_loop_accumulator_function(),
+    )
+    .expect("the loop fixture must lower through the real MIR->trust-ir bridge");
+    module.functions.into_iter().next().expect("the bridge emits one function")
+}
+
+/// Every var name a `{kind:...}` expression reads.
+fn dataflow_expr_vars(expr: &serde_json::Value, out: &mut Vec<String>) {
+    match expr["kind"].as_str() {
+        Some("var") => {
+            if let Some(name) = expr["name"].as_str() {
+                out.push(name.to_string());
+            }
+        }
+        Some("binary") => {
+            dataflow_expr_vars(&expr["lhs"], out);
+            dataflow_expr_vars(&expr["rhs"], out);
+        }
+        Some("unary") => dataflow_expr_vars(&expr["expr"], out),
+        _ => {}
+    }
+}
+
+/// Least-fixed-point GROUNDEDNESS over one rule: starting from the vars its body
+/// relation binds (a rule's ONLY bound vars — everything else is universally
+/// quantified, i.e. free for the solver to choose), close over the rule's
+/// defining equalities `x = E`. A var outside the result is one the solver may
+/// pick adversarially.
+fn dataflow_grounded_vars(
+    relation_args: &[serde_json::Value],
+    constraints: &[serde_json::Value],
+) -> std::collections::BTreeSet<String> {
+    let mut grounded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for arg in relation_args {
+        dataflow_expr_vars(arg, &mut Vec::new());
+        if let Some(name) = arg["name"].as_str() {
+            grounded.insert(name.to_string());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for constraint in constraints {
+            if constraint["kind"] != "binary" || constraint["op"] != "eq" {
+                continue;
+            }
+            let Some(defined) = constraint["lhs"]["name"].as_str() else { continue };
+            if constraint["lhs"]["kind"] != "var" || grounded.contains(defined) {
+                continue;
+            }
+            let mut reads = Vec::new();
+            dataflow_expr_vars(&constraint["rhs"], &mut reads);
+            if reads.iter().all(|name| grounded.contains(name)) {
+                grounded.insert(defined.to_string());
+                changed = true;
+            }
+        }
+    }
+    grounded
+}
+
+#[test]
+fn dataflow_threads_the_loop_accumulator_through_non_entry_relations() {
+    // (a) The loop cell IS a relation argument in a non-entry block. Before the
+    // loop-carried-state frame, every relation except the entry block was
+    // NULLARY (`arg_sorts == []`) and the only value threaded anywhere was the
+    // entry parameter — so `i >= 0` was not expressible over ANY predicate and
+    // PDR had nothing to strengthen.
+    let function = dataflow_loop_accumulator_trust_ir();
+    let (relations, rules, vars) =
+        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural, None)
+            .expect("a well-formed loop must not error")
+            .expect("the enriched encoder MUST fire for the bridge's own loop shape");
+
+    let relations = relations.as_array().expect("relations array");
+    let nullary: Vec<&str> = relations
+        .iter()
+        .filter(|relation| relation["name"] != "error")
+        .filter(|relation| relation["arg_sorts"].as_array().is_none_or(|args| args.is_empty()))
+        .filter_map(|relation| relation["name"].as_str())
+        .collect();
+    assert!(
+        nullary.is_empty(),
+        "every block relation must carry loop-carried state; these are still nullary: {nullary:?} \
+         (relations: {relations:?})"
+    );
+
+    // The cell column is named after the slot, per block, so a rule can tie a
+    // block's INCOMING slot value to its successor's.
+    let cell_columns: Vec<&str> = vars
+        .iter()
+        .filter_map(|var| var["name"].as_str())
+        .filter(|name| name.contains("_cell_v"))
+        .collect();
+    assert!(
+        !cell_columns.is_empty(),
+        "the un-aliased `let mut i` slot must be promoted to threaded cell columns; vars: {vars:?}"
+    );
+
+    // The back edge must UPDATE the cell rather than pass it through: some rule
+    // whose head is the loop header carries a cell argument that is NOT the
+    // source block's incoming cell column.
+    let rules = rules.as_array().expect("rules array");
+    let back_edge_updates = rules.iter().any(|rule| {
+        let Some(body_relation) = rule["body"]["relation"]["name"].as_str() else { return false };
+        let head_args: Vec<&str> =
+            rule["head"]["args"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect();
+        let body_args: Vec<&str> = rule["body"]["relation"]["args"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["name"].as_str())
+            .collect();
+        rule["head"]["name"] != "error"
+            && rule["head"]["name"] != body_relation
+            && head_args.iter().any(|name| !name.contains("_cell_v"))
+            && body_args.iter().any(|name| name.contains("_cell_v"))
+            && head_args != body_args
+    });
+    assert!(
+        back_edge_updates,
+        "some transition must pass a STORED value where the target expects its cell column \
+         (that update is what makes `i` loop-carried): {rules:?}"
+    );
+}
+
+#[test]
+fn dataflow_grounds_the_returned_value_in_the_loop_cell() {
+    // (b) + (c). Build the encoding for the return block exactly as a
+    // postcondition routing would — the block's relation premise plus its
+    // straight-line fold — and check that the RETURNED value is grounded in the
+    // relation's own arguments. `error :- bbRet(args), fold, NOT(ret >= 0)` is
+    // then NOT satisfiable by a free choice of `ret`: its value is pinned by an
+    // equality chain rooted in the relation arguments, so whether `error` is
+    // reachable is decided by what invariant holds of the CELL COLUMN — which is
+    // the question PDR is for.
+    //
+    // Before the loop-carried-state frame this failed: `ret` was the result of a
+    // havoc'd `Load`, so `v_0 = -1` satisfied the rule and routing the
+    // postcondition would have published a refutation of a TRUE contract.
+    let function = dataflow_loop_accumulator_trust_ir();
+    let frame = super::ChcDataflowFrame::build(&function);
+    let mut var_decls = super::ChcVarDecls::default();
+
+    let return_block = function
+        .blocks
+        .iter()
+        .find(|block| matches!(&block.terminator().map(|t| &t.inst), Some(trust_ir::Inst::Return { .. })))
+        .expect("the fixture returns");
+    let returned = match &return_block.terminator().expect("terminator").inst {
+        trust_ir::Inst::Return { values } => *values.first().expect("returns one value"),
+        _ => unreachable!(),
+    };
+
+    let relation_args = frame.relation_arg_exprs(return_block, &mut var_decls);
+    let fold = super::chc_fold_block_body(return_block, &frame, &mut var_decls);
+    let grounded = dataflow_grounded_vars(&relation_args, &fold.constraints);
+
+    let returned_name = super::chc_value_var_name(returned);
+    assert!(
+        grounded.contains(&returned_name),
+        "the returned value `{returned_name}` must be GROUNDED in the return block's relation \
+         arguments — otherwise `error :- bbRet(args), fold, NOT({returned_name} >= 0)` is \
+         satisfiable by free choice. grounded={grounded:?} args={relation_args:?} \
+         fold={:?}",
+        fold.constraints
+    );
+
+    // It is grounded THROUGH the promoted cell, not through anything else: the
+    // return block's relation carries exactly the slot column.
+    let arg_names: Vec<&str> =
+        relation_args.iter().filter_map(|arg| arg["name"].as_str()).collect();
+    assert!(
+        arg_names.iter().any(|name| name.contains("_cell_v")),
+        "the return block's relation must carry the promoted slot: {arg_names:?}"
+    );
+
+    // CONTROL that must not regress: grounding must not PIN the returned value
+    // to a constant. `ensures(*ret >= 5)` over the same loop is FALSE, and its
+    // error rule has to stay satisfiable — which it does exactly because the cell
+    // column is a free relation argument whose value the transitions, not this
+    // rule, determine. If any constraint here fixed the cell to a literal, a
+    // false postcondition would become unrefutable.
+    for constraint in &fold.constraints {
+        if constraint["kind"] == "binary"
+            && constraint["op"] == "eq"
+            && let Some(defined) = constraint["lhs"]["name"].as_str()
+            && arg_names.contains(&defined)
+        {
+            panic!(
+                "no fold constraint may define a relation ARGUMENT — that would pin the \
+                 loop-carried state and could make a false postcondition unrefutable: \
+                 {constraint:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dataflow_refuses_to_promote_a_slot_whose_address_escapes() {
+    // The promotion is sound ONLY because it is refused whenever the slot's
+    // address could escape: a hidden write through an alias would change the slot
+    // without a `Store` the fold can see, and the threaded column would then
+    // assert something the real semantics does not entail — the false-SAFE
+    // direction. Passing the address to a call is the canonical escape.
+    use trust_ir::{Block, BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId};
+
+    let build = |escapes: bool| {
+        let slot = ValueId::new(0);
+        let stored = ValueId::new(1);
+        let loaded = ValueId::new(2);
+        let mut bb0 = Block::new(BlockId::new(0));
+        bb0.body.push(
+            InstrNode::new(Inst::Alloca { ty: Ty::I32, count: None, align: None })
+                .with_result(slot),
+        );
+        bb0.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: trust_ir::Constant::Int(0) })
+                .with_result(stored),
+        );
+        bb0.body.push(InstrNode::new(Inst::Store {
+            ty: Ty::I32,
+            ptr: slot,
+            value: stored,
+            volatile: false,
+            align: None,
+        }));
+        if escapes {
+            // `takes_ptr(&mut i)` — the address is now observable by a callee.
+            bb0.body.push(InstrNode::new(Inst::Call {
+                callee: FuncId::new(1),
+                args: vec![slot],
+            }));
+        }
+        bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+        let mut bb1 = Block::new(BlockId::new(1));
+        bb1.body.push(
+            InstrNode::new(Inst::Load { ty: Ty::I32, ptr: slot, volatile: false, align: None })
+                .with_result(loaded),
+        );
+        bb1.body.push(InstrNode::new(Inst::Return { values: vec![loaded] }));
+
+        let mut function =
+            Function::new(FuncId::new(0), "demo::slot", FuncTyId::new(0), BlockId::new(0));
+        function.blocks = vec![bb0, bb1];
+        function
+    };
+
+    let kept = build(false);
+    assert_eq!(
+        super::ChcDataflowFrame::build(&kept).cells.len(),
+        1,
+        "a slot used only as a same-typed, non-volatile Load/Store `ptr` operand is promotable"
+    );
+
+    let escaped = build(true);
+    assert!(
+        super::ChcDataflowFrame::build(&escaped).cells.is_empty(),
+        "a slot whose address is passed to a call MUST keep today's havoc — promoting it would \
+         assert that no hidden write can change it, which is exactly what the escape allows"
+    );
+}
+
+/// A CHECKED counting loop with a real `Return`, self-contained so the goal-edge
+/// tests do not reach into another module's fixture:
+/// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i += 1; } i }`, lowered the
+/// way the bridge lowers it — the accumulator lives in an `Alloca`, and the
+/// checked add is `Overflow` + `Not` + a non-branching `Assert`.
+fn postcondition_goal_counting_loop() -> trust_ir::Function {
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, OverflowOp,
+        Ty, ValueId,
+    };
+    let n = ValueId::new(1);
+    let zero = ValueId::new(2);
+    let load_guard = ValueId::new(3);
+    let guard = ValueId::new(4);
+    let load_body = ValueId::new(5);
+    let one = ValueId::new(6);
+    let sum = ValueId::new(7);
+    let bit = ValueId::new(8);
+    let negated = ValueId::new(9);
+    let slot = ValueId::new(10);
+    let load_exit = ValueId::new(11);
+    let false_const = ValueId::new(12);
+
+    let load = |dest: ValueId| {
+        InstrNode::new(Inst::Load { ty: Ty::I32, ptr: slot, volatile: false, align: None })
+            .with_result(dest)
+    };
+    let store = |value: ValueId| {
+        InstrNode::new(Inst::Store { ty: Ty::I32, ptr: slot, value, volatile: false, align: None })
+    };
+
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32);
+    bb0.body.push(
+        InstrNode::new(Inst::Alloca { ty: Ty::I32, count: None, align: None }).with_result(slot),
+    );
+    bb0.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(0) }).with_result(zero),
+    );
+    bb0.body.push(store(zero));
+    bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+    let mut bb1 = Block::new(BlockId::new(1));
+    bb1.body.push(load(load_guard));
+    bb1.body.push(
+        InstrNode::new(Inst::ICmp { op: ICmpOp::Slt, ty: Ty::I32, lhs: load_guard, rhs: n })
+            .with_result(guard),
+    );
+    bb1.body.push(InstrNode::new(Inst::CondBr {
+        cond: guard,
+        then_target: BlockId::new(2),
+        then_args: vec![],
+        else_target: BlockId::new(3),
+        else_args: vec![],
+    }));
+
+    let mut bb2 = Block::new(BlockId::new(2));
+    bb2.body.push(load(load_body));
+    bb2.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) }).with_result(one),
+    );
+    bb2.body.push(
+        InstrNode::new(Inst::Overflow {
+            op: OverflowOp::AddOverflow,
+            ty: Ty::I32,
+            lhs: load_body,
+            rhs: one,
+        })
+        .with_result(sum)
+        .with_result(bit),
+    );
+    // The bridge's real assert shape: `icmp eq %bit, false`, not `UnOp::Not`.
+    bb2.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+            .with_result(false_const),
+    );
+    bb2.body.push(
+        InstrNode::new(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Bool, lhs: bit, rhs: false_const })
+            .with_result(negated),
+    );
+    bb2.body.push(InstrNode::new(Inst::Assert { cond: negated }));
+    bb2.body.push(store(sum));
+    bb2.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+    let mut bb3 = Block::new(BlockId::new(3));
+    bb3.body.push(load(load_exit));
+    bb3.body.push(InstrNode::new(Inst::Return { values: vec![load_exit] }));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::counting", FuncTyId::new(0), BlockId::new(0));
+    function.blocks.push(bb0);
+    function.blocks.push(bb1);
+    function.blocks.push(bb2);
+    function.blocks.push(bb3);
+    function
+}
+
+/// **THE POSTCONDITION COVERAGE GATE.** The encoder models every integer as a
+/// mathematical `int`, which is a sound OVER-approximation of the machine only
+/// while the two agree on executions the machine CONTINUES.
+///
+///   * checked arithmetic (`Overflow` + `Assert(Not(bit))`) is fine — on overflow
+///     the real program panics and never returns, so the model merely explores a
+///     superset of the real return states;
+///   * a WRAPPING add is not: reality wraps to a negative value and RETURNS it,
+///     while the model counts upward forever. The model is then a strict
+///     UNDER-approximation and `ensures(*ret >= 0)` would be "proved" for a
+///     function that demonstrably returns a negative number.
+///
+/// This is the false-SAFE direction, so the gate must refuse the second shape.
+#[test]
+fn the_postcondition_coverage_gate_refuses_unbounded_wrapping_arithmetic() {
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, OverflowOp,
+        Ty, ValueId,
+    };
+
+    // `checked`: %3,%4 = add.overflow %1,%2 ; %6 = false ; %5 = eq %4,%6 ;
+    //            assert %5 ; return %3
+    // `wrapping`: %3 = add %1,%2 ; return %3        <- the same sum, unchecked
+    let build = |wrapping: bool, assert_the_bit: bool| {
+        let n = ValueId::new(1);
+        let one = ValueId::new(2);
+        let sum = ValueId::new(3);
+        let bit = ValueId::new(4);
+        let negated = ValueId::new(5);
+        let false_const = ValueId::new(6);
+        let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32);
+        bb0.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) }).with_result(one),
+        );
+        if wrapping {
+            bb0.body.push(
+                InstrNode::new(Inst::BinOp {
+                    op: trust_ir::BinOp::Add,
+                    ty: Ty::I32,
+                    lhs: n,
+                    rhs: one,
+                })
+                .with_result(sum),
+            );
+        } else {
+            bb0.body.push(
+                InstrNode::new(Inst::Overflow {
+                    op: OverflowOp::AddOverflow,
+                    ty: Ty::I32,
+                    lhs: n,
+                    rhs: one,
+                })
+                .with_result(sum)
+                .with_result(bit),
+            );
+            if assert_the_bit {
+                // THE BRIDGE'S REAL SHAPE. `Terminator::Assert { expected: false }`
+                // lowers to `icmp eq %bit, false` + `Assert` — deliberately NOT
+                // `UnOp::Not` (`lower.rs`: "TrustIr unary `not` is a bitwise
+                // integer op"). Writing this test with `UnOp::Not` is what let the
+                // gate ship refusing every checked function in the real producer.
+                bb0.body.push(
+                    InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                        .with_result(false_const),
+                );
+                bb0.body.push(
+                    InstrNode::new(Inst::ICmp {
+                        op: ICmpOp::Eq,
+                        ty: Ty::Bool,
+                        lhs: bit,
+                        rhs: false_const,
+                    })
+                    .with_result(negated),
+                );
+                bb0.body.push(InstrNode::new(Inst::Assert { cond: negated }));
+            }
+        }
+        bb0.body.push(InstrNode::new(Inst::Return { values: vec![sum] }));
+        let mut function =
+            Function::new(FuncId::new(0), "demo::acc", FuncTyId::new(0), BlockId::new(0));
+        function.blocks.push(bb0);
+        function
+    };
+
+    assert!(
+        super::function_unbounded_int_arithmetic_is_faithful(&build(false, true)),
+        "checked arithmetic whose overflow bit is asserted-false traps on overflow, so the \
+         unbounded model is a sound over-approximation and must be admitted"
+    );
+    assert!(
+        !super::function_unbounded_int_arithmetic_is_faithful(&build(true, false)),
+        "a WRAPPING add is modeled as unbounded `int`; the real negative return state is \
+         absent from the model, so a false postcondition would be PROVED — refuse"
+    );
+    // `overflowing_add`: the bit is produced but nothing traps on it, so the real
+    // program CONTINUES with the wrapped value. Same hazard, different shape.
+    assert!(
+        !super::function_unbounded_int_arithmetic_is_faithful(&build(false, false)),
+        "an unasserted overflow bit means execution continues wrapped — refuse"
+    );
+}
+
+/// The bridge does not hand the overflow flag straight to the assert: it packs
+/// `Overflow`'s two results into a tuple (`Undef -> InsertField(_,0,result) ->
+/// InsertField(_,1,flag)`) and reads the flag back with `ExtractField(tuple, 1)`,
+/// often in a LATER block. The coverage gate has to follow that chain, or it
+/// refuses every checked function the real producer emits — which is precisely
+/// how the first version of this gate shipped inert.
+#[test]
+fn the_coverage_gate_follows_the_overflow_flag_through_the_tuple_chain() {
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, OverflowOp,
+        Ty, ValueId,
+    };
+    let n = ValueId::new(1);
+    let one = ValueId::new(2);
+    let sum = ValueId::new(3);
+    let flag = ValueId::new(4);
+    let undef = ValueId::new(5);
+    let with_value = ValueId::new(6);
+    let tuple = ValueId::new(7);
+    let read_back = ValueId::new(8);
+    let false_const = ValueId::new(9);
+    let negated = ValueId::new(10);
+
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32);
+    bb0.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) }).with_result(one),
+    );
+    bb0.body.push(
+        InstrNode::new(Inst::Overflow {
+            op: OverflowOp::AddOverflow,
+            ty: Ty::I32,
+            lhs: n,
+            rhs: one,
+        })
+        .with_result(sum)
+        .with_result(flag),
+    );
+    bb0.body.push(InstrNode::new(Inst::Undef { ty: Ty::I32 }).with_result(undef));
+    bb0.body.push(
+        InstrNode::new(Inst::InsertField { ty: Ty::I32, aggregate: undef, field: 0, value: sum })
+            .with_result(with_value),
+    );
+    bb0.body.push(
+        InstrNode::new(Inst::InsertField {
+            ty: Ty::I32,
+            aggregate: with_value,
+            field: 1,
+            value: flag,
+        })
+        .with_result(tuple),
+    );
+    bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+    // The read-back and the assert land in the NEXT block, as they do in real MIR.
+    let mut bb1 = Block::new(BlockId::new(1));
+    bb1.body.push(
+        InstrNode::new(Inst::ExtractField { ty: Ty::Bool, aggregate: tuple, field: 1 })
+            .with_result(read_back),
+    );
+    bb1.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+            .with_result(false_const),
+    );
+    bb1.body.push(
+        InstrNode::new(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Bool, lhs: read_back, rhs: false_const })
+            .with_result(negated),
+    );
+    bb1.body.push(InstrNode::new(Inst::Assert { cond: negated }));
+    bb1.body.push(InstrNode::new(Inst::Return { values: vec![sum] }));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::packed", FuncTyId::new(0), BlockId::new(0));
+    function.blocks.push(bb0);
+    function.blocks.push(bb1);
+
+    assert!(
+        super::function_unbounded_int_arithmetic_is_faithful(&function),
+        "the flag is asserted false through `InsertField`/`ExtractField`, so the checked add \
+         traps on overflow and the unbounded model is a sound over-approximation"
+    );
+}
+
+/// **THE `Inconclusive` DEFECT.** `ay-chc`'s proof-grade `solve_pdr_proof` runs no
+/// `ClauseInliner` preprocessing — deliberately, because `preserve_original_clauses`
+/// keeps the invariant over the caller's exact clauses so the replay seal can
+/// re-check it. The fold, however, names every intermediate SSA value, so it used
+/// to ship rules like
+///
+/// ```text
+///   bb2(v1, bb1_cell_v10) :- bb1(v1, bb1_cell_v10),
+///                            v3 = bb1_cell_v10, v4 = (v3 < v1), v4
+/// ```
+///
+/// where `v3` carries nothing. Measured on the real `f_loop` system: with those
+/// copies present PDR returns `Unknown(Inconclusive)`; with ONLY them substituted
+/// — `v6 = 1`, the dead overflow predicate and the rest left untouched — PDR
+/// returns `Safe` carrying the invariant `c >= 0`. So a var-to-var copy surviving
+/// into an emitted rule is not untidy, it is the difference between a proof and
+/// no proof.
+#[test]
+fn no_emitted_rule_ships_a_variable_to_variable_copy() {
+    for (mode, goal) in [
+        (super::ChcErrorMode::Structural, None),
+        (super::ChcErrorMode::ArithmeticSafetyOnly, None),
+    ] {
+        let Some((_relations, rules, _vars)) = super::trust_mc_dataflow_chc_for_function(
+            &postcondition_goal_counting_loop(),
+            mode,
+            goal,
+        )
+        .expect("encoder runs") else {
+            continue;
+        };
+        assert_copy_free(&rules, &format!("{mode:?}"));
+    }
+    let vc = serde_json::json!({
+        "kind": "unary",
+        "op": "not",
+        "expr": {
+            "kind": "binary",
+            "op": "ge",
+            "lhs": { "kind": "var", "name": "_0", "sort": { "kind": "int" } },
+            "rhs": { "kind": "int_const", "value": "0" },
+        },
+    });
+    let (_relations, rules, _vars) = super::trust_mc_dataflow_chc_for_function(
+        &postcondition_goal_counting_loop(),
+        super::ChcErrorMode::PostconditionGoal,
+        Some(&vc),
+    )
+    .expect("encoder runs")
+    .expect("admitted");
+    assert_copy_free(&rules, "PostconditionGoal");
+}
+
+fn assert_copy_free(rules: &serde_json::Value, label: &str) {
+    for rule in rules.as_array().expect("rules array") {
+        let empty = Vec::new();
+        for constraint in
+            rule["body"]["constraints"].as_array().unwrap_or(&empty)
+        {
+            if constraint["op"] != "eq" {
+                continue;
+            }
+            let (lhs, rhs) = (&constraint["lhs"], &constraint["rhs"]);
+            assert!(
+                !(lhs["kind"] == "var" && rhs["kind"] == "var"),
+                "{label}: a var-to-var copy survived into an emitted rule, which is what makes \
+                 proof-grade PDR return Inconclusive: {constraint}"
+            );
+        }
+    }
+}
+
+/// The goal edge exists, sits on the RETURN block, and binds the VC's return
+/// place to the value the function actually returns. Without that binding the
+/// VC's `_0` is a free variable and `¬Q` is satisfiable for free, so no
+/// postcondition could ever be discharged here.
+#[test]
+fn the_postcondition_goal_edge_binds_the_return_place_to_the_returned_value() {
+    let function = postcondition_goal_counting_loop();
+    let vc = serde_json::json!({
+        "kind": "unary",
+        "op": "not",
+        "expr": {
+            "kind": "binary",
+            "op": "ge",
+            "lhs": { "kind": "var", "name": "_0", "sort": { "kind": "int" } },
+            "rhs": { "kind": "int_const", "value": "0" },
+        },
+    });
+    let (_relations, rules, vars) = super::trust_mc_dataflow_chc_for_function(
+        &function,
+        super::ChcErrorMode::PostconditionGoal,
+        Some(&vc),
+    )
+    .expect("encoder runs")
+    .expect("the counting loop is checked arithmetic, so the coverage gate admits it");
+
+    let error_rules: Vec<_> = rules
+        .as_array()
+        .expect("rules array")
+        .iter()
+        .filter(|rule| rule["head"]["name"] == "error")
+        .collect();
+    assert_eq!(error_rules.len(), 1, "exactly one goal edge, at the return block: {error_rules:?}");
+    let body = &error_rules[0]["body"];
+    let rendered = serde_json::to_string(body).expect("serializable");
+    // The return place is COLLAPSED into the encoder's own name for the returned
+    // value, not carried alongside it. That substitution is what makes the goal
+    // solvable: left as a chain of copy equalities, neither single-engine PDR nor
+    // the adaptive portfolio converged on the real `f_loop` system in ~13 minutes,
+    // while the collapsed form is proved SAFE.
+    assert!(
+        !rendered.contains("\"_0\""),
+        "`_0` must be substituted away, not left as a copy chain: {rendered}"
+    );
+    // ... and the rule-level copy collapse takes it one step further, onto the
+    // block relation's OWN column, because an anchored name (one the relation
+    // carries) is always preferred as the class representative. That is the form
+    // proof-grade PDR can generalize on.
+    assert!(
+        rendered.contains("_cell_v10"),
+        "the goal must speak the block relation's own column: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"not\""),
+        "the goal edge must carry the obligation's negated conclusion: {rendered}"
+    );
+    // No structural edges: an unrelated panic must not block a postcondition proof.
+    assert!(
+        !rendered.contains("unreachable terminator"),
+        "PostconditionGoal emits no structural error edges: {rendered}"
+    );
+    assert!(
+        vars.iter().any(|var| var["name"] == "v1"),
+        "the encoder's own namespace is still declared: {vars:?}"
+    );
+}
+
+/// A function that never returns a value has no goal edge, and `error` would be
+/// unreachable VACUOUSLY — a false SAFE for whatever postcondition was
+/// redirected. Fall back to the flattened path instead.
+#[test]
+fn a_postcondition_goal_with_no_return_edge_falls_back() {
+    use trust_ir::{Block, BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId};
+
+    let n = ValueId::new(1);
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32);
+    bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+    let mut bb1 = Block::new(BlockId::new(1));
+    bb1.body.push(InstrNode::new(Inst::Br { target: BlockId::new(0), args: vec![] }));
+    let mut function =
+        Function::new(FuncId::new(0), "demo::diverges", FuncTyId::new(0), BlockId::new(0));
+    function.blocks.push(bb0);
+    function.blocks.push(bb1);
+
+    let vc = serde_json::json!({ "kind": "bool_const", "value": true });
+    assert!(
+        super::trust_mc_dataflow_chc_for_function(
+            &function,
+            super::ChcErrorMode::PostconditionGoal,
+            Some(&vc),
+        )
+        .expect("encoder runs")
+        .is_none(),
+        "no return block means no goal edge, which would prove `error` unreachable for free"
+    );
+    // And with no goal at all, likewise.
+    assert!(
+        super::trust_mc_dataflow_chc_for_function(
+            &postcondition_goal_counting_loop(),
+            super::ChcErrorMode::PostconditionGoal,
+            None,
+        )
+        .expect("encoder runs")
+        .is_none(),
+        "a PostconditionGoal encoding with no VC to place is not a proof of anything"
+    );
+}
+
+/// **THE FREE-BRANCH-GUARD DEFECT.** The fold modeled no boolean instruction:
+/// `Copy` and `BinOp` were gated on `ty.is_integer()` and there was no `UnOp`
+/// arm, so any boolean not produced directly by `ICmp` was havoc'd — and a
+/// `CondBr` guard is exactly such a value. The emitted system for the real
+/// bridge lowering of `while i < n` was
+///
+/// ```text
+///   bb4(c)     :- bb1(v0, c), v9 = c, v8 = (v9 lt v0), v11
+///   bb2(v0, c) :- bb1(v0, c), v9 = c, v8 = (v9 lt v0), not(v11)
+/// ```
+///
+/// with the comparison `v8` DEAD and the branch turning on a free `v11` that no
+/// rule defines. Both edges were unconditionally enabled, so `i < n` constrained
+/// nothing and the CFG was a nondeterministic choice.
+///
+/// The fixture below is deliberately shaped like the BRIDGE and not like
+/// `bridge_shaped_counting_loop`, which wires `ICmp` straight into `CondBr` and
+/// therefore could never have caught this: the real lowering interposes a
+/// `UnOp::Not` (which is why the loop-BODY edge carries `not(guard)` rather than
+/// `guard`), and that `Not` was the unmodeled link.
+#[test]
+fn a_negated_branch_guard_is_connected_to_the_comparison_it_came_from() {
+    use trust_ir::{
+        Block, BlockId, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, Ty, ValueId,
+    };
+
+    let n = ValueId::new(1);
+    let i = ValueId::new(2);
+    let cmp = ValueId::new(3);
+    let negated = ValueId::new(4);
+
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32).with_param(i, Ty::I32);
+    bb0.body.push(
+        InstrNode::new(Inst::ICmp { op: ICmpOp::Slt, ty: Ty::I32, lhs: i, rhs: n })
+            .with_result(cmp),
+    );
+    // The link the fold used to drop.
+    bb0.body.push(
+        InstrNode::new(Inst::UnOp { op: trust_ir::UnOp::Not, ty: Ty::Bool, operand: cmp })
+            .with_result(negated),
+    );
+    bb0.body.push(InstrNode::new(Inst::CondBr {
+        cond: negated,
+        then_target: BlockId::new(1),
+        then_args: vec![],
+        else_target: BlockId::new(2),
+        else_args: vec![],
+    }));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::guarded", FuncTyId::new(0), BlockId::new(0));
+    function.blocks.push(bb0);
+    function.blocks.push(Block::new(BlockId::new(1)));
+    function.blocks.push(Block::new(BlockId::new(2)));
+
+    let block = &function.blocks[0];
+    let frame = super::ChcDataflowFrame::build(&function);
+    let mut var_decls = super::ChcVarDecls::default();
+    let relation_args = frame.relation_arg_exprs(block, &mut var_decls);
+    let fold = super::chc_fold_block_body(block, &frame, &mut var_decls);
+    let grounded = dataflow_grounded_vars(&relation_args, &fold.constraints);
+
+    // The decisive assertion: the value the branch turns on is DEFINED, not free.
+    // Without the `UnOp` fold arm this name is absent and both edges are enabled.
+    assert!(
+        grounded.contains(&super::chc_value_var_name(negated)),
+        "the branch guard must be grounded in the comparison it came from, or the CFG is \
+         modeled as a nondeterministic choice and `i < n` constrains nothing: {grounded:?}"
+    );
+    // ... and it is grounded THROUGH the comparison, not by accident.
+    assert!(
+        grounded.contains(&super::chc_value_var_name(cmp)),
+        "the comparison itself must be grounded: {grounded:?}"
+    );
 }

@@ -8,12 +8,13 @@
 // modeled by the OPAQUE `idx_elem` cast carrier, so the delegate certifies FULLY
 // FAITHFUL modulo 3 WITHOUT a value theory.
 //
-// THE SHARP SOUNDNESS GATE — SAME WIDTH ONLY. `leading_zeros`/`ctlz` is
-// WIDTH-SENSITIVE (`ctlz(x as u64) != ctlz(x as u8)` for the same logical value), so
-// the delegation is bit-faithful ONLY when the cast preserves the WIDTH. A
-// DIFFERENT-width cast into the argument (even to the matching-width primary) MUST
-// DECLINE — the forgery panel below confirms each adversarial mutation declines the
-// recognizer (never a false witness; the kernel is never handed a wrong claim).
+// THE SHARP SIGNATURE GATE. The signed-primary specialization is SAME-WIDTH: a
+// cast whose destination does not match the certified callee's formal type must
+// decline. A later general lane may faithfully model a width-changing cast when
+// the certified callee has that exact formal type, using an opaque carrier keyed
+// by destination width/sign. That proves only model/program agreement for the
+// altered body; it does NOT assert that the body still has the library semantics
+// suggested by its def-path. The controls below keep those authorities separate.
 //
 // Uses ONLY the public API (`function_fully_faithful_witness_with_callees`,
 // `diagnose_fully_faithful_gate`, `CalleeFact`), so it exercises the same gate
@@ -120,8 +121,34 @@ fn set_callee(mut v: serde_json::Value, block: usize, callee: &str) -> Verifiabl
     serde_json::from_value(v).expect("mutated fn parses")
 }
 
-/// FAIL-CLOSED FORGERY PANEL — each adversarial mutation of a GENUINE signed
-/// delegate MUST DECLINE the fully-faithful witness (never certified) AND the
+/// Mutate the declared type of a Call destination without changing the
+/// certified callee. Synthetic MIR can express this even though rustc cannot;
+/// the certified signature gate must reject it.
+fn mutate_call_dest_ty(
+    mut v: serde_json::Value,
+    block: usize,
+    width: u64,
+    signed: bool,
+) -> VerifiableFunction {
+    let destination = v["body"]["blocks"][block]["terminator"]["Call"]["dest"]["local"]
+        .as_u64()
+        .expect("Call destination local") as usize;
+    let replacement = serde_json::json!({ "Int": { "width": width, "signed": signed } });
+    let local = v["body"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .iter_mut()
+        .find(|local| local["index"].as_u64() == Some(destination as u64))
+        .expect("declared Call destination local");
+    local["ty"] = replacement.clone();
+    if destination == 0 {
+        v["body"]["return_ty"] = replacement;
+    }
+    serde_json::from_value(v).expect("mutated fn parses")
+}
+
+/// FAIL-CLOSED FORGERY PANEL — each ill-typed, recursive, or result-recovery
+/// mutation of a GENUINE signed delegate MUST DECLINE the fully-faithful witness AND the
 /// production diagnose gate must NOT call it fully faithful. Because each declines
 /// at the RECOGNIZER, the kernel is never handed a wrong claim (kernel_rejected
 /// stays 0 by construction — no false witness is ever minted).
@@ -143,37 +170,29 @@ fn w_cast_arg_forgeries_all_decline() {
     let sb = "dumps/num__<impl i8>__swap_bytes.json";
 
     // F1 — DIFFERENT-WIDTH cast into arg (`self as u16` fed to the u8 primary): the
-    // width-sensitivity gate declines — the same bit pattern no longer reaches the
-    // same-width callee.
+    // exact actual/formal signature gate declines — a u16 actual cannot call the
+    // certified u8 primary.
     let f1 = mutate_cast_dest_ty(load_value(lz), 0, 16, false);
     // F2 — SELF-RECURSIVE callee (`num::<impl i8>::leading_zeros`): the self-call
     // guard declines (a callee's certificate cannot precede the caller's own).
     let f2 = set_callee(load_value(lz), 0, "num::<impl i8>::leading_zeros");
-    // F3 — non-bit-preserving SAME-SIGN WIDENING cast (`self as i16`): opposite-
-    // signedness is required AND same width — a widening sign-extend declines.
+    // F3 — non-bit-preserving SAME-SIGN WIDENING cast (`self as i16`) passed to
+    // the u8 primary: the exact actual/formal signature gate declines.
     let f3 = mutate_cast_dest_ty(load_value(lz), 0, 16, true);
-    // F4 — THE SHARP PROBE: a DIFFERENT-width cast (`self as u16`) fed to the
-    // MATCHING-width certified primary (`num::<impl u16>::leading_zeros`, which IS
-    // in the registry). This is a genuinely WRONG delegation (`ctlz` on 16 bits, not
-    // 8) that must STILL decline — the width gate refuses it before the callee
-    // resolution ever matters.
-    let f4 = {
-        let v = load_value(lz);
-        let v = set_callee(v, 0, "num::<impl u16>::leading_zeros");
-        // set_callee returned a VerifiableFunction; re-serialize to mutate the cast.
-        let vv = serde_json::to_value(&v).expect("reserialize");
-        mutate_cast_dest_ty(vv, 0, 16, false)
-    };
-    // F5 — DIFFERENT-WIDTH cast ON RESULT (`_3 as i16` instead of `_3 as i8`): the
+    // F4 — DIFFERENT-WIDTH cast ON RESULT (`_3 as i16` instead of `_3 as i8`): the
     // call-then-cast result-recovery arm's width gate declines.
-    let f5 = mutate_cast_dest_ty(load_value(sb), 1, 16, true);
+    let f4 = mutate_cast_dest_ty(load_value(sb), 1, 16, true);
+    // F5 — the u8 primary's certified return is u32, but the synthetic Call
+    // destination/whole-function return is forged to u16. Exact arguments are
+    // not enough: the complete certified signature must decline this edge.
+    let f5 = mutate_call_dest_ty(load_value(lz), 0, 16, false);
 
     for (name, f) in [
         ("F1 different-width cast into arg", f1),
         ("F2 self-recursive callee", f2),
         ("F3 same-sign widening cast into arg", f3),
-        ("F4 different-width cast into MATCHING-width primary", f4),
-        ("F5 different-width cast on result", f5),
+        ("F4 different-width cast on result", f4),
+        ("F5 certified return/destination type mismatch", f5),
     ] {
         assert!(
             function_fully_faithful_witness_with_callees(&f, &reg).is_none(),
@@ -182,4 +201,27 @@ fn w_cast_arg_forgeries_all_decline() {
         let diag = trust_clean::diagnose_fully_faithful_gate(&f, &reg);
         assert!(!diag.fully_faithful, "{name}: forgery must not be fully faithful");
     }
+}
+
+/// AUTHORITY-SEPARATION CONTROL — once both sides of the call edge say `u16`,
+/// the altered body is well typed and the general width-changing cast lane may
+/// model it opaquely. This is not a proof that the body implements the
+/// `i8::leading_zeros` library contract: no such value-level postcondition is
+/// authored here, and the carrier deliberately asserts no cast/ctlz equation.
+#[test]
+fn widthchanging_cast_to_matching_callee_is_faithfully_opaque() {
+    let reg = unsigned_primary_registry();
+    let v = set_callee(
+        load_value("dumps/num__<impl i8>__leading_zeros.json"),
+        0,
+        "num::<impl u16>::leading_zeros",
+    );
+    let f = mutate_cast_dest_ty(serde_json::to_value(v).expect("reserialize"), 0, 16, false);
+
+    assert!(
+        function_fully_faithful_witness_with_callees(&f, &reg)
+            .is_some_and(|certificate| certificate.is_modulo_3()),
+        "an exact u16 actual/formal edge is faithfully represented by the opaque cast carrier"
+    );
+    assert!(trust_clean::diagnose_fully_faithful_gate(&f, &reg).fully_faithful);
 }

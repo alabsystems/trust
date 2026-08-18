@@ -84,6 +84,8 @@ split-debuginfo = "unpacked"
 debug = false
 
 [patch.crates-io]
+# See the root manifest: memchr is first-party (crates/trust-memchr).
+memchr = { path = "trust-memchr" }
 rustc-hash = { path = "../first-party/ty/crates/tla-hash-fx" }
 rustc_version = { path = "../vendor/rustc_version_0_4_1" }
 
@@ -170,6 +172,7 @@ members = [
     "trust-disasm",
     "trust-loop",
     "trust-types",
+    "trust-symbols",
     "trust-upstream-compat",
     "trust-verifier-api",
     "trust-version",
@@ -194,6 +197,8 @@ members = [
     "trust-integration-tests",
     "trust-lift",
     "trust-machine-sem",
+    # first-party memchr; package name is `memchr` (see its manifest)
+    "trust-memchr",
     "trust-bmc",
     "trust-wp",
     "trust-vc-bridge",

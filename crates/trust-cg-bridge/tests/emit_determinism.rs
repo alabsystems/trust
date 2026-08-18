@@ -94,6 +94,7 @@ fn alu(name: &str, op: BinOp) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -158,6 +159,7 @@ fn author_max() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -247,6 +249,7 @@ fn author_clamp() -> VerifiableFunction {
             ],
             arg_count: 3,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -326,6 +329,7 @@ fn author_sum_loop() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -366,6 +370,7 @@ fn author_ptr_rw() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }

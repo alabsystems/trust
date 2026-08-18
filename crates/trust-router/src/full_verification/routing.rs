@@ -7,6 +7,7 @@ use trust_verifier_api::{
 
 use super::policy::{
     TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY, TRUST_VC_HARDENED_NAMESPACE,
+    TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +486,30 @@ pub(super) fn obligation_route_for_kind(kind: &ObligationKind) -> Option<Obligat
                 primary: PrimaryEngine::TrustMc,
                 proof_family: ProofFamily::TrustMcReachability,
                 minimum_assurance: RequiredAssurance::SmtBacked,
+            }
+        }
+        // `trust.vc.unbounded_allocation` (#nia-oom) is trust-vc-owned
+        // end-to-end on the BoundsCheck precedent above: the compiler
+        // constructs a MIR-memory proof unit whose predicate is the negated
+        // guard-conjoined `count >= CEILING` VC, and TrustVcTrustEngine
+        // discharges it with a replayable certificate at import time. Routing
+        // is DISPATCH, never proof: acceptance still requires the validated
+        // proof unit plus the replayed certificate, and a payload-less or
+        // unprovable obligation falls closed per-obligation.
+        //
+        // NEVER re-route this namespace to trust-mc / the whole-function CHC:
+        // that proof does not encode the capacity budget and exactly that
+        // mapping false-proved unbounded allocations (the recorded P0 at
+        // trust-verifier-api's `TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_
+        // NAMESPACE` doc).
+        ObligationKind::Custom { namespace, .. }
+            if namespace == TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE =>
+        {
+            ObligationRoute {
+                obligation_kind: "UnboundedAllocation",
+                primary: PrimaryEngine::TrustVc,
+                proof_family: ProofFamily::TrustVcOwnership,
+                minimum_assurance: RequiredAssurance::Sound,
             }
         }
         ObligationKind::Custom { .. } => return None,

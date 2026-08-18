@@ -132,6 +132,7 @@ fn make_checked_binop(name: &str, def_path: &str, op: BinOp) -> VerifiableFuncti
             ],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -174,6 +175,7 @@ fn make_division(name: &str, def_path: &str) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -219,6 +221,7 @@ fn make_array_index(name: &str, def_path: &str) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -272,6 +275,7 @@ fn make_with_contract(name: &str, def_path: &str) -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
@@ -301,6 +305,7 @@ fn make_noop(name: &str, def_path: &str) -> VerifiableFunction {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -568,6 +573,7 @@ fn test_m3_cross_function_contracts() {
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
@@ -626,6 +632,7 @@ fn test_m3_cross_function_contracts() {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![
             Contract {

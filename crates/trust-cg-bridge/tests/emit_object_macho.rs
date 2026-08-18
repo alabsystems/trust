@@ -41,6 +41,7 @@ fn make_add() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -70,6 +71,7 @@ fn make_identity() -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -92,6 +94,7 @@ fn make_unit_main() -> VerifiableFunction {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -180,6 +183,7 @@ fn make_checked_div_option() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: option_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -225,6 +229,7 @@ fn make_pair_helper() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: pair_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -275,6 +280,7 @@ fn make_pair_via_helper_call() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: pair_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -333,6 +339,7 @@ fn make_checked_add_overflowing() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -383,6 +390,7 @@ fn make_checked_add_overflow_main() -> VerifiableFunction {
             ],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -480,6 +488,7 @@ fn emit_module_objects_splits_two_function_module_with_stable_names_and_native_a
         object_path: None,
         function_count: 2,
         source_functions: None,
+        linkage: Vec::new(),
     };
 
     let objects = backend.emit_module_objects(&module).expect("emit_module_objects should succeed");
@@ -505,6 +514,7 @@ fn emit_module_objects_rejects_empty_module_without_object_output() {
         object_path: None,
         function_count: 0,
         source_functions: None,
+        linkage: Vec::new(),
     };
 
     let err = backend
@@ -593,6 +603,7 @@ fn emit_object_helper_call_struct_return_regression_emits_native_objects() {
         object_path: None,
         function_count: 2,
         source_functions: None,
+        linkage: Vec::new(),
     };
     let objects = backend
         .emit_module_objects(&module)

@@ -24,6 +24,19 @@ pub(super) fn generate_v2_contract_vcs_impl(
         None => build_semantic_guard_map(func),
     };
     let may_reassigned = v2_may_reassigned_per_block(func);
+    // Every `&mut`-parameter place the body stores to — the population the
+    // return-edge merge pin is allowed to state a reaching-value identity for.
+    // Function-wide on purpose: the writing block need not be a predecessor of
+    // the `Return` block at all (the ladder's top rung writes the flag three
+    // blocks upstream of the exit), which is exactly why the per-predecessor
+    // statement scan in `with_out_param_pins` could not see it.
+    let out_param_store_sorts = out_param_store_sorts(func);
+    // The authored `requires` clauses the assumption gate DROPPED — the entry
+    // hypothesis this function's postcondition VCs are assembled WITHOUT. Empty
+    // (the overwhelmingly common case) unless the function declares a `requires`
+    // and none of them is carried in `func.preconditions`; see the third
+    // silent-weakening tripwire below.
+    let dropped_requires = dropped_requires_clauses(func);
     let empty_kill: FxHashSet<String> = FxHashSet::default();
     let contract_metadata =
         if func.spec.is_empty() { None } else { Some(func.spec.to_contract_metadata()) };
@@ -101,14 +114,14 @@ pub(super) fn generate_v2_contract_vcs_impl(
     // `{base}_value*` / `{base}_sign` / `.__trust_ok_i` — the lowered
     // `matches!(r, Ok(..) if ..)` / `is_ok` / `unwrap` / `is_positive` idioms).
     // This lane grounds NONE of those names: the return-value pins below connect
-    // `_0`, never `_0_discr`/`_0_value*`, so `Not(post)` stays satisfiable by
+    // `_0`, never `_0__discr`/`_0__value*`, so `Not(post)` stays satisfiable by
     // havoc REGARDLESS of the body and the obligation is reported Failed with a
     // counterexample MINTED over the under-constrained encoding — not a program
     // trace. Such a postcondition must land as the fail-closed NON-REFUTABLE
     // Unknown (below), never as a refutable per-return-block VC, and never be
     // silently dropped (a false-PROVE).
     // Names the body-aware lane can now GROUND (Option/Result-return
-    // `_0_discr` — plus `_0_value` for an integer payload — when every return
+    // `_0__discr` — plus `_0__value` for an integer payload — when every return
     // path pins them in-body; empty otherwise — see
     // `enum_return_grounded_model_vars`). Subtracting these from the per-post
     // ungrounded set lets an Option<integer>/Result postcondition survive into
@@ -460,7 +473,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 formula = with_pins;
 
                 // Trust (Option/Result-return discriminant/value pin): ground the
-                // synthetic spec-model terms `_0_discr` / `_0_value` that the
+                // synthetic spec-model terms `_0__discr` / `_0__value` that the
                 // contract parser mints for `result.is_none()`/`is_some()`/
                 // `is_ok()`/`is_err()`/`unwrap()` to the body's ACTUAL in-body
                 // `_0 = Some(x)` / `_0 = None` / `_0 = Ok(x)` / `_0 = Err(e)`
@@ -474,23 +487,23 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // (`std_enum_model_discr`), NOT the raw machine variant index:
                 // Option's variant order matches the convention (None=0, Some=1 —
                 // identity), while Result's is INVERTED (`Ok` is machine variant 0
-                // but must pin `_0_discr==1`, the parser's `is_ok ⟹ _0_discr!=0`;
-                // `Err` is variant 1 and pins `_0_discr==0`). Pinning the raw
+                // but must pin `_0__discr==1`, the parser's `is_ok ⟹ _0__discr!=0`;
+                // `Err` is variant 1 and pins `_0__discr==0`). Pinning the raw
                 // index for Result would swap `is_ok`/`is_err` polarity — a
                 // simultaneous false-PROVE and false-FAIL. Pin at MOST ONE
                 // discriminant per return path (last / nearest-to-return wins) so
                 // two differing-variant assignments can never conjoin
-                // `_0_discr==0 ∧ _0_discr==1` into a vacuous UNSAT (a
+                // `_0__discr==0 ∧ _0__discr==1` into a vacuous UNSAT (a
                 // false-PROVE). SOUND: `_0 = Some(x)` / `_0 = Ok(x)` literally
-                // carries its variant and payload x, so `_0_discr==<model> ∧
-                // _0_value==x` are exact identities of the constructed value under
+                // carries its variant and payload x, so `_0__discr==<model> ∧
+                // _0__value==x` are exact identities of the constructed value under
                 // the parser's reading; `_0 = None` / `_0 = Err(e)` is
-                // `_0_discr==0` exactly — a FALSE postcondition still refutes
+                // `_0__discr==0` exactly — a FALSE postcondition still refutes
                 // (every term pinned to its genuine value, never credited).
-                // `_0_value` is pinned only on the payload variant's path
+                // `_0__value` is pinned only on the payload variant's path
                 // (`Some`/`Ok`) with an integer payload; leaving it free on the
                 // other path — and on non-integer payloads (ny-cert's Rat/Vec
-                // shapes, whose `_0_value*` terms the gate keeps UNGROUNDED so
+                // shapes, whose `_0__value*` terms the gate keeps UNGROUNDED so
                 // they never reach this refutable lane) — is sound (a free var
                 // only adds SAT/refute, never manufactures UNSAT/proof).
                 let enum_return_pin =
@@ -511,13 +524,13 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     });
                 if let Some((discr, payload)) = enum_return_pin {
                     let discr_def = Formula::Eq(
-                        Box::new(Formula::var_owned("_0_discr".to_string(), Sort::Int)),
+                        Box::new(Formula::var_owned("_0__discr".to_string(), Sort::Int)),
                         Box::new(Formula::Int(discr)),
                     );
                     formula = Formula::And(vec![discr_def, formula]);
                     if let Some(pf) = payload {
                         let value_def = Formula::Eq(
-                            Box::new(Formula::var_owned("_0_value".to_string(), Sort::Int)),
+                            Box::new(Formula::var_owned("_0__value".to_string(), Sort::Int)),
                             Box::new(pf),
                         );
                         formula = Formula::And(vec![value_def, formula]);
@@ -525,7 +538,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 }
 
                 // Trust (len-witness pin, b62): ground the CREDITED payload-
-                // component length pairs (`_0_value.<i>.<j>_len` — the lowered
+                // component length pairs (`_0__value.<i>.<j>_len` — the lowered
                 // crown `matches!(r, Ok(c) if c.….len() != c.….len())` idiom) on
                 // this return path, via the SAME per-path resolver the gate ran
                 // (`len_witness_path_pins` — gate/pin agreement is what keeps a
@@ -547,7 +560,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 }
 
                 // Trust (ordering/sign-witness pin, b62 F4): ground the
-                // CREDITED `__trust_ok` pair / `_0_value_sign` terms (the
+                // CREDITED `__trust_ok` pair / `_0__value__sign` terms (the
                 // lowered ny selfcheck/branch `matches!(r, Ok((d, c)) if
                 // d > c)` / `Ok(c) if c.is_positive()` idioms over opaque
                 // `Rat` arena handles) on this return path, via the SAME
@@ -759,6 +772,77 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     }
                 }
 
+                // Trust (EARLY-RETURN / DIVERGENT-EXIT postcondition
+                // false-refutation, 2026-08-02): the RETURN-EDGE GUARD and the
+                // MERGE PIN — the two facts a MULTI-PREDECESSOR `Return` block
+                // needs and that no existing lane supplies.
+                //
+                // The obligation body is versioned at the return block's end.
+                // With several return predecessors `version_token_at` hands a
+                // `&mut`-parameter place the reaching-def JOIN token
+                // (`self*.0.0#e_s1_0`), while EVERY conjunct that could
+                // constrain it — the out-parameter pin, the block defs, the
+                // semantic guards — carries a SINGLE establish token
+                // (`self*.0.0#s1_0`) or the bare entry name. The join name is
+                // name-disjoint from all of them, so it is FREE, and
+                // `Not(post)` is satisfiable BY HAVOC. Confirmed end to end:
+                // `ensures !self.st.f` over `if !self.st.f { return; }
+                // self.st.f = false;` emitted
+                // `(and true (not (not |self*.0.0#e_s1_0|)))` — a query about
+                // nothing — and its EXACT NEGATION emitted
+                // `(and true (not |self*.0.0#e_s1_0|))`, so `P` and `!P` came
+                // back with byte-identical verdicts. A verifier that answers
+                // the same for a clause and its negation is not checking that
+                // clause at all.
+                //
+                // Both facts are PER-PREDECESSOR, which is exactly what this
+                // VC is: `vc_blocks` is the return block's predecessor list, so
+                // this row quantifies over the executions that enter the return
+                // block through `vc_block` and no others.
+                //
+                // Conjoined HERE — after the deref-load re-conjoin above, which
+                // renames the whole formula at the RETURN block and would
+                // rewrite an entry-valued pin operand into the very join name
+                // the pin exists to constrain — and re-run through
+                // `v2_formula_with_block_defs` at the PREDECESSOR so the
+                // relevance filter can finally keep the defs that mention the
+                // names these facts introduce (the `_2 == self*.0.0` tying the
+                // guard temp to the flag was previously pruned as irrelevant,
+                // because nothing else in the VC mentioned either name). That
+                // re-run renames at `(vc_block, vc_block.stmts.len())`, which is
+                // the IDENTITY on both facts: the guard is conjoined bare and is
+                // MEANT to be stamped at that point, and the pin's predecessor
+                // operand is bare exactly when `version_token_at` is `None`
+                // there, so it renames to itself.
+                if vc_block.id != block.id {
+                    let (merge_pins, store_grounds) = return_edge_merge_pins(
+                        func,
+                        &sv,
+                        vc_block,
+                        block,
+                        &post,
+                        &out_param_store_sorts,
+                    );
+                    let mut edge_facts: Vec<Formula> = Vec::new();
+                    edge_facts.extend(return_edge_guard(func, vc_block, block.id));
+                    edge_facts.extend(merge_pins);
+                    if !edge_facts.is_empty() {
+                        edge_facts.push(formula);
+                        formula = Formula::And(edge_facts);
+                        formula = v2_formula_with_block_defs(func, vc_block, formula);
+                    }
+                    // The upstream store's own defining equation is already
+                    // stamped at ITS establish point, so it is conjoined AFTER
+                    // the predecessor-point rename above — re-stamping its
+                    // operands at the predecessor would read them at the wrong
+                    // program point.
+                    if !store_grounds.is_empty() {
+                        let mut with_grounds = store_grounds;
+                        with_grounds.push(formula);
+                        formula = Formula::And(with_grounds);
+                    }
+                }
+
                 if let Some(path_defs) = path_definition_map.get(&vc_block.id)
                     && !path_defs.is_empty()
                 {
@@ -944,7 +1028,41 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // still meaningful and must proceed. So each residue name is checked
                 // against the ASSEMBLED formula under the exact version token the
                 // obligation body carries, mirroring `formula_has_return_slot_pin`.
-                let unconstrained_out_param = unpinned_out_params.iter().find(|subject| {
+                //
+                // Trust (2026-08-02): the ledger is widened from "the two
+                // scanned blocks store it" to "the FUNCTION stores it", because
+                // the narrow version had a hole exactly where the ladder's top
+                // rung lives. `with_out_param_pins` scans only `[predecessor,
+                // return block]`, so when the store sits further upstream —
+                // `self.st.f = false` three blocks before the exit, with an
+                // opaque `self.helper()` call on one arm in between — `required`
+                // came back EMPTY, no tripwire fired, and the row was emitted as
+                // a refutable query over the unconstrained join name. That row
+                // then "refuted" the clause AND its exact negation identically,
+                // which is the discrimination collapse itself: a silent gap,
+                // reported as a verdict.
+                //
+                // `out_param_store_sorts` is the function-wide population, so a
+                // clause-mentioned place the body writes ANYWHERE is now
+                // accounted for. A place the body never writes is still absent
+                // from it and stays genuinely refutable, which is what makes
+                // `ensures self.n == 0` over an empty body correctly fail.
+                let clause_written_out_params: Vec<String> = {
+                    let mut names: Vec<String> = formula_var_sorts(&post)
+                        .into_iter()
+                        .map(|(name, _)| {
+                            name.split('#').next().unwrap_or(&name).to_string()
+                        })
+                        .filter(|base| {
+                            out_param_store_sorts.get(base).is_some_and(Option::is_some)
+                        })
+                        .collect();
+                    names.extend(unpinned_out_params.iter().cloned());
+                    names.sort();
+                    names.dedup();
+                    names
+                };
+                let unconstrained_out_param = clause_written_out_params.iter().find(|subject| {
                     let versioned = match sv.version_token_at(
                         func,
                         block.id,
@@ -965,6 +1083,88 @@ pub(super) fn generate_v2_contract_vcs_impl(
                              body writes but no conjunct pins at the obligation's read version; \
                              refusing a refutable query over a free post-state"
                         ),
+                        &format!("{post:?}"),
+                        clause_metadata,
+                    ));
+                    continue;
+                }
+
+                // Trust (P0 dropped-entry-hypothesis postcondition
+                // false-refutation, 2026-08-06) — the ENTRY-HYPOTHESIS sibling
+                // of the two tripwires above.
+                //
+                // `gate_contract_preconditions` drops the WHOLE contract-derived
+                // precondition set on any gate failure (a body local shadowing a
+                // parameter debug name, a predicate outside the assumable
+                // fragment, a predicate with no ground witness). Dropping is
+                // correct there — assuming a fact that binds the wrong variable
+                // is a false-PROVE. But this lane then assembles the
+                // postcondition VC over an entry state that NOTHING constrains
+                // beyond the always-true synthetic facts appended AFTER the gate
+                // (integer/char/discriminant ranges). `Not(post)` becomes
+                // satisfiable at an entry state the author's `requires` forbids,
+                // the row is reported Failed, and the full verifier mints
+                // `verified_counterexample = true` against CORRECT code —
+                // measured on `#[requires(n >= 0)] #[ensures(|r| *r >= 0)] fn
+                // f(n: i32) -> i32 { n }`, where the "counterexample" is
+                // `n = -1`, a call the precondition forbids. Same doctrine as
+                // the out-parameter twin: fail to the VISIBLE unsupported row
+                // instead of refuting.
+                //
+                // PRECISION. The trigger is not "the gate dropped something" and
+                // not "the clause mentions a constrained parameter" — either
+                // would suppress rows that are perfectly meaningful without the
+                // hypothesis. It is: EVERY counterexample that can be EXHIBITED
+                // for this assembled row is an entry state the dropped
+                // `requires` excludes (`only_excluded_counterexamples`). Firing
+                // therefore requires a concrete model in hand, so:
+                //   * a PROVABLE row has no model, none is found, and the row is
+                //     emitted unchanged — `ensures(*ret >= n)` over `{ n }` with
+                //     the same dropped `requires` still proves;
+                //   * a GENUINE bug whose counterexample satisfies the
+                //     precondition is found to be genuine and still refutes —
+                //     `requires(n >= 0)` with `ensures(|r| *r >= 5)` over `{ n }`
+                //     admits `n == 0`, which the precondition allows.
+                //
+                // TWO NAMESPACES. The clause is written in the SOURCE's
+                // spelling and this row in the BODY's, and they diverge exactly
+                // where the gate drops: for `{ let x = n; x }`,
+                // copy-propagation parks the body `let` on the parameter local
+                // and the last-write-wins debug-name collapse names local 1
+                // `x`, so the row reads `x`/`_0` while the clause reads `n` —
+                // one entity, parameter position 1, under two spellings. A
+                // spelling-only relevance test never connects them, which is
+                // why that case still minted `verified_counterexample = true`
+                // after the `__ret` fix. `forced_parameter_alias` recovers the
+                // correspondence by parameter POSITION and declines whenever it
+                // is not uniquely determined; the restatement it enables lives
+                // and dies inside `only_excluded_counterexamples` (which
+                // returns `bool`), so a clause the gate refused to assume can
+                // never reach an emitted formula.
+                //
+                // The search is bounded and fragment-limited, and every failure
+                // to decide declines to fire, so this is an INCOMPLETE fix by
+                // construction: false refutations survive wherever a model
+                // cannot be exhibited inside the fragment. That is an honest
+                // gap, not a claim. The Machine{w} lane is excluded outright —
+                // its emitted formula is the declared-width QF_BV translation
+                // below, and a model of the mathematical-`Int` spelling is not
+                // a model of that.
+                if !*machine_lane
+                    && !dropped_requires.is_empty()
+                    && only_excluded_counterexamples(func, &formula, &dropped_requires)
+                {
+                    vcs.push(contracts::spec_unverifiable_vc(
+                        func,
+                        v2_block_span(func, vc_block),
+                        "the authored `requires` was not assumed for body verification (see the \
+                         `is not assumed for body verification` warning on this function), and \
+                         every counterexample this row admits is an entry state that `requires` \
+                         excludes; refusing a refutable query over an under-constrained entry \
+                         state. To get a verdict, remove the reason the precondition was dropped: \
+                         rename the body local that shadows the parameter, restate the predicate \
+                         over the parameters directly, or replace an unsatisfiable predicate with \
+                         one that has a witness",
                         &format!("{post:?}"),
                         clause_metadata,
                     ));
@@ -1186,7 +1386,24 @@ pub(super) fn formula_has_return_slot_pin(formula: &Formula) -> bool {
 pub(super) fn formula_pins_var_name(formula: &Formula, name: &str) -> bool {
     match formula {
         Formula::And(conjuncts) => conjuncts.iter().any(|c| formula_pins_var_name(c, name)),
-        Formula::Eq(lhs, _) => matches!(&**lhs, Formula::Var(n, _) if n == name),
+        // Trust: a DISJUNCTION pins the name only when EVERY arm does. The
+        // path-guard lane wraps the assembled VC as `Or([And([guards.., body]),
+        // ..])` — one arm per path to the predecessor — so a pin conjoined
+        // before that wrap lands inside every arm and IS a pin, while an arm
+        // that leaves the name free makes the whole row satisfiable by havoc
+        // through that arm alone. Without this arm the test answered `false`
+        // for every multi-path VC, which would fire the tripwire on rows whose
+        // post-state is fully constrained.
+        Formula::Or(arms) => !arms.is_empty() && arms.iter().all(|a| formula_pins_var_name(a, name)),
+        // Trust: a SELF-equality is not a pin. `x == x` constrains nothing, yet
+        // it would satisfy the shape test and silently suppress the
+        // silent-weakening tripwire — converting the VISIBLE fail-closed row
+        // into exactly the invisible free-variable query the tripwire exists to
+        // prevent. (A tautology can be assembled by a later whole-formula
+        // rename collapsing both operands of a genuine pin onto one name.)
+        Formula::Eq(lhs, rhs) => {
+            matches!(&**lhs, Formula::Var(n, _) if n == name) && **lhs != **rhs
+        }
         _ => false,
     }
 }
@@ -1437,6 +1654,283 @@ fn is_out_param_place(func: &VerifiableFunction, place: &Place) -> bool {
         return false;
     }
     matches!(decl.ty, Ty::Ref { mutable: true, .. })
+}
+
+/// Every `&mut`-PARAMETER place the body STORES TO, keyed by the name the
+/// contract parser spells it with, valued by the place's sort.
+///
+/// This is the population the postcondition lane can legitimately reason about
+/// as a POST-STATE: a place the body never writes is not a post-state at all
+/// (`ensures self.n == 0` over an empty body is genuinely refutable and must
+/// stay so), and a place reached other than through a `&mut` parameter is
+/// excluded by `is_out_param_place` for the reasons documented there.
+///
+/// A name STORED AT TWO DIFFERENT SORTS is dropped: the sort disagreement means
+/// the name cannot be unified with the clause's reading of it, and guessing
+/// would risk pinning a Bool place under an Int reading.
+fn out_param_store_sorts(func: &VerifiableFunction) -> FxHashMap<String, Option<Sort>> {
+    let mut sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            let Statement::Assign { place, .. } = stmt else { continue };
+            if !is_out_param_place(func, place) {
+                continue;
+            }
+            let Some(sort) = crate::place_sort(func, place) else { continue };
+            sorts
+                .entry(crate::place_to_var_name(func, place))
+                .and_modify(|slot| {
+                    if slot.as_ref() != Some(&sort) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(sort));
+        }
+    }
+    sorts
+}
+
+/// The condition on the control-flow edge `pred -> ret`, as a DISJUNCTION.
+///
+/// The early-return path's postcondition is true BECAUSE of this guard —
+/// `if !self.st.f { return; }` returns only when the flag is ALREADY false, so
+/// the clause holds trivially there — and no existing lane supplies it. The
+/// path-guard lane keys on `vc_block` (`guard_paths_map.get(&vc_block.id)`), so
+/// it contributes the guards that reach the PREDECESSOR and stops: the one edge
+/// that selects THIS return is precisely the edge it drops. On the ladder's
+/// minimal reproducer the predecessor is the ENTRY block, whose guard set is
+/// empty, so the VC carried no branch information whatsoever.
+///
+/// SOUNDNESS — THE DISJUNCTION IS LOAD-BEARING. A `switchInt` may reach the same
+/// target on several values (`0 | 1 => return`). Conjoining those guards would
+/// assert `discr == 0 && discr == 1`: an UNSATISFIABLE premise makes the whole
+/// VC vacuously UNSAT, which the "SAT iff violation" convention reads as PROVED
+/// — a false proof minted out of nothing. The disjunction is the true edge
+/// condition. An edge that is also reachable UNGUARDED (`Goto`, a `Call` /
+/// `Assert` success edge) constrains nothing at all, so `None` is returned and
+/// no premise is added.
+///
+/// Returned BARE (unversioned) on purpose: the caller re-runs
+/// `v2_formula_with_block_defs` at `pred`'s terminal point, which stamps the
+/// guard's reads at exactly the program point they are evaluated — the same
+/// treatment `v2_formula_with_path_guards` gives every other path guard.
+fn return_edge_guard(
+    func: &VerifiableFunction,
+    pred: &trust_types::BasicBlock,
+    ret: BlockId,
+) -> Option<Formula> {
+    if !v2_terminator_targets(&pred.terminator).contains(&ret) {
+        return None;
+    }
+    // Reachable without taking any guarded clause: the edge asserts nothing.
+    if pred.terminator.unguarded_successors().contains(&ret) {
+        return None;
+    }
+    let mut disjuncts: Vec<Formula> = Vec::new();
+    for guarded in pred.terminator.discovered_clauses(pred.id) {
+        if matches!(guarded.target, trust_types::ClauseTarget::Block(t) if t == ret) {
+            disjuncts.push(guards::guard_to_formula(func, &guarded.guard));
+        }
+    }
+    match disjuncts.len() {
+        0 => None,
+        1 => disjuncts.pop(),
+        _ => Some(Formula::Or(disjuncts)),
+    }
+}
+
+/// The REACHING-VALUE IDENTITY across one return edge, for every
+/// `&mut`-parameter place the clause mentions.
+///
+/// `place#<join token at the return block> == place#<token at this
+/// predecessor's exit>`.
+///
+/// This VC is generated ONCE PER RETURN PREDECESSOR, so it quantifies exactly
+/// over the executions that enter `ret` through `pred`. Along every one of
+/// those, the place's value at `ret`'s entry IS its value at `pred`'s exit —
+/// nothing else runs in between. The equality is therefore a TRUE fact of every
+/// execution this row covers, and conjoining it removes only models that
+/// correspond to NO execution. It can turn a spurious refutation into a proof;
+/// it cannot make a violated clause unsatisfiable, because the predecessor-side
+/// token is itself constrained only by the body's own stores (the same-block pin
+/// lane and the block defs), never credited with a value the body did not write.
+///
+/// THREE GATES KEEP THE EQUALITY TRUE. Each one, if dropped, would be a false-
+/// PROOF vector, not merely a precision loss:
+///
+///   1. THE RETURN BLOCK MUST NOT WRITE THE PLACE before the use point. If it
+///      does, the obligation reads that block's OWN establish token and the
+///      predecessor's exit value is stale — pinning them equal would assert
+///      that a store did not happen. Checked by requiring the use-point token to
+///      equal the block's ENTRY token (`stmt_idx = 0`), i.e. by asking the SAME
+///      oracle that renamed the obligation rather than re-deriving liveness with
+///      a second, forkable rule.
+///
+///   2. THE PREDECESSOR'S TERMINATOR MUST NOT WRITE THE PLACE. A `Call` taking
+///      `&mut self` runs AFTER the block's statements, so the post-statement
+///      value is not what reaches `ret`. `terminator_def_names` is the same
+///      oracle the path-def lane kills stale facts with, and its overlap test
+///      catches a havoc of any ancestor (`self` covers `self*.0.0`).
+///
+///   3. THE TWO TOKENS MUST DIFFER. An equal pair is the single-predecessor
+///      case already owned by the same-block pin lane, and emitting `x == x`
+///      there would be worse than useless: `formula_pins_var_name` would count
+///      the tautology as a pin and suppress the silent-weakening tripwire,
+///      converting a VISIBLE fail-closed row into an invisible free-variable
+///      query.
+///
+/// COMPLETENESS IS UNTOUCHED. A genuinely violating execution reaches the return
+/// block through SOME predecessor, and that predecessor's own row still captures
+/// it with its own pins — which is why the false twin of every ladder rung still
+/// refutes, from the body's genuine stored value rather than from havoc.
+fn return_edge_merge_pins(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    pred: &trust_types::BasicBlock,
+    ret: &trust_types::BasicBlock,
+    post: &Formula,
+    out_params: &FxHashMap<String, Option<Sort>>,
+) -> (Vec<Formula>, Vec<Formula>) {
+    if out_params.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // Gate 2: anything the predecessor's TERMINATOR can write is off limits.
+    let term_defs = terminator_def_names(func, pred);
+
+    // Sorts the CLAUSE uses, keyed by base (unversioned) name — the same
+    // ambiguity discipline as `with_out_param_pins`.
+    let mut clause_sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
+    for (name, sort) in formula_var_sorts(post) {
+        let base = name.split('#').next().unwrap_or(&name).to_string();
+        clause_sorts
+            .entry(base)
+            .and_modify(|slot| {
+                if slot.as_ref() != Some(&sort) {
+                    *slot = None;
+                }
+            })
+            .or_insert(Some(sort));
+    }
+
+    let mut subjects: Vec<&String> = clause_sorts.keys().collect();
+    subjects.sort();
+
+    let mut pins = Vec::new();
+    let mut grounds = Vec::new();
+    for subject in subjects {
+        let Some(Some(clause_sort)) = clause_sorts.get(subject) else { continue };
+        // Only a place this body actually STORES TO through a `&mut` parameter,
+        // at a sort that agrees with the clause's reading of it.
+        let Some(Some(place_sort)) = out_params.get(subject) else { continue };
+        if place_sort != clause_sort {
+            continue;
+        }
+        if term_defs.iter().any(|d| place_names_overlap(d, subject)) {
+            continue; // gate 2
+        }
+        let use_tok = sv.version_token_at(func, ret.id, ret.stmts.len(), subject);
+        // Gate 1: the use-point token must BE the return block's entry token —
+        // otherwise the return block itself rewrote the place.
+        if use_tok != sv.version_token_at(func, ret.id, 0, subject) {
+            continue;
+        }
+        let Some(use_tok) = use_tok else { continue };
+        let pred_tok = sv.version_token_at(func, pred.id, pred.stmts.len(), subject);
+        if pred_tok.as_deref() == Some(use_tok.as_str()) {
+            continue; // gate 3
+        }
+        // GATE 4 — NEVER TRADE A VISIBLE GAP FOR AN INVISIBLE ONE. The pin makes
+        // the join name a constrained name, which is exactly what the
+        // silent-weakening tripwire below tests for; emitting it when the
+        // PREDECESSOR side is itself an ungrounded havoc would suppress the
+        // VISIBLE fail-closed row and leave the same refutable query over a free
+        // post-state, now invisible. So the predecessor side must be one of the
+        // two shapes this lane can actually account for:
+        //
+        //   * `None` — the ENTRY value. The row then says "the post-state IS the
+        //     pre-state", which is the literal truth of an early-return path and
+        //     is what lets the return-edge guard decide the clause. A clause the
+        //     guard does NOT decide stays genuinely refutable, as it must.
+        //   * a SINGLE statement establish token `s{b}_{k}` — one store reaches
+        //     `pred`'s exit along every path, so that store certainly executed
+        //     and its value can be pinned (below).
+        //
+        // A JOIN token (several stores reach) or a terminator havoc token
+        // (`s{b}_t`) grounds nothing: no pin is emitted and the row keeps
+        // today's fail-closed behaviour.
+        let ground = match &pred_tok {
+            None => None,
+            Some(tok) => match out_param_store_at_token(func, sv, subject, tok) {
+                Some(fact) => Some(fact),
+                None => continue,
+            },
+        };
+        let pred_name = match &pred_tok {
+            Some(tok) => format!("{subject}#{tok}"),
+            None => subject.clone(),
+        };
+        pins.push(Formula::Eq(
+            Box::new(Formula::var_owned(format!("{subject}#{use_tok}"), place_sort.clone())),
+            Box::new(Formula::var_owned(pred_name, place_sort.clone())),
+        ));
+        grounds.extend(ground);
+    }
+    (pins, grounds)
+}
+
+/// The defining equation of the store that mints `subject#{token}`, when
+/// `token` names one — `subject#s{b}_{k} == <the rvalue of block b's statement
+/// k>`.
+///
+/// The out-parameter pin lane refuses this whenever the obligation's own read
+/// token differs from the store's (its liveness gate), which is correct for a
+/// SAME-BLOCK pin but leaves the multi-block case with nothing: on the ladder's
+/// top rung the flag is stored three blocks upstream of the exit, so no lane
+/// scanning `[predecessor, return block]` can ever see it. The merge pin above
+/// supplies the missing link `join == s{b}_{k}`; this supplies the value.
+///
+/// SOUNDNESS. `subject#s{b}_{k}` is the SSA name for the value block `b`'s
+/// statement `k` stores, so the equation is that statement's own semantics — it
+/// pins the place to the value the BODY writes and can never credit a value the
+/// body did not write, which is why the false twin of every rung still refutes.
+/// The caller has already established that this token is the SINGLE reaching
+/// definition at the predecessor's exit, so the store certainly executed on
+/// every execution this row covers. Reads inside the rvalue are versioned at the
+/// read-point `k` — the values BEFORE this write — so a self-referential store
+/// (`*x = *x + 1`) yields `x*_new == x*_old + 1` rather than the unsatisfiable
+/// `x* == x* + 1`, exactly as `with_out_param_pins` does.
+///
+/// Returns `None` — no pin, fail closed — for anything outside that shape: a
+/// token that is not a single statement establish token, a statement that does
+/// not store `subject`, a `CheckedBinaryOp` or array-theory store (owned by
+/// their own encodings), or an rvalue the encoder cannot lower.
+fn out_param_store_at_token(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    subject: &str,
+    token: &str,
+) -> Option<Formula> {
+    let (block_part, stmt_part) = token.strip_prefix('s')?.split_once('_')?;
+    let block_idx: usize = block_part.parse().ok()?;
+    let stmt_idx: usize = stmt_part.parse().ok()?;
+    let block = func.body.blocks.get(block_idx).filter(|b| b.id.0 == block_idx)?;
+    let stmt = block.stmts.get(stmt_idx)?;
+    let Statement::Assign { place, rvalue, .. } = stmt else { return None };
+    if !is_out_param_place(func, place) || crate::place_to_var_name(func, place) != subject {
+        return None;
+    }
+    if matches!(rvalue, Rvalue::CheckedBinaryOp(..))
+        || crate::is_array_theory_element_store(func, place.local, stmt)
+    {
+        return None;
+    }
+    let sort = crate::place_sort(func, place)?;
+    let value = crate::chc::rvalue_to_formula(func, rvalue).ok()?;
+    let value = version_rename_at(&value, sv, func, block.id, stmt_idx);
+    Some(Formula::Eq(
+        Box::new(Formula::var_owned(format!("{subject}#{token}"), sort)),
+        Box::new(value),
+    ))
 }
 
 /// Conjoin out-parameter pins onto `formula`.

@@ -687,12 +687,13 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
         target: call_target,
         atomic,
         is_foreign,
+        is_unsafe_sig,
         ..
     } = &call_setup.terminator
     else {
         return None;
     };
-    if atomic.is_some() || *is_foreign {
+    if atomic.is_some() || *is_foreign || *is_unsafe_sig {
         return None;
     }
     let call_target = (*call_target)?;
@@ -828,7 +829,7 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
     if resolved == func.def_path {
         return None; // self-recursion (defensive) — fail closed.
     }
-    if fact.arg_count != 2 {
+    if !crate::mirsem::callee_signature_matches(func, call_args, call_dest, fact) {
         return None; // env + untupled x.
     }
     match &fact.requires {
@@ -1168,12 +1169,13 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
         target: call_target,
         atomic,
         is_foreign,
+        is_unsafe_sig,
         ..
     } = &setup.terminator
     else {
         return None;
     };
-    if atomic.is_some() || *is_foreign {
+    if atomic.is_some() || *is_foreign || *is_unsafe_sig {
         return None;
     }
     let call_target = (*call_target)?;
@@ -1375,7 +1377,7 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
     if resolved == func.def_path {
         return None;
     }
-    if fact.arg_count != 2 {
+    if !crate::mirsem::callee_signature_matches(func, call_args, call_dest, fact) {
         return None; // env + the untupled `&x`.
     }
     match &fact.requires {

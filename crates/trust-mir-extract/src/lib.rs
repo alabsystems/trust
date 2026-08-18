@@ -82,7 +82,8 @@ use rustc_hir::def::DefKind;
 use rustc_middle::mir;
 use rustc_middle::mir::trust_contract as rustc_trust_contract;
 use rustc_middle::ty::print::{
-    with_no_trimmed_paths, with_no_visible_paths, with_resolve_crate_name,
+    with_def_path_disambiguators, with_no_trimmed_paths, with_no_visible_paths,
+    with_resolve_crate_name,
 };
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_span::Symbol;
@@ -110,9 +111,82 @@ pub use verifier_api::{
 ///
 /// Trust uses this string as a semantic routing identity, so it must neither
 /// omit the local crate nor select a context-dependent visible re-export.
+///
+/// # THE ONE RENDERING SEAM — a NARROWING, **NOT** an injectivity guarantee
+///
+/// This function and [`safe_def_path_str_with_args`] are the PRIMARY producers
+/// of Trust's def-path identity space: the callee key (`convert::func_operand_name`),
+/// the bundled-body key (`VerifiableFunction::def_path`), every
+/// contract-summary key, and every panic-freedom / expected-absent / assumed-total
+/// / ABI-total discharge set. Routing what CAN be discriminated through HERE,
+/// rather than adding a check at each consumer, is deliberate — per-consumer
+/// checks are the shape that kept failing (see the `direct_call_def_path` doc
+/// comment for the exploited history).
+///
+/// "PRIMARY", not "only", and the distinction is load-bearing: this claim was
+/// shipped as "the ONLY producers" and refuted by measurement. Do not rebuild
+/// an argument on producer-exclusivity without re-establishing it — verify by
+/// grepping the `def_path_str` family, not by trusting this sentence.
+///
+/// **Do not read this string as an identity.** `with_def_path_disambiguators`
+/// removes three MEASURED collision classes: same-named siblings **in the same
+/// namespace**, a foreign import merging into its `extern` block's GRANDPARENT
+/// namespace, and a type parameter named after a primitive. It leaves at least
+/// FIVE, ENUMERATED on `direct_call_def_path`; residual 1 is an OPEN false proof
+/// with a checked-in reproducer. Any new consumer must still be safe when two
+/// distinct things arrive under one key.
+///
+/// The namespace qualifier is load-bearing, not hedging.
+/// `DefPathData::TypeNs(sym)` and `DefPathData::ValueNs(sym)` are DIFFERENT
+/// variants and the disambiguator counter is keyed on `(parent, DefPathData)`,
+/// so a `fn S` and a `struct S` under one parent are BOTH `#0` and both still
+/// render `S`. That is MEASURED OPEN — two distinct bundled bodies under one
+/// `krate::go::S::m`, identically on this seam's build and on the pristine base
+/// — and it is §RESIDUAL 7, with its two consumer-level differentials.
+///
+/// # What moves, and what a consumer may rely on
+///
+/// Two of the three closures move ONLY previously-ambiguous spellings: a
+/// `DisambiguatedDefPathData` disambiguator is nonzero only when an earlier
+/// sibling shares the same `(parent, DefPathData)`, and the `ty::ParamTy` marker
+/// fires only on a parameter whose name is a primitive. Note that the same
+/// sentence bounds what the disambiguator can REACH: siblings under different
+/// `DefPathData` variants are never counted together (§RESIDUAL 7).
+///
+/// The `{{extern}}` closure does NOT have that property and must not be
+/// described as if it did. It renders a segment rustc dropped
+/// UNCONDITIONALLY, so **every** path that traverses an `extern` block moves —
+/// including `core`/`alloc`/`std` ones (`core::ffi::c_str::strlen`,
+/// `core::num::imp::libm::*`, `alloc::alloc::__rust_alloc_error_handler`). That
+/// is a LOST-RECOVERY direction, so it was enumerated rather than argued:
+/// across the whole tree, 1363 `core|alloc|std::…` path literals were matched
+/// against the 253 item names declared in `library/{core,alloc,std}` `extern`
+/// blocks; 23 share a LAST SEGMENT and only three name a genuinely foreign item.
+/// All three are matched by ROOT + TAIL (`is_alloc_failure_abort_call`) or by
+/// LAST SEGMENT (`trust_vcgen::ffi_vcgen`'s `is_extern_call` /
+/// `extract_callee_name`), and a `ForeignMod` segment is neither a root nor a
+/// tail — pinned by unit tests in both files that were watched to FAIL against a
+/// planted exact-match. No `EXACT_TOTAL` entry, `has_trusted_std_root`
+/// classifier or `def_path_pins` spelling names a foreign item at all.
+///
+/// One correction to that census, MEASURED by repo-wide grep on this tree and
+/// stated because it changes what the pin buys: of those two recognizers only
+/// the `ffi_vcgen` pair is LIVE (`generate/entry.rs` gates every `Call` block on
+/// `is_foreign || is_extern_call` and then calls `generate_call_site_vcs`, which
+/// keys on `extract_callee_name`). `is_alloc_failure_abort_call` has NO
+/// production call site at all — definition, its own unit test, and this
+/// sentence are its only references — so `alloc::alloc::__rust_alloc_error
+/// _handler` has no live recovery lane to lose today. Its assert block pins the
+/// string contract for whoever wires it up; it is not evidence of a surviving
+/// discharge.
+///
+/// Note also that `{extern#N}` deliberately does not equal the bare keyword
+/// segment `extern`, so `ffi_vcgen::is_extern_call`'s pattern-2a segment test
+/// does not newly fire on every foreign path; genuine foreign imports are routed
+/// by `is_foreign` (`tcx.is_foreign_item`), the authoritative signal.
 pub fn safe_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    with_resolve_crate_name!(with_no_visible_paths!(with_no_trimmed_paths!(
-        tcx.def_path_str(def_id)
+    with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
+        with_no_trimmed_paths!(tcx.def_path_str(def_id))
     )))
 }
 
@@ -125,14 +199,56 @@ pub fn safe_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// (SOUNDNESS, hunt-11: a `Vec::<[u8; 1<<40]>::with_capacity(n)` capacity overflow
 /// was reported proved — and kernel-certified — because `T` was erased to the
 /// generic param here).
+///
+/// Discrimination (NOT injectivity): see [`safe_def_path_str`]. The flag reaches
+/// the nested types too (`args` and an impl's `Self`/trait ref all print through
+/// the same `print_path_with_simple`), which is what separates
+/// `<krate::f::S as core::fmt::Write>::write_fmt` from its sibling — there the
+/// ambiguity is in the SELF TYPE, not in the callee's own segments. The self type
+/// is also where the residual lives: this function renders a CALL's key from the
+/// caller's `args`, and a generic `args` vector renders exactly like the
+/// DEFINITION path of a generic body, which is a MEASURED false proof
+/// (`direct_call_def_path`, residual 1).
 pub fn safe_def_path_str_with_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     args: rustc_middle::ty::GenericArgsRef<'tcx>,
 ) -> String {
-    with_resolve_crate_name!(with_no_visible_paths!(with_no_trimmed_paths!(
-        tcx.def_path_str_with_args(def_id, args)
+    with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
+        with_no_trimmed_paths!(tcx.def_path_str_with_args(def_id, args))
     )))
+}
+
+/// [`safe_def_path_str`] plus the SYSROOT-IMPERSONATION stamp — the renderer for
+/// every TYPE name the extractor emits.
+///
+/// A `Ty::Adt`/`Ty::Datatype`/`AggregateKind::Adt` name is authenticated
+/// downstream by its printed root alone
+/// (`trust_vcgen::generate::alloc_vcs::ty_is_authenticated_std_iterator`), so a
+/// crate built `--crate-name std` used to hand out `std::vec::Endless` and be
+/// believed. `convert::sysroot_authenticated_path` carries the argument for why
+/// this is rule 2 only, why an honest graph renders byte-for-byte what it
+/// rendered before, and what the anchors still do NOT authenticate (residual R2).
+///
+/// EVERY site that renders a name into the emitted IR must use this, including
+/// the by-name back-edge/cut references, or a stamped definition and an unstamped
+/// reference to it stop matching and the recursion guards lose their key.
+pub fn sysroot_authenticated_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    convert::sysroot_authenticated_path(tcx, def_id.krate, safe_def_path_str(tcx, def_id))
+}
+
+/// [`safe_def_path_str_with_args`] plus the SYSROOT-IMPERSONATION stamp. See
+/// [`sysroot_authenticated_def_path_str`].
+pub fn sysroot_authenticated_def_path_str_with_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: rustc_middle::ty::GenericArgsRef<'tcx>,
+) -> String {
+    convert::sysroot_authenticated_path(
+        tcx,
+        def_id.krate,
+        safe_def_path_str_with_args(tcx, def_id, args),
+    )
 }
 
 /// Return an identity-bearing concrete def-path for a monomorphized instance.
@@ -1023,17 +1139,15 @@ fn stamp_loop_header_provenance_from_backedges(
         let mut candidates = backedges
             .iter()
             .filter_map(|backedge| {
-                let endpoints_compatible = match (
-                    backedge.header_hir_local_id,
-                    backedge.latch_hir_local_id,
-                ) {
-                    (Some(header_id), Some(latch_id)) => header_id == latch_id,
-                    _ => true,
-                };
+                let endpoints_compatible =
+                    match (backedge.header_hir_local_id, backedge.latch_hir_local_id) {
+                        (Some(header_id), Some(latch_id)) => header_id == latch_id,
+                        _ => true,
+                    };
                 (endpoints_compatible
                     && (backedge.header_hir_local_id == Some(hir_local_id)
                         || backedge.latch_hir_local_id == Some(hir_local_id)))
-                    .then_some(backedge.header)
+                .then_some(backedge.header)
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
@@ -1399,6 +1513,13 @@ fn extract_function_with_purpose<'tcx>(
     compiler_contracts: Option<&CompilerContractBundle>,
     purpose: ExtractionPurpose,
 ) -> VerifiableFunction {
+    // R0: open THIS function's out-of-band datatype-definition scope. Every
+    // canonical cut point lowered anywhere below — body locals, blocks, return
+    // type, and the contract/signature types lowered by the metadata pass — files
+    // its definition here, and the accumulated table is stamped onto the body
+    // below. The scope clears on entry and on drop, so one function's table can
+    // never inherit another's entry.
+    let _datatype_defs = ty_convert::DatatypeDefScope::begin();
     let def_id = body.source.def_id();
     let def_path = safe_def_path_str(tcx, def_id);
     let metadata = extract_metadata_with_contract_bundle(tcx, body, compiler_contracts);
@@ -1425,7 +1546,14 @@ fn extract_function_with_purpose<'tcx>(
     let mut debug_name_locals = build_debug_name_multimap(body);
     recover_direct_parameter_names(tcx, body, &mut debug_local_names, &mut debug_name_locals);
 
-    let verifiable_body = extract_body(tcx, body, purpose, &debug_local_names);
+    let mut verifiable_body = extract_body(tcx, body, purpose, &debug_local_names);
+    // R0: stamp what the type lowering recorded so far, BEFORE the gates below
+    // run — several of them (`gate_contract_preconditions`,
+    // `enum_discriminant_range_preconditions`) read the body's own types, and
+    // under markers-everywhere those types are bare markers that mean nothing
+    // without this table. It is re-stamped after the gates, since a gate may
+    // itself lower a type and add an entry.
+    verifiable_body.datatype_defs = ty_convert::collected_datatype_defs();
 
     // Derived bodies stay intact. An attribute/trait name cannot authorize a
     // synthetic zero-obligation replacement: Hash and Debug execute caller-
@@ -1464,10 +1592,16 @@ fn extract_function_with_purpose<'tcx>(
     // produce). Every present-but-conflicting debug-name case keeps its existing
     // fail-closed shadow gate untouched. The shared recovery above injects every
     // accepted HIR binding into both maps before body extraction.
+    // The HIR parameter spellings are the assumption gate's only positive
+    // parameter-hood evidence (see that module's header (IV)); recomputed from the
+    // same helper the debug-name recovery above uses, so the two can never
+    // disagree about which source name a MIR argument carries.
+    let hir_param_source_names = hir_parameter_source_names(tcx, body);
     let skipped = contract_assumption_gate::gate_contract_preconditions(
         &mut preconditions,
         &verifiable_body,
         &debug_name_locals,
+        hir_param_source_names.as_deref(),
     );
     for reason in &skipped {
         tcx.sess.dcx().span_warn(
@@ -1498,6 +1632,13 @@ fn extract_function_with_purpose<'tcx>(
     // `y >= 0`). A type tautology, so sound to add unconditionally after the
     // assumption gate (see `integer_param_range_preconditions`). Audit #6.
     preconditions.extend(integer_param_range_preconditions(&verifiable_body));
+
+    // R0: final stamp — a superset of the one taken right after `extract_body`
+    // (the accumulator only ever grows inside one scope, except that a CONFLICT
+    // removes a name, which is the fail-closed direction). Every bare marker this
+    // function's types carry is defined here or nowhere, and "nowhere" is exactly
+    // the pre-carrier decline.
+    verifiable_body.datatype_defs = ty_convert::collected_datatype_defs();
 
     VerifiableFunction {
         name,
@@ -1826,6 +1967,36 @@ fn place_ty_is_coroutine<'tcx>(
     matches!(ty.kind(), rustc_middle::ty::TyKind::Coroutine(..))
 }
 
+/// Trust (coroutine resume-state contract) — compile-time cross-pin of the
+/// reserved coroutine state discriminants against rustc's OWN ABI constants
+/// (`rustc_middle::ty::CoroutineArgsExt::{UNRESUMED,RETURNED,POISONED}`).
+///
+/// The shared recognizer (`trust_types::coroutine_resume_state_contract`)
+/// subtracts `trust_types::assumption::COROUTINE_RESERVED_STATE_{RETURNED,
+/// POISONED}` from the dispatch `SwitchInt`'s certified case set to obtain the
+/// LIVE resume-state set; trust-types cannot depend on rustc, so the values
+/// are pinned there and re-derived HERE from the authoritative constants. If
+/// rustc ever renumbers the reserved variants this fails the build instead of
+/// silently letting a terminal state into a live set (which would discharge
+/// the ResumedAfter* sentinels by construction — the exact unsoundness the
+/// contract lane exists to prevent).
+const _: () = {
+    use rustc_middle::ty::CoroutineArgsExt as _;
+    type Args<'tcx> = rustc_middle::ty::CoroutineArgs<TyCtxt<'tcx>>;
+    assert!(
+        Args::UNRESUMED as u128 == trust_types::assumption::COROUTINE_STATE_UNRESUMED,
+        "rustc UNRESUMED discriminant drifted from the trust-types pin"
+    );
+    assert!(
+        Args::RETURNED as u128 == trust_types::assumption::COROUTINE_RESERVED_STATE_RETURNED,
+        "rustc RETURNED discriminant drifted from the trust-types pin"
+    );
+    assert!(
+        Args::POISONED as u128 == trust_types::assumption::COROUTINE_RESERVED_STATE_POISONED,
+        "rustc POISONED discriminant drifted from the trust-types pin"
+    );
+};
+
 /// Mirror `trust_vcgen::u128_to_formula` so the invariant's constant terms are
 /// byte-identical to the switch guard's, guaranteeing they cancel for exhaustive
 /// matches regardless of the discriminant's absolute (possibly signed) value.
@@ -2041,7 +2212,6 @@ fn reject_contracts_for_synthetic_parameter(
     let namespace = match collision {
         trust_types::SourceContractSyntheticNameCollision::ReturnPlace => "return-place",
         trust_types::SourceContractSyntheticNameCollision::OldValue => "pre-state",
-        trust_types::SourceContractSyntheticNameCollision::Projection => "projection",
         trust_types::SourceContractSyntheticNameCollision::PositionalPlace => {
             "positional MIR-place"
         }
@@ -2408,7 +2578,7 @@ fn trust_annotation_from_item(item: &str) -> Vec<(TrustAnnotationKind, String)> 
         "boundary" | "trust_boundary" => {
             vec![(TrustAnnotationKind::Boundary, String::new())]
         }
-        "model" | "trust_model" => vec![(TrustAnnotationKind::Model, String::new())],
+        "model" => vec![(TrustAnnotationKind::Model, String::new())],
         _ => {
             if let Some(body) = trust_assumption_body(item) {
                 vec![(TrustAnnotationKind::Assumption, body)]
@@ -2909,10 +3079,10 @@ fn retype_source_contract_formula(
             }
         }
         let synthetic_base = name
-            .strip_suffix("_len")
-            .or_else(|| name.strip_suffix("_discr"))
-            .or_else(|| name.strip_suffix("_value"))
-            .or_else(|| name.strip_suffix("_sign"));
+            .strip_suffix("__len")
+            .or_else(|| name.strip_suffix("__discr"))
+            .or_else(|| name.strip_suffix("__value"))
+            .or_else(|| name.strip_suffix("__sign"));
         if synthetic_base.is_some_and(|base| signature_sorts.contains_key(base)) {
             sorts.insert(name, Sort::Int);
         }
@@ -2963,7 +3133,6 @@ fn contract_signature_environment_for_def<'tcx>(
             let namespace = match collision {
                 trust_types::SourceContractSyntheticNameCollision::ReturnPlace => "return-place",
                 trust_types::SourceContractSyntheticNameCollision::OldValue => "pre-state",
-                trust_types::SourceContractSyntheticNameCollision::Projection => "projection",
                 trust_types::SourceContractSyntheticNameCollision::PositionalPlace => {
                     "positional MIR-place"
                 }
@@ -3043,12 +3212,12 @@ pub fn extract_contract_param_types_for_instance<'tcx>(
         .map(|signature| signature.parameters.into_iter().map(|(_, ty)| ty).collect())
 }
 
-/// Rebind the source parser's exact collection accessor leaf (`p_len`) to the
+/// Rebind the source parser's exact collection accessor leaf (`p__len`) to the
 /// one length spelling consumed by MIR bounds and modular call substitution
 /// (`p__slice_len`). The rebinding is authorized only by the instantiated
-/// signature type. If a real parameter already owns `p_len`, the source leaf is
-/// ambiguous after parser lowering and the clause is rejected rather than
-/// allowing the two values to alias.
+/// signature type. The source leaf lives in the reserved `__` family, so a
+/// real parameter can never own its spelling; the collision check below is
+/// retained as a defensive invariant on caller-constructed parameter lists.
 fn canonicalize_entry_collection_lengths(
     mut formula: Formula,
     parameters: &[(String, Ty)],
@@ -3057,7 +3226,7 @@ fn canonicalize_entry_collection_lengths(
         if !contract_ty_has_collection_length(ty) {
             continue;
         }
-        let source = format!("{name}_len");
+        let source = format!("{name}__len");
         if !formula.free_variables().contains(&source) {
             continue;
         }
@@ -3222,7 +3391,7 @@ fn extract_body<'tcx>(
     let return_ty =
         ty_convert::convert_ty_in_env(tcx, typing_env, body.local_decls[mir::RETURN_PLACE].ty);
 
-    let mut vbody = VerifiableBody { locals, blocks, arg_count: body.arg_count, return_ty };
+    let mut vbody = VerifiableBody { locals, blocks, arg_count: body.arg_count, return_ty, datatype_defs: Default::default() };
     if purpose == ExtractionPurpose::Verification {
         // These rewrites are proof-oriented normalizations. Even where they are
         // logically equivalent, they are not a one-to-one executable lowering,
@@ -3256,26 +3425,61 @@ fn recover_direct_parameter_names(
     local_names: &mut FxHashMap<usize, String>,
     name_locals: &mut FxHashMap<String, Vec<usize>>,
 ) {
-    let Some(local_def_id) = body.source.def_id().as_local() else {
+    let Some(source_names) = hir_parameter_source_names(tcx, body) else {
         return;
     };
-    let Some(hir_body) = tcx.hir_maybe_body_owned_by(local_def_id) else {
-        return;
-    };
-    let source_names = hir_body
-        .params
-        .iter()
-        .map(|param| match param.pat.kind {
-            rustc_hir::PatKind::Binding(
-                rustc_hir::BindingMode(rustc_hir::ByRef::No, _),
-                _,
-                ident,
-                None,
-            ) => Some(ident.name.to_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
     merge_recovered_parameter_names(local_names, name_locals, body.arg_count, &source_names);
+}
+
+/// The HIR parameter spellings of `body`, in DECLARATION ORDER, one entry per
+/// HIR parameter: `Some(name)` iff that parameter's pattern is a plain by-value
+/// binding of a simple identifier, `None` for every other pattern.
+///
+/// This is a POSITIVE, LOCALLY CHECKABLE parameter-hood fact, and it is the only
+/// thing that entitles a consumer to say "MIR argument `_p`'s own source name is
+/// `s`". Nothing downstream may substitute an argument for it. Two consumers read
+/// it and they must never disagree:
+///
+///   * `recover_direct_parameter_names`, which repopulates debug names when
+///     optimized MIR dropped the parameter's row entirely; and
+///   * `contract_assumption_gate::gate_contract_preconditions`, whose forced
+///     restatement rewrites an authored `#[requires]` clause onto a parameter and
+///     therefore mints an assumed fact about the CALLER's argument.
+///
+/// `None` for a position is load-bearing, not a formatting detail. `ref q`, `_`
+/// and `q @ sub` all land here, and each one breaks the inference a row census
+/// would otherwise make: `rustc_mir_build`'s `args_and_body` emits an argument's
+/// debug row only under `pat.simple_ident()`, so for those patterns MIR local
+/// `_p` carries NO row of the parameter's own — while `CopyProp`'s `Replacer`
+/// happily rewrites BODY bindings' rows onto `_p`. A consumer that inferred
+/// "the earliest row on `_p` is the parameter's" from row multiplicity alone
+/// would then identify an ordinary `let` as the parameter and could restate a
+/// clause about a same-spelled module `const` onto the caller's argument — a
+/// false PROVE. Returning `None` here is what makes that unrepresentable.
+///
+/// Returns `None` (not a partly-filled vector) when the body is not local or has
+/// no HIR body, so an absent HIR is never mistaken for "no named parameters".
+fn hir_parameter_source_names(
+    tcx: TyCtxt<'_>,
+    body: &mir::Body<'_>,
+) -> Option<Vec<Option<String>>> {
+    let local_def_id = body.source.def_id().as_local()?;
+    let hir_body = tcx.hir_maybe_body_owned_by(local_def_id)?;
+    Some(
+        hir_body
+            .params
+            .iter()
+            .map(|param| match param.pat.kind {
+                rustc_hir::PatKind::Binding(
+                    rustc_hir::BindingMode(rustc_hir::ByRef::No, _),
+                    _,
+                    ident,
+                    None,
+                ) => Some(ident.name.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Merge one exact HIR parameter vector into both verifier name maps.
@@ -3312,11 +3516,21 @@ fn merge_recovered_parameter_names(
     let mut accepted = Vec::new();
     for (position, name) in source_names.iter().flatten().enumerate() {
         // A legal Rust parameter may occupy a name Trust later mints for a
-        // Formula leaf (`s__slice_len`, `__trust_constparam_*`, `_0_value`,
+        // Formula leaf (`s__slice_len`, `__trust_constparam_*`, `_0__value`,
         // etc.).  Never recover that spelling into the verifier model: the
         // per-local `_<index>` fallback is injective, while retaining the
         // source spelling could alias generated metadata even on a function
-        // with no contract bundle.
+        // with no contract bundle.  Same shared predicate as
+        // `build_debug_name_map` and the assumption gate's alias scan: this is
+        // the second (and last) way a name could reach `LocalDecl::name`, so it
+        // must refuse the reserved family too for the gate's exemption to hold.
+        //
+        // DEMOTION USES THE FULL CLASSIFIER, deliberately — NOT the alias scan's
+        // `reserved_synthetic_debug_name`, which is the strictly narrower `__`
+        // family. Demotion may be broad (a demoted name simply is not a body
+        // spelling); the alias-scan EXEMPTION may not, because exempting a name
+        // a user can legally bind would hide a real shadow. Sharing one predicate
+        // across both silently narrowed this filter and broke 70 extractor tests.
         if trust_types::source_contract_synthetic_name_collision(name).is_some() {
             continue;
         }
@@ -3744,7 +3958,7 @@ fn validate_codegen_terminator<'tcx>(
             }
             if callee == convert::TRUST_TOTAL_CLONE_SENTINEL
                 || callee.contains("::<__trust_try_total>")
-                || callee.contains("::<__trust_elem_bytes_")
+                || callee.contains(trust_types::TRUST_ELEM_BYTES_TOKEN_PREFIX)
                 || callee.contains("::<__trust_str_index>")
             {
                 return Err(unsupported(format!("verifier-only callable placeholder `{callee}`")));
@@ -4025,6 +4239,13 @@ fn build_debug_name_map(body: &mir::Body<'_>) -> FxHashMap<usize, String> {
                 // contract-less bodies whose query is never evaluated.  It
                 // also keeps every downstream fact producer on one spelling,
                 // rather than relying on each producer to duplicate a denylist.
+                // The predicate is shared with the assumption gate's alias scan
+                // ON PURPOSE: that scan skips exactly the names demoted here,
+                // and its soundness argument is precisely that a demoted name
+                // can never be a local's extracted name. Demotion uses the FULL
+                // classifier (see `merge_recovered_parameter_names`); the alias
+                // scan's exemption is the narrower `__` family, and the
+                // containment — exempt ⊆ demoted — is what makes it sound.
                 if trust_types::source_contract_synthetic_name_collision(&new_name).is_some() {
                     continue;
                 }
@@ -4163,6 +4384,25 @@ fn mutable_slice_store(xs: &mut [u32], index: usize, keep: bool) {
     while keep invariant xs.len() == xs.len() {
         xs[index] = 7;
     }
+}
+
+fn mutable_slice_retained_reborrow(xs: &mut [u32], index: usize, keep: bool) {
+    let retained = &mut *xs;
+    while keep invariant index == index {
+        retained[index] = 7;
+    }
+}
+
+fn mutable_slice_retained_return<'a>(
+    xs: &'a mut [u32],
+    index: usize,
+    keep: bool,
+) -> &'a mut [u32] {
+    let retained = &mut *xs;
+    while keep invariant index == index {
+        retained[index] = 7;
+    }
+    retained
 }
 
 fn mutable_fixed_store(xs: &mut [u32; 4], keep: bool) {
@@ -6132,6 +6372,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 ty: TrustContractPayloadType::Verifier(TrustContractVerifierSort::Bool),
                 kind: TrustContractPredicateKind::BoolLiteral { value: true },
                 source_bindings: Vec::new(),
+                source_place_bindings: None,
             },
             span: DUMMY_SP,
             keyword_span: Some(DUMMY_SP),
@@ -6187,6 +6428,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 ty: TrustContractPayloadType::Rust(tcx.types.bool),
                 kind: predicate_kind,
                 source_bindings: Vec::new(),
+                source_place_bindings: None,
             },
             span: DUMMY_SP,
             keyword_span: None,
@@ -6218,6 +6460,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     reason: sym::trust_test_contract_not_lowered,
                 },
                 source_bindings: Vec::new(),
+                source_place_bindings: None,
             },
             span: DUMMY_SP,
             keyword_span: Some(DUMMY_SP),
@@ -6251,7 +6494,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         bundle.summary = summary;
     }
 
-    fn extract_contract_fixture() -> ContractFixture {
+    fn extract_contract_fixture_with_mir_opt_level(mir_opt_level: u8) -> ContractFixture {
         let mut callbacks = ContractExtractionCallbacks {
             functions: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -6269,7 +6512,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "trust_mir_extract_contracts_fixture".to_string(),
             "--crate-type=lib".to_string(),
             "--edition=2021".to_string(),
-            "-Zmir-opt-level=3".to_string(),
+            format!("-Zmir-opt-level={mir_opt_level}"),
             "-Zno-codegen".to_string(),
             // All embedded compiler fixtures stop during analysis.  Select
             // rustc's built-in dummy backend explicitly so unit tests neither
@@ -6302,6 +6545,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 .expect("synthetic contract conversion fixture should be built"),
             query_contracts: callbacks.query_contracts,
         }
+    }
+
+    fn extract_contract_fixture() -> ContractFixture {
+        extract_contract_fixture_with_mir_opt_level(3)
     }
 
     fn extract_call_target_fixture() -> CallTargetFixture {
@@ -8185,7 +8432,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         let slice =
             Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
         let source = Formula::Gt(
-            Box::new(Formula::Var("xs_len".to_string(), Sort::Int)),
+            Box::new(Formula::Var("xs__len".to_string(), Sort::Int)),
             Box::new(Formula::Int(0)),
         );
         let canonical =
@@ -8199,11 +8446,32 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             )
         );
 
-        let collision = canonicalize_entry_collection_lengths(
-            Formula::Var("xs_len".to_string(), Sort::Int),
-            &[("xs".to_string(), slice), ("xs_len".to_string(), Ty::usize())],
+        // A parameter named `xs_len` is an ORDINARY binding: it neither blocks
+        // nor is captured by the `xs__len` accessor leaf's canonicalization.
+        let coexisting = canonicalize_entry_collection_lengths(
+            Formula::Gt(
+                Box::new(Formula::Var("xs__len".to_string(), Sort::Int)),
+                Box::new(Formula::Var("xs_len".to_string(), Sort::Int)),
+            ),
+            &[("xs".to_string(), slice.clone()), ("xs_len".to_string(), Ty::usize())],
         )
-        .expect_err("a real parameter must never alias the generated accessor leaf");
+        .expect("an ordinary `xs_len` parameter must not block canonicalization");
+        assert_eq!(
+            coexisting,
+            Formula::Gt(
+                Box::new(Formula::Var("xs__slice_len".to_string(), Sort::Int)),
+                Box::new(Formula::Var("xs_len".to_string(), Sort::Int)),
+            )
+        );
+
+        // Defensive invariant on caller-constructed parameter lists: a
+        // parameter literally spelled like the reserved accessor leaf still
+        // fails closed instead of aliasing.
+        let collision = canonicalize_entry_collection_lengths(
+            Formula::Var("xs__len".to_string(), Sort::Int),
+            &[("xs".to_string(), slice), ("xs__len".to_string(), Ty::usize())],
+        )
+        .expect_err("a reserved-spelling parameter must never alias the generated accessor leaf");
         assert!(collision.contains("collides"), "unexpected rejection: {collision}");
     }
 
@@ -8430,10 +8698,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     }
 
     #[test]
-    fn test_trust_annotation_from_item_trust_model() {
+    fn test_retired_trust_model_annotation_is_not_accepted() {
         let result = trust_annotation_from_item("trust_model");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, TrustAnnotationKind::Model);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -8913,28 +9180,19 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
 
     #[test]
     fn loop_header_provenance_accepts_header_only_and_latch_only_stamps() {
-        for (label, header_hir_local_id, latch_hir_local_id, duplicate_edge) in [
-            ("header-only", Some(10), None, true),
-            ("latch-only", None, Some(10), false),
-        ]
+        for (label, header_hir_local_id, latch_hir_local_id, duplicate_edge) in
+            [("header-only", Some(10), None, true), ("latch-only", None, Some(10), false)]
         {
             let mut bundle = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
                 portable_loop_spec(LoopContractKind::Invariant, 0, 10, None),
                 portable_loop_spec(LoopContractKind::Decreases, 0, 10, None),
             ]);
-            let backedge = StampedNaturalBackedge {
-                header: 3,
-                header_hir_local_id,
-                latch_hir_local_id,
-            };
-            let backedges =
-                if duplicate_edge { vec![backedge, backedge] } else { vec![backedge] };
+            let backedge =
+                StampedNaturalBackedge { header: 3, header_hir_local_id, latch_hir_local_id };
+            let backedges = if duplicate_edge { vec![backedge, backedge] } else { vec![backedge] };
             let failures = stamp_loop_header_provenance_from_backedges(&backedges, &mut bundle);
 
-            assert!(
-                failures.is_empty(),
-                "{label} compiler stamp must bind: {failures:?}"
-            );
+            assert!(failures.is_empty(), "{label} compiler stamp must bind: {failures:?}");
             assert!(
                 bundle.loop_contracts.iter().all(|spec| spec.mir_header == Some(3)),
                 "{label}: every clause in one source group must receive the same exact header",
@@ -8980,11 +9238,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
 
     #[test]
     fn loop_header_provenance_rejects_duplicate_hir_and_header_authority() {
-        let mut duplicate_hir =
-            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
-                portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(80)),
-                portable_loop_spec(LoopContractKind::Invariant, 1, 10, Some(81)),
-            ]);
+        let mut duplicate_hir = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+            portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(80)),
+            portable_loop_spec(LoopContractKind::Invariant, 1, 10, Some(81)),
+        ]);
         let failures = stamp_loop_header_provenance_from_backedges(
             &[StampedNaturalBackedge {
                 header: 3,
@@ -9002,11 +9259,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         );
         assert!(duplicate_hir.loop_contracts.iter().all(|spec| spec.mir_header.is_none()));
 
-        let mut duplicate_header =
-            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
-                portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(80)),
-                portable_loop_spec(LoopContractKind::Invariant, 1, 20, Some(81)),
-            ]);
+        let mut duplicate_header = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+            portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(80)),
+            portable_loop_spec(LoopContractKind::Invariant, 1, 20, Some(81)),
+        ]);
         let failures = stamp_loop_header_provenance_from_backedges(
             &[
                 StampedNaturalBackedge {
@@ -9024,9 +9280,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         );
         assert_eq!(failures.len(), 2);
         assert!(
-            failures.iter().all(|(_, reason)| {
-                reason.contains("e45.loop-source.non-injective-mir-header")
-            }),
+            failures
+                .iter()
+                .all(|(_, reason)| { reason.contains("e45.loop-source.non-injective-mir-header") }),
             "one MIR header cannot merge two source-loop groups: {failures:?}",
         );
         assert!(duplicate_header.loop_contracts.iter().all(|spec| spec.mir_header.is_none()));
@@ -9034,9 +9290,13 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
 
     #[test]
     fn loop_header_provenance_clears_stale_header_when_no_binding_exists() {
-        let mut bundle = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
-            portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(99)),
-        ]);
+        let mut bundle =
+            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![portable_loop_spec(
+                LoopContractKind::Invariant,
+                0,
+                10,
+                Some(99),
+            )]);
         let failures = stamp_loop_header_provenance_from_backedges(&[], &mut bundle);
 
         assert_eq!(failures.len(), 1);
@@ -9074,24 +9334,17 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             );
             if name == "nested_loop_provenance" {
                 for proposition in &bundle.typed_propositions {
-                    let (variable, expected_domain) =
-                        if proposition.body.contains("inner") {
-                            (
-                                "inner",
-                                CompilerContractValueDomain::MachineInt {
-                                    width: 16,
-                                    signed: true,
-                                },
-                            )
-                        } else {
-                            (
-                                "outer",
-                                CompilerContractValueDomain::MachineInt {
-                                    width: 32,
-                                    signed: false,
-                                },
-                            )
-                        };
+                    let (variable, expected_domain) = if proposition.body.contains("inner") {
+                        (
+                            "inner",
+                            CompilerContractValueDomain::MachineInt { width: 16, signed: true },
+                        )
+                    } else {
+                        (
+                            "outer",
+                            CompilerContractValueDomain::MachineInt { width: 32, signed: false },
+                        )
+                    };
                     assert_eq!(
                         proposition.variable_domains,
                         vec![CompilerContractVariableDomain {
@@ -9415,6 +9668,181 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 )),
                 "{name}: exact extracted mutable store must not hit an E4/E5 collection frontier: \
                  {vcs:#?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_rustc_config_extracts_retained_mutable_reborrow_and_terminal_escape() {
+        // MIR-opt 0 intentionally retains rustc's storage markers and local
+        // reborrow instead of letting copy propagation subsume it back into
+        // the source argument. Verification must be sound at every supported
+        // MIR optimization level, not only after the alias happens to vanish.
+        let fixture = extract_contract_fixture_with_mir_opt_level(0);
+
+        for name in ["mutable_slice_retained_reborrow", "mutable_slice_retained_return"] {
+            let mut function = fixture
+                .functions
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: function must be extracted"))
+                .clone();
+            let xs_local = function
+                .body
+                .locals
+                .iter()
+                .find(|decl| decl.name.as_deref() == Some("xs"))
+                .unwrap_or_else(|| panic!("{name}: source argument must retain its name"))
+                .index;
+            let alias_local = function
+                .body
+                .locals
+                .iter()
+                .find(|decl| decl.name.as_deref() == Some("retained"))
+                .unwrap_or_else(|| panic!("{name}: retained reborrow must remain a MIR local"))
+                .index;
+            assert_eq!(function.body.locals[xs_local].ty, function.body.locals[alias_local].ty);
+
+            let definitions = function
+                .body
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block.stmts.iter().enumerate().filter_map(move |(index, statement)| {
+                        matches!(
+                            statement,
+                            Statement::Assign {
+                                place,
+                                rvalue: Rvalue::Ref { mutable: true, place: source },
+                                ..
+                            } if place.local == alias_local
+                                && place.projections.is_empty()
+                                && source.local == xs_local
+                                && source.projections.as_slice() == [Projection::Deref]
+                        )
+                        .then_some((block.id, index))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [(definition_block, definition_index)] = definitions.as_slice() else {
+                panic!("{name}: expected one exact retained reborrow, got {definitions:?}");
+            };
+            assert_eq!(*definition_block, BlockId(0), "{name}: reborrow must dominate the loop");
+            assert!(
+                function.body.blocks[0]
+                    .stmts
+                    .iter()
+                    .take(*definition_index)
+                    .any(|statement| matches!(statement, Statement::StorageLive(local) if *local == alias_local)),
+                "{name}: the real rustc shape must exercise StorageLive before definition: \
+                 {:#?}",
+                function.body.blocks[0].stmts,
+            );
+            assert!(
+                function.body.blocks.iter().any(|block| {
+                    block.stmts.iter().any(|statement| {
+                        matches!(statement, Statement::Assign { place, .. }
+                            if place.local == alias_local
+                                && matches!(place.projections.as_slice(),
+                                    [Projection::Deref, Projection::Index(_)]
+                                        | [Projection::Deref, Projection::ConstantIndex { from_end: false, .. }]))
+                    })
+                }),
+                "{name}: the guarded store must execute through the retained alias",
+            );
+
+            if name == "mutable_slice_retained_return" {
+                let exact_terminal_reborrow = function.body.blocks.iter().any(|block| {
+                    matches!(block.terminator, Terminator::Return)
+                        && block.stmts.iter().enumerate().any(|(index, first)| {
+                            let Statement::Assign {
+                                place: temporary,
+                                rvalue: Rvalue::Ref { mutable: true, place: first_source },
+                                ..
+                            } = first
+                            else {
+                                return false;
+                            };
+                            let Some(Statement::StorageDead(dead_alias)) =
+                                block.stmts.get(index + 1)
+                            else {
+                                return false;
+                            };
+                            let Some(Statement::Assign {
+                                place: return_place,
+                                rvalue: Rvalue::Ref { mutable: true, place: returned_temporary },
+                                ..
+                            }) = block.stmts.get(index + 2)
+                            else {
+                                return false;
+                            };
+                            let Some(Statement::StorageDead(dead_temporary)) =
+                                block.stmts.get(index + 3)
+                            else {
+                                return false;
+                            };
+                            temporary.local > function.body.arg_count
+                                && temporary.local != alias_local
+                                && temporary.projections.is_empty()
+                                && first_source.local == alias_local
+                                && first_source.projections.as_slice() == [Projection::Deref]
+                                && *dead_alias == alias_local
+                                && return_place.local == 0
+                                && return_place.projections.is_empty()
+                                && returned_temporary.local == temporary.local
+                                && returned_temporary.projections.as_slice() == [Projection::Deref]
+                                && *dead_temporary == temporary.local
+                                && function.body.locals.get(temporary.local).is_some_and(|decl| {
+                                    decl.ty == function.body.return_ty
+                                        && decl.ty == function.body.locals[alias_local].ty
+                                })
+                                && block.stmts.iter().skip(index + 4).all(|later| {
+                                    matches!(
+                                        later,
+                                        Statement::StorageDead(_)
+                                            | Statement::Coverage
+                                            | Statement::ConstEvalCounter
+                                            | Statement::Nop
+                                    )
+                                })
+                        })
+                });
+                assert!(
+                    exact_terminal_reborrow,
+                    "{name}: escape authority is limited to rustc's exact terminal mutable-\
+                     reborrow handoff; \
+                     extracted body: {:#?}",
+                    function.body,
+                );
+            }
+
+            let bundle = fixture
+                .loop_contract_bundles
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: native loop contract bundle must be recorded"));
+            let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+            assert!(failures.is_empty(), "{name}: loop binding failures: {failures:?}");
+            let vcs = trust_vcgen::generate_vcs(&function);
+            assert_eq!(
+                vcs.iter()
+                    .filter(|vc| matches!(
+                        vc.kind,
+                        VcKind::LoopInvariantInitiation { .. }
+                            | VcKind::LoopInvariantConsecution { .. }
+                    ))
+                    .count(),
+                2,
+                "{name}: retained alias must keep the public E4 proof pair: {vcs:#?}; \
+                 extracted body: {:#?}",
+                function.body,
+            );
+            assert!(
+                !vcs.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::UnsupportedMir { detail, .. }
+                        if detail.contains("e45.collection")
+                            || detail.contains("e45.transition")
+                )),
+                "{name}: the exact compiler shape must not hit the alias frontier: {vcs:#?}",
             );
         }
     }
@@ -10091,7 +10519,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 }),
             ),
             Formula::Ge(
-                Box::new(Formula::Var("arr_len".to_string(), Sort::Bool)),
+                Box::new(Formula::Var("arr__len".to_string(), Sort::Bool)),
                 Box::new(Formula::Int(1)),
             ),
         ]);
@@ -10102,6 +10530,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         assert_eq!(**near, Formula::Var("near".to_string(), f64_sort.clone()));
         assert_eq!(**far, Formula::Var("far".to_string(), f64_sort));
         let Formula::Ge(len, _) = &items[1] else { panic!("Ge expected") };
-        assert_eq!(**len, Formula::Var("arr_len".to_string(), Sort::Int));
+        assert_eq!(**len, Formula::Var("arr__len".to_string(), Sort::Int));
     }
 }

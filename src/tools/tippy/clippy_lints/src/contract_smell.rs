@@ -12,20 +12,27 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks first-class contract clauses — `fn f(..) requires P ensures Q`
     /// and `while c invariant P decreases e` — for predicates that cannot
-    /// constrain what their clause position promises: an `ensures` naming no
-    /// part of the output record, a `requires` built only out of literals, a
-    /// loop whose `invariant`s name nothing the body works with, and a loop
-    /// `decreases` measure the body never touches.
+    /// constrain what their clause position promises: a `requires` built only
+    /// out of literals, a loop whose `invariant`s name nothing the body works
+    /// with, and a loop `decreases` measure the body never touches.
+    ///
+    /// It deliberately says NOTHING about `ensures`. The ratified design
+    /// (D2: entry values + the output record, `x'` ≡ `out.x`) would make an
+    /// unprimed-only postcondition vacuous — but the two-state carrier that
+    /// design needs (the deep E2 lane) is unimplemented, primes are reserved
+    /// grammar the compiler rejects, and a postcondition today is evaluated
+    /// purely in the EXIT state, where every unprimed name already denotes
+    /// the post-state. Until E2 lands there is nothing here to diagnose. See
+    /// the note in `check_signature_clauses` for the measurement and the
+    /// restore condition.
     ///
     /// ### Why is this bad?
     /// Each of these parses and elaborates into a real obligation, so nothing
     /// downstream objects — yet the obligation is not the one the author
-    /// meant. A postcondition over entry values alone restates the
-    /// precondition and constrains no caller; a literal precondition admits
-    /// every call or forbids all of them; a loop measure the body cannot
-    /// change never decreases, so the termination obligation it exists to
-    /// discharge can only fail. The clause looks like a specification and is
-    /// not one.
+    /// meant. A literal precondition admits every call or forbids all of
+    /// them; a loop measure the body cannot change never decreases, so the
+    /// termination obligation it exists to discharge can only fail. The
+    /// clause looks like a specification and is not one.
     ///
     /// This check is purely syntactic. It reads the authored clause and
     /// nothing else — never a solver, a proof, or a verification verdict —
@@ -34,17 +41,17 @@ declare_clippy_lint! {
     ///
     /// ### Example
     /// ```ignore
-    /// fn withdraw(balance: &mut u64, amount: u64)
-    ///     requires *balance >= amount
-    ///     ensures *balance >= amount
-    /// { *balance -= amount; }
+    /// while i < n
+    ///     invariant true
+    ///     decreases n
+    /// { i += 1; }
     /// ```
     /// Use instead:
     /// ```ignore
-    /// fn withdraw(balance: &mut u64, amount: u64)
-    ///     requires *balance >= amount
-    ///     ensures balance' == balance - amount
-    /// { *balance -= amount; }
+    /// while i < n
+    ///     invariant i <= n
+    ///     decreases n - i
+    /// { i += 1; }
     /// ```
     #[clippy::version = "1.99.0"]
     pub TRUST_CONTRACT_SMELL,
@@ -86,20 +93,50 @@ fn check_signature_clauses(cx: &EarlyContext<'_>, contract: &FnContract) {
         }
     }
 
-    for clause in &contract.trust_native_ensures {
-        if let Some((span, facts)) = authored(clause)
-            && !facts.names_post_state
-        {
-            span_lint_and_help(
-                cx,
-                TRUST_CONTRACT_SMELL,
-                span,
-                "this `ensures` predicate names no part of the output record",
-                None,
-                "parameter names here are entry values; the post-state is `result`, a primed output `x'`, or `out`",
-            );
-        }
-    }
+    // NO `ensures` ARM — deliberately, and not an oversight.
+    //
+    // It used to flag a postcondition that named no `result`/`out`/primed
+    // place, on the reasoning that unprimed names are ENTRY values so such a
+    // clause restates the precondition. That reasoning is the RATIFIED design
+    // — D2 in docs/design/2026-07-09-two-language-spec-surface.md:
+    // "parameters denote entry values, same as in `requires`"; `x'` ≡
+    // `out.x` — so the arm was not invented, it enforced the design of
+    // record. But the two-state carrier D2 needs (the deep E2 lane; see
+    // tests/ui/trust/e2_by_value_prime_discharge.rs, which discharges only
+    // the trivial by-value case) is NOT IMPLEMENTED. Today's carrier is
+    // one-state: `trust_contract_query` rejects every `&mut`-relevant primed
+    // place ("a prime is reserved native grammar for a post-state place, but
+    // the current contract carrier has no entry/post-state environment with
+    // which to bind it"), and the single state an `ensures` is evaluated in
+    // is the EXIT state. So on the shipped compiler, unprimed names in a
+    // postcondition already ARE the post-state, and the check was reporting
+    // correct, proved contracts as vacuous — enforcing the designed future
+    // against the only spelling the present can verify.
+    //
+    // Measured on stage2 `b371488b94`, two bodies under one clause
+    // (`ensures !self.flag`): the body writing `false` proves 2/2, one
+    // kernel-certified; the body writing `true` is REFUTED 0/2 with
+    // `verified_counterexample = true`. Entry-value semantics cannot tell
+    // those apart — nothing constrains the caller's entry value, so neither
+    // could prove and neither could be refuted. The verifier is reading the
+    // exit state.
+    //
+    // The arm was also unfixable in place, because its advice had no valid
+    // spelling: its own "use instead" example, `ensures balance' == balance -
+    // amount`, fails to verify — "primed post-state identifier `balance'` has
+    // no verified MIR state binding", fail-closed Unknown. Following the lint
+    // turned a fully proved contract into an unverifiable one, and there was
+    // no `ensures` that both satisfied the lint and verified.
+    //
+    // RESTORE THIS ARM when the deep E2 lane lands D2's two-state carrier —
+    // when primes lower to bound MIR places for `&mut` borrows, not just the
+    // by-value identity case. At that point unprimed names become entry
+    // values, the original reasoning becomes true, and `self`-rooted places
+    // must be counted as post-state. NOTE that day is also the day every
+    // existing `self.field` postcondition in downstream code silently changes
+    // meaning (exit → entry), so restoring the arm is part of that migration,
+    // not an independent cleanup.
+    let _ = &contract.trust_native_ensures;
 }
 
 /// Report loop clauses that cannot bear on the iteration they annotate.
@@ -179,9 +216,6 @@ fn authored_loop_clause(clause: &LoopClause) -> Option<(Span, PredicateFacts<'_>
 struct PredicateFacts<'a> {
     /// Every identifier-shaped token, in authored order.
     names: Vec<&'a str>,
-    /// Whether the predicate reaches the post-state: `result`, `out`, or any
-    /// primed name.
-    names_post_state: bool,
 }
 
 impl PredicateFacts<'_> {
@@ -205,10 +239,7 @@ impl PredicateFacts<'_> {
 /// mentions, which survives any disagreement about how they are combined.
 fn scan(payload: &str) -> PredicateFacts<'_> {
     let bytes = payload.as_bytes();
-    let mut facts = PredicateFacts {
-        names: Vec::new(),
-        names_post_state: false,
-    };
+    let mut facts = PredicateFacts { names: Vec::new() };
     let mut i = 0;
     while i < bytes.len() {
         let byte = bytes[i];
@@ -232,13 +263,14 @@ fn scan(payload: &str) -> PredicateFacts<'_> {
                 i += 1;
             }
             let name = &payload[start..i];
-            facts.names_post_state |= matches!(name, "result" | "out");
             facts.names.push(name);
             if bytes.get(i) == Some(&b'\'') {
-                // The cooked lexer spells a post-state projection as the name
-                // glued to a single quote, which is why `x'` needs no primed
-                // identifier rule anywhere upstream of here.
-                facts.names_post_state = true;
+                // A post-state projection is the name glued to a single quote.
+                // Nothing reads that fact today (the `ensures` arm is retired
+                // — see `check_signature_clauses`), but the prime must still
+                // be CONSUMED here: left behind, it would open a lifetime or
+                // character literal and swallow the rest of the predicate,
+                // corrupting the name list the surviving arms depend on.
                 i += 1;
             }
         } else {
@@ -314,33 +346,35 @@ impl<'ast> Visitor<'ast> for BodyNames {
 mod tests_for_scan {
     use super::scan;
 
+    /// A prime must be CONSUMED with the name it modifies. Nothing reads
+    /// "is post-state" any more (the `ensures` arm is retired), but if the
+    /// quote were left behind it would open a lifetime and swallow the rest of
+    /// the predicate — so the name list is the property worth pinning.
     #[test]
-    fn a_trailing_quote_is_a_post_state_prime() {
+    fn a_trailing_quote_is_consumed_with_its_name() {
         let facts = scan("balance'== balance - amount");
 
-        assert!(facts.names_post_state);
         assert_eq!(facts.names, ["balance", "balance", "amount"]);
     }
 
     #[test]
-    fn entry_values_alone_do_not_reach_the_post_state() {
+    fn a_predicate_naming_values_is_not_literal_only() {
         let facts = scan("x <= 1000 && y <= 1000");
 
-        assert!(!facts.names_post_state);
         assert!(!facts.names_nothing());
+        assert_eq!(facts.names, ["x", "y"]);
     }
 
     #[test]
-    fn result_and_out_name_the_output_record() {
-        assert!(scan("result >= x").names_post_state);
-        assert!(scan("out.result >= x").names_post_state);
+    fn output_record_names_are_ordinary_names_to_the_scanner() {
+        assert_eq!(scan("result >= x").names, ["result", "x"]);
+        assert_eq!(scan("out.result >= x").names, ["out", "result", "x"]);
     }
 
     #[test]
     fn a_lifetime_is_not_a_prime_and_contributes_no_name() {
         let facts = scan("forall i: & 'a u32, * i > 0");
 
-        assert!(!facts.names_post_state);
         assert_eq!(facts.names, ["forall", "i", "u32", "i"]);
     }
 
@@ -348,7 +382,6 @@ mod tests_for_scan {
     fn a_character_literal_closes_without_priming_its_contents() {
         let facts = scan("c == 'x' && d == '\\u{41}'");
 
-        assert!(!facts.names_post_state);
         assert_eq!(facts.names, ["c", "d"]);
     }
 
@@ -363,7 +396,6 @@ mod tests_for_scan {
     fn a_string_literal_hides_its_contents() {
         let facts = scan("tag == \"result x'\"");
 
-        assert!(!facts.names_post_state);
         assert_eq!(facts.names, ["tag"]);
     }
 

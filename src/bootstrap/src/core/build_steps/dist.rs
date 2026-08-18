@@ -97,8 +97,10 @@ fn verifier_dist_bin_names(target: TargetSelection) -> [String; 3] {
     [exe("ty", target), exe("ay", target), exe("clean", target)]
 }
 
-fn trustdoc_dist_bin_names(target: TargetSelection) -> [String; 1] {
-    [exe("trustdoc", target)]
+fn trustdoc_dist_bin_names(target: TargetSelection) -> [String; 2] {
+    // `rustdoc` alias mirrors `compiler_dist_bin_names`' `rustc`: cargo's
+    // doctest phase and rustup's proxy resolve the stock name.
+    [exe("trustdoc", target), exe("rustdoc", target)]
 }
 
 fn rust_analyzer_proc_macro_dist_bin_names(target: TargetSelection) -> [String; 1] {
@@ -633,9 +635,8 @@ impl Step for Rustc {
                 builder.copy_link(&from, &image.join("bin").join(&bin), FileType::Executable);
             }
 
-            // If enabled, copy the Trust-named rustdoc binary. The inherited
-            // `rustdoc` spelling remains a source-build config selector, not a
-            // shipped secondary alias.
+            // If enabled, copy the doc tool under its Trust name plus the
+            // inherited `rustdoc` alias (cargo doctests spawn the stock name).
             if builder.config.tools.as_ref().is_none_or(|tools| {
                 tools
                     .iter()

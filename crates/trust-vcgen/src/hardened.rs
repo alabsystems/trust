@@ -648,20 +648,17 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
             continue;
         }
 
-        // Trust #soundness: a BoundsCheck assert on a LITERAL in-range index
-        // (`cols[0]` on `[Vec4; 4]` — both sides compile-time constants with
-        // `index < len`) can NEVER panic, so there is no panic boundary to
-        // harden. The per-statement bounds VC is suppressed for exactly this
-        // case (see `v2_bounds_assert_const_index_in_range` for why emitting a
-        // constant-false violation loses proof authority at the vacuity gate);
-        // skip the twin identically, mirroring the Div/Rem and loop-yield
-        // skips above. A symbolic, call-written, or genuinely out-of-range
-        // constant index is NOT in the shape (fail-closed) and keeps its twin.
-        if matches!(msg, AssertMessage::BoundsCheck)
-            && crate::generate::v2_bounds_assert_const_index_in_range(func, block, cond, *expected)
-        {
-            continue;
-        }
+        // Trust (#57 follow-up): a BoundsCheck assert on a LITERAL in-range index
+        // (`arr[0]` on `[i64; 3]`) used to skip its twin here, mirroring the
+        // per-statement lane's suppression of the same shape. Both are gone. The
+        // twin is emitted, and it PROVES: its violation carries the block's own
+        // index def (`_i = k`) against the constant length, which is the same
+        // single-variable interval contradiction the per-statement bounds VC
+        // discharges. Measured over a3d's verified kernel: 95 literal-index
+        // hardened twins, 95 proved, 0 failed, 0 unknown. The loop-yield skip
+        // ABOVE is a different case and stays — there the twin does NOT carry the
+        // yield facts the per-statement lane conjoins, so it would over-refute a
+        // provably-safe guarded index; a constant index needs no such fact.
 
         // Trust: signed >= 128-bit arithmetic-overflow asserts (`Overflow(Add|Sub)`
         // and `OverflowNeg`) route to a SELF-CONTAINED BV violation instead of the
@@ -1076,6 +1073,7 @@ mod tests {
                 blocks,
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1429,6 +1427,7 @@ mod tests {
                 ],
                 arg_count: 3,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![Formula::Eq(
@@ -1567,6 +1566,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1708,6 +1708,7 @@ mod tests {
                 blocks,
                 arg_count: 1,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2044,6 +2045,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2199,6 +2201,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2346,7 +2349,7 @@ mod tests {
             name: "hash_bytes_nested_guard".to_string(),
             def_path: "crate::hash_bytes_nested_guard".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Unit },
+            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Unit, datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -2532,6 +2535,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2935,6 +2939,7 @@ mod hardened_signed_128_overflow_tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -3088,6 +3093,7 @@ mod hardened_signed_128_overflow_tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -3194,6 +3200,7 @@ mod hardened_signed_128_overflow_tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -3326,6 +3333,7 @@ mod hardened_signed_128_overflow_tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -3418,6 +3426,7 @@ mod hardened_signed_128_overflow_tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i128(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],

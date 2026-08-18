@@ -150,7 +150,7 @@ pub(crate) fn terminator_def_names(
     block: &trust_types::BasicBlock,
 ) -> Vec<String> {
     match &block.terminator {
-        Terminator::Call { args, dest, .. } => {
+        Terminator::Call { func: callee, args, dest, .. } => {
             // Trust (per-argument havoc refinement — the scheduled precision
             // follow-up behind the verify.precision.2026-07-08 ledger entry): a
             // callee can mutate caller-visible memory ONLY through its
@@ -202,6 +202,26 @@ pub(crate) fn terminator_def_names(
             // pointee, so we havoc the local's BASE name — its prefix-overlap kills
             // the pointer, its pointee `s*`, and any nested pointee `s.f*`.
             names.extend(mutable_pointer_local_names(func));
+            // Trust (BLOCKER 2 — opaque callee effect summaries): the alias list
+            // above is a WHOLE-FUNCTION over-approximation by BASE LOCAL name, so
+            // for a `&mut self` method it is the single name `self` — a projection
+            // ANCESTOR of every field spelling. One call to ANY helper therefore
+            // erased every field fact the body established, which is why no method
+            // that calls anything could discharge a `&mut self` postcondition (the
+            // visible `SpecUnverifiable` row). When the callee's OWN extracted MIR
+            // is available and falls inside the modeled fragment, replace this
+            // call's argument roots with the precise caller-side spellings of the
+            // paths the callee actually writes; every other alias name is retained
+            // verbatim. `None` (no body, outside the fragment, unresolvable
+            // argument shape, caller admits raw-pointer aliasing) keeps the
+            // conservative list unchanged. See `callee_write_set` for the full
+            // soundness discipline — the write-set is DERIVED from MIR, never
+            // declared, and is total-and-fail-closed over statements/terminators.
+            if let Some(refined) =
+                callee_write_set::refine_call_havoc_names(func, callee, args, &names)
+            {
+                names = refined;
+            }
             // Trust #soundness (LANE): the callee writes `dest` whether or not it
             // is a projection. A WHOLE-local dest (`lo = make()`) and a PROJECTED
             // dest (`s.0 = make()`, `s.field = make()`) both invalidate any
@@ -462,9 +482,97 @@ pub(crate) fn block_written_names(
     defs.extend(extract_set_discriminant_definitions(func, block));
     let mut names: FxHashSet<String> =
         defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
-    names.extend(deref_store_havoc_names(func, block));
+    names.extend(block_deref_store_havoc_names(func, block));
     names.extend(terminator_def_names(func, block));
     names
+}
+
+/// The opaque-deref-store havoc contribution to a BLOCK's gen-set, as the union
+/// over the block's statements of what [`stmt_writes_name`] reports for each.
+///
+/// WHY THIS EXISTS. `deref_store_havoc_names` is deliberately whole-block and
+/// whole-function: one opaque store anywhere in the block havocs EVERY mutably
+/// borrowed / mutable-pointer local's BASE name. Feeding that raw into the
+/// gen-set makes the inter-block reaching-def map believe a store to
+/// `self*.0.1` redefines its own SIBLING `self*.0.0` — because the base name
+/// `self` is a projection ANCESTOR of both, so `place_names_overlap` unions
+/// their version sets. `stmt_writes_name` already refuses exactly this
+/// (`opaque_store_confined_to_written_place`, the P0 multi-write fix), but that
+/// refinement lives only at STATEMENT granularity; `block_written_names` fed the
+/// unrefined list into `block_entry_versions`, so the BLOCK-level map kept the
+/// over-merge.
+///
+/// The consequence was a postcondition over `&mut self` on ANY body that writes
+/// two different fields: the flag's reaching-def token at the exit block became
+/// the join of every sibling store (`self*.0.0#e_s1_0_s4_0`), a name no pin
+/// could spell, so a TRUE clause and its exact NEGATION were both refuted from a
+/// free variable. This is the block-granularity twin of the statement-level fix,
+/// and computing it as the per-statement union makes the two oracles agree BY
+/// CONSTRUCTION rather than by a second, forkable rule.
+///
+/// SOUNDNESS. Shrinking a gen-set is the dangerous direction — a name that stops
+/// being re-versioned lets a STALE fact survive and vacuously discharge a real
+/// obligation. Three things keep this safe:
+///
+///   * a name is dropped ONLY under `opaque_store_confined_to_written_place`,
+///     which certifies from the TYPE that the pointer addresses a plain `struct`
+///     (no variants, `AdtKind::Struct`) through `Field` projections alone — so
+///     the written place is disjointly addressable and provably cannot alias a
+///     sibling field;
+///   * the union is over statements, so ONE unconfined opaque store anywhere in
+///     the block restores the full havoc for the whole block;
+///   * the exact written place is added explicitly, so the store still kills its
+///     own place, its ancestors and its descendants even when the block-def
+///     extraction produced no fact for an unlowerable rvalue.
+///
+/// Every OTHER local in the havoc list is retained for every store, so
+/// cross-pointer aliasing (`q*` havoced by a store through `p`) is untouched.
+fn block_deref_store_havoc_names(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+) -> FxHashSet<String> {
+    deref_store_havoc_names_over(func, block, &block.stmts)
+}
+
+/// [`block_deref_store_havoc_names`] over an arbitrary STATEMENT SLICE of
+/// `block`, so the point-in-block oracle (`writes_until`) and the whole-block
+/// one compute the same union over the statements each can see. `block` still
+/// selects the havoc LIST (`deref_store_havoc_names` is block-gated by design —
+/// a store anywhere in the block puts its referent-havoc in effect); `stmts`
+/// selects which stores contribute.
+fn deref_store_havoc_names_over(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    stmts: &[Statement],
+) -> FxHashSet<String> {
+    let havoc = deref_store_havoc_names(func, block);
+    let mut out: FxHashSet<String> = FxHashSet::default();
+    if havoc.is_empty() {
+        return out;
+    }
+    for stmt in stmts {
+        let Statement::Assign { place, .. } = stmt else { continue };
+        if !matches!(place.projections.first(), Some(trust_types::Projection::Deref))
+            || !crate::deref_pointer_is_opaque(func, place.local)
+        {
+            continue;
+        }
+        if !opaque_store_confined_to_written_place(func, place) {
+            // Unconfined: this statement alone havocs the whole list, so the
+            // union is the whole list and nothing further can shrink it.
+            return havoc.into_iter().collect();
+        }
+        // Minted with the SAME construction `mutable_pointer_local_names` uses,
+        // so the exclusion is name-consistent with the list by construction.
+        let store_base = crate::place_to_var_name(
+            func,
+            &trust_types::Place { local: place.local, projections: Vec::new() },
+        );
+        // The store's own tree is answered precisely by the written place name.
+        out.insert(crate::place_to_var_name(func, place));
+        out.extend(havoc.iter().filter(|h| !place_names_overlap(h, &store_base)).cloned());
+    }
+    out
 }
 
 /// Forward reaching-definition may-dataflow over names. Per-block OUT-sets
@@ -652,14 +760,21 @@ pub(crate) fn writes_until(
     // its referent-havoc is in effect from that point. `deref_store_havoc_names` is
     // block-level; gate it on a prefix occurrence so it does not leak BACKWARD to
     // reads before the store.
-    let has_opaque_prefix = block.stmts[..stmt_idx.min(block.stmts.len())].iter().any(|stmt| {
-        let trust_types::Statement::Assign { place, .. } = stmt else { return false };
-        matches!(place.projections.first(), Some(trust_types::Projection::Deref))
-            && crate::deref_pointer_is_opaque(func, place.local)
-    });
-    if has_opaque_prefix {
-        names.extend(deref_store_havoc_names(func, block));
-    }
+    //
+    // Trust: the CONTRIBUTION is the per-statement union, identical to
+    // `block_deref_store_havoc_names` but restricted to the prefix. Taking the
+    // raw block-level list here contradicts `stmt_writes_name`, which subtracts
+    // a certified disjoint store's own tree: `writes_until` would report a write
+    // overlapping `self*.0.0` for a block that only stores `self*.0.1`, then the
+    // per-statement search would find NO statement writing it, and
+    // `version_token_at` would fall through to the phantom `s{b}_pre`
+    // entry-havoc token — a name nothing can ever pin. The two oracles must
+    // agree, so this is the same union, prefix-restricted.
+    names.extend(deref_store_havoc_names_over(
+        func,
+        block,
+        &block.stmts[..stmt_idx.min(block.stmts.len())],
+    ));
     names
 }
 

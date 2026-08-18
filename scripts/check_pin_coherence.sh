@@ -20,13 +20,48 @@ cd "$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 fail=0
 problems=()
 
-# Enumerate submodule paths from .gitmodules (robust to working-tree state).
-while IFS= read -r path; do
-  [ -z "$path" ] && continue
+# Enumerate from the committed blob. A dirty/deleted worktree .gitmodules must
+# not be able to hide gitlinks, and process-substitution status must not turn a
+# parser failure (or an empty inventory) into a vacuous green run.
+module_rows=""
+if ! module_rows="$(git config --blob HEAD:.gitmodules --get-regexp 'submodule\..*\.path' 2>/dev/null)"; then
+  problems+=("GITMODULES-INVALID  .gitmodules  (cannot parse the committed submodule inventory at HEAD)")
+  fail=1
+elif [ -z "$module_rows" ]; then
+  problems+=("GITMODULES-EMPTY    .gitmodules  (the committed submodule inventory may not be empty)")
+  fail=1
+fi
 
-  recorded="$(git ls-tree HEAD "$path" 2>/dev/null | awk '{print $3}')"
-  if [ -z "$recorded" ]; then
-    problems+=("MISSING-GITLINK  $path  (no gitlink recorded at HEAD)")
+# A gitlink omitted from .gitmodules is still a submodule-shaped build input.
+# Compare both committed inventories so an undeclared extra cannot evade every
+# per-path check below.
+declared_paths="$(printf '%s\n' "$module_rows" | sed -n 's/^[^ ]* //p' | LC_ALL=C sort)"
+if ! tree_gitlinks="$(git ls-tree -r HEAD 2>/dev/null | awk '$1 == "160000" && $2 == "commit" { sub(/^[^\t]*\t/, ""); print }' | LC_ALL=C sort)"; then
+  problems+=("GITLINK-INVENTORY-FAILED  .gitmodules  (cannot enumerate committed gitlinks at HEAD)")
+  fail=1
+elif [ "$tree_gitlinks" != "$declared_paths" ]; then
+  problems+=("GITLINK-INVENTORY  .gitmodules  (declared submodules and committed 160000 gitlinks differ)")
+  fail=1
+fi
+
+while IFS= read -r module_row; do
+  [ -z "$module_row" ] && continue
+  module_key="${module_row%% *}"
+  path="${module_row#* }"
+  if [ "$module_key" = "$module_row" ] || [ -z "$path" ]; then
+    problems+=("GITMODULES-INVALID  .gitmodules  (malformed committed inventory row)")
+    fail=1
+    continue
+  fi
+
+  tree_row="$(git ls-tree HEAD -- "$path" 2>/dev/null || true)"
+  metadata="${tree_row%%$'\t'*}"
+  listed_path="${tree_row#*$'\t'}"
+  read -r mode object_type recorded extra <<<"$metadata"
+  if [ "$mode" != "160000" ] || [ "$object_type" != "commit" ] || \
+     [[ ! "$recorded" =~ ^[0-9a-f]{40}$ ]] || [ -n "${extra:-}" ] || \
+     [ "$listed_path" != "$path" ]; then
+    problems+=("MISSING-GITLINK  $path  (no exact 160000 commit gitlink recorded at HEAD)")
     fail=1
     continue
   fi
@@ -52,8 +87,44 @@ while IFS= read -r path; do
     continue
   fi
 
+  # Matching HEAD is not sufficient: tracked edits or untracked files change
+  # the code a local build consumes without changing the superproject gitlink.
+  # Include nested-submodule state and fail closed if Git cannot classify it.
+  if ! dirty="$(git -C "$path" status --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>/dev/null)"; then
+    problems+=("PIN-STATUS-FAILED  $path  pin=$recorded  (could not audit working-tree content)")
+    fail=1
+    continue
+  fi
+  if [ -n "$dirty" ]; then
+    problems+=("PIN-DIRTY        $path  pin=$recorded  (working-tree content differs from the committed pin)")
+    fail=1
+    continue
+  fi
+
+  # `git status` does not report an uninitialized nested submodule as dirty.
+  # Audit the recursive submodule state explicitly; every row must have Git's
+  # single-space "initialized at the recorded commit" prefix and a full SHA.
+  if ! nested_rows="$(git -C "$path" submodule status --recursive 2>/dev/null)"; then
+    problems+=("PIN-NESTED-STATUS-FAILED  $path  pin=$recorded  (could not audit nested submodules)")
+    fail=1
+    continue
+  fi
+  nested_bad=0
+  while IFS= read -r nested_row; do
+    [ -z "$nested_row" ] && continue
+    if [[ ! "$nested_row" =~ ^\ [0-9a-f]{40}\  ]]; then
+      nested_bad=1
+      break
+    fi
+  done <<<"$nested_rows"
+  if [ "$nested_bad" -ne 0 ]; then
+    problems+=("PIN-NESTED-DRIFT  $path  pin=$recorded  (nested submodule is uninitialized, conflicted, or off its recorded commit)")
+    fail=1
+    continue
+  fi
+
   echo "ok  $path  @ $recorded"
-done < <(git config --file .gitmodules --get-regexp 'submodule\..*\.path' | awk '{print $2}')
+done <<<"$module_rows"
 
 if [ "$fail" -ne 0 ]; then
   echo
@@ -61,6 +132,20 @@ if [ "$fail" -ne 0 ]; then
   for p in "${problems[@]}"; do echo "  - $p"; done
   echo
   echo "Resolve each before relying on any 'proven' claim. See WS-0.1 in the completion plan."
+  if [ -f scripts/submodule_sync.sh ]; then
+    echo
+    echo "PIN-DRIFT rows above are one word each; they do not say which direction."
+    echo "For the BEHIND / AHEAD / DIVERGENT classification, the commit counts, and"
+    echo "the exact restore command for the subset that is provably lossless:"
+    echo
+    echo "    scripts/submodule_sync.sh"
+    echo
+    echo "Do not blanket-run 'git submodule update': a worktree that is AHEAD of its"
+    echo "pin holds commits the pin does not, and a blanket update moves off them."
+    echo "submodule_sync.sh will restore an AHEAD/DIVERGENT module only when it has"
+    echo "proved that EVERY commit the pin lacks is held by a durable ref, and it"
+    echo "prints which ref holds which commit when it does."
+  fi
   exit 1
 fi
 

@@ -1428,6 +1428,14 @@ mod tests {
 
     #[test]
     fn pprust_rewrite_guard_classifies_clean_islands_as_authored_source() {
-        assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(DUMMY_SP)));
+        // Trust: the island payload is the real Clean parse (ruling v7/D1); an
+        // empty one is still authored verifier source.
+        assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(Box::new(
+            rustc_ast::CleanIsland {
+                content_span: DUMMY_SP,
+                text: rustc_span::Symbol::intern(""),
+                decls: thin_vec::ThinVec::new(),
+            }
+        ))));
     }
 }

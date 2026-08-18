@@ -197,6 +197,180 @@ pub const CONTRACT_PANIC_ROW_SOURCE: &str = "trust-contract";
 /// compiler-origin authority to an authored opaque body that contains it.
 pub const UNSUPPORTED_COMPILER_CONTRACT_PREFIX: &str = "__trust_unsupported_compiler_contract__:";
 
+// ---------------------------------------------------------------------------
+// Trust (coroutine resume-state contract): the bridge↔compiler↔targo contract
+// for the async/coroutine executor-protocol lane. rustc lowers an `async fn`
+// body to a coroutine whose resume ENTRY dispatches on the frame's resume-state
+// discriminant, with three compiler-inserted `assert(false, ResumedAfter*)`
+// protocol sentinels for the completed/poisoned/dropped states. The executor
+// premise ("never resume a completed coroutine") is a genuine CALLER-side
+// precondition (Rust's documented `Future::poll` contract), so it can never be
+// proved unconditionally. The bridge instead publishes it as a first-class
+// CONTRACT: it constrains the entry dispatch read to the LIVE resume states —
+// the dispatch `SwitchInt`'s own case set (whose `otherwise -> Unreachable`
+// arm is rustc's exhaustiveness certificate) MINUS the reserved RETURNED=1 /
+// POISONED=2 ABI discriminants — and re-emits the sentinels as ordinary
+// REFUTABLE asserts the solver must prove unreachable under that precondition.
+// A wrong live-state set therefore makes the sentinel proof FAIL, never
+// silently pass. trust-ir-bridge (producer) stamps the markers below onto the
+// sentinel obligations; the compiler's verify pass (consumer) may publish the
+// `contract:coroutine-resume-state` row ONLY from the bridge module's
+// authenticated evidence plus fully-proved rows; targo classifies the row as
+// exported-contract conditional evidence — never proof credit. Shared here so
+// the three ends cannot drift. Same marker-free doctrine as the assumption
+// prefixes above.
+// ---------------------------------------------------------------------------
+
+/// Prefix stamped by the trust-ir bridge on the `PanicFreedom` obligation of a
+/// compiler-inserted `ResumedAfter{Return,Panic,Drop}` sentinel that was lowered
+/// as a REFUTABLE assert under the coroutine resume-state entry contract
+/// (instead of the fail-closed path-scoped `Assume(false)` pruning used when no
+/// contract applies). The full description is produced ONLY by
+/// [`coroutine_resume_contract_obligation_description`] and consumed ONLY by
+/// [`parse_coroutine_resume_contract_obligation_description`], so producer and
+/// consumer cannot drift. This marker can appear only on obligations minted
+/// from compiler-generated `Terminator::Assert` messages (never user strings),
+/// which is what makes it an authenticated channel. Marker-free by
+/// construction (see module doc).
+pub const COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX: &str =
+    "[trust-coroutine-resume-state-contract] ";
+
+/// Prefix stamped by the trust-ir bridge on the CALLER-side `PanicFreedom`
+/// obligation minted at every in-bundle direct call whose callee is a
+/// contract-conditional coroutine resume body (the poll/resume site). WIRED
+/// via the audited absent-callee may-panic encoding — in-body `Assert(false)`
+/// marker + this marked obligation + the whole-function counted carrier — the
+/// only bridge encoding that verifiably reaches a published row (a bare
+/// bridge-private obligation is cleared at the public-bundle boundary and
+/// surfaces nowhere). No discharge lane exists yet and this prefix is in NO
+/// demotion allowlist, so the caller's aggregate stays honestly UNPROVED in
+/// every lane and a crate that polls its own coroutine fails closed — an
+/// executor that polls after completion can never verify clean on the
+/// strength of the callee's exported contract alone. Marker-free by
+/// construction, and mutually non-substring with the sentinel marker above
+/// ("-precondition]" vs "-state-contract]").
+pub const COROUTINE_RESUME_PRECONDITION_PREFIX: &str = "[trust-coroutine-resume-precondition] ";
+
+/// Row kind for the compiler-published coroutine resume-state contract row.
+/// Deliberately NOT `assumption:*`: the sentinels were genuinely solver-proved
+/// under the exported precondition (verified-modulo-callers, exactly like a
+/// `#[trust::requires]` definition-entry row), not skipped as a capability gap.
+/// The row still carries `Outcome::Skipped` on the wire — it is a published
+/// contract, never solver proof credit.
+pub const COROUTINE_RESUME_CONTRACT_ROW_KIND: &str = "contract:coroutine-resume-state";
+
+/// The `solver` label stamped on the published contract row.
+pub const COROUTINE_RESUME_CONTRACT_ROW_SOLVER: &str = "trust-classifier";
+
+/// Exact `reason` stamped on the published contract row. Consumers (targo's
+/// partition) require this exact string as part of the row-shape check, so a
+/// hand-built row that merely claims the kind cannot green.
+pub const COROUTINE_RESUME_CONTRACT_ROW_REASON: &str =
+    "proved-under-exported-precondition: every compiler-inserted ResumedAfterReturn/Panic/Drop \
+     sentinel was discharged by the solver under the coroutine resume-state entry contract; \
+     the crate's proof remains conditional on every caller establishing the resume state";
+
+/// Reserved coroutine state discriminant: the coroutine has returned/completed.
+///
+/// Pinned to `rustc_middle::ty::CoroutineArgsExt::RETURNED` (a rustc ABI
+/// constant, NOT a heuristic); `trust-mir-extract` carries a compile-time
+/// cross-check against the live rustc constant so the two can never drift.
+pub const COROUTINE_RESERVED_STATE_RETURNED: u128 = 1;
+
+/// Reserved coroutine state discriminant: the coroutine panicked (poisoned).
+/// Pinned to `rustc_middle::ty::CoroutineArgsExt::POISONED`; cross-checked in
+/// `trust-mir-extract` like [`COROUTINE_RESERVED_STATE_RETURNED`].
+pub const COROUTINE_RESERVED_STATE_POISONED: u128 = 2;
+
+/// The initial coroutine state discriminant (`UNRESUMED`). Every genuine resume
+/// dispatch includes it; the live-state recognizer requires it fail-closed.
+pub const COROUTINE_STATE_UNRESUMED: u128 = 0;
+
+/// Render a live-state set as the canonical `{0}` / `{0, 3}` spelling used in
+/// obligation descriptions and the contract row.
+#[must_use]
+pub fn coroutine_resume_contract_states_render(states: &[u128]) -> String {
+    let inner = states.iter().map(u128::to_string).collect::<Vec<_>>().join(", ");
+    format!("{{{inner}}}")
+}
+
+/// Whether `states` is a well-formed coroutine LIVE resume-state set: strictly
+/// sorted (deduped), non-empty, containing the mandatory `UNRESUMED=0` entry
+/// and excluding both reserved terminal discriminants. Every producer AND
+/// consumer of the contract validates through this single predicate.
+#[must_use]
+pub fn coroutine_resume_contract_states_are_valid(states: &[u128]) -> bool {
+    !states.is_empty()
+        && states.windows(2).all(|w| w[0] < w[1])
+        && states.contains(&COROUTINE_STATE_UNRESUMED)
+        && !states.contains(&COROUTINE_RESERVED_STATE_RETURNED)
+        && !states.contains(&COROUTINE_RESERVED_STATE_POISONED)
+}
+
+/// Build the sentinel obligation description the bridge stamps:
+/// `"[trust-coroutine-resume-state-contract] live states {0}: resumed after return"`.
+#[must_use]
+pub fn coroutine_resume_contract_obligation_description(
+    states: &[u128],
+    sentinel_desc: &str,
+) -> String {
+    format!(
+        "{COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX}live states \
+         {}: {sentinel_desc}",
+        coroutine_resume_contract_states_render(states)
+    )
+}
+
+/// Parse a sentinel obligation description produced by
+/// [`coroutine_resume_contract_obligation_description`]. Returns the live-state
+/// set and the trailing sentinel text, or `None` for ANY malformed spelling
+/// (fail-closed: a malformed marker is a defect, never evidence). The returned
+/// set is guaranteed [`coroutine_resume_contract_states_are_valid`].
+#[must_use]
+pub fn parse_coroutine_resume_contract_obligation_description(
+    desc: &str,
+) -> Option<(Vec<u128>, &str)> {
+    let rest = desc.strip_prefix(COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX)?;
+    let rest = rest.strip_prefix("live states {")?;
+    let (set, tail) = rest.split_once('}')?;
+    let sentinel = tail.strip_prefix(": ")?;
+    let mut states = Vec::new();
+    for part in set.split(',') {
+        states.push(part.trim().parse::<u128>().ok()?);
+    }
+    coroutine_resume_contract_states_are_valid(&states).then_some((states, sentinel))
+}
+
+/// Build the published contract row's description, naming the exact state set.
+#[must_use]
+pub fn coroutine_resume_contract_row_description(states: &[u128]) -> String {
+    format!(
+        "coroutine resume-state executor-protocol contract: ResumedAfterReturn/Panic/Drop \
+         sentinels proved unreachable under exported precondition `resume state ∈ {}` \
+         (reserved RETURNED=1/POISONED=2 excluded per rustc ABI)",
+        coroutine_resume_contract_states_render(states)
+    )
+}
+
+/// Parse the live-state set back out of a contract row description produced by
+/// [`coroutine_resume_contract_row_description`]. Fail-closed on any drift.
+#[must_use]
+pub fn parse_coroutine_resume_contract_row_description(desc: &str) -> Option<Vec<u128>> {
+    let rest = desc.strip_prefix(
+        "coroutine resume-state executor-protocol contract: ResumedAfterReturn/Panic/Drop \
+         sentinels proved unreachable under exported precondition `resume state ∈ {",
+    )?;
+    let (set, tail) = rest.split_once('}')?;
+    if tail != "` (reserved RETURNED=1/POISONED=2 excluded per rustc ABI)" {
+        return None;
+    }
+    let mut states = Vec::new();
+    for part in set.split(',') {
+        states.push(part.trim().parse::<u128>().ok()?);
+    }
+    coroutine_resume_contract_states_are_valid(&states).then_some(states)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +393,8 @@ mod tests {
             EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX,
             ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX,
             DROP_GLUE_ASSUMPTION_PREFIX,
+            COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
+            COROUTINE_RESUME_PRECONDITION_PREFIX,
         ] {
             let lower = prefix.to_ascii_lowercase();
             for marker in FULL_VERIFIER_MARKERS {
@@ -328,5 +504,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn coroutine_resume_contract_markers_are_disjoint_and_marker_free() {
+        for s in [
+            COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
+            COROUTINE_RESUME_PRECONDITION_PREFIX,
+            COROUTINE_RESUME_CONTRACT_ROW_KIND,
+            COROUTINE_RESUME_CONTRACT_ROW_REASON,
+        ] {
+            let lower = s.to_ascii_lowercase();
+            for marker in FULL_VERIFIER_MARKERS {
+                assert!(
+                    !lower.contains(marker),
+                    "coroutine contract string `{s}` must not contain full-verifier marker `{marker}`"
+                );
+            }
+        }
+        // The sentinel marker and the callsite-precondition marker must be
+        // mutually non-substring — `.starts_with()`-based classification of the
+        // two obligation families must never conflate them.
+        assert!(
+            !COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX
+                .contains(COROUTINE_RESUME_PRECONDITION_PREFIX)
+                && !COROUTINE_RESUME_PRECONDITION_PREFIX
+                    .contains(COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX)
+        );
+        // The row kind must never read as an assumption row and must never
+        // collide with the contract-panic bucket prefix.
+        assert!(!COROUTINE_RESUME_CONTRACT_ROW_KIND.starts_with("assumption:"));
+        assert!(!COROUTINE_RESUME_CONTRACT_ROW_KIND.starts_with(CONTRACT_PANIC_ROW_KIND_PREFIX));
+        // Pin the wire kind: compiler producer, targo consumer.
+        assert_eq!(COROUTINE_RESUME_CONTRACT_ROW_KIND, "contract:coroutine-resume-state");
+        // Reserved ABI discriminants pinned (cross-checked against the live
+        // rustc constants in trust-mir-extract).
+        assert_eq!(COROUTINE_STATE_UNRESUMED, 0);
+        assert_eq!(COROUTINE_RESERVED_STATE_RETURNED, 1);
+        assert_eq!(COROUTINE_RESERVED_STATE_POISONED, 2);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_description_round_trips() {
+        let desc = coroutine_resume_contract_obligation_description(&[0], "resumed after return");
+        let (states, sentinel) =
+            parse_coroutine_resume_contract_obligation_description(&desc).expect("round trip");
+        assert_eq!(states, vec![0]);
+        assert_eq!(sentinel, "resumed after return");
+
+        let desc =
+            coroutine_resume_contract_obligation_description(&[0, 3], "resumed after panic");
+        let (states, sentinel) =
+            parse_coroutine_resume_contract_obligation_description(&desc).expect("round trip");
+        assert_eq!(states, vec![0, 3]);
+        assert_eq!(sentinel, "resumed after panic");
+
+        let row = coroutine_resume_contract_row_description(&[0, 3]);
+        assert_eq!(parse_coroutine_resume_contract_row_description(&row), Some(vec![0, 3]));
+    }
+
+    #[test]
+    fn coroutine_resume_contract_parser_fails_closed() {
+        // A live set containing a reserved terminal state is a DEFECT: parsing
+        // must refuse it even when the spelling is otherwise well-formed —
+        // accepting RETURNED=1 as "live" is exactly the by-construction
+        // discharge the contract lane exists to forbid.
+        let poisoned = format!(
+            "{COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX}live states {{0, 1}}: resumed after return"
+        );
+        assert!(parse_coroutine_resume_contract_obligation_description(&poisoned).is_none());
+        // Missing the mandatory UNRESUMED=0 entry.
+        let no_zero = format!(
+            "{COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX}live states {{3}}: resumed after return"
+        );
+        assert!(parse_coroutine_resume_contract_obligation_description(&no_zero).is_none());
+        // Unsorted / duplicated sets.
+        let unsorted = format!(
+            "{COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX}live states {{3, 0}}: resumed after drop"
+        );
+        assert!(parse_coroutine_resume_contract_obligation_description(&unsorted).is_none());
+        let dup = format!(
+            "{COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX}live states {{0, 0}}: resumed after drop"
+        );
+        assert!(parse_coroutine_resume_contract_obligation_description(&dup).is_none());
+        // Empty set, junk payloads, missing prefix.
+        let empty = format!(
+            "{COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX}live states {{}}: resumed after drop"
+        );
+        assert!(parse_coroutine_resume_contract_obligation_description(&empty).is_none());
+        assert!(
+            parse_coroutine_resume_contract_obligation_description(
+                "live states {0}: resumed after return"
+            )
+            .is_none()
+        );
+        assert!(parse_coroutine_resume_contract_row_description("junk").is_none());
     }
 }

@@ -401,7 +401,9 @@ fn bind_origin_to_statement(
 
 fn statement_span(statement: &Statement) -> Option<&SourceSpan> {
     match statement {
-        Statement::Assign { span, .. } | Statement::Unsupported { span, .. } => Some(span),
+        Statement::Assign { span, .. }
+        | Statement::Unsupported { span, .. }
+        | Statement::CopyNonOverlapping { span, .. } => Some(span),
         _ => None,
     }
 }

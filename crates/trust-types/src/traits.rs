@@ -631,6 +631,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let found = collect_trait_impls(&resolver, &body);

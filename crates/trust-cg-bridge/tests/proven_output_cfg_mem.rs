@@ -102,6 +102,7 @@ fn make_cmp_fn(name: &str, op: BinOp) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::bool_ty(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -139,6 +140,7 @@ fn make_ptr_rw() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }

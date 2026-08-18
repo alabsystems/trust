@@ -479,6 +479,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: vec![Formula::Bool(true)],

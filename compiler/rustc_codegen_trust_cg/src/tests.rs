@@ -242,6 +242,28 @@ fn output_gate_modes_follow_the_tracked_closed_domain() {
     assert!(output_gate_mode_from_name("typo").is_err());
 }
 
+// Trust (F1): the frontend selector is a CLOSED domain like the gate mode, and
+// its default has to be the shipped MIR path. Both facts are load-bearing: the
+// default is what makes "the default path is unchanged" true by construction,
+// and a typo that fell through to `mir` would silently compile the MIR path
+// while the caller believed they had measured F1.
+#[test]
+fn trust_cg_frontend_domain_is_closed_and_defaults_to_mir() {
+    assert_eq!(trust_cg_frontend_from_name("mir"), Ok(TrustCgFrontend::Mir));
+    assert_eq!(trust_cg_frontend_from_name("trust-ir"), Ok(TrustCgFrontend::TrustIr));
+    assert!(trust_cg_frontend_from_name("trust_ir").is_err());
+    assert!(trust_cg_frontend_from_name("").is_err());
+    assert!(trust_cg_frontend_from_name("typo").is_err());
+    // The option table's declared default, read back through the same resolver
+    // the backend uses.
+    assert_eq!(
+        trust_cg_frontend_from_name(
+            &rustc_session::config::UnstableOptions::default().trust_cg_frontend
+        ),
+        Ok(TrustCgFrontend::Mir),
+    );
+}
+
 #[test]
 fn batteries_on_strict_verification_forces_output_preservation() {
     assert!(matches!(
@@ -273,20 +295,37 @@ fn cross_target_and_allocator_paths_fail_closed_under_strict() {
 
 #[test]
 fn production_linkage_policy_never_strengthens_weak_definitions() {
+    // The two STRONG definitions the object emitters can express. `Internal` is
+    // admitted because the function-symbol path now carries a per-function
+    // binding (Mach-O local / ELF `STB_LOCAL`) AND the codegen unit is emitted
+    // as ONE object, so a local callee stays reachable from its callers.
     assert!(production_function_symbol_contract_supported(
         Linkage::External,
         Visibility::Default
     ));
-    assert!(!production_function_symbol_contract_supported(
-        Linkage::External,
-        Visibility::Hidden
-    ));
-    assert!(!production_function_symbol_contract_supported(
-        Linkage::External,
-        Visibility::Protected
-    ));
-    for linkage in [
+    assert!(production_function_symbol_contract_supported(
         Linkage::Internal,
+        Visibility::Default
+    ));
+
+    // VISIBILITY is still `Default`-only, on BOTH admitted linkages: no writer
+    // carries an `N_PEXT` / `STV_HIDDEN` / `STV_PROTECTED` channel, so admitting
+    // one would silently change dynamic-link behavior.
+    for linkage in [Linkage::External, Linkage::Internal] {
+        assert!(
+            !production_function_symbol_contract_supported(linkage, Visibility::Hidden),
+            "{linkage:?} / Hidden"
+        );
+        assert!(
+            !production_function_symbol_contract_supported(linkage, Visibility::Protected),
+            "{linkage:?} / Protected"
+        );
+    }
+
+    // Everything that is NOT a strong definition stays refused: weak, link-once,
+    // common, and available-externally all have coalescing/interposition
+    // semantics the emitters do not implement.
+    for linkage in [
         Linkage::AvailableExternally,
         Linkage::Common,
         Linkage::ExternalWeak,
@@ -300,6 +339,21 @@ fn production_linkage_policy_never_strengthens_weak_definitions() {
             "{linkage:?}"
         );
     }
+}
+
+#[test]
+fn admitted_linkages_map_onto_the_two_emittable_bindings() {
+    assert_eq!(
+        bridge_function_linkage(Linkage::External),
+        Ok(bridge_backend::FunctionLinkage::External)
+    );
+    assert_eq!(
+        bridge_function_linkage(Linkage::Internal),
+        Ok(bridge_backend::FunctionLinkage::Internal)
+    );
+    // A linkage the gate never admits must fail closed here rather than be
+    // silently exported as a strong definition.
+    assert!(bridge_function_linkage(Linkage::WeakODR).is_err());
 }
 
 #[test]
@@ -422,6 +476,10 @@ fn apply_direct_call_name_overrides_rewrites_call_terminators() {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            // Trust (R0 carrier): back-fill of the new `VerifiableBody::datatype_defs`
+            // table. An empty table is exactly the pre-carrier meaning, so this is a
+            // no-op restatement of what this body already asserted.
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

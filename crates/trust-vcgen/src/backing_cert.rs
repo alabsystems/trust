@@ -314,7 +314,7 @@ mod tests {
             name: name.into(),
             def_path: name.into(),
             span: span(),
-            body: VerifiableBody { return_ty: Ty::Unit, locals, blocks, arg_count },
+            body: VerifiableBody { return_ty: Ty::Unit, locals, blocks, arg_count, datatype_defs: Default::default() },
             contracts: Vec::new(),
             preconditions: Vec::new(),
             postconditions: Vec::new(),

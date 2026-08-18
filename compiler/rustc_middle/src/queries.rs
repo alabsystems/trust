@@ -645,7 +645,7 @@ rustc_queries! {
     /// `optimized_mir` ensures this query before stealing the source body. This lets
     /// recursive Trust-IR closure construction inspect any local function without peeking
     /// at the mutable state of a `Steal` or depending on query execution order.
-    query mir_for_trust_verification(key: LocalDefId) -> &'tcx mir::Body<'tcx> {
+    query mir_for_trust_verification(key: LocalDefId) -> Option<&'tcx mir::Body<'tcx>> {
         no_hash
         desc { "caching MIR of `{}` for Trust verification", tcx.def_path_str(key) }
     }

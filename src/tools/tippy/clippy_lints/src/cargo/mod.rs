@@ -3,6 +3,9 @@ mod common_metadata;
 // the same `cargo metadata` the with-deps lane already fetches.
 mod external_dependency_source;
 mod feature_name;
+// Trust: `trust_hand_encoded_solver_query` joins this family because the
+// package directory it scans is the one `cargo metadata` names.
+mod hand_encoded_solver_query;
 mod lint_groups_priority;
 mod multiple_crate_versions;
 mod wildcard_dependencies;
@@ -242,6 +245,76 @@ declare_clippy_lint! {
     "a dependency resolved from a registry or a git repository rather than from this tree"
 }
 
+// Trust: lint added by Trust; see the lint/proof boundary in
+// docs/TIPPY_REBRAND.md — this pass reports a structural fact about the tree,
+// never a judgement about whether a proof holds.
+declare_clippy_lint! {
+    /// ### What it does
+    /// Reports a directory in this package that holds both a hand-written
+    /// SMT-LIB solver query and the shell script that discharges it, when the
+    /// solver that script reaches for is one nothing in this build produces.
+    ///
+    /// ### Why is this bad?
+    /// The query is a second copy of the property, written by hand over a model
+    /// of the code rather than over the code. Nothing connects the two: the
+    /// model is transcribed once and then never re-derived, so an edit to the
+    /// function it describes leaves the query still saying what the function
+    /// used to do, and still answering `unsat`. Nothing in the build reads it
+    /// either — no `cargo build`, no `cargo test` and no `trustc` run touches
+    /// the query or its verdict, because the only thing that does is a script
+    /// looking for a solver binary on the developer's machine.
+    ///
+    /// The stack already spans this route end to end. `trust-vc` and `trust-wp`
+    /// build the verification condition from the MIR that actually ships, and
+    /// `trust-mc` discharges it through the same solver the script is reaching
+    /// for by hand — so the property is stated once, on the item, and is
+    /// re-derived on every compile. A property the stack cannot yet express is
+    /// worth reporting as a gap in `trust-mc`, `trust-vc` or `trust-wp`, where
+    /// closing it serves every crate; encoding it by hand serves one directory
+    /// and hides the gap.
+    ///
+    /// The report is a structural fact and nothing more: these files are here,
+    /// and this build does not read them. It is not a verification result, it
+    /// is not a claim that the hand-written query is wrong, and it is not
+    /// evidence about either. A lint may report what the verifier found; a lint
+    /// may never be proof authority — and lint passes run long before
+    /// `TrustVerify`, so this pass cannot know what was proved, what failed, or
+    /// what was never attempted.
+    ///
+    /// ### Known problems
+    /// A solver's own corpus is not reported, because a corpus is read by a
+    /// test harness the build runs and carries no discharge script beside it —
+    /// but a corpus that grew one would be reported. The narrower guard is the
+    /// solver itself: a package whose build produces the tool the script
+    /// invokes is working *on* that tool, so its SMT files are the tool's
+    /// material and nothing is reported.
+    ///
+    /// Only files under the compiled package's own directory are seen. A proof
+    /// bundle kept at a workspace root, beside no `[package]` at all, is
+    /// reported for no crate.
+    ///
+    /// A script whose solver name is built out of a shell variable names no
+    /// tool this pass can identify, and nothing is reported for it.
+    ///
+    /// ### Example
+    /// ```text
+    /// crates/flow-control/
+    ///   src/lib.rs                     // fn keep_tail_chars(budget: u64) -> u64
+    ///   proofs/ay/kt1_clamp_bound.smt2 // (assert ...) (check-sat)  ; EXPECT: unsat
+    ///   proofs/ay/verify.sh            // "$HOME/.cargo/bin/ay" kt1_clamp_bound.smt2
+    /// ```
+    /// Use instead:
+    /// ```text
+    /// crates/flow-control/
+    ///   src/lib.rs                     // #[trust::ensures(result <= budget)]
+    ///                                  // fn keep_tail_chars(budget: u64) -> u64
+    /// ```
+    #[clippy::version = "1.99.0"]
+    pub TRUST_HAND_ENCODED_SOLVER_QUERY,
+    restriction,
+    "a hand-written solver query discharged beside the build instead of through the Trust verification stack"
+}
+
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for wildcard dependencies in the `Cargo.toml`.
@@ -279,6 +352,8 @@ impl_lint_pass!(Cargo => [
     REDUNDANT_FEATURE_NAMES,
     // Trust: added with `trust_external_dependency_source`.
     TRUST_EXTERNAL_DEPENDENCY_SOURCE,
+    // Trust: added with `trust_hand_encoded_solver_query`.
+    TRUST_HAND_ENCODED_SOLVER_QUERY,
     WILDCARD_DEPENDENCIES,
 ]);
 
@@ -309,7 +384,16 @@ impl LateLintPass<'_> for Cargo {
         // a `cargo vendor` source replacement, both leave the declared source
         // naming the registry they replaced; only the resolved package says where
         // cargo reads the code from.
-        static WITH_DEPS_LINTS: &[&Lint] = &[MULTIPLE_CRATE_VERSIONS, TRUST_EXTERNAL_DEPENDENCY_SOURCE];
+        // Trust: `trust_hand_encoded_solver_query` needs the resolved graph too.
+        // Whether the build produces the solver a proof script reaches for is
+        // settled by every package cargo compiles, not by the direct
+        // dependencies alone — a solver pulled in through one of them is still
+        // a solver this build has.
+        static WITH_DEPS_LINTS: &[&Lint] = &[
+            MULTIPLE_CRATE_VERSIONS,
+            TRUST_EXTERNAL_DEPENDENCY_SOURCE,
+            TRUST_HAND_ENCODED_SOLVER_QUERY,
+        ];
 
         lint_groups_priority::check(cx);
 
@@ -340,6 +424,7 @@ impl LateLintPass<'_> for Cargo {
                     multiple_crate_versions::check(cx, &metadata, &self.allowed_duplicate_crates);
                     // Trust: see `WITH_DEPS_LINTS` above.
                     external_dependency_source::check(cx, &metadata);
+                    hand_encoded_solver_query::check(cx, &metadata);
                 },
                 Err(e) => {
                     for lint in WITH_DEPS_LINTS {

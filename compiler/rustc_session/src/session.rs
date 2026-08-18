@@ -707,6 +707,22 @@ impl Session {
         trust_ir_lower_strict_by_flags(self.opts.unstable_opts.trust_ir_lower)
     }
 
+    /// Trust (F1): does the trust-cg backend take its per-function input from the
+    /// direct source (THIR) -> trust-ir producer instead of from MIR?
+    ///
+    /// Lives here because two very distant places need the same answer: the
+    /// backend, which routes `trust_ir_of` into LIR, and `mir_built`'s hook,
+    /// which must FORCE `trust_ir_of` while THIR is still alive. `check_unsafety`
+    /// steals THIR during analysis, and the query's provider fails closed on a
+    /// stolen `Thir`, so a consumer that first asks at codegen time would get
+    /// `None` for every body in the crate. The backend applies the closed-domain
+    /// parse (`trust_cg_frontend_from_name`) that rejects a typo; this predicate
+    /// only answers "is the non-default producer selected", for which any value
+    /// other than the exact spelling is `false`.
+    pub fn trust_cg_frontend_is_trust_ir(&self) -> bool {
+        self.opts.unstable_opts.trust_cg_frontend == "trust-ir"
+    }
+
     /// Structured reporting role. Unknown callback-injected values are handled
     /// as `Unscoped`; the driver rejects them before work.
     pub fn trust_crate_role(&self) -> TrustCrateRole {

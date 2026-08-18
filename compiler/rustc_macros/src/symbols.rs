@@ -38,6 +38,7 @@ mod tests;
 mod kw {
     syn::custom_keyword!(Keywords);
     syn::custom_keyword!(Symbols);
+    syn::custom_keyword!(AppendOnly);
 }
 
 struct Keyword {
@@ -102,6 +103,10 @@ impl Parse for Value {
 struct Input {
     keywords: Punctuated<Keyword, Token![,]>,
     symbols: Punctuated<Symbol, Token![,]>,
+    /// trust: the INDEX-STABLE TAIL. See the `AppendOnly` block in
+    /// `rustc_span/src/symbol.rs` for why this section exists and when to use
+    /// it. Optional: `symbols! { Keywords {..} Symbols {..} }` stays legal.
+    append_only: Punctuated<Symbol, Token![,]>,
 }
 
 impl Parse for Input {
@@ -116,7 +121,16 @@ impl Parse for Input {
         braced!(content in input);
         let symbols = Punctuated::parse_terminated(&content)?;
 
-        Ok(Input { keywords, symbols })
+        let append_only = if input.peek(kw::AppendOnly) {
+            input.parse::<kw::AppendOnly>()?;
+            let content;
+            braced!(content in input);
+            Punctuated::parse_terminated(&content)?
+        } else {
+            Punctuated::new()
+        };
+
+        Ok(Input { keywords, symbols, append_only })
     }
 }
 
@@ -182,7 +196,11 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
             // This allows us to display errors at the proper span, while minimizing
             // unrelated errors caused by bailing out (and not generating code).
             errors.list.push(e);
-            Input { keywords: Default::default(), symbols: Default::default() }
+            Input {
+                keywords: Default::default(),
+                symbols: Default::default(),
+                append_only: Default::default(),
+            }
         }
     };
 
@@ -195,7 +213,8 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
         input.keywords.len()
             + input.symbols.len()
             + prefill_ints.clone().count()
-            + prefill_letters.clone().count(),
+            + prefill_letters.clone().count()
+            + input.append_only.len(),
     );
 
     // Generate the listed keywords.
@@ -285,6 +304,53 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
         };
 
         let name = &symbol.name;
+        symbols_stream.extend(quote! {
+            pub const #name: Symbol = Symbol::new(#idx);
+        });
+    }
+
+    // trust: the INDEX-STABLE TAIL.
+    //
+    // These are interned LAST -- after the keywords, after the listed symbols,
+    // after the digit/letter prefill, and after the env-derived symbols -- so
+    // adding an entry here cannot renumber any symbol that already exists.
+    //
+    // WHY THAT MATTERS: `rustc_metadata` encodes a predefined symbol as its raw
+    // u32 index (`SYMBOL_PREDEFINED`, rmeta/encoder.rs), so an already-built
+    // `.rmeta` is only readable by a compiler whose index -> string map agrees
+    // with the one that wrote it. This repo rebuilds the DRIVER alone against a
+    // FROZEN prebuilt stage1 std, so renumbering is not "recompile everything",
+    // it is "the std on disk becomes unreadable". See the `AppendOnly` block in
+    // `rustc_span/src/symbol.rs` for the full failure mode (E0463).
+    for symbol in input.append_only.iter() {
+        let name = &symbol.name;
+        let value = match &symbol.value {
+            Value::SameAsName => name.to_string(),
+            Value::String(lit) => lit.value(),
+            Value::Env(..) => {
+                errors.list.push(syn::Error::new_spanned(
+                    name,
+                    "env!() values are not supported in the AppendOnly section; \
+                     they are interned before it and would defeat its index stability",
+                ));
+                continue;
+            }
+            Value::Unsupported(expr) => {
+                errors.list.push(syn::Error::new_spanned(
+                    expr,
+                    concat!(
+                        "unsupported expression for symbol value; implement support for this in ",
+                        file!(),
+                    ),
+                ));
+                continue;
+            }
+        };
+        let idx = entries.insert(symbol.name.span(), &value, &mut errors);
+
+        prefill_stream.extend(quote! {
+            #value,
+        });
         symbols_stream.extend(quote! {
             pub const #name: Symbol = Symbol::new(#idx);
         });

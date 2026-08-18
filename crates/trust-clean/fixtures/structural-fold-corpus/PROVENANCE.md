@@ -17,6 +17,41 @@ corpus (including all rung-A members) was regenerated 2026-07-10 with the
 fresh `rustc 1.99.0-dev (8e74b3bab 2026-07-10) (trustc)` — the rung-A verdicts
 are unchanged under the new binary (pinned by `tests/structural_fold_corpus.rs`).
 
+**Regenerated again 2026-08-04, and this is the generation in which R0 actually
+disappears.** The compiler is a stage2-equivalent carrying the `TyKind::Pat` arm
+in `ty_convert::nominal_frontier`; without it the canonical-cut lowering had
+never fired on a single real body, so every recursive type was cut
+root-relatively. The observable difference: `SOURCE::Tree` used to reach
+`xor_all.json` as 7 structured `Ty::Adt`s AND 24 bare markers, and now reaches it
+as markers only, with its definition recorded once in `VerifiableBody::
+datatype_defs`. The corpus is ~3x smaller as a direct result — the recursive
+definition is stored once instead of re-inlined at every occurrence. Pinned by
+`tests/structural_fold_corpus.rs::no_shipped_body_spells_one_type_both_ways`.
+
+> BUILD-STAGE NOTE, now CONFIRMED. These bytes were first cut with
+> `build/host/stage1/bin/trustc`, because `./x.py build` defaults to stage 1
+> under `profile = "compiler"` and stage2 still held the pre-fix compiler at the
+> time. They were then regenerated against a full `--stage 2` build of the same
+> tree (`rustc 1.99.0-dev (0529a6e9e 2026-08-05)`) and the result is
+> BYTE-IDENTICAL — `git status` reports no change across all 16 members. So the
+> stage1/stage2 equivalence this corpus relies on is measured, not assumed.
+>
+> Keep the habit anyway: `regenerate.sh` defaults `TRUSTC` to the stage2 path and
+> will otherwise silently reproduce whichever compiler happens to sit there, so
+> check `trustc --version --verbose`'s `commit-hash` against the tree you meant
+> to measure before trusting a regeneration.
+
+One identity change also came with the 2026-08-04 generation, visible in every
+member:
+`safe_def_path_str` renders the CRATE-QUALIFIED DEFINITION-SITE path since
+`bd2d6ed1fc` (2026-07-13), so the fixture's own types are spelled `SOURCE::Tree`
+/ `SOURCE::TaggedTree` where the 2026-07-10 bytes spelled them `Tree` /
+`TaggedTree`, and std items arrive under their definition crate
+(`alloc::sync::Arc`, not `std::sync::Arc`). The recognizers pin BOTH renderings
+through `crate::def_path_pins` rather than re-pinning to whichever the newest
+compiler emits — see that module's doc for why admitting the two spellings of one
+`DefId` does not widen what a pin admits.
+
 This is RUNGS A + B of the structural-fold lane
 (`docs/design/2026-07-10-structural-fold-lane.md` §5 Rungs A-B, §4): the
 mini-ADT pilot for the structural-recursion certification story —

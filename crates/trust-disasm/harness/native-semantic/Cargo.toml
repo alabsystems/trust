@@ -1,0 +1,30 @@
+[package]
+name = "native-semantic"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace on purpose, for the same reason as native-invariant: this
+# harness executes candidate instructions natively and must be buildable and
+# runnable without dragging the compiler workspace along.
+[workspace]
+
+[[bin]]
+name = "natsem-diff"
+path = "src/main.rs"
+
+[dependencies]
+trust-disasm = { path = "../.." }
+trust-machine-sem = { path = "../../../trust-machine-sem" }
+# Two uses, both deliberately the SHIPPING vocabulary rather than a local copy:
+#   - `collect_free_var_decls`: deciding whether an effect READS x18 is a
+#     question about the formula's free variables, and this is the collector the
+#     SMT discharge itself uses.
+#   - `Formula` constructors in `src/mutate.rs`: the non-vacuity mutations build
+#     WRONG formulas, and they must be wrong in the way a real bug is wrong —
+#     well-sorted terms the concrete replayer accepts and evaluates. A mutation
+#     the replayer refuses proves nothing, because it never reaches a comparison.
+trust-types = { path = "../../../trust-types" }
+
+[profile.release]
+debug-assertions = false

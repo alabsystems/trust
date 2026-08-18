@@ -214,8 +214,10 @@ class DiagnosticFixture:
             if "-vV" in sys.argv:
                 print(IDENTITY)
                 raise SystemExit(0)
-            dump_arg = next(arg for arg in sys.argv if arg.startswith("-Ztrust-dump=mir:"))
-            dump = pathlib.Path(dump_arg.split("=", 1)[1])
+            dump_arg = next(
+                arg for arg in sys.argv if arg.startswith("-Ztrust-dump=mir-only:")
+            )
+            dump = pathlib.Path(dump_arg.split(":", 1)[1])
             dump.mkdir(parents=True, exist_ok=True)
             if MODE == "compile_failure":
                 print("synthetic compiler failure", file=sys.stderr)

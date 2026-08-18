@@ -13,7 +13,7 @@ use super::*;
 /// parser lowers `.is_some()`/`.is_none()`/`.unwrap()` PURELY BY METHOD NAME
 /// regardless of receiver type — so `#[ensures(|r| r.is_some())]` over a body
 /// returning that enum's index-0 payload variant would prove a FALSE post
-/// (`_0_discr==1` pinned, `Not(post)` = `_0_discr==0`, `1==0` UNSAT ⇒ vacuous
+/// (`_0__discr==1` pinned, `Not(post)` = `_0__discr==0`, `1==0` UNSAT ⇒ vacuous
 /// PROVE). `core`/`std` are reserved, so an exact canonical-path match is sound.
 /// The `name` carries no generic args (they are resolved into the ADT's
 /// `fields`/`variants`), so `==` is correct (verified via -Ztrust-dump=mir:<dir>:
@@ -36,9 +36,9 @@ pub(super) fn is_std_result_name(name: &str) -> bool {
 /// std enum `kind` via machine variant index `variant` (0 or 1).
 ///
 /// The spec parser (`trust_types::spec_parse::map_method_call`) models BOTH
-/// wrappers with ONE convention — `{base}_discr == 0` = the "empty" variant:
-///   `is_none()`/`is_err()` => `_0_discr == 0`;
-///   `is_some()`/`is_ok()`  => `_0_discr != 0`.
+/// wrappers with ONE convention — `{base}__discr == 0` = the "empty" variant:
+///   `is_none()`/`is_err()` => `_0__discr == 0`;
+///   `is_some()`/`is_ok()`  => `_0__discr != 0`.
 /// For `Option` the machine variant order matches (None = variant 0, Some =
 /// variant 1), so the mapping is the identity. For `Result` it is INVERTED:
 /// `Ok` is machine variant 0 and `Err` is variant 1 (`Result { Ok(T), Err(E) }`
@@ -58,7 +58,7 @@ pub(super) fn std_enum_model_discr(kind: StdEnumReturn, variant: usize) -> i128 
 
 /// The machine variant index of `kind`'s PAYLOAD-carrying variant (`Some` /
 /// `Ok`) — the only variant whose single operand the return pin may credit as
-/// the parser's `_0_value` payload term.
+/// the parser's `_0__value` payload term.
 pub(super) fn std_enum_payload_variant(kind: StdEnumReturn) -> usize {
     match kind {
         StdEnumReturn::Option => 1, // Some
@@ -135,7 +135,7 @@ pub(super) fn lenwitness_rvalue_tag(rv: &Rvalue) -> String {
 /// happened to rebuild an in-body `Err` aggregate on every path). Without this,
 /// `resolve_enum_return_aggregate` finds NO in-body wrapper aggregate on the
 /// forward-return path, `_0`'s def bottoms out at a Call-dest with no
-/// whole-local def, and the whole discr gate fails closed (`_0_discr`
+/// whole-local def, and the whole discr gate fails closed (`_0__discr`
 /// UNGROUNDED for the entire function — the b62 `certify_upper` bug).
 ///
 /// Returns `(kind, variant)` — the std enum kind (from the return type) and the
@@ -144,7 +144,7 @@ pub(super) fn lenwitness_rvalue_tag(rv: &Rvalue) -> String {
 /// (fail-closed) otherwise.
 ///
 /// SOUNDNESS (why only forced-EMPTY-variant edges ground): the pin is
-/// `_0_discr == std_enum_model_discr(kind, EMPTY)`, TRUE on this path iff
+/// `_0__discr == std_enum_model_discr(kind, EMPTY)`, TRUE on this path iff
 /// reaching `fwd_block` implies `discriminant(call_dest) == EMPTY_tag`. This
 /// holds when (1) `call_dest` is a `Call` dest whose value is stable
 /// (`place_source_is_stable` — so its discriminant is IDENTICAL at the switch
@@ -510,7 +510,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
 }
 
 /// The groundability GATE for Option/Result-return postconditions. Returns the
-/// set of synthetic spec-model names (`_0_discr`, `_0_value`) that the
+/// set of synthetic spec-model names (`_0__discr`, `_0__value`) that the
 /// body-aware contract lane can now GROUND — i.e. connect to the return slot's
 /// real construction — or an EMPTY set (fail-closed) when it cannot.
 ///
@@ -532,16 +532,16 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
 /// false-refute) or credited-but-unpinned.
 ///
 /// WHICH names are credited:
-///  * `_0_discr` — always (once (a)+(b) hold): the pin loop pins it on every
+///  * `_0__discr` — always (once (a)+(b) hold): the pin loop pins it on every
 ///    return path to the PARSER-convention value (`std_enum_model_discr` —
 ///    Result's mapping is INVERTED vs its machine variant order).
-///  * `_0_value` — only when the payload variant (`Some`/`Ok`) is a single
+///  * `_0__value` — only when the payload variant (`Some`/`Ok`) is a single
 ///    INTEGER field, so the pinned term matches the `Sort::Int` the parser
 ///    mints. For `Option` a non-integer payload refuses the WHOLE gate
 ///    (pre-existing behavior, kept: no regression risk in this change); for
 ///    `Result` — the ny-cert selfcheck/crown shapes, whose payloads are Rat
-///    handles / Vec aggregates — `_0_discr` alone is credited and every
-///    `_0_value*` / `*_sign` / `.__trust_ok_i` term stays UNGROUNDED, so any
+///    handles / Vec aggregates — `_0__discr` alone is credited and every
+///    `_0__value*` / `*__sign` / `.__trust_ok_i` term stays UNGROUNDED, so any
 ///    postcondition referencing them still routes to the fail-closed
 ///    SpecModelUngrounded Unknown (never a refutable havoc'd VC).
 pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHashSet<String> {
@@ -551,7 +551,7 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
     let Some(Ty::Adt { name, variants, .. }) = crate::local_ty_ref(func, 0) else {
         lenwitness_dbg!(
             &func.def_path,
-            "discr-gate: return type of _0 is not Ty::Adt -> _0_discr UNGROUNDED"
+            "discr-gate: return type of _0 is not Ty::Adt -> _0__discr UNGROUNDED"
         );
         return empty;
     };
@@ -564,7 +564,7 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
         } else {
             lenwitness_dbg!(
                 &func.def_path,
-                "discr-gate: return adt name={name} is NOT std Option/Result -> _0_discr UNGROUNDED"
+                "discr-gate: return adt name={name} is NOT std Option/Result -> _0__discr UNGROUNDED"
             );
             return empty;
         };
@@ -577,14 +577,14 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
     else {
         lenwitness_dbg!(
             &func.def_path,
-            "discr-gate: payload variant {payload_name}(tag {payload_tag}) missing from lowered variant defs -> _0_discr UNGROUNDED"
+            "discr-gate: payload variant {payload_name}(tag {payload_tag}) missing from lowered variant defs -> _0__discr UNGROUNDED"
         );
         return empty;
     };
     if !variants.iter().any(|v| v.name == empty_name && v.discriminant == empty_tag) {
         lenwitness_dbg!(
             &func.def_path,
-            "discr-gate: empty variant {empty_name}(tag {empty_tag}) missing from lowered variant defs -> _0_discr UNGROUNDED"
+            "discr-gate: empty variant {empty_name}(tag {empty_tag}) missing from lowered variant defs -> _0__discr UNGROUNDED"
         );
         return empty;
     }
@@ -600,7 +600,7 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
     if kind == StdEnumReturn::Option && !int_payload {
         lenwitness_dbg!(
             &func.def_path,
-            "discr-gate: Option with non-integer Some payload -> whole gate refused, _0_discr UNGROUNDED"
+            "discr-gate: Option with non-integer Some payload -> whole gate refused, _0__discr UNGROUNDED"
         );
         return empty;
     }
@@ -633,7 +633,7 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
                 other => {
                     lenwitness_dbg!(
                         &func.def_path,
-                        "discr-gate: return path bb{}->bb{} FAILS gate ({}) -> _0_discr UNGROUNDED for the WHOLE function",
+                        "discr-gate: return path bb{}->bb{} FAILS gate ({}) -> _0__discr UNGROUNDED for the WHOLE function",
                         vc_block.id.0,
                         block.id.0,
                         match other {
@@ -647,9 +647,9 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
         }
     }
     let mut set = FxHashSet::default();
-    set.insert("_0_discr".to_string());
+    set.insert("_0__discr".to_string());
     if int_payload {
-        set.insert("_0_value".to_string());
+        set.insert("_0__value".to_string());
     }
     lenwitness_dbg!(
         &func.def_path,
@@ -658,12 +658,12 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
     set
 }
 
-/// Parse `_0_value.<i>.<j>…_len` (any `#version` token stripped) into its
-/// positional field path. `None` for every other shape — the bare `_0_value_len`,
+/// Parse `_0__value.<i>.<j>…__len` (any `#version` token stripped) into its
+/// positional field path. `None` for every other shape — the bare `_0__value__len`,
 /// non-numeric segments, other bases — which keep today's fail-closed routing.
 pub(super) fn parse_len_model_var(name: &str) -> Option<LenModelVar> {
     let base = name.split('#').next().unwrap_or(name);
-    let core = base.strip_prefix("_0_value.")?.strip_suffix("_len")?;
+    let core = base.strip_prefix("_0__value.")?.strip_suffix("__len")?;
     if core.is_empty() {
         return None;
     }
@@ -1379,19 +1379,19 @@ pub(super) fn len_witness_credited_pairs(
     pairs
 }
 
-/// Parse `_0_value.__trust_ok_<i>` (any `#version` token stripped).
+/// Parse `_0__value.__trust_ok_<i>` (any `#version` token stripped).
 pub(super) fn parse_ok_pair_model_var(name: &str) -> Option<OkPairModelVar> {
     let base = name.split('#').next().unwrap_or(name);
-    let index = base.strip_prefix("_0_value.__trust_ok_")?.parse::<usize>().ok()?;
+    let index = base.strip_prefix("_0__value.__trust_ok_")?.parse::<usize>().ok()?;
     Some(OkPairModelVar { name: base.to_string(), index })
 }
 
-/// Parse the RETURN-payload sign term `_0_value_sign` (any `#version` token
-/// stripped). Other `{base}_sign` names (params, deeper projections) stay
+/// Parse the RETURN-payload sign term `_0__value__sign` (any `#version` token
+/// stripped). Other `{base}__sign` names (params, deeper projections) stay
 /// fail-closed: only the returned payload's own construction is grounded.
 pub(super) fn parse_sign_model_var(name: &str) -> Option<String> {
     let base = name.split('#').next().unwrap_or(name);
-    (base == "_0_value_sign").then(|| base.to_string())
+    (base == "_0__value__sign").then(|| base.to_string())
 }
 
 /// The two sides of an ordering ATOM (`Lt/Le/Gt/Ge/Eq`) — the only formula
@@ -1449,7 +1449,7 @@ pub(super) fn ordering_pair_coverage(posts: &[&Formula]) -> Vec<(OkPairModelVar,
     pairs
 }
 
-/// True iff `_0_value_sign` occurs in the declared postconditions and EVERY
+/// True iff `_0__value__sign` occurs in the declared postconditions and EVERY
 /// occurrence sits inside an ordering atom against the LITERAL 0 (either
 /// side). Any other position — a nonzero constant (which would need Int
 /// discreteness), another variable, arithmetic — keeps the term uncredited.
@@ -1513,6 +1513,21 @@ pub(super) fn partial_ord_witness_facts(callee: &str, ty_name: &str) -> Option<O
     let method = rest
         .strip_prefix(" as std::cmp::PartialOrd>::")
         .or_else(|| rest.strip_prefix(" as core::cmp::PartialOrd>::"))?;
+    // The extractor appends an exact monomorphization fingerprint to every
+    // rendered callee. Strip only its canonical fixed-width form: accepting a
+    // lookalike suffix would widen this closed witness allowlist.
+    let method = if let Some((method, tag)) = method.rsplit_once("::<__trust_args@") {
+        let Some(hex) = tag.strip_suffix('>') else {
+            return None;
+        };
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        method
+    } else {
+        method
+    };
     match method {
         "lt" => Some(OrderFacts::LT),
         "le" => Some(OrderFacts::LE),
@@ -1525,7 +1540,7 @@ pub(super) fn partial_ord_witness_facts(callee: &str, ty_name: &str) -> Option<O
 /// Classify an allowlisted SIGN witness callee: the payload type's own
 /// INHERENT sign predicate `{ty_name}::{is_positive,is_negative,is_zero}`,
 /// returning the outcome set its TRUE result admits for `(payload, 0)`.
-/// These are the exact predicates the spec parser's `{base}_sign` convention
+/// These are the exact predicates the spec parser's `{base}__sign` convention
 /// denotes (all three share one sign term — the parser's own trichotomy
 /// reading, see `spec_parse`).
 pub(super) fn sign_witness_facts(callee: &str, ty_name: &str) -> Option<OrderFacts> {
@@ -1863,7 +1878,7 @@ pub(super) fn ordering_witness_credited_items(
     let mut items: Vec<OrdWitnessItem> =
         ordering_pair_coverage(&refs).into_iter().map(|(a, b)| OrdWitnessItem::Pair(a, b)).collect();
     if sign_var_covered(&refs) {
-        items.push(OrdWitnessItem::Sign("_0_value_sign".to_string()));
+        items.push(OrdWitnessItem::Sign("_0__value__sign".to_string()));
     }
     if items.is_empty() {
         return items;

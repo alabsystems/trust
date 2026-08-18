@@ -131,6 +131,7 @@ fn representative_sort_arm() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: expr_dt(),
+            datatype_defs: Default::default(),
         },
         contracts: Vec::new(),
         preconditions: Vec::new(),

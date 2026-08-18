@@ -135,6 +135,7 @@ fn author_max() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -157,6 +158,7 @@ fn author_min() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -205,6 +207,7 @@ fn author_abs() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -268,6 +271,7 @@ fn author_clamp() -> VerifiableFunction {
             ],
             arg_count: 3,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -452,7 +456,10 @@ impl<'a> Executor<'a> {
             if let Some((condition, target, _fallthrough)) = cond_branch {
                 // path_cond is the REAL machine branch condition over the post-Subs
                 // symbolic NZCV flags now in `state.flags`.
-                let path_cond = condition_to_formula(&state, condition);
+                // A condition the machine model does not evaluate must REFUSE
+                // this replay, not become an `always taken` path condition.
+                let path_cond = condition_to_formula(&state, condition)
+                    .map_err(|er| ExecError::Unsupported(format!("condition at {pc:#x}: {er}")))?;
 
                 // The branch target is a constant PC-relative address resolved by
                 // trust-disasm. The fallthrough is, by AArch64 definition, pc+4 —

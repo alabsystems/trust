@@ -91,6 +91,10 @@ pub enum Opcode {
     Strh,
     /// Load pair.
     Ldp,
+    /// Load pair of 32-bit words, each SIGN-extended into a 64-bit register.
+    /// Distinct from [`Self::Ldp`]: the elements are 4 bytes but the
+    /// destinations are X registers.
+    Ldpsw,
     /// Store pair.
     Stp,
     /// Load exclusive.
@@ -307,6 +311,7 @@ impl fmt::Display for Opcode {
             Self::Strb => "STRB",
             Self::Strh => "STRH",
             Self::Ldp => "LDP",
+            Self::Ldpsw => "LDPSW",
             Self::Stp => "STP",
             Self::Ldxr => "LDXR",
             Self::Stxr => "STXR",

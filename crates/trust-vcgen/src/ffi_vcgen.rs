@@ -447,6 +447,19 @@ mod tests {
         // A safe generic method whose TURBOFISH carries an fn-pointer type is
         // a def path, not a type — excluded by the `::<` discriminator.
         assert!(!is_extern_call("std::vec::Vec::<extern \"C\" fn()>::push", &db));
+        // The identity seam now renders the `{{extern}}` DefPath segment that
+        // rustc's printer dropped, and it renders as `{extern#N}` — NOT as the
+        // bare keyword `extern`. So pattern 2a's segment equality does NOT
+        // newly fire on every foreign def path, and this heuristic's verdict is
+        // BYTE-UNCHANGED by the seam (`t_k::go::boom` and
+        // `t_k::go::{extern#0}::boom` agree). That is the intended behaviour,
+        // not an oversight: genuine foreign imports carry `is_foreign`
+        // (tcx.is_foreign_item) from extraction, the authoritative signal, and
+        // making this fallback fire on `{extern#N}` would route every foreign
+        // call into the no-summary fail-closed branch — a NEW spurious
+        // obligation on code that already routes correctly.
+        assert!(!is_extern_call("t_k::go::{extern#0}::boom", &db));
+        assert!(!is_extern_call("t_k::go::boom", &db));
     }
 
     #[test]
@@ -462,6 +475,19 @@ mod tests {
         // std-namespace carve: a terminal segment that IS a modeled libc name
         // keeps the synthetic-binding shape routable.
         assert!(is_extern_call("std::ffi::c_str::strlen", &db));
+        // `strlen` is a genuine FOREIGN import in an `extern` block inside
+        // `CStr::from_ptr`'s body, so `safe_def_path_str` now renders the
+        // `{extern#N}` segment rustc's printer used to drop (that drop merged the
+        // import into its GRANDPARENT namespace and aliased a real call key).
+        // This lane is a RECOVERY — it binds the call to a modeled summary
+        // instead of the fail-closed unmodeled-FFI obligation — so it must keep
+        // routing. Both matches used here are namespace-position-independent:
+        // `contains("::ffi::")` and the LAST segment.
+        assert!(is_extern_call("core::ffi::c_str::{extern#0}::strlen", &db));
+        assert!(is_extern_call("std::ffi::c_str::{extern#0}::strlen", &db));
+        // The T1 over-refutation guard is unchanged by the new segment: a
+        // qualified Rust path is still not an extern call.
+        assert!(!is_extern_call("std::sync::RwLock::<T>::write", &db));
     }
 
     #[test]
@@ -469,6 +495,10 @@ mod tests {
         assert_eq!(extract_callee_name("libc::malloc"), "malloc");
         assert_eq!(extract_callee_name("std::ffi::c_str::strlen"), "strlen");
         assert_eq!(extract_callee_name("malloc"), "malloc");
+        // The seam's `{extern#N}` segment is a MIDDLE segment, so the summary
+        // key — the last segment — is unmoved.
+        assert_eq!(extract_callee_name("core::ffi::c_str::{extern#0}::strlen"), "strlen");
+        assert_eq!(extract_callee_name("my_sys::ffi::{extern#2}::malloc"), "malloc");
     }
 
     #[test]

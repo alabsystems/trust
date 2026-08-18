@@ -40,3 +40,14 @@ fn require_repository_trust_ir<T: RepositoryTrustIrUniverse>(_: &T) {}
 fn trust_ir_from_ty_is_repository_trust_ir(function: tla_check::GpuFunction) {
     require_repository_trust_ir(&function.module);
 }
+
+trait RepositoryTlaCoreUniverse {}
+
+impl RepositoryTlaCoreUniverse for tla_core::FileId {}
+
+fn require_repository_tla_core<T: RepositoryTlaCoreUniverse>(_: T) {}
+
+#[allow(dead_code)]
+fn tla_core_from_clean_is_repository_tla_core(file: clean_tla::tla_core::FileId) {
+    require_repository_tla_core(file);
+}

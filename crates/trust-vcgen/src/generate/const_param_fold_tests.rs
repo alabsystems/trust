@@ -53,6 +53,7 @@ fn const_param_divisor_is_satisfiably_zero_never_provably_nonzero() {
             blocks: vec![],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

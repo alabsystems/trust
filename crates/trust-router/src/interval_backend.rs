@@ -1495,6 +1495,13 @@ fn prove_alloc_context(conjuncts: &[&Formula], extra: &[&Formula]) -> AllocConte
     let bounded = atoms.iter().all(|atom| {
         let mut visiting = FxHashSet::default();
         let iv = env.eval(atom.term, &mut visiting);
+        // Why: EMPTY is the crossed form [1, 0], so reading `hi` alone sees 0 and
+        // clears every threshold — an UNSAT antecedent would discharge the goal
+        // vacuously, which `Interval::EMPTY`'s own contract forbids. Declining here
+        // yields Unbounded, so an exact structural witness can still force Failed.
+        if iv.is_empty() {
+            return false;
+        }
         match iv.hi {
             // `Ge(term, C)` is impossible iff `term <= hi < C`; `Gt(term, C)`
             // is impossible iff `term <= hi <= C`.
@@ -2832,6 +2839,29 @@ mod tests {
     }
 
     #[test]
+    fn declines_alloc_count_whose_guards_are_contradictory() {
+        // Contradictory guards (`count == 2^28` AND `count <= 2^28 - 1`) intersect to
+        // the EMPTY interval. EMPTY is the crossed form [1, 0], so reading `hi` alone
+        // sees 0 and clears the threshold — the obligation would be "proved" VACUOUSLY
+        // over an operand denoting no value, which Interval::EMPTY's contract forbids.
+        //
+        // This is the ICE that fired 6 times as
+        // "positive-witness invariant breach: `interval` proved a structurally refuted
+        // obligation": structural folding sees the ground violation as true, interval
+        // claimed it bounded, and the fail-closed tripwire caught the disagreement.
+        let formula = Formula::And(vec![
+            Formula::Eq(Box::new(var("count")), Box::new(Formula::Int(1 << 28))),
+            Formula::Le(Box::new(var("count")), Box::new(Formula::Int((1 << 28) - 1))),
+            Formula::Le(Box::new(Formula::Int(0)), Box::new(var("count"))),
+            ge(var("count"), Formula::Int(1 << 28)),
+        ]);
+        assert!(
+            !IntervalBackend::provable(&alloc_vc(formula)),
+            "an empty (UNSAT) interval must never discharge an allocation goal"
+        );
+    }
+
+    #[test]
     fn declines_unguarded_alloc_count() {
         // No dominating size guard: `count = len * 2` with `len` unbounded above can
         // reach the ceiling — the failure atom is satisfiable, so we MUST decline
@@ -3234,6 +3264,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![

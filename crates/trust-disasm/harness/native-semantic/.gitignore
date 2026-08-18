@@ -1,0 +1,18 @@
+# Build products. `natsem` and `target/` were TRACKED before this gate existed,
+# which meant a rebuilt binary showed up as a repo diff on every run and the
+# real changes — baseline.json, the model, the corpus — had to be found among
+# ~350 fingerprint files. Committing the artifacts of a check makes the check
+# annoying to run, and a check that is annoying to run is a check that stops
+# being run.
+#
+# `git rm -r --cached natsem target` is needed once to drop the already-tracked
+# copies; this file only stops new ones.
+target/
+natsem
+
+# Sweep output. Written per run, named by tier, and never reviewed as a diff.
+result.*
+
+# `population-fast.txt` is NOT ignored: the fast tier's population is a
+# committed artifact on purpose, so the gate replays a word set that is
+# reviewable as a diff rather than regenerated from a scan that could drift.

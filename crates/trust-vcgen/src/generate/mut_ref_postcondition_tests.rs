@@ -65,6 +65,7 @@ fn build(
             blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
             arg_count: 1,
             return_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

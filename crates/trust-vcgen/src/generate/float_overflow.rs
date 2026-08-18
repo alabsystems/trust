@@ -149,7 +149,30 @@ pub(super) fn v2_build_float_overflow_vc(
     ) {
         return None;
     }
-    let formula = v2_float_overflow_witness_formula(context.func, op, lhs, rhs)?;
+    // Trust 2026-08-03 — do NOT let "no witness shape" masquerade as
+    // "discharged". A `None` here is indistinguishable from the discharge
+    // `return None` ten lines above, and that conflation is what made every f32
+    // op emit NO obligation at all before the width arms were generalised: the
+    // row came back `no_obligations` / `proved` having checked nothing.
+    //
+    // The width arms now cover binary32/binary64, but the CONFLATION is the
+    // durable defect — it silently swallows any width the arms do not cover, and
+    // f16/f128 are exactly that today. For an unmodellable width, emit the
+    // obligation carrying the MAXIMAL over-approximation of the violation set
+    // (`true`). That is the sound direction by this module's own criterion — the
+    // witness must over-approximate, and `true` contains every real overflow —
+    // so it can never be proved UNSAT and can never falsely discharge. The row
+    // stays visible and unproved instead of vanishing into a `proved`.
+    let formula = match v2_float_overflow_witness_formula(context.func, op, lhs, rhs) {
+        Some(formula) => formula,
+        None if !float_witness_width_is_supported(v2_float_operand_width(context.func, lhs)?) => {
+            Formula::Bool(true)
+        }
+        // A SUPPORTED width that still yielded no witness means there is
+        // genuinely nothing to model (e.g. a non-float operand slipped through);
+        // keep the historical behaviour.
+        None => return None,
+    };
     // F7: conjoin the ENTRY-STABLE contract magnitude bounds on the operands
     // as pure-BV hypotheses, so the typed-CHC/PDR solver lane can discharge
     // the witness from a `#[requires]` bound (previously the witness carried
@@ -295,6 +318,27 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
         ));
     }
     hypotheses
+}
+
+/// Whether this module can build a SOUND overflow witness for `width`.
+///
+/// The witness arms cover binary32 and binary64. `f16`/`f128` are deliberately
+/// absent: fabricating their constants would risk an UNDER-approximating
+/// witness, which is the one direction that is a false-proof channel (see the
+/// soundness note on [`v2_float_overflow_witness_formula`]). Refusing them is
+/// correct — refusing them SILENTLY is not, which is what
+/// [`v2_build_float_overflow_vc`] now prevents.
+#[must_use]
+pub(super) fn float_witness_width_is_supported(width: u32) -> bool {
+    matches!(width, 32 | 64)
+}
+
+/// The float width of `operand`, or `None` if it is not a float.
+pub(super) fn v2_float_operand_width(func: &VerifiableFunction, operand: &Operand) -> Option<u32> {
+    match crate::operand_ty_cow(func, operand).as_deref() {
+        Some(Ty::Float { width }) => Some(*width),
+        _ => None,
+    }
 }
 
 pub(super) fn v2_float_overflow_witness_formula(

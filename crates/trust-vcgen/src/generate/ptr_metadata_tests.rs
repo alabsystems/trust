@@ -15,6 +15,8 @@ fn slice_len_upper_bound_gate_excludes_zst() {
     // Provably non-ZST (>= 1 byte): upper bound is sound.
     assert!(ty_is_definitely_non_zst(&Ty::Int { width: 8, signed: false }));
     assert!(ty_is_definitely_non_zst(&Ty::Int { width: 32, signed: false })); // char
+    assert!(ty_is_definitely_non_zst(&Ty::Char));
+    assert!(ty_is_definitely_non_zst(&Ty::PtrSizedInt { signed: false }));
     assert!(ty_is_definitely_non_zst(&Ty::Bool));
     assert!(ty_is_definitely_non_zst(&Ty::Ref { mutable: false, inner: Box::new(Ty::Bool) }));
     // Struct/tuple with a non-ZST field is non-ZST (no regression on &[Struct]).
@@ -66,6 +68,7 @@ fn ptr_metadata_fn(operand_ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -126,6 +129,7 @@ fn recursive_adt_return_and_params_emit_no_unsupported_vc() {
             }],
             arg_count: 3,
             return_ty: expr,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -170,6 +174,7 @@ fn non_recursive_unsupported_type_still_fails_closed() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -226,6 +231,7 @@ fn recursive_adt_constructor_with_inner_overflow_still_emits_overflow_vc() {
             }],
             arg_count: 2,
             return_ty: expr,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -277,6 +283,7 @@ fn generic_param_declaration_emits_no_unsupported_vc() {
             }],
             arg_count: 2,
             return_ty: generic_param_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -331,6 +338,7 @@ fn generic_param_relaxation_is_param_specific() {
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -394,6 +402,7 @@ fn generic_function_inner_overflow_still_emits_overflow_vc() {
             }],
             arg_count: 3,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -443,6 +452,7 @@ fn unmodeled_array_declaration_emits_no_unsupported_vc() {
             }],
             arg_count: 2,
             return_ty: Ty::u8(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -487,6 +497,7 @@ fn unmodeled_array_relaxation_is_array_specific() {
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -660,6 +671,7 @@ fn try_into_unwrap_fn(
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -791,6 +803,7 @@ fn arbitrary_result_unwrap_is_still_flagged() {
             ],
             arg_count: 0,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -980,6 +993,7 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
             ],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1160,6 +1174,7 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
             ],
             arg_count: 0,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

@@ -105,3 +105,8 @@ echo "Trust git hooks: installed (core.hooksPath = $HOOKS_DIR)"
 echo "  pre-push runs scripts/pr_gate.sh, scripts/check_pin_coherence.sh, and"
 echo "  scripts/check_bridge_pin.sh --check. A known-red lane needs an owned,"
 echo "  expiring row in tests/trust-comprehensive/divergences.toml."
+echo
+echo "  post-merge / post-rewrite / post-checkout are ADVISORY: they announce"
+echo "  submodule pin drift right after a pull, rebase or branch switch — the"
+echo "  moment the gitlinks move and the submodule worktrees do not. They print"
+echo "  to stderr, never block, and never mutate a worktree."

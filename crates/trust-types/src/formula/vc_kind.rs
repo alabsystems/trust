@@ -508,6 +508,15 @@ impl VcKind {
                 BinOp::Add => "overflow:add",
                 BinOp::Sub => "overflow:sub",
                 BinOp::Mul => "overflow:mul",
+                // `Div`/`Rem` overflow (`MIN / -1`, `MIN % -1`) are real checked
+                // arithmetic ops with their own `mir_assert::Overflow(Div|Rem)`
+                // twins. Collapsing them onto the op-less `overflow` tag erased
+                // the op token that same-span twin subsumption keys on, so a
+                // PROVED div-overflow sibling could never discharge its twin
+                // (`direct_panic_sibling_family` fails closed on op-less tags,
+                // by design, to prevent cross-op discharge). Name them.
+                BinOp::Div => "overflow:div",
+                BinOp::Rem => "overflow:rem",
                 _ => "overflow",
             },
             VcKind::ShiftOverflow { op, .. } => match op {
@@ -842,6 +851,10 @@ impl VcKind {
                     "overflow:sub"
                 } else if detail.starts_with("arithmetic overflow (Mul)") {
                     "overflow:mul"
+                } else if detail.starts_with("arithmetic overflow (Div)") {
+                    "overflow:div"
+                } else if detail.starts_with("arithmetic overflow (Rem)") {
+                    "overflow:rem"
                 } else if detail.starts_with("arithmetic overflow") {
                     "overflow"
                 } else if detail.starts_with("shift overflow (Shl)") {
@@ -943,8 +956,9 @@ impl VcKind {
                 match Self::recovered_full_lane_vc_tag(kind, detail) {
                     // ArithmeticOverflow / ShiftOverflow / NegationOverflow arms.
                     Some(
-                        "overflow:add" | "overflow:sub" | "overflow:mul" | "overflow"
-                        | "shift:left" | "shift:right" | "shift" | "negation",
+                        "overflow:add" | "overflow:sub" | "overflow:mul" | "overflow:div"
+                        | "overflow:rem" | "overflow" | "shift:left" | "shift:right" | "shift"
+                        | "negation",
                     ) => overflow_checks,
                     // DivisionByZero / RemainderByZero / IndexOutOfBounds /
                     // SliceBoundsCheck / Assertion / Unreachable arms.
@@ -1308,7 +1322,10 @@ mod tests {
             ),
             ("FullVerification::ArithmeticSafety", "arithmetic overflow (Sub)", "overflow:sub"),
             ("FullVerification::ArithmeticSafety", "arithmetic overflow (Mul)", "overflow:mul"),
-            ("FullVerification::ArithmeticSafety", "arithmetic overflow (Div)", "overflow"),
+            // `Div`/`Rem` keep their op token: same-span twin subsumption keys
+            // on it, and an op-less tag fails closed.
+            ("FullVerification::ArithmeticSafety", "arithmetic overflow (Div)", "overflow:div"),
+            ("FullVerification::ArithmeticSafety", "arithmetic overflow (Rem)", "overflow:rem"),
             ("FullVerification::ArithmeticSafety", "shift overflow (Shl)", "shift:left"),
             ("FullVerification::ArithmeticSafety", "shift overflow (Shr)", "shift:right"),
             ("FullVerification::ArithmeticSafety", "negation overflow (i32)", "negation"),
@@ -1421,6 +1438,7 @@ mod tests {
             ("FullVerification::ArithmeticSafety", "arithmetic overflow (Sub)", true, false),
             ("FullVerification::ArithmeticSafety", "arithmetic overflow (Mul)", true, false),
             ("FullVerification::ArithmeticSafety", "arithmetic overflow (Div)", true, false),
+            ("FullVerification::ArithmeticSafety", "arithmetic overflow (Rem)", true, false),
             ("FullVerification::ArithmeticSafety", "shift overflow (Shl)", true, false),
             ("FullVerification::ArithmeticSafety", "shift overflow (Shr)", true, false),
             ("FullVerification::ArithmeticSafety", "negation overflow (i32)", true, false),

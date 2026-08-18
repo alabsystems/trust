@@ -49,7 +49,7 @@ expires_on = "2026-07-28"
 # category — tests/ui/linking/macos-ignoring-duplicate.rs and
 # tests/ui/linking/macos-search-path.rs — now ledgered per-test as
 # test-exc.linking.*.strict-exec-drift in
-# tests/upstream-rust/test-exceptions.toml (expire 2026-08-21).
+# tests/upstream-rust/test-exceptions.toml (expire 2026-10-16).
 [[items]]
 id = "upstream.blocker.ui-diagnostic-drift"
 scope = "upstream-rust"
@@ -59,8 +59,8 @@ suite = "ui"
 path = "tests/ui/**"
 reason = "Retired as a category-level blocker per the PR rule (break category blockers into per-test entries): the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly two tests/ui failures in this category (tests/ui/linking/macos-ignoring-duplicate.rs, tests/ui/linking/macos-search-path.rs), both now per-test rows in tests/upstream-rust/test-exceptions.toml. The former backing row was separately resolved to the audited porter model (accepted_narrow_divergence) with the vanilla tests/ui lane green (21159 passed / 0 failed / 606 ignored, reviewed 2026-07-11)."
 compatibility_impact = "Bounded to the two ledgered per-test rows until a fresh strict executed run reclassifies them; no category-wide unknown remains recorded."
-required_action = "Confirm or retire the two per-test rows on the next strict stage2 executed run (their waivers expire 2026-08-21)."
-expires_on = "2026-08-21"
+required_action = "Confirm or retire the two per-test rows on an aarch64-apple-darwin strict stage2 run. HOST-BOUND (noted 2026-08-10): both tests are `//@ only-apple`, so a Linux lane IGNORES them and can neither confirm nor retire them — the 2026-07-12 evidence run was itself aarch64-apple-darwin. Kept in step with the per-test rows, which moved to the same date for the same reason."
+expires_on = "2026-10-16"
 
 [[items]]
 id = "upstream.blocker.crash-status-drift"
@@ -100,14 +100,14 @@ expires_on = "2026-09-30"
 [[items]]
 id = "upstream.blocker.stage-sysroot-skew"
 scope = "upstream-rust"
-status = "decomposed_to_per_test"
+status = "resolved"
 ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
 suite = "tool"
 path = "src/tools/**"
 reason = "Retired as a category-level blocker per the PR rule: the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly 71 failing tests in this category, all tests/ui-fulldeps/** rustc-private failures (E0463/E0460 from the incoherently assembled dylib-only rustc-private sysroot), now ledgered as 71 per-test rows in tests/upstream-rust/test-exceptions.toml. Harness/bootstrap root cause, not a trustc compiler regression; the fix obligation remains on the active backing divergences.toml row."
 compatibility_impact = "Harness validity risk bounded to the 71 ledgered per-test rows plus the backing row's tool-build failures; not proof of public Trust semantic divergence."
-required_action = "Fix prepare_rustc_private_sysroot to assemble a coherent stage2 rustc-private sysroot, then retire the 71 per-test rows on a fresh green fulldeps lane (waivers expire 2026-08-21)."
-expires_on = "2026-08-21"
+required_action = "DONE 2026-08-10. The root cause was fixed by `94446ac500` on 2026-07-11 — thirteen days BEFORE these rows were written, which is why re-measurement retired them rather than a new fix doing so. Fresh lane: 76 ui-fulldeps tests, 0 failed, sysroot control firing twice (reports/artifacts/2026-08-10-ui-fulldeps-lane.log). All 71 per-test rows deleted from test-exceptions.toml. The backing divergences.toml row stays ACTIVE, narrowed to the rustdoc/parser tool builds, which this run did not exercise."
+resolved_on = "2026-08-10"
 
 [[items]]
 id = "upstream.blocker.rustdoc-linkcheck-drift"

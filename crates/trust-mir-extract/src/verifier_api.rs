@@ -36,11 +36,13 @@ const TRUST_VC_HARDENED_DETAIL_METADATA_KEY: &str = "trust.vc.hardened.detail";
 // silently split a lane in two.
 use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
 // Trust (P0 false-proof fix): namespace for the `UnboundedAllocation` (#nia-oom)
-// capacity obligation. Deliberately NOT `trust.vc.hardened`, so
-// `native_trust_ir_route_for_api_obligation` returns `None` (non-routable) and the
-// capacity check stays on the per-VC ay/interval lane that actually solves
-// `count >= ceiling`, rather than inheriting a native whole-function CHC "safe"
-// verdict that never modeled the allocation budget.
+// capacity obligation. Deliberately NOT `trust.vc.hardened`, so the capacity
+// check can never inherit a native whole-function CHC "safe" verdict that never
+// modeled the allocation budget (the recorded P0). The namespace's ONLY native
+// route is the trust-vc MIR-memory proof-unit + replayable-certificate lane
+// (`trust_vc_formula_obligation`, the BoundsCheck precedent), whose predicate IS
+// the negated `count >= ceiling` VC; the front-line ay/interval lane still
+// solves the same formula per-VC.
 use trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE as TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE;
 const TRUST_SOURCE_DIGEST_METADATA_KEY: &str = "trust.mir-extract.source.digest.sha256";
 /// Compiler-owned crate disambiguator carried by authority-bearing bundles.
@@ -195,6 +197,7 @@ fn validated_vc_source_contract_binding(
     function: &VerifiableFunction,
     compiler_contracts: &CompilerContractBundle,
     vc: &VerificationCondition,
+    target_pointer_width_bits: Option<u32>,
 ) -> Option<ValidatedVcSourceContractBinding> {
     let index = vc.contract_metadata?.source_contract_index?;
     let contract = canonical_source_contract(function, compiler_contracts, index)?;
@@ -203,6 +206,7 @@ fn validated_vc_source_contract_binding(
         function,
         contract,
         compiler_contracts.typed_proposition(index, contract),
+        target_pointer_width_bits,
     );
     Some(ValidatedVcSourceContractBinding {
         index,
@@ -332,6 +336,7 @@ fn exact_fresh_source_role_rows_match(
     required_role: &str,
     raw_vcs: &[VerificationCondition],
     augmented_vcs: &[VerificationCondition],
+    target_pointer_width_bits: Option<u32>,
 ) -> bool {
     if raw_vcs.len() != augmented_vcs.len() {
         return false;
@@ -339,17 +344,23 @@ fn exact_fresh_source_role_rows_match(
 
     let mut expected_choices = Vec::new();
     for (raw, augmented) in raw_vcs.iter().zip(augmented_vcs) {
-        let Some(raw_binding) =
-            validated_vc_source_contract_binding(function, compiler_contracts, raw)
-        else {
+        let Some(raw_binding) = validated_vc_source_contract_binding(
+            function,
+            compiler_contracts,
+            raw,
+            target_pointer_width_bits,
+        ) else {
             continue;
         };
         if raw_binding.index != source_index || raw_binding.role != required_role {
             continue;
         }
-        let Some(augmented_binding) =
-            validated_vc_source_contract_binding(function, compiler_contracts, augmented)
-        else {
+        let Some(augmented_binding) = validated_vc_source_contract_binding(
+            function,
+            compiler_contracts,
+            augmented,
+            target_pointer_width_bits,
+        ) else {
             return false;
         };
         if augmented_binding.index != source_index || augmented_binding.role != required_role {
@@ -383,9 +394,13 @@ fn exact_fresh_source_role_rows_match(
     let supplied = supplied_vcs
         .iter()
         .filter(|vc| {
-            validated_vc_source_contract_binding(function, compiler_contracts, vc).is_some_and(
-                |binding| binding.index == source_index && binding.role == required_role,
+            validated_vc_source_contract_binding(
+                function,
+                compiler_contracts,
+                vc,
+                target_pointer_width_bits,
             )
+            .is_some_and(|binding| binding.index == source_index && binding.role == required_role)
         })
         .collect::<Vec<_>>();
     if supplied.len() != expected_choices.len() {
@@ -429,6 +444,7 @@ fn exact_fresh_loop_contract_vc_replacements(
     compiler_contracts: &CompilerContractBundle,
     supplied_vcs: &[VerificationCondition],
     feedback: &[trust_vcgen::LoopInvariantFeedbackCandidate],
+    target_pointer_width_bits: Option<u32>,
 ) -> BTreeSet<usize> {
     let Some((raw_vcs, augmented_vcs)) =
         trust_vcgen::regenerate_loop_contract_production_variants(function, feedback)
@@ -467,6 +483,7 @@ fn exact_fresh_loop_contract_vc_replacements(
                         role,
                         &raw_vcs,
                         &augmented_vcs,
+                        target_pointer_width_bits,
                     )
                 })
             }
@@ -481,6 +498,7 @@ fn exact_fresh_loop_contract_vc_replacements(
                     "loop_decreases",
                     &raw_vcs,
                     &augmented_vcs,
+                    target_pointer_width_bits,
                 )
             }
             TrustTypesContractKind::Decreases
@@ -494,6 +512,7 @@ fn exact_fresh_loop_contract_vc_replacements(
                     "recursion_decreases",
                     &raw_recursion_vcs,
                     &augmented_recursion_vcs,
+                    target_pointer_width_bits,
                 )
             }
             _ => false,
@@ -539,6 +558,20 @@ pub fn contract_bundle_to_verifier_api_with_crate_name(
     function: &VerifiableFunction,
     compiler_contracts: &CompilerContractBundle,
     crate_name: &str,
+) -> TrustContractBundle {
+    // No target pointer width is nameable through this compatibility surface;
+    // pointer-sized quantifier binders fail closed (see
+    // `spec_quantifier_sort_domain`).
+    contract_bundle_to_verifier_api_for_target(function, compiler_contracts, crate_name, None)
+}
+
+/// Shared bundle constructor carrying the compilation target's pointer width
+/// (in bits) for pointer-sized spec binders. `None` fails those binders closed.
+fn contract_bundle_to_verifier_api_for_target(
+    function: &VerifiableFunction,
+    compiler_contracts: &CompilerContractBundle,
+    crate_name: &str,
+    target_pointer_width_bits: Option<u32>,
 ) -> TrustContractBundle {
     let source_digest = verifier_source_digest(function);
     let function_context = function_context_with_crate_name(function, crate_name);
@@ -586,8 +619,12 @@ pub fn contract_bundle_to_verifier_api_with_crate_name(
             continue;
         };
 
-        let (predicate, unsupported_reason, lowering) =
-            lower_contract_predicate(function, contract, typed_proposition);
+        let (predicate, unsupported_reason, lowering) = lower_contract_predicate(
+            function,
+            contract,
+            typed_proposition,
+            target_pointer_width_bits,
+        );
         let predicate_schema = predicate_schema(&predicate);
         let predicate_digest = contract_predicate_digest(function, index, contract, &predicate);
         let mut metadata = vec![MetadataEntry {
@@ -714,16 +751,25 @@ pub fn contract_bundle_to_verifier_api_with_crate_name(
 /// schema. `stable_crate_id` is the independently compiler-owned authority
 /// identity and is bound into both bundle metadata and the bundle ID so a
 /// verifier response from a same-name crate instance cannot be replayed.
+///
+/// `target_pointer_width_bits` is the compilation target's pointer width from
+/// `tcx.data_layout.pointer_size().bits()`; it gives `usize`/`isize` quantifier
+/// binders their exact domain. `None` — or any width outside the supported
+/// 16/32/64 set — keeps those binders failing closed.
 #[must_use]
-#[allow(deprecated)]
 pub fn contract_bundle_to_verifier_api_with_compiler_identity(
     function: &VerifiableFunction,
     compiler_contracts: &CompilerContractBundle,
     crate_name: &str,
     stable_crate_id: u64,
+    target_pointer_width_bits: Option<u32>,
 ) -> TrustContractBundle {
-    let mut bundle =
-        contract_bundle_to_verifier_api_with_crate_name(function, compiler_contracts, crate_name);
+    let mut bundle = contract_bundle_to_verifier_api_for_target(
+        function,
+        compiler_contracts,
+        crate_name,
+        target_pointer_width_bits,
+    );
     bind_compiler_crate_identity(&mut bundle, function, stable_crate_id);
     bundle
 }
@@ -773,6 +819,11 @@ pub fn function_to_verifier_api_bundle_with_crate_name(
 }
 
 /// Convert contracts and VCs with the complete rustc crate identity.
+///
+/// `target_pointer_width_bits` follows the
+/// [`contract_bundle_to_verifier_api_with_compiler_identity`] contract: the
+/// target's pointer width in bits, or `None` to fail pointer-sized quantifier
+/// binders closed.
 #[must_use]
 pub fn function_to_verifier_api_bundle_with_compiler_identity(
     function: &VerifiableFunction,
@@ -780,6 +831,7 @@ pub fn function_to_verifier_api_bundle_with_compiler_identity(
     vcs: &[VerificationCondition],
     crate_name: &str,
     stable_crate_id: u64,
+    target_pointer_width_bits: Option<u32>,
 ) -> TrustContractBundle {
     function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compiler_identity(
         function,
@@ -788,6 +840,7 @@ pub fn function_to_verifier_api_bundle_with_compiler_identity(
         &[],
         crate_name,
         stable_crate_id,
+        target_pointer_width_bits,
     )
 }
 
@@ -988,7 +1041,6 @@ pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates(
 #[deprecated(
     note = "crate name is not a rustc crate-instance authority; use function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compiler_identity"
 )]
-#[allow(deprecated)]
 #[must_use]
 pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_name(
     function: &VerifiableFunction,
@@ -997,15 +1049,50 @@ pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_n
     feedback: &[trust_vcgen::LoopInvariantFeedbackCandidate],
     crate_name: &str,
 ) -> TrustContractBundle {
+    // No target pointer width is nameable through this compatibility surface;
+    // pointer-sized quantifier binders fail closed (see
+    // `spec_quantifier_sort_domain`).
+    function_to_verifier_api_bundle_for_target(
+        function,
+        compiler_contracts,
+        vcs,
+        feedback,
+        crate_name,
+        None,
+    )
+}
+
+/// Shared contracts+VCs bundle constructor carrying the compilation target's
+/// pointer width (in bits) for pointer-sized spec binders. `None` fails those
+/// binders closed. One width flows through every predicate lowering in the
+/// bundle — contract rows and VC source-contract bindings alike — so predicate
+/// digests never diverge within a build.
+fn function_to_verifier_api_bundle_for_target(
+    function: &VerifiableFunction,
+    compiler_contracts: &CompilerContractBundle,
+    vcs: &[VerificationCondition],
+    feedback: &[trust_vcgen::LoopInvariantFeedbackCandidate],
+    crate_name: &str,
+    target_pointer_width_bits: Option<u32>,
+) -> TrustContractBundle {
     let function_context = function_context_with_crate_name(function, crate_name);
-    let mut bundle =
-        contract_bundle_to_verifier_api_with_crate_name(function, compiler_contracts, crate_name);
+    let mut bundle = contract_bundle_to_verifier_api_for_target(
+        function,
+        compiler_contracts,
+        crate_name,
+        target_pointer_width_bits,
+    );
     let source_digest = verifier_source_digest(function);
     let emitted_vc_indices = verifier_api_emitted_vc_indices(function, compiler_contracts, vcs)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let exact_loop_contract_replacements =
-        exact_fresh_loop_contract_vc_replacements(function, compiler_contracts, vcs, feedback);
+    let exact_loop_contract_replacements = exact_fresh_loop_contract_vc_replacements(
+        function,
+        compiler_contracts,
+        vcs,
+        feedback,
+        target_pointer_width_bits,
+    );
     if !exact_loop_contract_replacements.is_empty() {
         let replacement_contract_ids = exact_loop_contract_replacements
             .iter()
@@ -1080,8 +1167,12 @@ pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_n
         metadata.extend(vc_formula_payload.into_metadata());
         metadata.extend(mir_memory_metadata);
         let required_strength = trust_vc_mir_memory_required_strength(&obligation_kind);
-        let source_contract_binding =
-            validated_vc_source_contract_binding(function, compiler_contracts, vc);
+        let source_contract_binding = validated_vc_source_contract_binding(
+            function,
+            compiler_contracts,
+            vc,
+            target_pointer_width_bits,
+        );
         if let Some(binding) = &source_contract_binding {
             metadata.extend([
                 MetadataEntry {
@@ -1128,8 +1219,12 @@ pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_n
 
 /// Convert contracts and VCs with loop feedback and the complete rustc crate
 /// identity.
+///
+/// `target_pointer_width_bits` follows the
+/// [`contract_bundle_to_verifier_api_with_compiler_identity`] contract: the
+/// target's pointer width in bits, or `None` to fail pointer-sized quantifier
+/// binders closed.
 #[must_use]
-#[allow(deprecated)]
 pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compiler_identity(
     function: &VerifiableFunction,
     compiler_contracts: &CompilerContractBundle,
@@ -1137,13 +1232,15 @@ pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compile
     feedback: &[trust_vcgen::LoopInvariantFeedbackCandidate],
     crate_name: &str,
     stable_crate_id: u64,
+    target_pointer_width_bits: Option<u32>,
 ) -> TrustContractBundle {
-    let mut bundle = function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_name(
+    let mut bundle = function_to_verifier_api_bundle_for_target(
         function,
         compiler_contracts,
         vcs,
         feedback,
         crate_name,
+        target_pointer_width_bits,
     );
     bind_compiler_crate_identity(&mut bundle, function, stable_crate_id);
     bundle
@@ -1153,6 +1250,7 @@ fn lower_contract_predicate(
     function: &VerifiableFunction,
     contract: &Contract,
     typed_proposition: Option<&trust_types::CompilerContractProposition>,
+    target_pointer_width_bits: Option<u32>,
 ) -> (ContractPredicate, Option<String>, &'static str) {
     if let Some(reason) = contract.body.strip_prefix(UNSUPPORTED_COMPILER_CONTRACT_PREFIX) {
         let reason = format!(
@@ -1225,7 +1323,7 @@ fn lower_contract_predicate(
     }
 
     if let Some(body) = contract.body.strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX) {
-        return lower_simple_contract_expr(function, contract, body);
+        return lower_simple_contract_expr(function, contract, body, target_pointer_width_bits);
     }
 
     match contract.body.trim() {
@@ -1436,6 +1534,7 @@ fn lower_simple_contract_expr(
     function: &VerifiableFunction,
     contract: &Contract,
     body: &str,
+    target_pointer_width_bits: Option<u32>,
 ) -> (ContractPredicate, Option<String>, &'static str) {
     let attr = parse_spec_attr(contract.kind.attr_name(), body);
     let Ok(attr) = attr else {
@@ -1511,7 +1610,7 @@ fn lower_simple_contract_expr(
         );
     }
 
-    match trust_spec_predicate(function, spec_expr) {
+    match trust_spec_predicate(function, spec_expr, target_pointer_width_bits) {
         Ok(predicate) => (predicate, None, "spec_expr"),
         Err(reason) => {
             let reason =
@@ -1564,8 +1663,9 @@ fn trust_ir_bool_literal(value: bool) -> ContractPredicate {
 fn trust_spec_predicate(
     function: &VerifiableFunction,
     expr: &SpecExpr,
+    target_pointer_width_bits: Option<u32>,
 ) -> Result<ContractPredicate, String> {
-    let mut lowerer = SpecExprLowerer::new(function);
+    let mut lowerer = SpecExprLowerer::new(function, target_pointer_width_bits);
     let root = lowerer.lower_expr(expr, Some(TrustSpecSort::Bool))?;
     if root.sort != TrustSpecSort::Bool {
         return Err(format!("predicate root has sort {:?}, expected bool", root.sort));
@@ -1579,10 +1679,13 @@ struct SpecExprLowerer {
     return_sort: Option<TrustSpecSort>,
     variables: BTreeMap<String, TrustSpecVariable>,
     quantified: BTreeMap<String, TrustSpecSort>,
+    /// Compilation-target pointer width for `usize`/`isize` binders; `None`
+    /// (the caller could not name the target) fails those binders closed.
+    target_pointer_width_bits: Option<u32>,
 }
 
 impl SpecExprLowerer {
-    fn new(function: &VerifiableFunction) -> Self {
+    fn new(function: &VerifiableFunction, target_pointer_width_bits: Option<u32>) -> Self {
         let locals = function
             .body
             .locals
@@ -1598,6 +1701,7 @@ impl SpecExprLowerer {
             return_sort: ty_to_spec_sort(&function.body.return_ty),
             variables: BTreeMap::new(),
             quantified: BTreeMap::new(),
+            target_pointer_width_bits,
         }
     }
 
@@ -1738,7 +1842,7 @@ impl SpecExprLowerer {
         ty: &str,
         body: &SpecExpr,
     ) -> Result<TrustSpecExpr, String> {
-        let (sort, domain) = spec_quantifier_sort_domain(ty)
+        let (sort, domain) = spec_quantifier_sort_domain(ty, self.target_pointer_width_bits)
             .ok_or_else(|| format!("quantified variable `{var}` has unsupported type `{ty}`"))?;
         let previous = self.quantified.insert(var.to_string(), sort);
         self.record_variable(var, sort, TrustSpecVariableOrigin::Quantified)?;
@@ -1919,7 +2023,10 @@ impl SpecQuantifierDomain {
     }
 }
 
-fn spec_quantifier_sort_domain(ty: &str) -> Option<(TrustSpecSort, Option<SpecQuantifierDomain>)> {
+fn spec_quantifier_sort_domain(
+    ty: &str,
+    target_pointer_width_bits: Option<u32>,
+) -> Option<(TrustSpecSort, Option<SpecQuantifierDomain>)> {
     let int = |domain| Some((TrustSpecSort::Int, domain));
     match ty {
         "bool" | "Bool" => Some((TrustSpecSort::Bool, None)),
@@ -1946,10 +2053,33 @@ fn spec_quantifier_sort_domain(ty: &str) -> Option<(TrustSpecSort, Option<SpecQu
         "u32" => int(Some(SpecQuantifierDomain::UnsignedInclusive { max: u32::MAX.into() })),
         "u64" => int(Some(SpecQuantifierDomain::UnsignedInclusive { max: u64::MAX.into() })),
         "u128" => int(Some(SpecQuantifierDomain::UnsignedInclusive { max: u128::MAX })),
-        // The bridge has no target pointer-width input. Reject both universal
+        // Pointer-sized binders take their exact domain from the compilation
+        // target's pointer width, supplied by the compiler caller from
+        // `tcx.data_layout.pointer_size()` — never the host, never a guess.
+        // Without a supported width (16/32/64), keep rejecting both universal
         // and existential pointer-sized binders rather than publishing a
         // different proposition over a guessed or unbounded domain.
-        "usize" | "isize" => None,
+        "usize" => match target_pointer_width_bits {
+            Some(16) => int(Some(SpecQuantifierDomain::UnsignedInclusive { max: u16::MAX.into() })),
+            Some(32) => int(Some(SpecQuantifierDomain::UnsignedInclusive { max: u32::MAX.into() })),
+            Some(64) => int(Some(SpecQuantifierDomain::UnsignedInclusive { max: u64::MAX.into() })),
+            _ => None,
+        },
+        "isize" => match target_pointer_width_bits {
+            Some(16) => int(Some(SpecQuantifierDomain::Inclusive {
+                min: i16::MIN.into(),
+                max: i16::MAX.into(),
+            })),
+            Some(32) => int(Some(SpecQuantifierDomain::Inclusive {
+                min: i32::MIN.into(),
+                max: i32::MAX.into(),
+            })),
+            Some(64) => int(Some(SpecQuantifierDomain::Inclusive {
+                min: i64::MIN.into(),
+                max: i64::MAX.into(),
+            })),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3340,9 +3470,20 @@ fn trust_vc_formula_obligation(kind: &ObligationKind) -> bool {
     // validate_trust_vc_request failed the WHOLE bundle
     // (MissingTrustVcEvidenceForObligation) — one bounds obligation poisoned
     // every other obligation in the function.
+    //
+    // `trust.vc.unbounded_allocation` (#nia-oom) joins the SAME transport: the
+    // unit's predicate is the negated `count >= CEILING` capacity VC (guards
+    // conjoined) — the exact formula alloc_vcs.rs emits and the front line
+    // already kernel-certifies. This is the ONLY route the namespace may take:
+    // it stays out of the trust-mc formula set below and out of the native
+    // whole-function CHC (the recorded P0; see `vc_obligation_kind`).
     matches!(
         kind,
         ObligationKind::MemorySafety | ObligationKind::Ownership | ObligationKind::BoundsCheck
+    ) || matches!(
+        kind,
+        ObligationKind::Custom { namespace, .. }
+            if namespace == TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE
     )
 }
 
@@ -4491,15 +4632,19 @@ fn vc_obligation_kind(kind: &VcKind) -> ObligationKind {
         // routable ArithmeticSafety obligation (e.g. `a as u32 + 1` in the same
         // tuple) inherited the whole-function `Proved` transport and FALSE-PROVED
         // (the fuzzer's `sr_vec_from_elem_*` families). By keeping it OUT of the
-        // native routable set (a non-`trust.vc.hardened` `Custom` namespace returns
-        // `None` from `native_trust_ir_route_for_api_obligation`), the alloc
-        // obligation never enters the CHC bundle, so no whole-function proof can
-        // claim it; it stays non-definitive and the per-VC ay/interval bridge
-        // (`bridge_v1_ay_proofs_into_native_results`) discharges the REAL
-        // `count >= ceiling` formula — proving a dominating-guard-bounded count and
-        // refuting an unguarded one with a concrete `count = ceiling` witness, exactly
-        // as the alloc-only (no-sibling) case already does. The failure-escalation
-        // path keys on the `VcKind` (`is_refutable_l0_safety_vc_kind`), not this
+        // trust-mc/CHC routable set, the alloc obligation never enters the CHC
+        // bundle, so no whole-function proof can claim it. Its ONLY native route
+        // is the trust-vc MIR-memory proof-unit lane (the BoundsCheck precedent,
+        // `trust_vc_formula_obligation`): the unit's predicate is the negated
+        // `count >= ceiling` VC itself, discharged with a replayable certificate
+        // at import time, so the proof that reaches the native lane ENCODES the
+        // capacity budget — the property whose absence was the P0. The per-VC
+        // ay/interval bridge (`bridge_v1_ay_proofs_into_native_results`) still
+        // discharges the REAL `count >= ceiling` formula on the front line —
+        // proving a dominating-guard-bounded count and refuting an unguarded one
+        // with a concrete `count = ceiling` witness, exactly as the alloc-only
+        // (no-sibling) case already does. The failure-escalation path keys on
+        // the `VcKind` (`is_refutable_l0_safety_vc_kind`), not this
         // ObligationKind, so a refuted allocation still hard-errors under strict.
         VcKind::UnboundedAllocation { .. } => ObligationKind::Custom {
             namespace: TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE.to_string(),
@@ -4739,6 +4884,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -4817,6 +4963,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![
                 Contract {
@@ -4910,6 +5057,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![Contract {
                 kind: TrustTypesContractKind::Decreases,
@@ -5227,12 +5375,14 @@ mod tests {
             &compiler_contracts,
             "demo",
             0x11,
+            None,
         );
         let second = contract_bundle_to_verifier_api_with_compiler_identity(
             &function,
             &compiler_contracts,
             "demo",
             0x22,
+            None,
         );
 
         assert_eq!(first.subject, second.subject);
@@ -5264,6 +5414,7 @@ mod tests {
                 &compiler_contracts,
                 "demo",
                 stable_crate_id,
+                None,
             );
             assert_eq!(
                 metadata_value(&bundle.metadata, TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY,),
@@ -5712,16 +5863,230 @@ mod tests {
             },
         ]);
 
-        let bundle = contract_bundle_to_verifier_api(&function, &compiler_contracts);
+        // The compatibility surface cannot name a target, and the production
+        // constructor must stay closed for an absent or unsupported width —
+        // never fall back to a guessed domain.
+        let unsupported_sentinels = |bundle: &TrustContractBundle| {
+            assert_eq!(bundle.obligations.len(), 2);
+            assert!(
+                bundle.contracts.iter().all(|contract| matches!(
+                    &contract.predicate,
+                    ContractPredicate::Unsupported { .. }
+                ))
+            );
+            assert!(bundle.obligations.iter().all(|obligation| matches!(
+                &obligation.kind,
+                ObligationKind::Custom { namespace, name }
+                    if namespace == "trust.contract" && name == "unsupported"
+            )));
+        };
 
-        assert_eq!(bundle.obligations.len(), 2);
-        assert!(
-            bundle.contracts.iter().all(|contract| matches!(
-                &contract.predicate,
-                ContractPredicate::Unsupported { .. }
-            ))
+        unsupported_sentinels(&contract_bundle_to_verifier_api(&function, &compiler_contracts));
+        for width in [None, Some(0), Some(8), Some(24), Some(128)] {
+            unsupported_sentinels(&contract_bundle_to_verifier_api_with_compiler_identity(
+                &function,
+                &compiler_contracts,
+                "demo",
+                0x11,
+                width,
+            ));
+        }
+    }
+
+    #[test]
+    fn pointer_sized_quantifier_domain_follows_the_supplied_target_width() {
+        // The domain is computed from the SUPPLIED target width — never the
+        // host, never a hardcoded 64 — and every unknown width stays closed.
+        for (bits, expected_max) in [
+            (16u32, u128::from(u16::MAX)),
+            (32, u128::from(u32::MAX)),
+            (64, u128::from(u64::MAX)),
+        ] {
+            let Some((
+                TrustSpecSort::Int,
+                Some(SpecQuantifierDomain::UnsignedInclusive { max }),
+            )) = spec_quantifier_sort_domain("usize", Some(bits))
+            else {
+                panic!("usize must lower at supplied width {bits}");
+            };
+            assert_eq!(max, expected_max);
+        }
+        for (bits, expected_min, expected_max) in [
+            (16u32, i128::from(i16::MIN), i128::from(i16::MAX)),
+            (32, i128::from(i32::MIN), i128::from(i32::MAX)),
+            (64, i128::from(i64::MIN), i128::from(i64::MAX)),
+        ] {
+            let Some((TrustSpecSort::Int, Some(SpecQuantifierDomain::Inclusive { min, max }))) =
+                spec_quantifier_sort_domain("isize", Some(bits))
+            else {
+                panic!("isize must lower at supplied width {bits}");
+            };
+            assert_eq!((min, max), (expected_min, expected_max));
+        }
+        for unsupported in [None, Some(0), Some(24), Some(48), Some(128)] {
+            assert!(spec_quantifier_sort_domain("usize", unsupported).is_none());
+            assert!(spec_quantifier_sort_domain("isize", unsupported).is_none());
+        }
+        // The width input must never leak into fixed-width binders.
+        assert!(matches!(
+            spec_quantifier_sort_domain("u8", Some(16)),
+            Some((TrustSpecSort::Int, Some(SpecQuantifierDomain::UnsignedInclusive { max: 255 })))
+        ));
+        assert!(spec_quantifier_sort_domain("u8", None).is_some());
+    }
+
+    #[test]
+    fn pointer_sized_forall_lowers_typed_with_the_target_domain_guard() {
+        // Production path: the SAME compiler-identity constructor the
+        // compiler's build_full_verification_input calls, now carrying the
+        // target pointer width. On a 32-bit target the guard must bind i to
+        // [0, u32::MAX]; a 64-bit host must not leak in.
+        let function = test_function();
+        let compiler_contracts = CompilerContractBundle::new(vec![Contract {
+            kind: TrustTypesContractKind::Ensures,
+            span: function.span.clone(),
+            body: format!("{LOWERED_COMPILER_CONTRACT_PREFIX}forall(i: usize, i == i)"),
+        }]);
+
+        let bundle = contract_bundle_to_verifier_api_with_compiler_identity(
+            &function,
+            &compiler_contracts,
+            "demo",
+            0x11,
+            Some(32),
         );
-        assert!(bundle.obligations.iter().all(|obligation| matches!(
+
+        assert_eq!(bundle.obligations.len(), 1);
+        assert_eq!(
+            metadata_value(&bundle.contracts[0].metadata, "trust.contract.lowering"),
+            Some("spec_expr"),
+        );
+        let predicate = typed_spec_predicate(&bundle.contracts[0].predicate);
+        let TrustSpecExprKind::Quantifier {
+            quantifier: TrustSpecQuantifier::Forall,
+            variable_sort: TrustSpecSort::Int,
+            body,
+            ..
+        } = predicate.root.kind
+        else {
+            panic!("expected typed usize universal")
+        };
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Implies, lhs: guard, rhs: original } =
+            body.kind
+        else {
+            panic!("universal domain must imply its body")
+        };
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::And, lhs: lower, rhs: upper } =
+            guard.kind
+        else {
+            panic!("usize domain must carry lower and upper bounds")
+        };
+        assert!(matches!(lower.kind, TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Ge, .. }));
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Le, rhs: upper_bound, .. } =
+            upper.kind
+        else {
+            panic!("usize upper bound must use <=")
+        };
+        assert!(matches!(
+            upper_bound.kind,
+            TrustSpecExprKind::IntLiteral { ref value } if value == "4294967295"
+        ));
+        assert!(matches!(
+            original.kind,
+            TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Eq, .. }
+        ));
+    }
+
+    #[test]
+    fn pointer_sized_existential_gets_the_signed_target_domain_guard() {
+        // isize existentials conjoin their exact signed target range: choosing
+        // a witness outside the target's isize would change the proposition.
+        let function = test_function();
+        let compiler_contracts = CompilerContractBundle::new(vec![Contract {
+            kind: TrustTypesContractKind::Ensures,
+            span: function.span.clone(),
+            body: format!("{LOWERED_COMPILER_CONTRACT_PREFIX}exists(i: isize, i < 0)"),
+        }]);
+
+        let bundle = contract_bundle_to_verifier_api_with_compiler_identity(
+            &function,
+            &compiler_contracts,
+            "demo",
+            0x11,
+            Some(64),
+        );
+
+        let predicate = typed_spec_predicate(&bundle.contracts[0].predicate);
+        let TrustSpecExprKind::Quantifier {
+            quantifier: TrustSpecQuantifier::Exists,
+            variable_sort: TrustSpecSort::Int,
+            body,
+            ..
+        } = predicate.root.kind
+        else {
+            panic!("expected typed isize existential")
+        };
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::And, lhs: guard, rhs: original } =
+            body.kind
+        else {
+            panic!("existential domain must be conjoined with its body")
+        };
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::And, lhs: lower, rhs: upper } =
+            guard.kind
+        else {
+            panic!("isize domain must carry lower and upper bounds")
+        };
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Ge, rhs: lower_bound, .. } =
+            lower.kind
+        else {
+            panic!("isize lower bound must use >=")
+        };
+        assert!(matches!(
+            lower_bound.kind,
+            TrustSpecExprKind::IntLiteral { ref value } if value == "-9223372036854775808"
+        ));
+        let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Le, rhs: upper_bound, .. } =
+            upper.kind
+        else {
+            panic!("isize upper bound must use <=")
+        };
+        assert!(matches!(
+            upper_bound.kind,
+            TrustSpecExprKind::IntLiteral { ref value } if value == "9223372036854775807"
+        ));
+        assert!(matches!(
+            original.kind,
+            TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Lt, .. }
+        ));
+    }
+
+    #[test]
+    fn full_bundle_constructor_threads_the_target_width_to_quantifier_binders() {
+        // The contracts+VCs funnel must see the same width as the
+        // contract-only reference constructor.
+        let function = test_function();
+        let compiler_contracts = CompilerContractBundle::new(vec![Contract {
+            kind: TrustTypesContractKind::Ensures,
+            span: function.span.clone(),
+            body: format!("{LOWERED_COMPILER_CONTRACT_PREFIX}forall(i: usize, i == i)"),
+        }]);
+
+        let bundle =
+            function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compiler_identity(
+                &function,
+                &compiler_contracts,
+                &[],
+                &[],
+                "demo",
+                0x11,
+                Some(32),
+            );
+
+        assert!(matches!(
+            typed_spec_predicate(&bundle.contracts[0].predicate).root.kind,
+            TrustSpecExprKind::Quantifier { quantifier: TrustSpecQuantifier::Forall, .. }
+        ));
+        assert!(bundle.obligations.iter().all(|obligation| !matches!(
             &obligation.kind,
             ObligationKind::Custom { namespace, name }
                 if namespace == "trust.contract" && name == "unsupported"
@@ -6583,12 +6948,13 @@ mod tests {
     }
 
     /// Trust (P0 false-proof fix): an `UnboundedAllocation` capacity obligation must
-    /// map to the non-native-routable `trust.vc.unbounded_allocation` Custom kind, NOT
+    /// map to the dedicated `trust.vc.unbounded_allocation` Custom kind, NOT
     /// `ArithmeticSafety`. If it were `ArithmeticSafety` the native trust-mc whole-function
     /// CHC proof (which does not model the allocation budget) would false-prove it whenever
     /// a sibling routable arithmetic obligation exists (the `sr_vec_from_elem_*` fuzzer
-    /// families). Keeping it OUT of the native routable set forces it onto the per-VC ay
-    /// lane, which solves the real `count >= ceiling` obligation.
+    /// families). Its ONLY native route is the trust-vc MIR-memory proof-unit lane
+    /// (whose predicate is the negated capacity VC itself); the per-VC ay lane still
+    /// solves the real `count >= ceiling` obligation on the front line.
     #[test]
     fn unbounded_allocation_vc_is_not_arithmetic_safety() {
         let function = test_function();
@@ -6619,6 +6985,81 @@ mod tests {
             }
         );
         assert_ne!(bundle.obligations[0].kind, ObligationKind::ArithmeticSafety);
+    }
+
+    /// Trust (#nia-oom, batch 6): the capacity obligation rides the trust-vc
+    /// MIR-memory proof-unit transport (the BoundsCheck precedent) — the unit's
+    /// predicate is the negated guard-conjoined `count >= ceiling` VC, so the
+    /// certificate that discharges it ENCODES the allocation budget. This pins
+    /// (a) the proof-unit metadata attach, (b) the stable `custom` obligation-id
+    /// label, and (c) that the kind never joins the trust-mc formula set (the
+    /// P0 direction).
+    #[test]
+    fn unbounded_allocation_vc_carries_the_trust_vc_proof_unit() {
+        let function = trust_vc_memory_test_function(Ty::usize());
+        let compiler_contracts = CompilerContractBundle::default();
+        // The exact alloc_vcs.rs shape: violation `count >= CEILING` conjoined
+        // with the dominating guard (`count <= 1024`), UNSAT under the guard.
+        let formula = trust_types::Formula::And(vec![
+            trust_types::Formula::Ge(
+                Box::new(trust_types::Formula::var("x", trust_types::Sort::Int)),
+                Box::new(trust_types::Formula::Int(1 << 28)),
+            ),
+            trust_types::Formula::Le(
+                Box::new(trust_types::Formula::var("x", trust_types::Sort::Int)),
+                Box::new(trust_types::Formula::Int(1024)),
+            ),
+        ]);
+        let vcs = vec![VerificationCondition {
+            kind: VcKind::UnboundedAllocation {
+                callee: "Vec::with_capacity".to_string(),
+                count: "x".to_string(),
+                detail: "bulk allocation may reach the ceiling".to_string(),
+            },
+            function: trust_types::Symbol::intern("demo::f"),
+            location: function.span.clone(),
+            formula,
+            contract_metadata: None,
+            obligation: None,
+        }];
+
+        let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
+        let obligation = &bundle.obligations[0];
+
+        // (b) The obligation id keeps the pre-existing `custom` label — the
+        // proof-unit payload binds by this exact id.
+        assert_eq!(obligation.obligation_id, "vc:demo__f:custom:0");
+        // (a) The full trust-vc MIR-memory proof-unit metadata set, exactly as
+        // for BoundsCheck.
+        assert_eq!(
+            metadata_value(&obligation.metadata, TRUST_VC_CONDITION_ORIGIN_METADATA_KEY),
+            Some(TRUST_VC_CONDITION_ORIGIN_METADATA_VALUE)
+        );
+        assert_eq!(
+            metadata_value(&obligation.metadata, TRUST_VC_PROOF_OBLIGATION_METADATA_KEY),
+            Some(TRUST_VC_PROOF_OBLIGATION_METADATA_VALUE)
+        );
+        assert_eq!(
+            metadata_value(&obligation.metadata, TRUST_VC_OWNERSHIP_CONTEXT_METADATA_KEY),
+            Some(TRUST_VC_OWNERSHIP_CONTEXT_METADATA_VALUE)
+        );
+        assert_eq!(
+            metadata_value(
+                &obligation.metadata,
+                TRUST_VC_MIR_MEMORY_PROOF_UNIT_SCHEMA_METADATA_KEY
+            ),
+            Some(TRUST_VC_MIR_MEMORY_PROOF_UNIT_SCHEMA_VERSION)
+        );
+        let raw_payload =
+            metadata_value(&obligation.metadata, TRUST_VC_MIR_MEMORY_PROOF_UNIT_METADATA_KEY)
+                .expect("the capacity obligation must carry the structured proof unit");
+        let payload: serde_json::Value =
+            serde_json::from_str(raw_payload).expect("proof unit parses");
+        assert_eq!(payload["obligations"][0]["id"], "vc:demo__f:custom:0");
+        // (c) NEVER a trust-mc formula obligation — the CHC proof does not
+        // encode the capacity budget (the recorded P0).
+        assert!(!trust_mc_formula_obligation(&obligation.kind, &vcs[0].kind));
+        assert!(trust_vc_formula_obligation(&obligation.kind));
     }
 
     #[test]

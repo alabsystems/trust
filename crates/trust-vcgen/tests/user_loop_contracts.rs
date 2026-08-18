@@ -72,6 +72,7 @@ fn counted_loop() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -237,6 +238,7 @@ fn nested_spanless_header_loops() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -917,6 +919,7 @@ fn exact_loop_path_limit_fails_the_whole_e4_lane_closed() {
             blocks,
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -944,7 +947,7 @@ fn exact_loop_path_limit_fails_the_whole_e4_lane_closed() {
 }
 
 #[test]
-fn nested_cycle_fails_the_outer_e4_transition_closed() {
+fn nested_cycle_without_an_inner_invariant_fails_the_outer_e4_transition_closed() {
     let mut func = nested_spanless_header_loops();
     let spec = LoopContractSpec {
         kind: LoopContractKind::Invariant,
@@ -961,8 +964,8 @@ fn nested_cycle_fails_the_outer_e4_transition_closed() {
     let (solver, preclassified) = generate_vcs_with_discharge(&func);
     let details = loop_unsupported_details(&solver, &preclassified);
     assert!(
-        details.iter().any(|detail| detail.contains("e45.transition.nested-or-cyclic-subpath")),
-        "an inner cycle must reject the outer transition instead of being summarized: {details:#?}",
+        details.iter().any(|detail| detail.contains("e45.transition.nested-invariant-missing")),
+        "an inner cycle without its own invariant must reject the outer transition: {details:#?}",
     );
     assert!(
         !solver.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })),

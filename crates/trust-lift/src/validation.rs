@@ -647,6 +647,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         }
     }
 
@@ -726,6 +727,7 @@ mod tests {
             blocks: vec![],
             arg_count: 0,
             return_ty: Ty::unit_ty(),
+            datatype_defs: Default::default(),
         };
         let lifted = make_lifted(body);
 

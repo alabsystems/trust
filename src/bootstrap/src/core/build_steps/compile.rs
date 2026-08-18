@@ -293,15 +293,22 @@ impl Step for Std {
                 Kind::Build,
             );
             std_cargo(builder, target, &mut cargo, &self.crates);
-            // Trust (opt-in via `TRUST_STD_ENCODE_MIR=1`): encode MIR for ALL std
-            // functions (not just generic/inline ones) so the trust-ir frontend
-            // can lower the FULL std dependency closure of a program
+            // Trust (DEFAULT ON; opt out with `TRUST_STD_ENCODE_MIR=0`): encode MIR
+            // for ALL std functions (not just generic/inline ones) so the trust-ir
+            // frontend can lower the FULL std dependency closure of a program
             // self-contained (e.g. hashbrown's non-inline RawTableInner::ctrl_slice),
             // instead of leaving them as MIR-unavailable link leaves. Additive
             // metadata only — the compiled std object code is byte-identical, so
-            // linking/binaries are unaffected; it only enlarges the rlib metadata
-            // and is therefore OFF by default (no cost to ordinary builds).
-            if std::env::var_os("TRUST_STD_ENCODE_MIR").is_some() {
+            // linking and binaries are unaffected; only the rlib metadata grows.
+            //
+            // Why the default flipped: whether a std function was MIR-encoded is
+            // decided by `cross_crate_inlinable`, which requires `checker.calls == 0`.
+            // That made verifiability an accident of a body's call count —
+            // `Formatter::alternate` (0 calls) bundled and PROVED while
+            // `Formatter::write_str` (1 call) stayed an absent callee, so no impl of
+            // `Debug` or `Display` could verify. An inlining heuristic must not decide
+            // what a VERIFYING compiler is able to prove.
+            if std::env::var_os("TRUST_STD_ENCODE_MIR").is_none_or(|v| v != "0") {
                 cargo.rustflag("-Zalways-encode-mir");
             }
             cargo
@@ -2098,6 +2105,15 @@ fn restore_local_compiler_runtime_artifacts(
 
     let rustc_libdir = sysroot.join(builder.libdir_relative(compiler));
     t!(fs::create_dir_all(&rustc_libdir));
+    // Hash-named driver dylibs from a previous assembly are not replaced by a
+    // copy with a new hash. Leaving both in the public compiler libdir makes
+    // rustc-private wrappers unable to select the compiler's unique runtime
+    // and can load a driver from the wrong compiler generation. The full
+    // librustc stamp below is authoritative, so remove every prior driver
+    // runtime before restoring that exact generation.
+    if !builder.config.dry_run() {
+        t!(prune_rustc_driver_runtime_artifacts(&rustc_libdir));
+    }
     for path in runtime_artifacts {
         let Some(filename) = path.file_name() else {
             continue;
@@ -2115,6 +2131,19 @@ fn restore_local_compiler_runtime_artifacts(
             }
         }
     }
+}
+
+fn prune_rustc_driver_runtime_artifacts(libdir: &Path) -> std::io::Result<()> {
+    if !libdir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(libdir)? {
+        let path = entry?.path();
+        if is_rustc_driver_runtime_artifact(&path) {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
 fn existing_local_compiler_runtime_artifacts(
@@ -2179,16 +2208,21 @@ fn validate_assembled_local_compiler(builder: &Builder<'_>, compiler: Compiler, 
     }
 
     let rustc_libdir = builder.rustc_libdir(compiler);
-    let has_driver = builder
+    let drivers = builder
         .read_dir(&rustc_libdir)
         .into_iter()
-        .any(|entry| is_rustc_driver_runtime_artifact(&entry.path()));
-    assert!(
-        has_driver,
-        "assembled stage{} compiler at `{}` has no librustc_driver runtime in `{}`",
+        .map(|entry| entry.path())
+        .filter(|path| is_rustc_driver_runtime_artifact(path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        drivers.len(),
+        1,
+        "assembled stage{} compiler at `{}` must contain exactly one librustc_driver runtime in `{}`; found {}: {}",
         compiler.stage,
         sysroot.display(),
-        rustc_libdir.display()
+        rustc_libdir.display(),
+        drivers.len(),
+        drivers.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
     );
 
     if compiler.host == builder.build.host_target {

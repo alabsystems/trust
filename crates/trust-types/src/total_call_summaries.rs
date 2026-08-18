@@ -2,7 +2,8 @@
 //! pipeline stage must agree on.
 //!
 //! The TrustIr bridge models certain total calls as fresh-symbolic results and
-//! attaches known postcondition facts (e.g. `len() <= isize::MAX`). The VC
+//! attaches known postcondition facts (e.g. a nonnegative `len()`, plus
+//! `len() <= isize::MAX` when the byte-size invariant proves it). The VC
 //! formula lane must attach the SAME facts to the SAME calls, or obligations
 //! discharged via the formula path see an unconstrained result and false-FAIL
 //! safe code (observed: `s.len() + 1`, build #30). Keeping the matcher here —
@@ -20,12 +21,14 @@
 /// collection, hashing, or ordering summaries.
 pub const TRUST_TOTAL_CLONE_SENTINEL: &str = "__trust_total_clone";
 
-/// True for `str`/`String`/`Vec`/slice `len()` calls, whose result is bounded
-/// by `isize::MAX` (no Rust allocation exceeds `isize::MAX` bytes, so no
-/// element count does either — a language-level safety invariant, never
-/// vacuous).
+/// True for canonical `str`/`String`/`Vec`/slice `len()` calls.
+///
+/// This is a call-identity predicate, not an upper-bound theorem: a slice or
+/// `Vec` of a zero-sized type can have a length greater than `isize::MAX`.
+/// Consumers that only need to identify the collection operation (for example,
+/// to tie its result to an abstract collection length) should use this matcher.
 #[must_use]
-pub fn total_summary_len_bound(callee: &str) -> bool {
+pub fn total_summary_len_call(callee: &str) -> bool {
     if callee.starts_with("__trust_crate@") || !callee.ends_with("::len") {
         return false;
     }
@@ -43,6 +46,36 @@ pub fn total_summary_len_bound(callee: &str) -> bool {
     ]
     .iter()
     .any(|root| canonical_plain_trait_method(callee, root, "len"))
+}
+
+/// True when the callee name alone proves that `len() <= isize::MAX`.
+///
+/// `str` and `String` lengths count bytes, so the allocation/object-size limit
+/// supplies the bound without inspecting a receiver type. Slice lengths need a
+/// separate non-ZST receiver check; `Vec<T>` is intentionally excluded because
+/// the current verifier type can erase `T`, making `Vec<()>` indistinguishable
+/// from a non-ZST vector at this boundary.
+#[must_use]
+pub fn total_summary_len_bound(callee: &str) -> bool {
+    if callee.starts_with("__trust_crate@") || !callee.ends_with("::len") {
+        return false;
+    }
+    ["core::str::", "alloc::str::", "std::str::", "alloc::string::String", "std::string::String"]
+        .iter()
+        .any(|root| canonical_plain_trait_method(callee, root, "len"))
+}
+
+/// True for a canonical slice `len()` call. Its result has the
+/// `isize::MAX` upper bound only when the caller additionally proves that the
+/// receiver's element type is non-zero-sized.
+#[must_use]
+pub fn total_summary_slice_len_call(callee: &str) -> bool {
+    if callee.starts_with("__trust_crate@") || !callee.ends_with("::len") {
+        return false;
+    }
+    ["core::slice::", "alloc::slice::", "std::slice::"]
+        .iter()
+        .any(|root| canonical_plain_trait_method(callee, root, "len"))
 }
 
 /// True for the std value-preserving INTEGER conversions `<intT as From<intS>>::from(x)`
@@ -102,14 +135,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn len_summary_requires_an_unambiguous_standard_root() {
+    fn len_call_requires_an_unambiguous_standard_root() {
         for callee in [
             "core::str::<impl str>::len",
             "alloc::string::String::len",
             "alloc::vec::Vec::<u8>::len",
             "core::slice::<impl [u8]>::len",
         ] {
-            assert!(total_summary_len_bound(callee), "expected canonical len: {callee}");
+            assert!(total_summary_len_call(callee), "expected canonical len: {callee}");
         }
         for callee in [
             "mycrate::String::len",
@@ -120,8 +153,27 @@ mod tests {
             "core::str::evil::len",
             "core::slice::Iter::<u8>::len",
         ] {
-            assert!(!total_summary_len_bound(callee), "must fail closed: {callee}");
+            assert!(!total_summary_len_call(callee), "must fail closed: {callee}");
         }
+    }
+
+    #[test]
+    fn name_only_len_bound_excludes_zst_capable_collections() {
+        for callee in ["core::str::<impl str>::len", "alloc::string::String::len"] {
+            assert!(total_summary_len_bound(callee), "byte length is bounded: {callee}");
+        }
+        for callee in [
+            "alloc::vec::Vec::<u8>::len",
+            "core::slice::<impl [u8]>::len",
+            "core::slice::<impl [()]>::len",
+        ] {
+            assert!(
+                !total_summary_len_bound(callee),
+                "the name alone cannot exclude a ZST receiver: {callee}"
+            );
+        }
+        assert!(total_summary_slice_len_call("core::slice::<impl [u8]>::len"));
+        assert!(!total_summary_slice_len_call("core::slice::Iter::<u8>::len"));
     }
 
     #[test]

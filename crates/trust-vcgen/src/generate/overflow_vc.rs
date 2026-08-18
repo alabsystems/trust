@@ -195,6 +195,46 @@ pub(super) fn v2_signed_mul_corners_fit(a: (i128, i128), b: (i128, i128)) -> boo
     [(la, lb), (la, hb), (ha, lb), (ha, hb)].into_iter().all(|(x, y)| x.checked_mul(y).is_some())
 }
 
+/// Whether `lhs * rhs` at signed 128-bit provably CANNOT overflow, by the
+/// bounded-corner argument.
+///
+/// THE SINGLE SOURCE OF TRUTH for that question, deliberately. Two callers must
+/// agree on it exactly, and they answer for opposite reasons:
+///
+///  * `v2_build_overflow_vc_for_operands` uses it to mint NO obligation.
+///  * `v2_overflow_assert_provably_cannot_fire` uses it to suppress the assert
+///    BEFORE the builder runs — necessary because in the assert lane a builder
+///    returning `None` means "could not analyse" and raises
+///    `RecognizedSafetyAssertProofGap`, not "provably safe".
+///
+/// Were these two to drift apart, the assert lane would call the builder, get
+/// `None`, and emit a proof gap — i.e. a runtime check. That is the fail-closed
+/// direction, so a divergence costs precision, never soundness. Sharing this
+/// function removes the possibility either way.
+///
+/// Answers `false` for every shape that is not the signed-128 Mul case, so it is
+/// safe to call unconditionally.
+pub(super) fn v2_signed_mul_provably_cannot_overflow(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    stmt_index: Option<usize>,
+) -> bool {
+    if !matches!(op, BinOp::Mul) {
+        return false;
+    }
+    let Some((width, signed)) = int_op_type(func, lhs, rhs) else {
+        return false;
+    };
+    if !signed || width < 128 {
+        return false;
+    }
+    v2_signed_mul_corner_bounds(func, block, lhs, rhs, stmt_index)
+        .is_some_and(|(a_box, b_box)| v2_signed_mul_corners_fit(a_box, b_box))
+}
+
 /// Trust (arith ARM, 2026-07-31): split a block-def-versioned arithmetic-overflow
 /// violation body `And([lhs_range, rhs_range, out_of_range])` into the authenticated
 /// obligation. `rec_body` is the version-renamed body as it appears INSIDE the emitted
@@ -288,20 +328,58 @@ pub(super) fn v2_build_overflow_vc_for_operands(
     // reassigned-stale operand yields no box ⇒ no proof), and a `checked_mul` overflow on ANY
     // corner keeps the fail-closed runtime-check. Never a false PROVE.
     if signed && width >= 128 && matches!(op, BinOp::Mul) {
-        if let Some((a_box, b_box)) = v2_signed_mul_corner_bounds(func, block, lhs, rhs, stmt_index)
-            && v2_signed_mul_corners_fit(a_box, b_box)
-        {
-            return Some(VerificationCondition {
-                kind: VcKind::ArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) },
-                function: func.name.clone().into(),
-                location: span.clone(),
-                // Violation formula is trivially UNSAT ⇒ "no overflow" is PROVED (the
-                // codebase's no-overflow proof shape; the dual of the Bool(true) fail-closed
-                // obligation the provably-overflowing const-pow path emits).
-                formula: Formula::Bool(false),
-                contract_metadata: None,
-                obligation: None,
-            });
+        if v2_signed_mul_provably_cannot_overflow(func, block, op, lhs, rhs, stmt_index) {
+            // SUPPRESS — mint nothing. This used to emit
+            // `formula: Formula::Bool(false), obligation: None` on the theory
+            // that "trivially UNSAT ⇒ certifies". It never certified, for two
+            // independent reasons, either of which is fatal:
+            //
+            //  1. `trust_router::constant_folder::apply_vacuity_gate` cannot
+            //     distinguish a constant-false violation from the legacy vacuous
+            //     placeholder it exists to reject, so it rewrote the row to
+            //     `Unknown { reason: "vacuous proof rejected …" }`. That gate runs
+            //     on EVERY row in `build_proof_results`.
+            //  2. Even exempted from the gate, `convert_result` demotes any Proved
+            //     row carrying no row-bound `ResultProofAuthority`, and a bare
+            //     `Bool(false)` with `obligation: None` can acquire none:
+            //     `certify_vc` has no family for it, both production safety
+            //     certifiers require an authenticated `ObligationRecord`, and the
+            //     one vacuity-exempt native authority is the CHC/PDR lane — which
+            //     is exactly the lane that declines signed 128-bit Mul, the reason
+            //     this arm exists at all.
+            //
+            // So the capability read as a proof at this seam and was graded
+            // Unknown/runtime-checked one layer down, with a diagnostic that
+            // actively misdescribed it.
+            //
+            // Suppression is this module tree's convention for a "provably
+            // cannot fire" case whose obligation could carry NO authority even
+            // if minted — see `v2_build_float_overflow_vc` returning `None` and
+            // the Div/Rem nonzero-constant skip, both of which would emit a bare
+            // `Bool(false)` with `obligation: None`. It is NOT the convention
+            // for every provably-safe case: the literal in-range BoundsCheck
+            // (`arr[0]` on `[i64; 3]`) IS minted, because its violation is an
+            // arithmetic core carrying a real `ObligationRecord` — reason 1
+            // does not fire on it and reason 2 does not apply. See the
+            // `AssertMessage::BoundsCheck` arm in `safety.rs`.
+            //
+            // The ASSERT lane must not see this `None`. There, a builder returning
+            // `None` means "could not analyse" and raises
+            // `RecognizedSafetyAssertProofGap`, so the suppression is decided
+            // BEFORE the builder by `v2_overflow_assert_provably_cannot_fire`,
+            // which shares `v2_signed_mul_provably_cannot_overflow` with this arm
+            // so the two can never disagree. If they ever did, this `None` would
+            // become a proof gap — the fail-closed direction.
+            //
+            // SOUNDNESS unchanged: reaching here needs a genuinely finite box on
+            // BOTH operands from every-path facts and all four corner products
+            // fitting i128 (interval arithmetic puts the extremes of a product
+            // over a box at its corners). A symbolic, one-sided-bounded or
+            // reassigned-stale operand yields no box, and a `checked_mul`
+            // overflow on ANY corner falls through to the fail-closed runtime
+            // check below. Never a false PROVE.
+            let _ = (lhs_ty, rhs_ty);
+            return None;
         }
         return Some(unsupported_mir_vc(
             func,
@@ -1898,12 +1976,20 @@ pub(super) fn v2_assert_failure_formula(func: &VerifiableFunction, cond: &Operan
     if expected { Formula::Not(Box::new(cond_f)) } else { cond_f }
 }
 
+// Trust (#57, 2026-08-17) — these five now DELEGATE to `trust_types::static_truth`.
+// The bodies moved there verbatim so the trust-ir spine can apply the SAME fold:
+// the spine used to emit a divisor obligation for `n % 2` that trust-vcgen folded
+// away, which was the entire surviving population of the missing-obligation alarm.
+// Reimplementing the fold on the spine side would have made any drift between the
+// two copies surface as a phantom disagreement — an alarm about the checkers
+// disagreeing rather than about a hole in the checking. One definition, two callers.
+
 pub(super) fn v2_assert_failure_is_known_false(
     block: &trust_types::BasicBlock,
     cond: &Operand,
     expected: bool,
 ) -> bool {
-    v2_condition_truth_until(block, cond, block.stmts.len()).is_some_and(|truth| truth == expected)
+    trust_types::static_truth::assert_failure_is_known_false(block, cond, expected)
 }
 
 pub(super) fn v2_condition_truth_until(
@@ -1911,13 +1997,7 @@ pub(super) fn v2_condition_truth_until(
     cond: &Operand,
     end_stmt_exclusive: usize,
 ) -> Option<bool> {
-    match cond {
-        Operand::Constant(ConstValue::Bool(value)) => Some(*value),
-        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
-            v2_local_condition_truth_until(block, place.local, end_stmt_exclusive)
-        }
-        _ => None,
-    }
+    trust_types::static_truth::condition_truth_until(block, cond, end_stmt_exclusive)
 }
 
 pub(super) fn v2_local_condition_truth_until(
@@ -1925,84 +2005,15 @@ pub(super) fn v2_local_condition_truth_until(
     local: usize,
     end_stmt_exclusive: usize,
 ) -> Option<bool> {
-    for (idx, stmt) in block.stmts.iter().take(end_stmt_exclusive).enumerate().rev() {
-        let Statement::Assign { place, rvalue, .. } = stmt else {
-            continue;
-        };
-        if place.local != local || !place.projections.is_empty() {
-            continue;
-        }
-        return match rvalue {
-            Rvalue::Use(operand) => v2_condition_truth_until(block, operand, idx),
-            Rvalue::BinaryOp(BinOp::Eq, lhs, rhs) => v2_constant_eq_truth(lhs, rhs),
-            Rvalue::BinaryOp(BinOp::Ne, lhs, rhs) => {
-                v2_constant_eq_truth(lhs, rhs).map(|truth| !truth)
-            }
-            _ => None,
-        };
-    }
-
-    None
+    trust_types::static_truth::local_condition_truth_until(block, local, end_stmt_exclusive)
 }
 
 pub(super) fn v2_constant_eq_truth(lhs: &Operand, rhs: &Operand) -> Option<bool> {
-    match (lhs, rhs) {
-        (Operand::Constant(lhs), Operand::Constant(rhs)) => v2_const_eq_truth(lhs, rhs),
-        _ => None,
-    }
+    trust_types::static_truth::constant_eq_truth(lhs, rhs)
 }
 
 pub(super) fn v2_const_eq_truth(lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
-    match (lhs, rhs) {
-        (ConstValue::Bool(lhs), ConstValue::Bool(rhs)) => Some(lhs == rhs),
-        (ConstValue::Int(lhs), ConstValue::Int(rhs)) => Some(lhs == rhs),
-        (ConstValue::Uint(lhs, _), ConstValue::Uint(rhs, _)) => Some(lhs == rhs),
-        (ConstValue::Int(lhs), ConstValue::Uint(rhs, _)) => {
-            (*lhs >= 0).then_some(*lhs as u128 == *rhs)
-        }
-        (ConstValue::Uint(lhs, _), ConstValue::Int(rhs)) => {
-            (*rhs >= 0).then_some(*lhs == *rhs as u128)
-        }
-        (ConstValue::Float(lhs), ConstValue::Float(rhs)) => Some(lhs == rhs),
-        (ConstValue::Unit, ConstValue::Unit) => Some(true),
-        // Callable identity is extraction evidence for syntactic recognizers,
-        // never a solver-level equality fact. Historical dumps encoded these
-        // values as Unit; returning unknown is strictly more conservative.
-        (ConstValue::CallableItem { .. }, _) | (_, ConstValue::CallableItem { .. }) => None,
-        // two `&str` literals are equal iff their bytes match. This is
-        // exact (the bytes come straight from the literal's allocation), so it is
-        // sound to let it decide a constant branch. Without this arm the catch-all
-        // would answer `Some(false)` for *equal* strings and could prune the
-        // genuinely-taken branch, dropping its safety obligations.
-        (ConstValue::Str { bytes: lhs }, ConstValue::Str { bytes: rhs }) => Some(lhs == rhs),
-        // An `OpaqueConst` (fresh-symbolic aggregate/opaque constant — empty
-        // collections, `Cell`, alloc handles, `&[&str]` tables) or an
-        // `OpaqueScalar` (a const-generic / associated / `size_of` integer with no
-        // evaluated value) carries no decidable value, so its equality is UNKNOWN.
-        // Return `None` so the caller verifies BOTH branches rather than pruning
-        // one. This MUST precede the `_ => Some(false)` catch-all: answering
-        // "definitely unequal" for two opaque consts that are in fact equal would
-        // prune the genuinely-taken branch and silently drop its safety obligations
-        // — a false PROVE. (Same hazard the `Str` arm above guards against for equal
-        // string literals.)
-        (ConstValue::OpaqueConst, _) | (_, ConstValue::OpaqueConst) => None,
-        // A `UnitVariantRef` (promoted `&Option<T>::None`-style reference constant)
-        // value-lowers exactly like `OpaqueConst` — a fresh symbolic ref with no
-        // decidable value — so its equality is UNKNOWN. Return `None` (verify BOTH
-        // branches), never `Some(false)`, for the same false-PROVE hazard as above.
-        (ConstValue::UnitVariantRef { .. }, _) | (_, ConstValue::UnitVariantRef { .. }) => None,
-        (ConstValue::OpaqueScalar { .. }, _) | (_, ConstValue::OpaqueScalar { .. }) => None,
-        // Trust: piece #7a — a const-generic PARAM value carries no decidable
-        // value, so its equality is UNKNOWN. Return `None` (verify BOTH branches),
-        // NEVER `Some(false)` — answering "definitely unequal" for a const-param
-        // that is in fact equal (`N == N`) would prune the taken branch and drop
-        // its safety obligations (a false PROVE). This MUST precede the
-        // `_ => Some(false)` catch-all, exactly like the `OpaqueScalar` arm. It is
-        // sound EVEN for two SYNTACTICALLY-distinct params `M`, `N`: `None`
-        // over-approximates (checks both sides), never merges them.
-        (ConstValue::ConstParam { .. }, _) | (_, ConstValue::ConstParam { .. }) => None,
-        _ => Some(false),
-    }
+    trust_types::static_truth::const_eq_truth(lhs, rhs)
 }
 
 /// True iff `target` is the `otherwise` arm of some `SwitchInt` whose

@@ -259,3 +259,20 @@ fn assembled_compiler_driver_detection_excludes_codegen_plugins() {
     assert!(!is_rustc_driver_runtime_artifact(Path::new("librustc_codegen_trust_cg-1234.dylib")));
     assert!(!is_rustc_driver_runtime_artifact(Path::new("librustc_driver-1234.rmeta")));
 }
+
+#[test]
+fn compiler_runtime_restore_prunes_every_stale_driver_generation() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let old = temp.path().join("librustc_driver-old.dylib");
+    let older = temp.path().join("librustc_driver-older.dylib");
+    let backend = temp.path().join("librustc_codegen_trust_cg-current.dylib");
+    fs::write(&old, b"old driver").unwrap();
+    fs::write(&older, b"older driver").unwrap();
+    fs::write(&backend, b"current backend").unwrap();
+
+    prune_rustc_driver_runtime_artifacts(temp.path()).unwrap();
+
+    assert!(!old.exists());
+    assert!(!older.exists());
+    assert!(backend.exists(), "codegen backends are not driver generations");
+}

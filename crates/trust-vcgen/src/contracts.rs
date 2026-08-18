@@ -354,17 +354,19 @@ fn terminator_source_span(term: &Terminator) -> SourceSpan {
 /// (`trust_types::spec_parse::map_method_call`) mints for Option/Result payload
 /// and numeric sign predicates:
 ///
-/// - `{base}_discr`  — `is_ok()` / `is_err()` / `is_some()` / `is_none()`
-/// - `{base}_value`  (and any `.field` projection of it, including the
+/// - `{base}__discr` — `is_ok()` / `is_err()` / `is_some()` / `is_none()`
+/// - `{base}__value` (and any `.field` projection of it, including the
 ///   positional `.__trust_ok_<i>` tuple binds a lowered
 ///   `matches!(r, Ok((a, b)) if ..)` produces) — `unwrap()` / `matches!` payload
-/// - `{base}_sign`   — `is_positive()` / `is_negative()` / `is_zero()`
+/// - `{base}__sign`  — `is_positive()` / `is_negative()` / `is_zero()`
 ///
 /// NO VC-generation lane grounds these names to MIR facts today: nothing links
-/// `_0_discr` to the return slot's discriminant (`_0.__tag`), or `_0_value*` /
-/// `*_sign` to payload fields. They are free (havoc'd) in every emitted VC.
+/// `_0__discr` to the return slot's discriminant (`_0.__tag`), or `_0__value*` /
+/// `*__sign` to payload fields. They are free (havoc'd) in every emitted VC.
 ///
-/// Matching is deliberately by NAME SHAPE (suffix / marker segment): a false
+/// Matching is deliberately by NAME SHAPE (suffix / marker segment) over the
+/// reserved `__` family only: a user binding such as `x_discr` or `max_value`
+/// is a single-underscore spelling and must stay an ORDINARY variable. A false
 /// positive can only route an obligation to the fail-closed Unknown shape
 /// (drop-only, sound); a false negative keeps today's behavior.
 pub(crate) fn is_spec_model_var(name: &str) -> bool {
@@ -375,10 +377,10 @@ pub(crate) fn is_spec_model_var(name: &str) -> bool {
     if base.contains(".__trust_ok_") {
         return true;
     }
-    // A `{base}_value.field` projection keeps the `_value` marker in its first
+    // A `{base}__value.field` projection keeps the `__value` marker in its first
     // path segment (spec_parse only projects fields off the payload term).
     let head = base.split('.').next().unwrap_or(base);
-    head.ends_with("_discr") || head.ends_with("_sign") || head.ends_with("_value")
+    head.ends_with("__discr") || head.ends_with("__sign") || head.ends_with("__value")
 }
 
 /// The synthetic spec-model variables (see [`is_spec_model_var`]) occurring
@@ -907,7 +909,7 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
         }
 
         // SOUNDNESS (ny selfcheck over-refutation): an `#[ensures]` whose parsed
-        // predicate references synthetic spec-model terms (`{base}_discr` /
+        // predicate references synthetic spec-model terms (`{base}__discr` /
         // `{base}_value*` / `{base}_sign` / `.__trust_ok_i` — the lowered
         // `matches!(r, Ok(..) if ..)` / `is_ok` / `unwrap` / `is_positive`
         // idioms) is UNDER-CONSTRAINED: no lane grounds those names to MIR
@@ -1114,15 +1116,18 @@ fn generate_loop_invariant_vcs(
         return;
     }
     let header = BlockId(header_block);
-    let Some(entry_state) = symbolic_state_at_loop_entry(func, header) else {
-        vcs.push(loop_contract_unsupported_vc(
-            func,
-            contract,
-            format!(
-                "loop invariant `{expr}` is outside the exact straight-line entry fragment at bb{header_block}"
-            ),
-        ));
-        return;
+    let entry_contexts = match symbolic_loop_invariant_entry_contexts(func, header) {
+        Ok(contexts) => contexts,
+        Err(reason) => {
+            vcs.push(loop_contract_unsupported_vc(
+                func,
+                contract,
+                format!(
+                    "{reason}: loop invariant `{expr}` has no complete exact initiation model at bb{header_block}"
+                ),
+            ));
+            return;
+        }
     };
     let transitions = match symbolic_loop_transitions(func, header) {
         Ok(transitions) => transitions,
@@ -1138,10 +1143,20 @@ fn generate_loop_invariant_vcs(
         }
     };
 
-    let invariant_at_entry = substitute_formula_state(&invariant, &entry_state);
-    let mut initiation = typed_preconditions;
-    initiation.push(Formula::Not(Box::new(invariant_at_entry)));
-    let mut initiation = conjunction(initiation);
+    let mut initiation = disjunction(
+        entry_contexts
+            .iter()
+            .map(|context| {
+                let invariant_at_entry = substitute_formula_state(&invariant, &context.state);
+                let mut assumptions =
+                    if context.function_entry { typed_preconditions.clone() } else { Vec::new() };
+                assumptions.extend(context.assumptions.clone());
+                assumptions.push(context.guard.clone());
+                assumptions.push(Formula::Not(Box::new(invariant_at_entry)));
+                conjunction(assumptions)
+            })
+            .collect(),
+    );
 
     // The post-state is independently symbolically executed through one full
     // successful iteration.  This is deliberately NOT `P && !P`: a wrong
@@ -1401,8 +1416,11 @@ fn type_and_validate_loop_formula(
 /// one `length` Formula likewise joins source `xs.len()` to exact MIR `Len` (and
 /// the exact slice `PtrMetadata` shape). This is not a general array-theory
 /// lane: immutable sources may have a finite set of independently exact,
-/// non-escaping shared aliases, while an exclusive source admits only guarded
-/// element stores and has no alias/reborrow/call/intrinsic/reseat/escape lane.
+/// stable shared aliases, including whole-view observations by ordinary safe
+/// Rust callees. An exclusive source admits guarded element stores either
+/// directly or through one unique, entry-dominating retained reborrow; that
+/// alias can escape only through one exact terminal handoff to the final return
+/// value.
 #[derive(Clone)]
 struct ReadOnlyCollectionModel {
     /// Local through which this particular access is performed.
@@ -1437,7 +1455,7 @@ impl ReadOnlyCollectionModel {
     }
 
     fn length_name(&self) -> String {
-        format!("{}_len", self.name)
+        format!("{}__len", self.name)
     }
 
     fn length_formula(&self) -> Formula {
@@ -1509,6 +1527,62 @@ fn operand_place(operand: &Operand) -> Option<&trust_types::Place> {
 
 fn operand_mentions_local(operand: &Operand, local: usize) -> bool {
     operand_place(operand).is_some_and(|place| place.local == local)
+}
+
+/// Whether one ordinary Rust call can observe, but cannot change, the modeled
+/// shared collection through `local`.
+///
+/// The collection lane admits only shared references to scalar element types;
+/// those types contain no `UnsafeCell`. In a well-defined Rust execution, a
+/// safe non-foreign callee therefore cannot mutate the referenced sequence.
+/// Keep the admission exact: the argument must be a whole-place `Copy`, the
+/// destination must not overwrite/project through the collection local, and
+/// unsafe/foreign calls remain outside the model. Other arguments are
+/// irrelevant to this collection's stability.
+fn safe_shared_collection_call_preserves_local(
+    func: &VerifiableFunction,
+    args: &[Operand],
+    dest: &trust_types::Place,
+    is_foreign: bool,
+    is_unsafe_sig: bool,
+    local: usize,
+) -> bool {
+    let touched = args
+        .iter()
+        .filter(|operand| operand_mentions_local_anywhere(operand, local))
+        .collect::<Vec<_>>();
+    // A call destination is a definition even when the old collection value is
+    // not also passed as an argument. Reject that reseat before the no-touch
+    // fast path.
+    if place_mentions_local_anywhere(dest, local) {
+        return false;
+    }
+    if touched.is_empty() {
+        return true;
+    }
+    if is_foreign || is_unsafe_sig {
+        return false;
+    }
+    let Some(decl) = func.body.locals.get(local) else {
+        return false;
+    };
+    let Ty::Ref { mutable: false, inner } = &decl.ty else {
+        return false;
+    };
+    let elem = match inner.as_ref() {
+        Ty::Slice { elem } | Ty::Array { elem, .. } => elem.as_ref(),
+        _ => return false,
+    };
+    if read_only_collection_element_sort(elem).is_none() {
+        return false;
+    }
+    touched.into_iter().all(|operand| {
+        matches!(
+            operand,
+            Operand::Copy(place)
+                if place.local == local && place.projections.is_empty()
+        )
+    })
 }
 
 fn read_only_collection_index_projection<'a>(
@@ -1770,6 +1844,103 @@ fn exact_fixed_array_slice_metadata_pair(
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExactSliceRawMetadataPair {
+    pointer_local: usize,
+    length_local: usize,
+}
+
+/// Verify rustc's exact opt-level-0 slice-length lowering:
+///
+/// ```text
+/// raw = &raw const (*slice);
+/// len = PtrMetadata(Move(raw));
+/// ```
+///
+/// This is admitted only as one adjacent, non-escaping metadata observation.
+/// The raw pointer is a fresh non-argument local with the exact `*const [T]`
+/// type, is moved once into `PtrMetadata`, and occurs nowhere else in the
+/// function. It therefore grants no authority for general raw-pointer aliases,
+/// dereferences, mutation, or provenance reasoning.
+fn exact_slice_raw_metadata_pair(
+    func: &VerifiableFunction,
+    collection_local: usize,
+    block_index: usize,
+    statement_index: usize,
+) -> Option<ExactSliceRawMetadataPair> {
+    let block = func.body.blocks.get(block_index)?;
+    if block.id != BlockId(block_index) {
+        return None;
+    }
+    let Statement::Assign { place: pointer, rvalue: Rvalue::AddressOf(false, source), .. } =
+        block.stmts.get(statement_index)?
+    else {
+        return None;
+    };
+    if !pointer.projections.is_empty()
+        || pointer.local == collection_local
+        || pointer.local <= func.body.arg_count
+        || source.local != collection_local
+        || source.projections.as_slice() != [Projection::Deref]
+    {
+        return None;
+    }
+    let collection_decl = func.body.locals.get(collection_local)?;
+    if collection_decl.index != collection_local {
+        return None;
+    }
+    let Ty::Ref { inner, .. } = &collection_decl.ty else { return None };
+    let Ty::Slice { elem } = inner.as_ref() else { return None };
+    if read_only_collection_element_sort(elem).is_none() {
+        return None;
+    }
+    let pointer_decl = func.body.locals.get(pointer.local)?;
+    let Ty::RawPtr { mutable: false, pointee } = &pointer_decl.ty else { return None };
+    if pointer_decl.index != pointer.local || pointee.as_ref() != inner.as_ref() {
+        return None;
+    }
+
+    let Statement::Assign {
+        place: length,
+        rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Move(metadata_pointer)),
+        ..
+    } = block.stmts.get(statement_index + 1)?
+    else {
+        return None;
+    };
+    if !length.projections.is_empty()
+        || length.local == pointer.local
+        || length.local <= func.body.arg_count
+        || metadata_pointer.local != pointer.local
+        || !metadata_pointer.projections.is_empty()
+        || func
+            .body
+            .locals
+            .get(length.local)
+            .is_none_or(|decl| decl.index != length.local || !is_normalized_usize_ty(&decl.ty))
+    {
+        return None;
+    }
+
+    for (candidate_block, body) in func.body.blocks.iter().enumerate() {
+        for (candidate_statement, statement) in body.stmts.iter().enumerate() {
+            if candidate_block == block_index
+                && (candidate_statement == statement_index
+                    || candidate_statement == statement_index + 1)
+            {
+                continue;
+            }
+            if statement_mentions_local_anywhere(statement, pointer.local) {
+                return None;
+            }
+        }
+        if terminator_mentions_local_anywhere(&body.terminator, pointer.local) {
+            return None;
+        }
+    }
+    Some(ExactSliceRawMetadataPair { pointer_local: pointer.local, length_local: length.local })
+}
+
 fn rvalue_preserves_read_only_collection(
     func: &VerifiableFunction,
     rvalue: &Rvalue,
@@ -1838,8 +2009,11 @@ fn exact_shared_collection_alias_definition(
 /// Validate one shared local alias as a pure, non-escaping view of its source
 /// argument. Exactly one `alias = Copy(source)` definition is admitted for this
 /// alias; other independently exact aliases of the same source are allowed.
-/// Reseat, chained alias, call, projected write, address/reborrow, or unknown
-/// effect rejects the complete collection model.
+/// Reseat, chained alias, projected write, address/reborrow, or unknown effect
+/// rejects the complete collection model. An exact whole-place `Copy` may cross
+/// an ordinary safe Rust call: scalar shared collections are `Freeze`, so the
+/// callee cannot mutate them in a well-defined execution. Unsafe, foreign, and
+/// projected call uses remain outside the model.
 fn read_only_collection_alias_is_stable(
     func: &VerifiableFunction,
     alias_local: usize,
@@ -1859,10 +2033,15 @@ fn read_only_collection_alias_is_stable(
         return false;
     }
 
-    for block in &func.body.blocks {
-        for statement in &block.stmts {
+    for (block_index, block) in func.body.blocks.iter().enumerate() {
+        for (statement_index, statement) in block.stmts.iter().enumerate() {
             if exact_shared_collection_alias_definition(func, statement, source_local)
                 == Some(alias_local)
+            {
+                continue;
+            }
+            if exact_slice_raw_metadata_pair(func, alias_local, block_index, statement_index)
+                .is_some()
             {
                 continue;
             }
@@ -1901,12 +2080,15 @@ fn read_only_collection_alias_is_stable(
             }
         }
         match &block.terminator {
-            Terminator::Call { args, dest, .. } => {
-                if dest.local == alias_local
-                    || args
-                        .iter()
-                        .any(|operand| operand_mentions_local_anywhere(operand, alias_local))
-                {
+            Terminator::Call { args, dest, is_foreign, is_unsafe_sig, .. } => {
+                if !safe_shared_collection_call_preserves_local(
+                    func,
+                    args,
+                    dest,
+                    *is_foreign,
+                    *is_unsafe_sig,
+                    alias_local,
+                ) {
                     return false;
                 }
             }
@@ -1935,18 +2117,487 @@ fn read_only_collection_alias_is_stable(
     true
 }
 
+/// One compiler-shaped, entry-dominating exclusive reborrow of a mutable
+/// collection argument. Only rustc's type-correct dereferenced place spelling
+/// (`&mut *source`) is accepted. A bare `&mut source` would have type
+/// `&mut &mut [T]`, so accepting it while the destination claims `&mut [T]`
+/// would lend authority to an ill-typed portable body. No copy/move alias and
+/// no alias-of-alias is treated as an exclusive borrow.
+fn exact_exclusive_collection_reborrow_definition(
+    func: &VerifiableFunction,
+    statement: &Statement,
+    source_local: usize,
+) -> Option<usize> {
+    let Statement::Assign {
+        place: alias,
+        rvalue: Rvalue::Ref { mutable: true, place: source },
+        ..
+    } = statement
+    else {
+        return None;
+    };
+    if !alias.projections.is_empty()
+        || alias.local == source_local
+        || alias.local <= func.body.arg_count
+        || source.local != source_local
+        || source.projections.as_slice() != [Projection::Deref]
+    {
+        return None;
+    }
+    let source_decl = func.body.locals.get(source_local)?;
+    let alias_decl = func.body.locals.get(alias.local)?;
+    if source_decl.ty != alias_decl.ty {
+        return None;
+    }
+    let Ty::Ref { mutable: true, inner } = &source_decl.ty else {
+        return None;
+    };
+    matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. }).then_some(alias.local)
+}
+
+fn exact_exclusive_collection_reborrow_source(
+    func: &VerifiableFunction,
+    statement: &Statement,
+) -> Option<(usize, usize)> {
+    let mut matches = (1..=func.body.arg_count).filter_map(|source| {
+        exact_exclusive_collection_reborrow_definition(func, statement, source)
+            .map(|alias| (source, alias))
+    });
+    let pair = matches.next()?;
+    matches.next().is_none().then_some(pair)
+}
+
+fn exact_terminal_mutable_alias_return(
+    func: &VerifiableFunction,
+    block: &BasicBlock,
+    statement_index: usize,
+    alias_local: usize,
+) -> bool {
+    let Some(Statement::Assign { place, rvalue: Rvalue::Use(Operand::Move(source)), .. }) =
+        block.stmts.get(statement_index)
+    else {
+        return false;
+    };
+    place.local == 0
+        && place.projections.is_empty()
+        && source.local == alias_local
+        && source.projections.is_empty()
+        && func.body.locals.get(alias_local).is_some_and(|decl| decl.ty == func.body.return_ty)
+        && matches!(block.terminator, Terminator::Return)
+        && block.stmts.iter().skip(statement_index + 1).all(|statement| {
+            matches!(
+                statement,
+                Statement::StorageDead(_)
+                    | Statement::Coverage
+                    | Statement::ConstEvalCounter
+                    | Statement::Nop
+            )
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExactTerminalMutableAliasReborrowReturn {
+    first_statement: usize,
+    temporary_local: usize,
+}
+
+impl ExactTerminalMutableAliasReborrowReturn {
+    fn contains_statement(self, statement_index: usize) -> bool {
+        (self.first_statement..self.first_statement + 4).contains(&statement_index)
+    }
+}
+
+/// Verify rustc's exact opt-level-0 spelling for returning a retained mutable
+/// slice reborrow:
+///
+/// ```text
+/// temporary = &mut *alias;
+/// StorageDead(alias);
+/// _0 = &mut *temporary;
+/// StorageDead(temporary);
+/// return;
+/// ```
+///
+/// The temporary must be a fresh, type-identical non-argument local with one
+/// entry-block `StorageLive` and no occurrence outside these four statements.
+/// In particular, the first exclusive view is dead before the return view is
+/// created. This admits the compiler's ownership-preserving handoff without
+/// granting authority to general chained reborrows or simultaneously live
+/// aliases.
+fn exact_terminal_mutable_alias_reborrow_return(
+    func: &VerifiableFunction,
+    block_index: usize,
+    statement_index: usize,
+    alias_local: usize,
+) -> Option<ExactTerminalMutableAliasReborrowReturn> {
+    let block = func.body.blocks.get(block_index)?;
+    if block.id != BlockId(block_index) || !matches!(block.terminator, Terminator::Return) {
+        return None;
+    }
+    let Statement::Assign {
+        place: temporary,
+        rvalue: Rvalue::Ref { mutable: true, place: alias },
+        ..
+    } = block.stmts.get(statement_index)?
+    else {
+        return None;
+    };
+    if !temporary.projections.is_empty()
+        || temporary.local <= func.body.arg_count
+        || temporary.local == alias_local
+        || alias.local != alias_local
+        || alias.projections.as_slice() != [Projection::Deref]
+    {
+        return None;
+    }
+    let Statement::StorageDead(dead_alias) = block.stmts.get(statement_index + 1)? else {
+        return None;
+    };
+    if *dead_alias != alias_local {
+        return None;
+    }
+    let Statement::Assign {
+        place: return_place,
+        rvalue: Rvalue::Ref { mutable: true, place: returned_temporary },
+        ..
+    } = block.stmts.get(statement_index + 2)?
+    else {
+        return None;
+    };
+    if return_place.local != 0
+        || !return_place.projections.is_empty()
+        || returned_temporary.local != temporary.local
+        || returned_temporary.projections.as_slice() != [Projection::Deref]
+    {
+        return None;
+    }
+    let Statement::StorageDead(dead_temporary) = block.stmts.get(statement_index + 3)? else {
+        return None;
+    };
+    if *dead_temporary != temporary.local
+        || func
+            .body
+            .locals
+            .get(alias_local)
+            .is_none_or(|decl| decl.index != alias_local || decl.ty != func.body.return_ty)
+        || func
+            .body
+            .locals
+            .get(temporary.local)
+            .is_none_or(|decl| decl.index != temporary.local || decl.ty != func.body.return_ty)
+        || func
+            .body
+            .locals
+            .first()
+            .is_none_or(|decl| decl.index != 0 || decl.ty != func.body.return_ty)
+        || block.stmts.iter().skip(statement_index + 4).any(|statement| {
+            !matches!(
+                statement,
+                Statement::StorageDead(_)
+                    | Statement::Coverage
+                    | Statement::ConstEvalCounter
+                    | Statement::Nop
+            ) || statement_mentions_local_anywhere(statement, alias_local)
+                || statement_mentions_local_anywhere(statement, temporary.local)
+        })
+    {
+        return None;
+    }
+
+    let mut storage_live_site = None;
+    for (candidate_block, body) in func.body.blocks.iter().enumerate() {
+        for (candidate_statement, statement) in body.stmts.iter().enumerate() {
+            if candidate_block == block_index
+                && (statement_index..statement_index + 4).contains(&candidate_statement)
+            {
+                continue;
+            }
+            if matches!(statement, Statement::StorageLive(local) if *local == temporary.local) {
+                if storage_live_site.replace((candidate_block, candidate_statement)).is_some() {
+                    return None;
+                }
+            } else if statement_mentions_local_anywhere(statement, temporary.local) {
+                return None;
+            }
+        }
+        if terminator_mentions_local_anywhere(&body.terminator, temporary.local) {
+            return None;
+        }
+    }
+    if storage_live_site.is_none_or(|(candidate_block, _)| candidate_block != 0) {
+        return None;
+    }
+
+    Some(ExactTerminalMutableAliasReborrowReturn {
+        first_statement: statement_index,
+        temporary_local: temporary.local,
+    })
+}
+
+/// Validate one retained mutable alias as a single exclusive state identity.
+///
+/// The reborrow must be defined exactly once in entry block bb0, so it
+/// dominates every modeled use. The original argument may appear nowhere else
+/// in executable MIR after it lends its state. The alias admits the same exact
+/// bounds-authenticated Store/Select/Len grammar as a direct `&mut` argument,
+/// and may escape only as the final `Move(alias)` into `_0` of a Return block,
+/// or through rustc's exact terminal two-reborrow handoff after
+/// `StorageDead(alias)`. Calls, intrinsics, any other second/chained reborrow,
+/// reseating, side-effecting projections, and any future statement/terminator
+/// fail the whole model closed.
+fn exclusive_mutable_collection_alias_pair_is_stable(
+    func: &VerifiableFunction,
+    source_local: usize,
+    alias_local: usize,
+) -> bool {
+    let Some(source_model) = read_only_collection_shape_for_local(func, source_local) else {
+        return false;
+    };
+    if !source_model.is_exclusive_mutable() {
+        return false;
+    }
+    let mut alias_model = source_model.clone();
+    alias_model.local = alias_local;
+
+    let definitions = func
+        .body
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block.stmts.iter().enumerate().filter_map(move |(index, statement)| {
+                (exact_exclusive_collection_reborrow_definition(func, statement, source_local)
+                    == Some(alias_local))
+                .then_some((block.id, index))
+            })
+        })
+        .collect::<Vec<_>>();
+    let [(definition_block, definition_index)] = definitions.as_slice() else {
+        return false;
+    };
+    if *definition_block != BlockId(0)
+        || func.body.blocks.iter().any(|block| {
+            block.id != BlockId(0) && terminator_edges_to(&block.terminator, BlockId(0)) != 0
+        })
+        || func.body.blocks[0].stmts.iter().take(*definition_index).any(|statement| {
+            !matches!(statement, Statement::StorageLive(local) if *local == alias_local)
+                && (statement_mentions_local_anywhere(statement, source_local)
+                    || statement_mentions_local_anywhere(statement, alias_local))
+        })
+    {
+        return false;
+    }
+    // No second exclusive view of the source can coexist in this whole-body
+    // model. Sequential lifetime reasoning is deliberately outside this lane.
+    if func
+        .body
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .filter(|statement| {
+            exact_exclusive_collection_reborrow_definition(func, statement, source_local).is_some()
+        })
+        .count()
+        != 1
+    {
+        return false;
+    }
+
+    let mut terminal_escapes = 0usize;
+    for (block_index, block) in func.body.blocks.iter().enumerate() {
+        let mut terminal_reborrow_matches = (0..block.stmts.len()).filter_map(|statement_index| {
+            exact_terminal_mutable_alias_reborrow_return(
+                func,
+                block_index,
+                statement_index,
+                alias_local,
+            )
+        });
+        let terminal_reborrow = terminal_reborrow_matches.next();
+        if terminal_reborrow_matches.next().is_some() {
+            return false;
+        }
+        for (statement_index, statement) in block.stmts.iter().enumerate() {
+            if exact_exclusive_collection_reborrow_definition(func, statement, source_local)
+                == Some(alias_local)
+            {
+                continue;
+            }
+            if exact_terminal_mutable_alias_return(func, block, statement_index, alias_local) {
+                terminal_escapes = terminal_escapes.saturating_add(1);
+                continue;
+            }
+            if terminal_reborrow.is_some_and(|shape| shape.contains_statement(statement_index)) {
+                if terminal_reborrow.is_some_and(|shape| shape.first_statement == statement_index) {
+                    terminal_escapes = terminal_escapes.saturating_add(1);
+                }
+                continue;
+            }
+            if exact_slice_raw_metadata_pair(func, alias_local, block_index, statement_index)
+                .is_some()
+            {
+                continue;
+            }
+            // After the dominating reborrow, executable MIR has only one view
+            // of this state. Source-level contract spelling may still use the
+            // argument name because both names bind the canonical array.
+            if statement_mentions_local_anywhere(statement, source_local) {
+                return false;
+            }
+            if matches!(statement, Statement::StorageLive(local) if *local == alias_local)
+                && !(block.id == BlockId(0) && statement_index < *definition_index)
+            {
+                return false;
+            }
+            if matches!(statement, Statement::StorageDead(local) if *local == alias_local)
+                && (!matches!(block.terminator, Terminator::Return)
+                    || block.stmts.iter().skip(statement_index + 1).any(|later| {
+                        !matches!(
+                            later,
+                            Statement::StorageDead(_)
+                                | Statement::Coverage
+                                | Statement::ConstEvalCounter
+                                | Statement::Nop
+                        )
+                    }))
+            {
+                return false;
+            }
+            match statement {
+                Statement::Assign { place, rvalue, .. } => {
+                    if place.local == source_local {
+                        return false;
+                    }
+                    if place.local == alias_local {
+                        let Some(projection) =
+                            exact_exclusive_mutable_store_projection(func, place, &alias_model)
+                        else {
+                            return false;
+                        };
+                        if !exact_exclusive_mutable_store_value_is_typed(func, place, rvalue)
+                            || !mutable_collection_store_bounds_authenticated(
+                                func,
+                                block.id,
+                                statement_index,
+                                projection,
+                                &alias_model,
+                            )
+                            || !rvalue_preserves_read_only_collection(func, rvalue, alias_local)
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if !rvalue_preserves_read_only_collection(func, rvalue, alias_local) {
+                        return false;
+                    }
+                }
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if place.local == source_local || place.local == alias_local =>
+                {
+                    return false;
+                }
+                Statement::Intrinsic { args, .. }
+                    if args.iter().any(|operand| {
+                        operand_mentions_local_anywhere(operand, source_local)
+                            || operand_mentions_local_anywhere(operand, alias_local)
+                    }) =>
+                {
+                    return false;
+                }
+                Statement::Unsupported { .. } => return false,
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Retag { .. }
+                | Statement::PlaceMention(_)
+                | Statement::Intrinsic { .. }
+                | Statement::SetDiscriminant { .. }
+                | Statement::Deinit { .. }
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                _ => return false,
+            }
+        }
+        if terminator_mentions_local_anywhere(&block.terminator, source_local) {
+            return false;
+        }
+        match &block.terminator {
+            Terminator::Call { args, dest, .. } => {
+                if [source_local, alias_local].contains(&dest.local)
+                    || args.iter().any(|operand| {
+                        operand_mentions_local_anywhere(operand, source_local)
+                            || operand_mentions_local_anywhere(operand, alias_local)
+                    })
+                {
+                    return false;
+                }
+            }
+            Terminator::SwitchInt { discr, .. } => {
+                if !operand_uses_collection_only_as_element_read(func, discr, source_local)
+                    || !operand_uses_collection_only_as_element_read(func, discr, alias_local)
+                {
+                    return false;
+                }
+            }
+            Terminator::Assert { cond, .. } => {
+                if !operand_uses_collection_only_as_element_read(func, cond, source_local)
+                    || !operand_uses_collection_only_as_element_read(func, cond, alias_local)
+                {
+                    return false;
+                }
+            }
+            Terminator::Drop { place, .. }
+                if place.local == source_local || place.local == alias_local =>
+            {
+                return false;
+            }
+            Terminator::Opaque { .. } => return false,
+            Terminator::Goto(_)
+            | Terminator::Return
+            | Terminator::Drop { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            _ => return false,
+        }
+    }
+    terminal_escapes <= 1
+}
+
+fn exclusive_mutable_collection_alias_model_for_local(
+    func: &VerifiableFunction,
+    local: usize,
+) -> Option<ReadOnlyCollectionModel> {
+    let pairs = (1..=func.body.arg_count)
+        .flat_map(|source_local| {
+            func.body.blocks.iter().flat_map(move |block| {
+                block.stmts.iter().filter_map(move |statement| {
+                    exact_exclusive_collection_reborrow_definition(func, statement, source_local)
+                        .map(|alias_local| (source_local, alias_local))
+                })
+            })
+        })
+        .filter(|(source, alias)| local == *source || local == *alias)
+        .collect::<Vec<_>>();
+    let [(source_local, alias_local)] = pairs.as_slice() else {
+        return None;
+    };
+    if !exclusive_mutable_collection_alias_pair_is_stable(func, *source_local, *alias_local) {
+        return None;
+    }
+    let mut model = read_only_collection_shape_for_local(func, *source_local)?;
+    model.local = if local == *alias_local { *alias_local } else { *source_local };
+    Some(model)
+}
+
 fn exact_exclusive_mutable_store_projection<'a>(
     func: &VerifiableFunction,
     place: &'a trust_types::Place,
     model: &ReadOnlyCollectionModel,
 ) -> Option<&'a Projection> {
-    if !model.is_exclusive_mutable()
-        || model.local != model.source_local
-        || place.local != model.source_local
-    {
+    if !model.is_exclusive_mutable() || place.local != model.local {
         return None;
     }
-    let projection = read_only_collection_index_projection(place, model.source_local)?;
+    let projection = read_only_collection_index_projection(place, model.local)?;
     match projection {
         Projection::Index(index_local) => {
             let index_decl = func.body.locals.get(*index_local)?;
@@ -2053,27 +2704,39 @@ fn exact_collection_length_definition_before(
     {
         return false;
     }
-    let mut definitions = block.stmts.iter().take(before_statement).filter_map(|statement| {
-        let Statement::Assign { place, rvalue, .. } = statement else {
-            return None;
-        };
-        (place.local == len_local && place.projections.is_empty()).then_some(rvalue)
-    });
-    let Some(definition) = definitions.next() else {
+    let mut definitions =
+        block.stmts.iter().take(before_statement).enumerate().filter_map(|(index, statement)| {
+            let Statement::Assign { place, rvalue, .. } = statement else {
+                return None;
+            };
+            (place.local == len_local && place.projections.is_empty()).then_some((index, rvalue))
+        });
+    let Some((definition_index, definition)) = definitions.next() else {
         return false;
     };
     if definitions.next().is_some() {
         return false;
     }
     match definition {
-        Rvalue::Len(place) => exact_read_only_collection_len_place(place, model.source_local),
+        Rvalue::Len(place) => exact_read_only_collection_len_place(place, model.local),
         Rvalue::UnaryOp(UnOp::PtrMetadata, metadata) => {
             matches!(&model.length, ReadOnlyCollectionLength::Slice)
-                && matches!(
+                && (matches!(
                     metadata,
                     Operand::Copy(place) | Operand::Move(place)
-                        if place.local == model.source_local && place.projections.is_empty()
-                )
+                        if place.local == model.local && place.projections.is_empty()
+                ) || definition_index.checked_sub(1).is_some_and(|pair_index| {
+                    exact_slice_raw_metadata_pair(func, model.local, block.id.0, pair_index)
+                        .is_some_and(|pair| {
+                            pair.length_local == len_local
+                                && matches!(
+                                    metadata,
+                                    Operand::Move(place)
+                                        if place.local == pair.pointer_local
+                                            && place.projections.is_empty()
+                                )
+                        })
+                }))
         }
         _ => false,
     }
@@ -2219,8 +2882,11 @@ fn exclusive_mutable_collection_arg_is_stable(func: &VerifiableFunction, local: 
         return false;
     }
 
-    for block in &func.body.blocks {
+    for (block_index, block) in func.body.blocks.iter().enumerate() {
         for (statement_index, statement) in block.stmts.iter().enumerate() {
+            if exact_slice_raw_metadata_pair(func, local, block_index, statement_index).is_some() {
+                continue;
+            }
             match statement {
                 Statement::Assign { place, rvalue, .. } => {
                     if place.local == local {
@@ -2328,6 +2994,11 @@ fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -
                     ) {
                         continue;
                     }
+                    if exact_slice_raw_metadata_pair(func, local, block_index, statement_index)
+                        .is_some()
+                    {
+                        continue;
+                    }
                     if let Some(alias_local) =
                         exact_shared_collection_alias_definition(func, statement, local)
                     {
@@ -2366,12 +3037,15 @@ fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -
             }
         }
         match &block.terminator {
-            Terminator::Call { args, dest, .. } => {
-                // Passing the modeled sequence across a call would require an
-                // interprocedural Freeze/alias proof; this narrow lane has none.
-                if dest.local == local
-                    || args.iter().any(|operand| operand_mentions_local(operand, local))
-                {
+            Terminator::Call { args, dest, is_foreign, is_unsafe_sig, .. } => {
+                if !safe_shared_collection_call_preserves_local(
+                    func,
+                    args,
+                    dest,
+                    *is_foreign,
+                    *is_unsafe_sig,
+                    local,
+                ) {
                     return false;
                 }
             }
@@ -2492,9 +3166,13 @@ fn exact_collection_model_for_local(
     if let Some(model) = read_only_collection_shape_for_local(func, local)
         && model.is_exclusive_mutable()
     {
-        return exclusive_mutable_collection_arg_is_stable(func, local).then_some(model);
+        if exclusive_mutable_collection_arg_is_stable(func, local) {
+            return Some(model);
+        }
+        return exclusive_mutable_collection_alias_model_for_local(func, local);
     }
-    read_only_collection_model_for_local(func, local)
+    exclusive_mutable_collection_alias_model_for_local(func, local)
+        .or_else(|| read_only_collection_model_for_local(func, local))
 }
 
 fn read_only_collection_model_for_name(
@@ -2584,7 +3262,7 @@ fn type_loop_formula(
         // to the same `xs__slice_len` leaf used by bounds VCs and modular σ
         // summaries. E4 has one narrower symbolic collection model whose length
         // term is `model.length_formula()`; bind the canonical leaf to that same
-        // term just as source loop clauses' `xs_len` projection leaf is bound
+        // term just as source loop clauses' `xs__len` projection leaf is bound
         // below. Neither spelling remains an independent free variable here.
         if let Some(base) = name.strip_suffix("__slice_len")
             && let Some(model) = read_only_collection_model_for_name(func, base)
@@ -2601,7 +3279,7 @@ fn type_loop_formula(
             replacements.insert(name, model.length_formula());
             continue;
         }
-        if let Some(base) = name.strip_suffix("_len")
+        if let Some(base) = name.strip_suffix("__len")
             && let Some(model) = read_only_collection_model_for_name(func, base)
         {
             if body_has_formula_local_name(func, &name)
@@ -2780,7 +3458,7 @@ fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32,
         Some((local_part, field)) => (local_part, Some(field.parse::<usize>().ok()?)),
         None => (base, None),
     };
-    // A source `xs.len()` is compiler-lowered to the synthetic `xs_len` leaf
+    // A source `xs.len()` is compiler-lowered to the synthetic `xs__len` leaf
     // and rebound by `type_loop_formula` to the exact stable slice model.
     // Preserve its source `usize` domain here: otherwise an ordinary
     // `i <= xs.len()` invariant combines a 64-bit `i` with an untyped Int
@@ -2788,7 +3466,7 @@ fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32,
     // are constants and never need this synthetic-variable case.
     if field.is_none()
         && !body_has_formula_local_name(func, local_part)
-        && let Some(collection_name) = local_part.strip_suffix("_len")
+        && let Some(collection_name) = local_part.strip_suffix("__len")
         && let Some(model) = read_only_collection_model_for_name(func, collection_name)
         && matches!(model.length, ReadOnlyCollectionLength::Slice)
     {
@@ -2811,7 +3489,9 @@ fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32,
         },
     };
     match ty {
-        Ty::Int { width, signed } => Some((*width, *signed)),
+        Ty::Int { width, signed } if rust_machine_width_supported(*width) => {
+            Some((*width, *signed))
+        }
         Ty::PtrSizedInt { signed } => Some((64, *signed)),
         _ => None,
     }
@@ -2996,7 +3676,7 @@ fn machine_unsigned_literal_pattern(value: u128, width: u32, signed: bool) -> Op
     (value <= max).then_some(value as i128)
 }
 
-fn rust_shift_width_supported(width: u32) -> bool {
+fn rust_machine_width_supported(width: u32) -> bool {
     matches!(width, 8 | 16 | 32 | 64 | 128)
 }
 
@@ -3004,7 +3684,7 @@ fn rust_shift_width_supported(width: u32) -> bool {
 /// shifted value's signed range on the shift count.  Rust permits a shift RHS
 /// of any integer type; only its low `log2(width)` bits select the operation.
 fn rust_shift_literal_pattern(value: u128, width: u32) -> Option<i128> {
-    if !rust_shift_width_supported(width) {
+    if !rust_machine_width_supported(width) {
         return None;
     }
     let mask = if width == 128 { u128::MAX } else { (1_u128 << width) - 1 };
@@ -3012,7 +3692,7 @@ fn rust_shift_literal_pattern(value: u128, width: u32) -> Option<i128> {
 }
 
 fn rust_shift_amount_formula(amount: &Formula, width: u32) -> Option<Box<Formula>> {
-    if !rust_shift_width_supported(width) {
+    if !rust_machine_width_supported(width) {
         return None;
     }
     Some(Box::new(Formula::BvAnd(
@@ -3023,7 +3703,7 @@ fn rust_shift_amount_formula(amount: &Formula, width: u32) -> Option<Box<Formula
 }
 
 fn resize_shift_amount(amount: Formula, source_width: u32, target_width: u32) -> Option<Formula> {
-    if !rust_shift_width_supported(source_width) || !rust_shift_width_supported(target_width) {
+    if !rust_machine_width_supported(source_width) || !rust_machine_width_supported(target_width) {
         return None;
     }
     Some(match source_width.cmp(&target_width) {
@@ -3050,7 +3730,7 @@ fn machine_faithful_shift_amount(
     width: u32,
     allow_div_rem: bool,
 ) -> Option<Formula> {
-    if !rust_shift_width_supported(width) {
+    if !rust_machine_width_supported(width) {
         return None;
     }
     let Formula::BvAnd(raw_amount, mask, node_width) = amount else {
@@ -3377,11 +4057,12 @@ fn initial_symbolic_state(func: &VerifiableFunction) -> FxHashMap<String, Formul
                 state.insert(model.name.clone(), model.base_formula());
                 state.insert(model.length_name(), model.length_formula());
             } else {
-                // The alias acquires the canonical base only when its unique
-                // definition is symbolically executed. Before that, retain a
-                // distinct placeholder so a malformed use-before-definition
-                // cannot gain source identity.
-                state.insert(name.clone(), Formula::Var(name, model.array_sort()));
+                // Alias admission already proves one unique definition in bb0,
+                // no predecessor back to bb0, and no use before it. Loop
+                // transitions start at the dominated header rather than bb0,
+                // so install the canonical identity here as well as replaying
+                // the definition on function-entry initiation paths.
+                state.insert(name.clone(), model.base_formula());
             }
         } else {
             state.insert(name.clone(), Formula::Var(name, crate::sort_for_ty(&decl.ty)));
@@ -3551,6 +4232,296 @@ fn formula_symbol_names(formula: &Formula) -> FxHashSet<String> {
     names
 }
 
+#[derive(Clone)]
+struct SymbolicLoopEntryContext {
+    state: FxHashMap<String, Formula>,
+    guard: Formula,
+    assumptions: Vec<Formula>,
+    /// Only the outermost loop's first arrival may assume function-entry
+    /// preconditions directly. A nested loop can be re-entered on later outer
+    /// iterations, where a mutable parameter no longer denotes its definition-
+    /// entry value; its initiation therefore rests on the enclosing loop's
+    /// independently proved invariant instead.
+    function_entry: bool,
+}
+
+fn typed_loop_invariants_for_header(
+    func: &VerifiableFunction,
+    header: BlockId,
+) -> Result<Vec<Formula>, String> {
+    let mut invariants = Vec::new();
+    for contract in &func.contracts {
+        if !matches!(contract.kind, ContractKind::LoopInvariant) {
+            continue;
+        }
+        let Some((candidate_header, text)) = loop_contract_body(&contract.body) else {
+            continue;
+        };
+        if candidate_header != header.0 {
+            continue;
+        }
+        let parsed = parse_spec_expr(&text).ok_or_else(|| {
+            format!("e45.transition.nested-invariant-unparseable: bb{} `{text}`", header.0)
+        })?;
+        let typed = type_and_validate_loop_formula(func, parsed, Sort::Bool).ok_or_else(|| {
+            format!("e45.transition.nested-invariant-untyped: bb{} `{text}`", header.0)
+        })?;
+        if !invariants.contains(&typed) {
+            invariants.push(typed);
+        }
+    }
+    if invariants.is_empty() {
+        return Err(format!(
+            "e45.transition.nested-invariant-missing: bb{} has no authored invariant to summarize its cycle",
+            header.0
+        ));
+    }
+    Ok(invariants)
+}
+
+/// Union every multi-latch natural-loop row by semantic header identity.
+/// `detect_loops` deliberately returns one row per backedge; composition needs
+/// the complete domain for a header, never the first favorable latch.
+fn natural_loop_domains(func: &VerifiableFunction) -> FxHashMap<BlockId, FxHashSet<BlockId>> {
+    let mut domains: FxHashMap<BlockId, FxHashSet<BlockId>> = FxHashMap::default();
+    for info in crate::termination::detect_loops(&func.body) {
+        domains.entry(info.header).or_default().extend(info.body_blocks);
+    }
+    domains
+}
+
+fn direct_enclosing_loop_header(
+    func: &VerifiableFunction,
+    nested: BlockId,
+) -> Result<Option<BlockId>, String> {
+    let domains = natural_loop_domains(func);
+    let mut candidates = domains
+        .iter()
+        .filter(|(header, blocks)| **header != nested && blocks.contains(&nested))
+        .map(|(header, blocks)| (*header, blocks.len()))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    candidates.sort_by_key(|(header, size)| (*size, header.0));
+    let minimum = candidates[0].1;
+    let equally_inner = candidates
+        .iter()
+        .take_while(|(_, size)| *size == minimum)
+        .map(|(header, _)| *header)
+        .collect::<Vec<_>>();
+    match equally_inner.as_slice() {
+        [header] => Ok(Some(*header)),
+        _ => Err(format!(
+            "e45.transition.nested-parent-ambiguous: bb{} is contained by equally specific loop headers {:?}",
+            nested.0,
+            equally_inner.iter().map(|header| header.0).collect::<Vec<_>>()
+        )),
+    }
+}
+
+fn symbolic_loop_invariant_entry_contexts(
+    func: &VerifiableFunction,
+    header: BlockId,
+) -> Result<Vec<SymbolicLoopEntryContext>, String> {
+    let Some(parent) = direct_enclosing_loop_header(func, header)? else {
+        let state = symbolic_state_at_loop_entry(func, header)
+            .ok_or_else(|| "e45.transition.entry-not-straight-line".to_string())?;
+        return Ok(vec![SymbolicLoopEntryContext {
+            state,
+            guard: Formula::Bool(true),
+            assumptions: Vec::new(),
+            function_entry: true,
+        }]);
+    };
+
+    let parent_invariants = typed_loop_invariants_for_header(func, parent)?;
+    symbolic_paths_from_loop_header_to_target(func, parent, header, parent_invariants)
+}
+
+/// Execute every acyclic path from an enclosing loop header to one nested
+/// header. These are the initiation sites of the nested invariant. A path that
+/// completes an outer iteration without visiting `target` contributes no row:
+/// the arbitrary next outer-header state is already covered by the enclosing
+/// invariant's consecution, and the same path family starts again from there.
+fn symbolic_paths_from_loop_header_to_target(
+    func: &VerifiableFunction,
+    parent: BlockId,
+    target: BlockId,
+    assumptions: Vec<Formula>,
+) -> Result<Vec<SymbolicLoopEntryContext>, String> {
+    const MAX_EXACT_LOOP_PATHS: usize = 64;
+
+    let domains = natural_loop_domains(func);
+    let in_parent = domains
+        .get(&parent)
+        .ok_or_else(|| format!("e45.transition.nested-parent-not-natural-loop: bb{}", parent.0))?;
+    if !in_parent.contains(&target) {
+        return Err(format!(
+            "e45.transition.nested-target-outside-parent: bb{} is not in bb{}",
+            target.0, parent.0
+        ));
+    }
+    let parent_block = func
+        .body
+        .blocks
+        .get(parent.0)
+        .ok_or_else(|| "e45.transition.invalid-parent-header".to_string())?;
+    let mut header_state = initial_symbolic_state(func);
+    apply_symbolic_statements(func, parent_block, &mut header_state, None)
+        .ok_or_else(|| "e45.transition.parent-header-statements".to_string())?;
+    let Terminator::SwitchInt { discr, targets, otherwise, .. } = &parent_block.terminator else {
+        return Err("e45.transition.parent-header-not-switch".to_string());
+    };
+
+    let mut body_targets = targets
+        .iter()
+        .map(|(_, successor)| *successor)
+        .chain(std::iter::once(*otherwise))
+        .filter(|successor| *successor != parent && in_parent.contains(successor))
+        .collect::<Vec<_>>();
+    body_targets.sort_by_key(|block| block.0);
+    body_targets.dedup();
+    let mut pending = Vec::new();
+    for successor in body_targets {
+        let guard = switch_edge_formula(func, discr, targets, *otherwise, successor, &header_state)
+            .ok_or_else(|| "e45.transition.parent-header-guard".to_string())?;
+        pending.push(PendingLoopPath {
+            current: successor,
+            state: header_state.clone(),
+            guard,
+            blocks: Vec::new(),
+            seen: FxHashSet::default(),
+        });
+    }
+
+    let nested_headers = domains
+        .keys()
+        .filter(|candidate| **candidate != parent && in_parent.contains(candidate))
+        .copied()
+        .collect::<FxHashSet<_>>();
+    let mut entries = Vec::new();
+    while let Some(mut path) = pending.pop() {
+        if trust_types::verify_budget::budget_exhausted() {
+            return Err("e45.transition.nested-entry-budget-exhausted".to_string());
+        }
+        if entries.len().saturating_add(pending.len()) >= MAX_EXACT_LOOP_PATHS {
+            return Err(format!(
+                "e45.transition.nested-entry-path-limit: exact path count exceeds {MAX_EXACT_LOOP_PATHS}"
+            ));
+        }
+        if path.current == target {
+            if !checked_update_shapes_are_authenticated(func, &path.blocks) {
+                return Err("e45.transition.nested-entry-checked-shape".to_string());
+            }
+            entries.push(SymbolicLoopEntryContext {
+                state: path.state,
+                guard: path.guard,
+                assumptions: assumptions.clone(),
+                function_entry: false,
+            });
+            continue;
+        }
+        if path.current == parent || !in_parent.contains(&path.current) {
+            continue;
+        }
+        if nested_headers.contains(&path.current) {
+            return Err(format!(
+                "e45.transition.nested-entry-intervening-cycle: bb{} is reached before target bb{}",
+                path.current.0, target.0
+            ));
+        }
+        if !path.seen.insert(path.current) {
+            return Err(format!(
+                "e45.transition.nested-entry-cyclic-subpath: bb{}",
+                path.current.0
+            ));
+        }
+
+        let block = func
+            .body
+            .blocks
+            .get(path.current.0)
+            .ok_or_else(|| "e45.transition.nested-entry-invalid-block".to_string())?;
+        path.blocks.push(path.current);
+        apply_symbolic_statements(func, block, &mut path.state, Some(&path.guard)).ok_or_else(
+            || format!("e45.transition.nested-entry-statement-shape: bb{}", block.id.0),
+        )?;
+        let push_edge =
+            |successor: BlockId, edge_guard: Formula, pending: &mut Vec<PendingLoopPath>| {
+                let mut next = path.clone();
+                next.current = successor;
+                next.guard = conjunction(vec![next.guard, edge_guard]);
+                pending.push(next);
+            };
+        match &block.terminator {
+            Terminator::Goto(successor) => {
+                push_edge(*successor, Formula::Bool(true), &mut pending);
+            }
+            Terminator::Assert { cond, expected, target: successor, .. } => {
+                let cond = symbolic_operand(func, cond, &path.state).ok_or_else(|| {
+                    format!("e45.transition.nested-entry-assert-condition: bb{}", block.id.0)
+                })?;
+                let success = if *expected { cond } else { Formula::Not(Box::new(cond)) };
+                push_edge(*successor, success, &mut pending);
+            }
+            Terminator::SwitchInt { discr, targets, otherwise, .. } => {
+                let mut successors = targets
+                    .iter()
+                    .map(|(_, successor)| *successor)
+                    .chain(std::iter::once(*otherwise))
+                    .collect::<Vec<_>>();
+                successors.sort_by_key(|successor| successor.0);
+                successors.dedup();
+                for successor in successors {
+                    if successor != parent && !in_parent.contains(&successor) {
+                        continue;
+                    }
+                    let edge_guard = switch_edge_formula(
+                        func,
+                        discr,
+                        targets,
+                        *otherwise,
+                        successor,
+                        &path.state,
+                    )
+                    .ok_or_else(|| {
+                        format!("e45.transition.nested-entry-branch-guard: bb{}", block.id.0)
+                    })?;
+                    push_edge(successor, edge_guard, &mut pending);
+                }
+            }
+            Terminator::Return | Terminator::Unreachable | Terminator::Resume => {}
+            Terminator::Call { .. } => {
+                return Err(format!("e45.transition.nested-entry-call-effect: bb{}", block.id.0));
+            }
+            Terminator::Drop { .. } => {
+                return Err(format!("e45.transition.nested-entry-drop-effect: bb{}", block.id.0));
+            }
+            Terminator::Opaque { .. } => {
+                return Err(format!(
+                    "e45.transition.nested-entry-opaque-terminator: bb{}",
+                    block.id.0
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "e45.transition.nested-entry-future-terminator: bb{}",
+                    block.id.0
+                ));
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(format!(
+            "e45.transition.nested-entry-unreachable: bb{} has no modeled path from parent bb{}",
+            target.0, parent.0
+        ));
+    }
+    Ok(entries)
+}
+
 fn symbolic_state_at_loop_entry(
     func: &VerifiableFunction,
     header: BlockId,
@@ -3574,7 +4545,7 @@ fn symbolic_state_at_loop_entry(
             return None;
         }
         let block = func.body.blocks.get(current.0)?;
-        apply_symbolic_statements(func, &block.stmts, &mut state, None)?;
+        apply_symbolic_statements(func, block, &mut state, None)?;
         current = match &block.terminator {
             Terminator::Goto(target) | Terminator::Assert { target, .. } => *target,
             _ => return None,
@@ -3583,11 +4554,28 @@ fn symbolic_state_at_loop_entry(
     Some(state)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SymbolicLoopTransition {
     post_state: FxHashMap<String, Formula>,
     guard: Formula,
     latch: BlockId,
+}
+
+fn require_complete_natural_latch_coverage(
+    expected: &FxHashSet<BlockId>,
+    transitions: &[SymbolicLoopTransition],
+) -> Result<(), String> {
+    let covered = transitions.iter().map(|transition| transition.latch).collect::<FxHashSet<_>>();
+    if &covered == expected {
+        return Ok(());
+    }
+    let mut missing = expected.difference(&covered).map(|latch| latch.0).collect::<Vec<_>>();
+    missing.sort_unstable();
+    let mut unexpected = covered.difference(expected).map(|latch| latch.0).collect::<Vec<_>>();
+    unexpected.sort_unstable();
+    Err(format!(
+        "e45.transition.uncovered-backedges: missing latch blocks {missing:?}; unexpected latch blocks {unexpected:?}"
+    ))
 }
 
 #[derive(Clone)]
@@ -3611,7 +4599,24 @@ fn symbolic_loop_transitions(
     func: &VerifiableFunction,
     header: BlockId,
 ) -> Result<Vec<SymbolicLoopTransition>, String> {
+    symbolic_loop_transitions_with_ancestors(func, header, &[])
+}
+
+fn symbolic_loop_transitions_with_ancestors(
+    func: &VerifiableFunction,
+    header: BlockId,
+    ancestors: &[BlockId],
+) -> Result<Vec<SymbolicLoopTransition>, String> {
     const MAX_EXACT_LOOP_PATHS: usize = 64;
+
+    if ancestors.contains(&header) {
+        return Err(format!(
+            "e45.transition.composition-cycle: loop header bb{} recursively summarizes itself",
+            header.0
+        ));
+    }
+    let mut active_headers = ancestors.to_vec();
+    active_headers.push(header);
 
     let loop_infos = crate::termination::detect_loops(&func.body)
         .into_iter()
@@ -3623,6 +4628,12 @@ fn symbolic_loop_transitions(
     let in_loop: FxHashSet<_> =
         loop_infos.iter().flat_map(|info| info.body_blocks.iter().copied()).collect();
     let latches: FxHashSet<_> = loop_infos.iter().map(|info| info._latch).collect();
+    let loop_domains = natural_loop_domains(func);
+    let nested_headers = loop_domains
+        .keys()
+        .filter(|candidate| **candidate != header && in_loop.contains(candidate))
+        .copied()
+        .collect::<FxHashSet<_>>();
     let header_block = func
         .body
         .blocks
@@ -3630,7 +4641,7 @@ fn symbolic_loop_transitions(
         .ok_or_else(|| "e45.transition.invalid-header".to_string())?;
 
     let mut header_state = initial_symbolic_state(func);
-    apply_symbolic_statements(func, &header_block.stmts, &mut header_state, None)
+    apply_symbolic_statements(func, header_block, &mut header_state, None)
         .ok_or_else(|| "e45.transition.header-statements".to_string())?;
     let Terminator::SwitchInt { discr, targets, otherwise, .. } = &header_block.terminator else {
         return Err("e45.transition.header-not-switch".to_string());
@@ -3662,7 +4673,7 @@ fn symbolic_loop_transitions(
     }
 
     let mut transitions = Vec::new();
-    let mut covered_latches = FxHashSet::default();
+    let mut nested_summary_serial = 0usize;
     while let Some(mut path) = pending.pop() {
         if trust_types::verify_budget::budget_exhausted() {
             return Err("e45.transition.budget-exhausted".to_string());
@@ -3685,7 +4696,6 @@ fn symbolic_loop_transitions(
             if !checked_update_shapes_are_authenticated(func, &path.blocks) {
                 return Err("e45.transition.checked-shape".to_string());
             }
-            covered_latches.insert(latch);
             transitions.push(SymbolicLoopTransition {
                 post_state: path.state,
                 guard: path.guard,
@@ -3696,6 +4706,22 @@ fn symbolic_loop_transitions(
         if !in_loop.contains(&path.current) {
             // A body edge leaving the natural-loop set is an exit, not a
             // successful iteration and therefore has no E4/E5 step obligation.
+            continue;
+        }
+        if nested_headers.contains(&path.current) {
+            nested_summary_serial = nested_summary_serial.saturating_add(1);
+            let summary = summarize_nested_loop(
+                func,
+                path.current,
+                path.state.clone(),
+                nested_summary_serial,
+                &active_headers,
+            )?;
+            let mut next = path;
+            next.current = summary.exit;
+            next.state = summary.state;
+            next.guard = conjunction(vec![next.guard, summary.guard]);
+            pending.push(next);
             continue;
         }
         if !path.seen.insert(path.current) {
@@ -3711,7 +4737,7 @@ fn symbolic_loop_transitions(
             .get(path.current.0)
             .ok_or_else(|| "e45.transition.invalid-block".to_string())?;
         path.blocks.push(path.current);
-        apply_symbolic_statements(func, &block.stmts, &mut path.state, Some(&path.guard))
+        apply_symbolic_statements(func, block, &mut path.state, Some(&path.guard))
             .ok_or_else(|| format!("e45.transition.statement-shape: bb{}", block.id.0))?;
 
         let push_edge =
@@ -3772,16 +4798,198 @@ fn symbolic_loop_transitions(
     if transitions.is_empty() {
         return Err("e45.transition.no-complete-iteration".to_string());
     }
-    if covered_latches != latches {
-        let mut missing =
-            latches.difference(&covered_latches).map(|latch| latch.0).collect::<Vec<_>>();
-        missing.sort_unstable();
-        return Err(format!(
-            "e45.transition.uncovered-backedges: missing latch blocks {missing:?}"
-        ));
-    }
+    require_complete_natural_latch_coverage(&latches, &transitions)?;
     transitions.sort_by_key(|transition| transition.latch.0);
     Ok(transitions)
+}
+
+struct NestedLoopSummary {
+    exit: BlockId,
+    state: FxHashMap<String, Formula>,
+    guard: Formula,
+}
+
+fn modeled_terminator_successors(terminator: &Terminator) -> Result<Vec<BlockId>, String> {
+    let mut successors = match terminator {
+        Terminator::Goto(target) | Terminator::Assert { target, .. } => vec![*target],
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            targets.iter().map(|(_, target)| *target).chain(std::iter::once(*otherwise)).collect()
+        }
+        Terminator::Return | Terminator::Unreachable | Terminator::Resume => Vec::new(),
+        Terminator::Call { .. } => {
+            return Err("e45.transition.nested-summary-call-effect".to_string());
+        }
+        Terminator::Drop { .. } => {
+            return Err("e45.transition.nested-summary-drop-effect".to_string());
+        }
+        Terminator::Opaque { .. } => {
+            return Err("e45.transition.nested-summary-opaque-terminator".to_string());
+        }
+        _ => return Err("e45.transition.nested-summary-future-terminator".to_string()),
+    };
+    successors.sort_by_key(|target| target.0);
+    successors.dedup();
+    Ok(successors)
+}
+
+/// Replace one exact nested natural loop by a conservative relational summary.
+///
+/// The inner E4 rows prove every authored inner invariant independently. For
+/// an execution that eventually leaves the inner loop, the state at its final
+/// header therefore satisfies those invariants and its header's exit guard.
+/// Havocing every scalar local assigned anywhere in the complete inner-loop
+/// domain and retaining only those two facts is an over-approximation: it may
+/// reject a true outer invariant, but cannot omit a real exiting execution.
+/// A projected write, side exit, missing invariant, partial latch model, or
+/// unmodeled effect rejects composition instead of receiving a favorable
+/// summary.
+fn summarize_nested_loop(
+    func: &VerifiableFunction,
+    header: BlockId,
+    mut state: FxHashMap<String, Formula>,
+    serial: usize,
+    ancestors: &[BlockId],
+) -> Result<NestedLoopSummary, String> {
+    // This recursively authenticates every inner latch and every deeper exact
+    // summary before the outer loop is allowed to use the invariant boundary.
+    symbolic_loop_transitions_with_ancestors(func, header, ancestors).map_err(|reason| {
+        format!("e45.transition.nested-summary-inner-model: bb{}: {reason}", header.0)
+    })?;
+
+    let domains = natural_loop_domains(func);
+    let inner = domains
+        .get(&header)
+        .ok_or_else(|| format!("e45.transition.nested-summary-not-natural-loop: bb{}", header.0))?;
+    let header_block =
+        func.body.blocks.get(header.0).ok_or_else(|| {
+            format!("e45.transition.nested-summary-invalid-header: bb{}", header.0)
+        })?;
+    let Terminator::SwitchInt { discr, targets, otherwise, .. } = &header_block.terminator else {
+        return Err(format!("e45.transition.nested-summary-header-not-switch: bb{}", header.0));
+    };
+
+    let mut exits = modeled_terminator_successors(&header_block.terminator)?
+        .into_iter()
+        .filter(|successor| !inner.contains(successor))
+        .collect::<Vec<_>>();
+    exits.sort_by_key(|exit| exit.0);
+    exits.dedup();
+    let [exit] = exits.as_slice() else {
+        return Err(format!(
+            "e45.transition.nested-summary-exit-cardinality: bb{} has {} distinct header exits",
+            header.0,
+            exits.len()
+        ));
+    };
+    for block_id in inner.iter().filter(|block_id| **block_id != header) {
+        let block = func.body.blocks.get(block_id.0).ok_or_else(|| {
+            format!("e45.transition.nested-summary-invalid-block: bb{}", block_id.0)
+        })?;
+        if modeled_terminator_successors(&block.terminator)?
+            .iter()
+            .any(|successor| !inner.contains(successor))
+        {
+            return Err(format!(
+                "e45.transition.nested-summary-side-exit: bb{} exits inner header bb{} outside its authenticated header guard",
+                block_id.0, header.0
+            ));
+        }
+    }
+
+    let invariants = typed_loop_invariants_for_header(func, header)?;
+    let mut modified = FxHashSet::default();
+    for block_id in inner {
+        let block = func.body.blocks.get(block_id.0).ok_or_else(|| {
+            format!("e45.transition.nested-summary-invalid-block: bb{}", block_id.0)
+        })?;
+        for statement in &block.stmts {
+            match statement {
+                Statement::Assign { place, .. } if place.projections.is_empty() => {
+                    let decl = func.body.locals.get(place.local).ok_or_else(|| {
+                        format!("e45.transition.nested-summary-invalid-local: _{}", place.local)
+                    })?;
+                    if !matches!(
+                        decl.ty,
+                        Ty::Bool
+                            | Ty::Char
+                            | Ty::Int { .. }
+                            | Ty::PtrSizedInt { .. }
+                            | Ty::Tuple(_)
+                    ) {
+                        return Err(format!(
+                            "e45.transition.nested-summary-nonscalar-write: bb{} writes _{} of type {:?}",
+                            block_id.0, place.local, decl.ty
+                        ));
+                    }
+                    modified.insert(place.local);
+                }
+                Statement::Assign { place, .. } => {
+                    return Err(format!(
+                        "e45.transition.nested-summary-projected-write: bb{} writes {:?}",
+                        block_id.0, place
+                    ));
+                }
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                _ => {
+                    return Err(format!(
+                        "e45.transition.nested-summary-statement-effect: bb{}",
+                        block_id.0
+                    ));
+                }
+            }
+        }
+    }
+
+    for local in modified {
+        let base = crate::place_to_var_name(func, &trust_types::Place::local(local));
+        let keys = state
+            .keys()
+            .filter(|key| symbolic_state_key_belongs_to_local(key, &base))
+            .cloned()
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Err(format!(
+                "e45.transition.nested-summary-state-missing: _{} has no symbolic entry",
+                local
+            ));
+        }
+        for key in keys {
+            let sort = trust_types::check_formula_sort(
+                state.get(&key).expect("key collected from this state"),
+            )
+            .map_err(|error| {
+                format!("e45.transition.nested-summary-state-sort: `{key}` is ill-sorted: {error}")
+            })?;
+            // `#...` is intentionally an SSA-version suffix. The exact machine
+            // translator strips it before resolving the source local's width
+            // and signedness, so a havoced u8 remains u8 rather than becoming
+            // an untyped mathematical Int.
+            let fresh = format!("{key}#e45_nested_bb{}_{}", header.0, serial);
+            state.insert(key, Formula::Var(fresh, sort));
+        }
+    }
+
+    let invariant_state = state.clone();
+    let invariant_guard = conjunction(
+        invariants
+            .iter()
+            .map(|invariant| substitute_formula_state(invariant, &invariant_state))
+            .collect(),
+    );
+    apply_symbolic_statements(func, header_block, &mut state, None).ok_or_else(|| {
+        format!("e45.transition.nested-summary-header-statements: bb{}", header.0)
+    })?;
+    let exit_guard = switch_edge_formula(func, discr, targets, *otherwise, *exit, &state)
+        .ok_or_else(|| format!("e45.transition.nested-summary-exit-guard: bb{}", header.0))?;
+    Ok(NestedLoopSummary {
+        exit: *exit,
+        state,
+        guard: conjunction(vec![invariant_guard, exit_guard]),
+    })
 }
 
 fn switch_edge_formula(
@@ -3843,6 +5051,59 @@ fn disjunction(mut formulas: Vec<Formula>) -> Formula {
         0 => Formula::Bool(false),
         1 => formulas.pop().unwrap(),
         _ => Formula::Or(formulas),
+    }
+}
+
+/// Require a machine-arithmetic RHS to inhabit the LHS domain exactly.
+///
+/// `ConstValue::Int` is the one legacy/contextual portable-MIR spelling whose
+/// source width was erased during extraction.  Authenticate it by value
+/// against the declared LHS width and signedness.  `ConstValue::Uint` retains
+/// its source width, so it must match exactly.  Shifts are the sole exception:
+/// Rust permits an independently typed integer RHS and masks its low bits at
+/// the LHS width.
+fn machine_rhs_matches_lhs_type(
+    func: &VerifiableFunction,
+    op: BinOp,
+    lhs_ty: &Ty,
+    rhs: &Operand,
+) -> bool {
+    if !machine_integer_ty(lhs_ty) {
+        return false;
+    }
+    let Some(width) = lhs_ty.int_width() else {
+        return false;
+    };
+    let signed = lhs_ty.is_signed();
+    if matches!(op, BinOp::Shl | BinOp::Shr) {
+        return match rhs {
+            Operand::Constant(ConstValue::Int(_)) => true,
+            Operand::Constant(ConstValue::Uint(value, source_width)) => {
+                rust_machine_width_supported(*source_width)
+                    && machine_unsigned_literal_pattern(
+                        *value,
+                        *source_width,
+                        /* signed */ false,
+                    )
+                    .is_some()
+            }
+            _ => crate::operand_ty_cow(func, rhs).as_deref().is_some_and(machine_integer_ty),
+        };
+    }
+    match rhs {
+        Operand::Constant(ConstValue::Int(value)) => {
+            machine_literal_pattern(*value, width, signed).is_some()
+        }
+        Operand::Constant(ConstValue::Uint(value, source_width)) => {
+            !signed
+                && *source_width == width
+                && machine_unsigned_literal_pattern(*value, width, false).is_some()
+        }
+        _ => crate::operand_ty_cow(func, rhs).is_some_and(|rhs_ty| {
+            machine_integer_ty(&rhs_ty)
+                && rhs_ty.int_width() == Some(width)
+                && rhs_ty.is_signed() == signed
+        }),
     }
 }
 
@@ -3909,18 +5170,7 @@ fn checked_update_shape_is_authenticated(
     let Some(lhs_ty) = crate::operand_ty_cow(func, lhs).map(|ty| ty.into_owned()) else {
         return false;
     };
-    let Some(rhs_ty) = crate::operand_ty_cow(func, rhs).map(|ty| ty.into_owned()) else {
-        return false;
-    };
-    let operand_types_match = if matches!(op, BinOp::Shl | BinOp::Shr) {
-        // MIR shifts alone permit an independently typed integer RHS.  The
-        // tuple value still has the LHS type; symbolic_binop authenticates and
-        // normalizes the count at its own exact portable type.
-        machine_integer_ty(&lhs_ty) && machine_integer_ty(&rhs_ty)
-    } else {
-        lhs_ty == rhs_ty
-    };
-    if !operand_types_match {
+    if !machine_rhs_matches_lhs_type(func, *op, &lhs_ty, rhs) {
         return false;
     }
     let Some(tuple_decl) = func.body.locals.iter().find(|decl| decl.index == tuple_local) else {
@@ -4049,20 +5299,75 @@ fn apply_symbolic_exclusive_mutable_store(
         return None;
     }
     let current = current_collection_base(func, &model, state)?;
-    state.insert(
-        model.name.clone(),
-        Formula::Store(Box::new(current), Box::new(index), Box::new(value)),
-    );
+    let updated = Formula::Store(Box::new(current), Box::new(index), Box::new(value));
+    let access_name = crate::place_to_var_name(func, &trust_types::Place::local(model.local));
+    state.insert(access_name, updated.clone());
+    state.insert(model.name.clone(), updated);
     Some(())
 }
 
 fn apply_symbolic_statements(
     func: &VerifiableFunction,
-    statements: &[Statement],
+    block: &BasicBlock,
     state: &mut FxHashMap<String, Formula>,
     machine_arithmetic_guard: Option<&Formula>,
 ) -> Option<()> {
-    for statement in statements {
+    let block_index = func.body.blocks.iter().position(|candidate| std::ptr::eq(candidate, block));
+    let mut statements = block.stmts.iter().enumerate().peekable();
+    while let Some((statement_index, statement)) = statements.next() {
+        let raw_metadata_pair = match statement {
+            Statement::Assign { rvalue: Rvalue::AddressOf(false, source), .. } => block_index
+                .and_then(|block_index| {
+                    exact_slice_raw_metadata_pair(func, source.local, block_index, statement_index)
+                }),
+            _ => None,
+        };
+        if let Some(pair) = raw_metadata_pair {
+            let Statement::Assign { rvalue: Rvalue::AddressOf(false, source), .. } = statement
+            else {
+                unreachable!("raw metadata pair was recognized from this statement")
+            };
+            let model = exact_collection_model_for_local(func, source.local)?;
+            current_collection_base(func, &model, state)?;
+            let length = model.length_formula();
+            if matches!(&model.length, ReadOnlyCollectionLength::Slice)
+                && state.get(&model.length_name()) != Some(&length)
+            {
+                return None;
+            }
+            invalidate_symbolic_local(func, pair.pointer_local, state);
+            invalidate_symbolic_local(func, pair.length_local, state);
+            state.insert(
+                crate::place_to_var_name(func, &trust_types::Place::local(pair.length_local)),
+                length,
+            );
+            let (consumed_index, _) = statements.next()?;
+            if consumed_index != statement_index + 1 {
+                return None;
+            }
+            continue;
+        }
+        if let Some((source_local, alias_local)) =
+            exact_exclusive_collection_reborrow_source(func, statement)
+        {
+            let source_model = exact_collection_model_for_local(func, source_local)?;
+            let alias_model = exact_collection_model_for_local(func, alias_local)?;
+            if source_model.source_local != source_local
+                || alias_model.source_local != source_local
+                || source_model.name != alias_model.name
+                || source_model.array_sort() != alias_model.array_sort()
+            {
+                return None;
+            }
+            let current = state.get(&source_model.name)?.clone();
+            if !formula_has_sort(&current, source_model.array_sort()) {
+                return None;
+            }
+            let alias_name =
+                crate::place_to_var_name(func, &trust_types::Place::local(alias_local));
+            state.insert(alias_name, current);
+            continue;
+        }
         match statement {
             Statement::Assign { place, rvalue, .. } if place.projections.is_empty() => {
                 let dest = crate::place_to_var_name(func, place);
@@ -4312,6 +5617,9 @@ fn symbolic_binop(
         let ty = ty.as_deref()?;
         let width = ty.int_width()?;
         let signed = ty.is_signed();
+        if !machine_rhs_matches_lhs_type(func, op, ty, rhs) {
+            return None;
+        }
         let lhs_bv = Box::new(Formula::IntToBv(Box::new(lhs_formula.clone()), width));
         let rhs_bv = Box::new(Formula::IntToBv(Box::new(rhs_formula.clone()), width));
         let machine_value = match op {
@@ -4341,52 +5649,6 @@ fn symbolic_binop(
             _ => None,
         };
         if let Some(machine_value) = machine_value {
-            // MIR's integer literals are stored without their contextual Rust
-            // type in the portable VF. Accept such a literal only when its bit
-            // pattern fits the LHS's exact declared domain; every non-literal
-            // operand must retain identical width and signedness. Comparisons
-            // deliberately bypass this check because they produce no machine
-            // value and are translated with the whole formula's authenticated
-            // domain below.
-            let rhs_matches = if matches!(op, BinOp::Shl | BinOp::Shr) {
-                // MIR shifts deliberately permit every integer RHS width and
-                // signedness.  Its exact declared type is used by the pure-BV
-                // translator above; non-shift operations retain the strict
-                // homogeneous-domain rule below.
-                match rhs {
-                    // `Int` lacks contextual type metadata in the portable VF,
-                    // but every i128 carrier is a valid source bit pattern and
-                    // masking its low bits is independent of that lost type.
-                    Operand::Constant(ConstValue::Int(_)) => true,
-                    Operand::Constant(ConstValue::Uint(value, source_width)) => {
-                        rust_shift_width_supported(*source_width)
-                            && machine_unsigned_literal_pattern(
-                                *value,
-                                *source_width,
-                                /* signed */ false,
-                            )
-                            .is_some()
-                    }
-                    _ => {
-                        crate::operand_ty_cow(func, rhs).as_deref().is_some_and(machine_integer_ty)
-                    }
-                }
-            } else {
-                match rhs {
-                    Operand::Constant(ConstValue::Int(value)) => {
-                        machine_literal_pattern(*value, width, signed).is_some()
-                    }
-                    Operand::Constant(ConstValue::Uint(value, _)) => {
-                        machine_unsigned_literal_pattern(*value, width, signed).is_some()
-                    }
-                    _ => crate::operand_ty_cow(func, rhs).is_some_and(|rhs_ty| {
-                        rhs_ty.int_width() == Some(width) && rhs_ty.is_signed() == signed
-                    }),
-                }
-            };
-            if !rhs_matches {
-                return None;
-            }
             return Some(Formula::BvToInt(Box::new(machine_value), width, signed));
         }
     }
@@ -4476,7 +5738,8 @@ fn predicate_asserted_by_true_guard(guard: &Formula) -> &Formula {
 }
 
 fn machine_integer_ty(ty: &Ty) -> bool {
-    matches!(ty, Ty::Int { .. } | Ty::PtrSizedInt { .. })
+    matches!(ty, Ty::Int { width, .. } if rust_machine_width_supported(*width))
+        || matches!(ty, Ty::PtrSizedInt { .. })
 }
 
 fn symbolic_operand(
@@ -4546,6 +5809,7 @@ fn trust_wp_metadata_for_source(source_contract_index: usize) -> ContractMetadat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trust_router::{InProcessAyBackend, VerificationBackend};
     use trust_types::{ConstValue, Place};
 
     fn contract_test_function(contracts: Vec<Contract>) -> VerifiableFunction {
@@ -4565,6 +5829,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts,
             preconditions: vec![],
@@ -4596,18 +5861,17 @@ mod tests {
         let mut state = initial_symbolic_state(&func);
         state.insert(checked_value.clone(), Formula::Int(7));
         state.insert(checked_flag.clone(), Formula::Bool(false));
+        let whole_local_assignment = BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Return,
+        };
         assert!(
-            apply_symbolic_statements(
-                &func,
-                &[Statement::Assign {
-                    place: Place::local(1),
-                    rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
-                    span: SourceSpan::default(),
-                }],
-                &mut state,
-                None,
-            )
-            .is_some()
+            apply_symbolic_statements(&func, &whole_local_assignment, &mut state, None,).is_some()
         );
         assert!(state.contains_key(&checked_base));
         assert!(!state.contains_key(&checked_value));
@@ -4615,18 +5879,17 @@ mod tests {
 
         state.insert(checked_value.clone(), Formula::Int(9));
         state.insert(checked_flag.clone(), Formula::Bool(true));
+        let projected_assignment = BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::field(1, 0),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(1, 32))),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Return,
+        };
         assert!(
-            apply_symbolic_statements(
-                &func,
-                &[Statement::Assign {
-                    place: Place::field(1, 0),
-                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(1, 32))),
-                    span: SourceSpan::default(),
-                }],
-                &mut state,
-                None,
-            )
-            .is_none(),
+            apply_symbolic_statements(&func, &projected_assignment, &mut state, None,).is_none(),
             "projected writes remain outside the exact transition fragment",
         );
         assert!(!state.contains_key(&checked_base));
@@ -4708,6 +5971,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![
                 Contract {
@@ -4725,6 +5989,336 @@ mod tests {
             postconditions: vec![],
             spec: Default::default(),
         }
+    }
+
+    fn compositional_nested_loop_function() -> VerifiableFunction {
+        // while outer > 0 invariant outer <= 10 && inner <= 10 decreases outer {
+        //     while inner > 0 invariant inner <= 10 decreases inner {
+        //         if choose { inner -= 1 } else { inner -= 1 }
+        //     }
+        //     outer -= 1;
+        // }
+        //
+        // bb4 and bb6 are two distinct inner latches. The only inner exit is
+        // the false edge of bb2, into the outer post block bb5.
+        VerifiableFunction {
+            name: "compositional_nested_loop".to_string(),
+            def_path: "test::compositional_nested_loop".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".into()) },
+                    LocalDecl { index: 1, ty: Ty::u32(), name: Some("outer".into()) },
+                    LocalDecl { index: 2, ty: Ty::u32(), name: Some("inner".into()) },
+                    LocalDecl { index: 3, ty: Ty::Bool, name: Some("choose".into()) },
+                    LocalDecl { index: 4, ty: Ty::Bool, name: Some("outer_cond".into()) },
+                    LocalDecl { index: 5, ty: Ty::Bool, name: Some("inner_cond".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Gt,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(0, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(4)),
+                            targets: vec![(1, BlockId(2))],
+                            otherwise: BlockId(7),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(5),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Gt,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Constant(ConstValue::Uint(0, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(5)),
+                            targets: vec![(1, BlockId(3))],
+                            otherwise: BlockId(5),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(3)),
+                            targets: vec![(1, BlockId(4))],
+                            otherwise: BlockId(6),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Sub,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Goto(BlockId(2)),
+                    },
+                    BasicBlock {
+                        id: BlockId(5),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(1),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Sub,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(6),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Sub,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Goto(BlockId(2)),
+                    },
+                    BasicBlock { id: BlockId(7), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 3,
+                return_ty: Ty::Unit,
+                // Pre-existing `cfg(test)` build break on main: `VerifiableBody`
+                // grew a required `datatype_defs` field and this one fixture was
+                // never updated, so `--lib` tests for the whole crate could not
+                // compile. Empty = no out-of-band datatype definitions, exactly
+                // like every other synthetic fixture in this file.
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![
+                Contract {
+                    kind: ContractKind::LoopInvariant,
+                    span: SourceSpan::default(),
+                    body: "bb1: outer <= 10 && inner <= 10".to_string(),
+                },
+                Contract {
+                    kind: ContractKind::Decreases,
+                    span: SourceSpan::default(),
+                    body: "bb1: outer".to_string(),
+                },
+                Contract {
+                    kind: ContractKind::LoopInvariant,
+                    span: SourceSpan::default(),
+                    body: "bb2: inner <= 10".to_string(),
+                },
+                Contract {
+                    kind: ContractKind::Decreases,
+                    span: SourceSpan::default(),
+                    body: "bb2: inner".to_string(),
+                },
+            ],
+            preconditions: vec![
+                parse_spec_expr("outer <= 10 && inner <= 10")
+                    .expect("nested-loop precondition parses"),
+            ],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn nested_cycle_composition_uses_all_inner_latches_and_independent_invariants() {
+        let func = compositional_nested_loop_function();
+        let inner = symbolic_loop_transitions(&func, BlockId(2))
+            .expect("the inner multi-latch loop has an exact transition model");
+        assert_eq!(
+            inner.iter().map(|transition| transition.latch).collect::<FxHashSet<_>>(),
+            [BlockId(4), BlockId(6)].into_iter().collect(),
+            "both inner backedges must be modeled",
+        );
+        let outer = symbolic_loop_transitions(&func, BlockId(1))
+            .expect("the outer loop must compose through the authenticated inner invariant");
+        assert_eq!(outer.len(), 1);
+        assert_eq!(outer[0].latch, BlockId(5));
+        assert!(
+            outer[0]
+                .post_state
+                .get("inner")
+                .is_some_and(|value| matches!(value, Formula::Var(name, Sort::Int)
+                    if name.starts_with("inner#e45_nested_bb2_"))),
+            "the inner mutation must be conservatively havoced, not copied from a favorable latch: {:?}",
+            outer[0].post_state,
+        );
+
+        let mut vcs = Vec::new();
+        check_contracts(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter()
+                .filter(|vc| matches!(
+                    vc.kind,
+                    VcKind::LoopInvariantInitiation { .. }
+                        | VcKind::LoopInvariantConsecution { .. }
+                ))
+                .count(),
+            4,
+            "both loops retain independent E4 initiation/consecution rows: {vcs:#?}",
+        );
+        assert!(
+            !vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { detail, .. }
+                    if detail.contains("e45.transition")
+            )),
+            "the exact nested composition must not degrade to a marker: {vcs:#?}",
+        );
+        let outer_consecution = vcs
+            .iter()
+            .find(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { header_block: 1, .. }))
+            .expect("outer consecution row");
+        assert!(
+            formula_contains_var_prefix(&outer_consecution.formula, "inner#e45_nested_bb2_"),
+            "the public outer VC must retain the conservative inner-state boundary: {outer_consecution:#?}",
+        );
+    }
+
+    #[test]
+    fn nested_multi_latch_omission_mutation_is_rejected() {
+        let func = compositional_nested_loop_function();
+        let complete = symbolic_loop_transitions(&func, BlockId(2))
+            .expect("the reference inner transition set is complete");
+        let expected = [BlockId(4), BlockId(6)].into_iter().collect::<FxHashSet<_>>();
+        require_complete_natural_latch_coverage(&expected, &complete)
+            .expect("the unmodified transition set covers both latches");
+
+        let mut omitted = complete;
+        omitted.retain(|transition| transition.latch != BlockId(6));
+        let error = require_complete_natural_latch_coverage(&expected, &omitted)
+            .expect_err("dropping one favorable/non-favorable latch must fail closed");
+        assert!(
+            error.contains("uncovered-backedges") && error.contains("[6]"),
+            "the blocker must identify the omitted natural backedge: {error}",
+        );
+    }
+
+    #[test]
+    fn wrong_inner_invariant_stays_public_sat_and_good_row_has_checked_ay_proof() {
+        let backend = InProcessAyBackend::new().with_timeout(30_000);
+
+        let good = compositional_nested_loop_function();
+        let mut good_rows = Vec::new();
+        check_contracts(&good, &mut good_rows);
+        let good_inner = good_rows
+            .iter()
+            .find(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { header_block: 2, .. }))
+            .expect("public inner consecution row");
+        let good_result = backend.verify(good_inner);
+        assert!(
+            matches!(
+                &good_result,
+                trust_types::VerificationResult::Proved {
+                    strength,
+                    proof_certificate: Some(certificate),
+                    ..
+                } if *strength == trust_types::ProofStrength::smt_unsat_strict_checked()
+                    && !certificate.is_empty()
+            ),
+            "the valid public row must be UNSAT with AY's strict-checked proof artifact: \
+             {good_result:#?}",
+        );
+
+        let mut wrong = compositional_nested_loop_function();
+        let inner_contract = wrong
+            .contracts
+            .iter_mut()
+            .find(|contract| {
+                matches!(contract.kind, ContractKind::LoopInvariant)
+                    && contract.body.starts_with("bb2:")
+            })
+            .expect("inner invariant contract");
+        inner_contract.body = "bb2: inner == 10".to_string();
+
+        let (solver_rows, preclassified) = crate::generate_vcs_with_discharge(&wrong);
+        assert!(
+            !preclassified.iter().any(|(vc, result)| {
+                matches!(vc.kind, VcKind::LoopInvariantConsecution { header_block: 2, .. })
+                    && matches!(result, trust_types::VerificationResult::Proved { .. })
+            }),
+            "no in-process prepass may grant authority to the non-inductive inner clause: \
+             {preclassified:#?}",
+        );
+        let wrong_inner = solver_rows
+            .iter()
+            .find(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { header_block: 2, .. }))
+            .expect("the non-inductive public row must remain solver-visible");
+        let wrong_result = backend.verify(wrong_inner);
+        assert!(
+            matches!(
+                &wrong_result,
+                trust_types::VerificationResult::Failed {
+                    solver,
+                    counterexample: Some(_),
+                    ..
+                } if solver.as_str() == "ay-in-process"
+            ),
+            "`inner == 10` is falsified by the exact decrement transition and must be SAT, not \
+             proved or dropped: {wrong_result:#?}",
+        );
+    }
+
+    fn formula_contains_var_prefix(formula: &Formula, prefix: &str) -> bool {
+        let mut found = false;
+        formula.visit(&mut |node| {
+            found |= matches!(node, Formula::Var(name, _) if name.starts_with(prefix));
+        });
+        found
+    }
+
+    #[test]
+    fn nested_cycle_composition_fails_closed_on_missing_invariant_or_side_exit() {
+        let mut missing = compositional_nested_loop_function();
+        missing.contracts.retain(|contract| {
+            !matches!(contract.kind, ContractKind::LoopInvariant)
+                || !contract.body.starts_with("bb2:")
+        });
+        let error = symbolic_loop_transitions(&missing, BlockId(1))
+            .expect_err("an inner cycle without its own invariant cannot be summarized");
+        assert!(error.contains("nested-invariant-missing"), "unexpected blocker: {error}");
+
+        let mut side_exit = compositional_nested_loop_function();
+        side_exit.body.blocks[6].terminator = Terminator::SwitchInt {
+            discr: Operand::Copy(Place::local(3)),
+            targets: vec![(1, BlockId(2))],
+            otherwise: BlockId(5),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        };
+        let error = symbolic_loop_transitions(&side_exit, BlockId(1))
+            .expect_err("an inner body side exit has no exact invariant/guard summary");
+        assert!(error.contains("nested-summary-side-exit"), "unexpected blocker: {error}");
     }
 
     fn read_only_collection_loop_function(inner: Ty) -> VerifiableFunction {
@@ -4785,6 +6379,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![Contract {
                 kind: ContractKind::LoopInvariant,
@@ -4886,6 +6481,7 @@ mod tests {
                 ],
                 arg_count: 3,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![Contract {
                 kind: ContractKind::LoopInvariant,
@@ -4896,6 +6492,145 @@ mod tests {
             postconditions: vec![],
             spec: Default::default(),
         }
+    }
+
+    fn retained_mutable_collection_reborrow_function(
+        inner: Ty,
+        return_alias: bool,
+    ) -> VerifiableFunction {
+        let mut func = exclusive_mutable_collection_loop_function(inner);
+        func.name = "retained_mutable_collection_reborrow".to_string();
+        func.def_path = "test::retained_mutable_collection_reborrow".to_string();
+        let alias_local = func.body.locals.len();
+        let alias_ty = func.body.locals[1].ty.clone();
+        func.body.locals.push(LocalDecl {
+            index: alias_local,
+            ty: alias_ty.clone(),
+            name: Some("retained".into()),
+        });
+        func.body.blocks[0].stmts.push(Statement::StorageLive(alias_local));
+        func.body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(alias_local),
+            rvalue: Rvalue::Ref {
+                mutable: true,
+                place: Place { local: 1, projections: vec![Projection::Deref] },
+            },
+            span: SourceSpan::default(),
+        });
+        let Statement::Assign { rvalue: Rvalue::Len(length_place), .. } =
+            &mut func.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        length_place.local = alias_local;
+        for statement in &mut func.body.blocks[3].stmts {
+            match statement {
+                Statement::Assign { place, .. } if !place.projections.is_empty() => {
+                    place.local = alias_local;
+                }
+                Statement::Assign { rvalue: Rvalue::Use(Operand::Copy(place)), .. }
+                    if !place.projections.is_empty() =>
+                {
+                    place.local = alias_local;
+                }
+                _ => {}
+            }
+        }
+        if return_alias {
+            func.body.return_ty = alias_ty.clone();
+            func.body.locals[0].ty = alias_ty;
+            func.body.blocks[4].stmts.push(Statement::Assign {
+                place: Place::local(0),
+                rvalue: Rvalue::Use(Operand::Move(Place::local(alias_local))),
+                span: SourceSpan::default(),
+            });
+        }
+        func
+    }
+
+    /// Replace the portable direct move-return fixture with rustc's exact
+    /// opt-level-0 terminal mutable-reborrow handoff.
+    fn use_rustc_terminal_mutable_reborrow_return(
+        func: &mut VerifiableFunction,
+        alias_local: usize,
+    ) -> usize {
+        let temporary_local = func.body.locals.len();
+        let alias_ty = func.body.locals[alias_local].ty.clone();
+        assert_eq!(func.body.return_ty, alias_ty);
+        func.body.locals.push(LocalDecl {
+            index: temporary_local,
+            ty: alias_ty,
+            name: Some("return_reborrow".into()),
+        });
+        func.body.blocks[0].stmts.insert(0, Statement::StorageLive(temporary_local));
+        func.body.blocks[4].stmts = vec![
+            Statement::Assign {
+                place: Place::local(temporary_local),
+                rvalue: Rvalue::Ref {
+                    mutable: true,
+                    place: Place { local: alias_local, projections: vec![Projection::Deref] },
+                },
+                span: SourceSpan::default(),
+            },
+            Statement::StorageDead(alias_local),
+            Statement::Assign {
+                place: Place::local(0),
+                rvalue: Rvalue::Ref {
+                    mutable: true,
+                    place: Place { local: temporary_local, projections: vec![Projection::Deref] },
+                },
+                span: SourceSpan::default(),
+            },
+            Statement::StorageDead(temporary_local),
+        ];
+        temporary_local
+    }
+
+    /// Replace the fixture's direct `Len(*collection)` with rustc's opt-level-0
+    /// two-statement raw-pointer metadata observation.
+    fn use_rustc_slice_raw_metadata_len_lowering(
+        func: &mut VerifiableFunction,
+        collection_local: usize,
+    ) -> usize {
+        let Ty::Ref { inner, .. } = &func.body.locals[collection_local].ty else {
+            panic!("fixture collection must be a reference")
+        };
+        let Ty::Slice { .. } = inner.as_ref() else { panic!("fixture collection must be a slice") };
+        let pointer_ty = Ty::RawPtr { mutable: false, pointee: inner.clone() };
+        let pointer_local = func.body.locals.len();
+        func.body.locals.push(LocalDecl {
+            index: pointer_local,
+            ty: pointer_ty,
+            name: Some("_slice_metadata_pointer".into()),
+        });
+        let Statement::Assign { place: length, rvalue: Rvalue::Len(_), .. } =
+            &func.body.blocks[2].stmts[0]
+        else {
+            panic!("fixture must begin its guard block with Len")
+        };
+        let length = length.clone();
+        func.body.blocks[2].stmts.splice(
+            0..1,
+            [
+                Statement::Assign {
+                    place: Place::local(pointer_local),
+                    rvalue: Rvalue::AddressOf(
+                        false,
+                        Place { local: collection_local, projections: vec![Projection::Deref] },
+                    ),
+                    span: SourceSpan::default(),
+                },
+                Statement::Assign {
+                    place: length,
+                    rvalue: Rvalue::UnaryOp(
+                        UnOp::PtrMetadata,
+                        Operand::Move(Place::local(pointer_local)),
+                    ),
+                    span: SourceSpan::default(),
+                },
+            ],
+        );
+        pointer_local
     }
 
     fn set_mutable_collection_fixture_projection(
@@ -5031,7 +6766,7 @@ mod tests {
         );
 
         let entry = symbolic_state_at_loop_entry(&func, BlockId(1)).expect("exact preheader");
-        let length = Formula::Var("xs_len".into(), Sort::Int);
+        let length = Formula::Var("xs__len".into(), Sort::Int);
         assert_eq!(length, model_length);
         assert_eq!(entry.get("n"), Some(&length));
         assert_eq!(entry.get("xs"), Some(&canonical_base));
@@ -5071,7 +6806,7 @@ mod tests {
         );
         let metadata_entry =
             symbolic_state_at_loop_entry(&metadata_func, BlockId(1)).expect("exact metadata entry");
-        assert_eq!(metadata_entry.get("n"), Some(&Formula::Var("xs_len".into(), Sort::Int)));
+        assert_eq!(metadata_entry.get("n"), Some(&Formula::Var("xs__len".into(), Sort::Int)));
     }
 
     #[test]
@@ -5115,12 +6850,34 @@ mod tests {
             "an authenticated `usize` index and its slice length share one machine domain: {vcs:#?}",
         );
 
+        // An ORDINARY local named `xs_len` no longer collides: the projection
+        // leaf is minted `xs__len`, so the invariant still rebinds exactly.
+        let mut ordinary = func.clone();
+        let ordinary_local = ordinary.body.locals.len();
+        ordinary.body.locals.push(LocalDecl {
+            index: ordinary_local,
+            ty: Ty::usize(),
+            name: Some("xs_len".into()),
+        });
+        assert!(
+            type_loop_formula(
+                &ordinary,
+                parse_spec_expr("n <= xs.len()").expect("ordinary formula parses"),
+                Sort::Bool,
+            )
+            .is_some(),
+            "an ordinary `xs_len` local must not block the collection projection",
+        );
+
+        // A local occupying the reserved model spelling itself (`xs__len`, a
+        // forged carrier — extraction demotes every `__` debug name) must still
+        // fail closed at this public reconstruction boundary.
         let mut collision = func;
         let collision_local = collision.body.locals.len();
         collision.body.locals.push(LocalDecl {
             index: collision_local,
             ty: Ty::usize(),
-            name: Some("xs_len".into()),
+            name: Some("xs__len".into()),
         });
         assert!(
             type_loop_formula(
@@ -5129,7 +6886,7 @@ mod tests {
                 Sort::Bool,
             )
             .is_none(),
-            "a real `xs_len` local must not borrow the collection projection's machine domain",
+            "a forged `xs__len` local must not borrow the collection projection's machine domain",
         );
         assert!(
             type_loop_formula(
@@ -5167,7 +6924,7 @@ mod tests {
         );
         let entry = symbolic_state_at_loop_entry(&func, BlockId(1)).expect("exact preheader");
         assert_eq!(entry.get("n"), Some(&Formula::Int(4)));
-        assert_eq!(entry.get("xs_len"), Some(&Formula::Int(4)));
+        assert_eq!(entry.get("xs__len"), Some(&Formula::Int(4)));
         assert_eq!(
             entry.get("_array_slice_view"),
             Some(
@@ -5350,6 +7107,45 @@ mod tests {
                 1,
             );
         }
+
+        // Passing an exact shared scalar collection view to an ordinary safe
+        // Rust callee preserves the sequence. Shared references to the admitted
+        // scalar element types contain no UnsafeCell, and the call cannot write
+        // through the whole-place Copy in any well-defined execution.
+        let mut called_alias = aliased;
+        called_alias.body.blocks.push(BasicBlock {
+            id: BlockId(4),
+            stmts: vec![],
+            terminator: Terminator::Return,
+        });
+        called_alias.body.blocks[3].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "inspect".into(),
+            args: vec![Operand::Copy(Place::local(4))],
+            dest: Place::local(5),
+            target: Some(BlockId(4)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+        };
+        assert!(read_only_collection_alias_is_stable(&called_alias, 4, 1));
+        assert_collection_loop_is_supported(&called_alias);
+
+        let mut overwritten_source = base();
+        overwritten_source.body.blocks[2].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "replacement".into(),
+            args: vec![],
+            dest: Place::local(1),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+        };
+        assert!(!read_only_collection_arg_is_stable(&overwritten_source, 1));
+        assert_collection_loop_is_explicitly_unsupported(&overwritten_source);
     }
 
     #[test]
@@ -5404,10 +7200,58 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
         };
+        assert!(
+            read_only_collection_arg_is_stable(&collection_call, 1),
+            "the Freeze proof establishes collection stability independently of transition effects",
+        );
         assert_collection_loop_is_explicitly_unsupported(&collection_call);
         assert!(
-            collection_blocker(&collection_call).contains("e45.collection.call-escape"),
-            "call escape must expose its machine-readable blocker",
+            collection_blocker(&collection_call).contains("e45.transition.call-effect"),
+            "a call on the modeled iteration path still needs an exact transition summary",
+        );
+
+        let mut foreign_collection_call = base();
+        foreign_collection_call.body.blocks[2].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "foreign_inspect".into(),
+            args: vec![Operand::Copy(Place::local(1))],
+            dest: Place::local(4),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: true,
+            is_unsafe_sig: false,
+        };
+        assert!(!read_only_collection_arg_is_stable(&foreign_collection_call, 1));
+        assert_collection_loop_is_explicitly_unsupported(&foreign_collection_call);
+        assert!(
+            collection_blocker(&foreign_collection_call).contains("e45.collection.call-escape"),
+            "foreign calls must not acquire scalar-Freeze authority",
+        );
+
+        let mut projected_collection_call = base();
+        projected_collection_call.body.blocks[2].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "inspect_element".into(),
+            args: vec![Operand::Copy(Place {
+                local: 1,
+                projections: vec![
+                    Projection::Deref,
+                    Projection::ConstantIndex { offset: 0, min_length: 1, from_end: false },
+                ],
+            })],
+            dest: Place::local(4),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+        };
+        assert!(!read_only_collection_arg_is_stable(&projected_collection_call, 1));
+        assert_collection_loop_is_explicitly_unsupported(&projected_collection_call);
+        assert!(
+            collection_blocker(&projected_collection_call).contains("e45.collection.call-escape"),
+            "projected call operands remain outside the exact whole-view lane",
         );
 
         let mut escaping_alias = base();
@@ -5426,7 +7270,7 @@ mod tests {
             span: SourceSpan::default(),
             atomic: None,
             is_foreign: false,
-            is_unsafe_sig: false,
+            is_unsafe_sig: true,
         };
         assert_collection_loop_is_explicitly_unsupported(&escaping_alias);
         assert!(
@@ -5608,6 +7452,274 @@ mod tests {
             "a fixed-array constant index proven `< N` needs no dynamic assert",
         );
         assert_collection_loop_is_supported(&fixed_constant);
+    }
+
+    #[test]
+    fn retained_mutable_reborrow_keeps_one_canonical_store_identity() {
+        for return_alias in [false, true] {
+            let func = retained_mutable_collection_reborrow_function(
+                Ty::Slice { elem: Box::new(Ty::u32()) },
+                return_alias,
+            );
+            let alias_local = func.body.locals.len() - 1;
+            let source_model = exact_collection_model_for_local(&func, 1)
+                .expect("source must retain source-contract identity");
+            let alias_model = exact_collection_model_for_local(&func, alias_local)
+                .expect("entry-dominating retained reborrow must be modeled");
+            assert_eq!(source_model.source_local, 1);
+            assert_eq!(alias_model.source_local, 1);
+            assert_eq!(source_model.name, "xs");
+            assert_eq!(alias_model.name, "xs");
+            assert!(exclusive_mutable_collection_alias_pair_is_stable(&func, 1, alias_local,));
+            assert_collection_loop_is_supported(&func);
+
+            let transitions = symbolic_loop_transitions(&func, BlockId(1))
+                .expect("retained mutable alias transition");
+            assert_eq!(transitions.len(), 1);
+            let source_post = transitions[0].post_state.get("xs").expect("source post-state");
+            let alias_post = transitions[0].post_state.get("retained").expect("alias post-state");
+            assert!(matches!(source_post, Formula::Store(..)));
+            assert_eq!(alias_post, source_post, "source and alias must never fork state");
+            assert_eq!(
+                transitions[0].post_state.get("observed"),
+                Some(&Formula::Select(
+                    Box::new(source_post.clone()),
+                    Box::new(Formula::Var("index".into(), Sort::Int)),
+                )),
+                "read-after-write through the alias must see the canonical Store",
+            );
+
+            let mut vcs = Vec::new();
+            check_contracts(&func, &mut vcs);
+            let (_, consecution) = e4_pair(&vcs);
+            let mut contains_store = false;
+            consecution.formula.visit(&mut |formula| {
+                contains_store |= matches!(formula, Formula::Store(..));
+            });
+            assert!(contains_store, "retained-alias E4 must carry the Store");
+        }
+
+        let mut compiler_return = retained_mutable_collection_reborrow_function(
+            Ty::Slice { elem: Box::new(Ty::u32()) },
+            true,
+        );
+        let alias_local = compiler_return.body.locals.len() - 1;
+        let temporary_local =
+            use_rustc_terminal_mutable_reborrow_return(&mut compiler_return, alias_local);
+        assert_eq!(
+            exact_terminal_mutable_alias_reborrow_return(&compiler_return, 4, 0, alias_local),
+            Some(ExactTerminalMutableAliasReborrowReturn { first_statement: 0, temporary_local }),
+        );
+        assert!(exclusive_mutable_collection_alias_pair_is_stable(
+            &compiler_return,
+            1,
+            alias_local,
+        ));
+        assert_collection_loop_is_supported(&compiler_return);
+        let transitions = symbolic_loop_transitions(&compiler_return, BlockId(1))
+            .expect("compiler-shaped terminal return must retain the E4 transition");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].post_state.get("xs"), transitions[0].post_state.get("retained"),);
+    }
+
+    #[test]
+    fn opt0_slice_raw_metadata_pair_is_an_exact_nonescaping_length_observation() {
+        let mut direct =
+            exclusive_mutable_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
+        let direct_pointer = use_rustc_slice_raw_metadata_len_lowering(&mut direct, 1);
+        assert_eq!(
+            exact_slice_raw_metadata_pair(&direct, 1, 2, 0),
+            Some(ExactSliceRawMetadataPair { pointer_local: direct_pointer, length_local: 4 }),
+        );
+        assert!(exclusive_mutable_collection_arg_is_stable(&direct, 1));
+        assert_collection_loop_is_supported(&direct);
+        let direct_transitions =
+            symbolic_loop_transitions(&direct, BlockId(1)).expect("exact direct opt0 transition");
+        assert!(matches!(direct_transitions[0].post_state.get("xs"), Some(Formula::Store(..))));
+
+        let mut retained = retained_mutable_collection_reborrow_function(
+            Ty::Slice { elem: Box::new(Ty::u32()) },
+            false,
+        );
+        let alias_local = retained.body.locals.len() - 1;
+        let retained_pointer =
+            use_rustc_slice_raw_metadata_len_lowering(&mut retained, alias_local);
+        assert_eq!(
+            exact_slice_raw_metadata_pair(&retained, alias_local, 2, 0),
+            Some(ExactSliceRawMetadataPair { pointer_local: retained_pointer, length_local: 4 }),
+        );
+        assert!(exclusive_mutable_collection_alias_pair_is_stable(&retained, 1, alias_local,));
+        assert_collection_loop_is_supported(&retained);
+        let retained_transitions = symbolic_loop_transitions(&retained, BlockId(1))
+            .expect("exact retained-alias opt0 transition");
+        let source_post = retained_transitions[0].post_state.get("xs").unwrap();
+        assert!(matches!(source_post, Formula::Store(..)));
+        assert_eq!(retained_transitions[0].post_state.get("retained"), Some(source_post));
+    }
+
+    #[test]
+    fn opt0_slice_raw_metadata_pair_tampers_fail_closed() {
+        let base = || {
+            let mut func = retained_mutable_collection_reborrow_function(
+                Ty::Slice { elem: Box::new(Ty::u32()) },
+                false,
+            );
+            let alias_local = func.body.locals.len() - 1;
+            let pointer_local = use_rustc_slice_raw_metadata_len_lowering(&mut func, alias_local);
+            (func, alias_local, pointer_local)
+        };
+
+        let (mut copied_metadata_pointer, _, pointer_local) = base();
+        let Statement::Assign { rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, metadata), .. } =
+            &mut copied_metadata_pointer.body.blocks[2].stmts[1]
+        else {
+            unreachable!()
+        };
+        *metadata = Operand::Copy(Place::local(pointer_local));
+        assert_collection_loop_is_explicitly_unsupported(&copied_metadata_pointer);
+
+        let (mut escaped_pointer, _, pointer_local) = base();
+        let escaped_local = escaped_pointer.body.locals.len();
+        escaped_pointer.body.locals.push(LocalDecl {
+            index: escaped_local,
+            ty: escaped_pointer.body.locals[pointer_local].ty.clone(),
+            name: Some("escaped_pointer".into()),
+        });
+        escaped_pointer.body.blocks[2].stmts.insert(
+            2,
+            Statement::Assign {
+                place: Place::local(escaped_local),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(pointer_local))),
+                span: SourceSpan::default(),
+            },
+        );
+        assert_collection_loop_is_explicitly_unsupported(&escaped_pointer);
+
+        let (mut nonadjacent, _, _) = base();
+        nonadjacent.body.blocks[2].stmts.insert(1, Statement::Nop);
+        assert_collection_loop_is_explicitly_unsupported(&nonadjacent);
+
+        let (mut mutable_raw_pointer, _, pointer_local) = base();
+        let Statement::Assign { rvalue: Rvalue::AddressOf(mutable, _), .. } =
+            &mut mutable_raw_pointer.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        *mutable = true;
+        let Ty::RawPtr { mutable, .. } = &mut mutable_raw_pointer.body.locals[pointer_local].ty
+        else {
+            unreachable!()
+        };
+        *mutable = true;
+        assert_collection_loop_is_explicitly_unsupported(&mutable_raw_pointer);
+    }
+
+    #[test]
+    fn retained_mutable_reborrow_tampers_fail_closed() {
+        let base = || {
+            retained_mutable_collection_reborrow_function(
+                Ty::Slice { elem: Box::new(Ty::u32()) },
+                false,
+            )
+        };
+
+        let mut duplicate = base();
+        let duplicate_definition = duplicate.body.blocks[0].stmts[1].clone();
+        duplicate.body.blocks[0].stmts.push(duplicate_definition);
+        assert_collection_loop_is_explicitly_unsupported(&duplicate);
+
+        let mut dead_before_definition = base();
+        let alias_local = dead_before_definition.body.locals.len() - 1;
+        dead_before_definition.body.blocks[0].stmts.insert(1, Statement::StorageDead(alias_local));
+        assert_collection_loop_is_explicitly_unsupported(&dead_before_definition);
+
+        let mut ill_typed_bare_source = base();
+        let Statement::Assign { rvalue: Rvalue::Ref { place, .. }, .. } =
+            &mut ill_typed_bare_source.body.blocks[0].stmts[1]
+        else {
+            unreachable!()
+        };
+        place.projections.clear();
+        assert_collection_loop_is_explicitly_unsupported(&ill_typed_bare_source);
+
+        let mut source_after_reborrow = base();
+        let Statement::Assign { rvalue: Rvalue::Use(Operand::Copy(place)), .. } =
+            &mut source_after_reborrow.body.blocks[3].stmts[1]
+        else {
+            unreachable!()
+        };
+        place.local = 1;
+        assert_collection_loop_is_explicitly_unsupported(&source_after_reborrow);
+
+        let mut chained = base();
+        let alias_local = chained.body.locals.len() - 1;
+        let chained_local = chained.body.locals.len();
+        chained.body.locals.push(LocalDecl {
+            index: chained_local,
+            ty: chained.body.locals[alias_local].ty.clone(),
+            name: Some("chained".into()),
+        });
+        chained.body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(chained_local),
+            rvalue: Rvalue::Ref {
+                mutable: true,
+                place: Place { local: alias_local, projections: vec![Projection::Deref] },
+            },
+            span: SourceSpan::default(),
+        });
+        assert_collection_loop_is_explicitly_unsupported(&chained);
+
+        let mut call_escape = base();
+        let alias_local = call_escape.body.locals.len() - 1;
+        call_escape.body.blocks[3].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "escape".into(),
+            args: vec![Operand::Move(Place::local(alias_local))],
+            dest: Place::local(0),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+        };
+        assert_collection_loop_is_explicitly_unsupported(&call_escape);
+
+        let mut reseated = base();
+        let alias_local = reseated.body.locals.len() - 1;
+        reseated.body.blocks[3].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(alias_local),
+                rvalue: Rvalue::Use(Operand::Move(Place::local(alias_local))),
+                span: SourceSpan::default(),
+            },
+        );
+        assert_collection_loop_is_explicitly_unsupported(&reseated);
+
+        let mut copied_return = retained_mutable_collection_reborrow_function(
+            Ty::Slice { elem: Box::new(Ty::u32()) },
+            true,
+        );
+        let Statement::Assign { rvalue: Rvalue::Use(operand), .. } =
+            &mut copied_return.body.blocks[4].stmts[0]
+        else {
+            unreachable!()
+        };
+        let Operand::Move(place) = operand else { unreachable!() };
+        *operand = Operand::Copy(place.clone());
+        assert_collection_loop_is_explicitly_unsupported(&copied_return);
+
+        let mut overlapping_terminal_reborrow = retained_mutable_collection_reborrow_function(
+            Ty::Slice { elem: Box::new(Ty::u32()) },
+            true,
+        );
+        let alias_local = overlapping_terminal_reborrow.body.locals.len() - 1;
+        use_rustc_terminal_mutable_reborrow_return(&mut overlapping_terminal_reborrow, alias_local);
+        // Without the exact intervening StorageDead, both exclusive views are
+        // live when the return reborrow is created. The nearest relaxed shape
+        // must not inherit authority from the compiler-specific handoff.
+        overlapping_terminal_reborrow.body.blocks[4].stmts[1] = Statement::Nop;
+        assert_collection_loop_is_explicitly_unsupported(&overlapping_terminal_reborrow);
     }
 
     #[test]
@@ -6032,7 +8144,7 @@ mod tests {
     //
     // The ny-cert selfcheck postconditions (`check_entailment` / `check_chain` /
     // `check_farkas`) lower to Result-model predicates over SYNTHETIC spec-model
-    // terms (`_0_discr`, `_0_value*`, `*_sign`, `.__trust_ok_i`) that no body
+    // terms (`_0__discr`, `_0__value*`, `*__sign`, `.__trust_ok_i`) that no body
     // fact grounds. The old encoding emitted the refutable `Not(post)` whose
     // negation is satisfiable by havoc — reported Failed with a counterexample
     // minted over the under-constrained encoding, NOT a program trace. These
@@ -6053,7 +8165,7 @@ mod tests {
     fn ny_farkas_style_ensures_lands_unknown_not_refutable() {
         // Compiler-lowered text of ny-cert `check_farkas`'s
         // `#[ensures(|r: &Result<Rat, CheckError>| !matches!(r, Ok(c) if c.is_positive()))]`.
-        // It PARSES (into `_0_discr` / `_0_value_sign` atoms) but cannot be
+        // It PARSES (into `_0__discr` / `_0__value__sign` atoms) but cannot be
         // grounded: `Rat` is an opaque interned handle, so the sign term has no
         // MIR carrier and the discriminant term is never linked to `_0`.
         let body = "!((result.is_ok()) && (result.unwrap().is_positive()))";
@@ -6072,7 +8184,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "exactly one fail-closed row (never dropped): {vcs:#?}");
         let VcKind::UnsupportedMir { detail, .. } = &rows[0].kind else { unreachable!() };
         assert!(
-            detail.contains("_0_discr") && detail.contains("_0_value_sign"),
+            detail.contains("_0__discr") && detail.contains("_0__value__sign"),
             "the row must name the ungrounded model terms: {detail}"
         );
 
@@ -6225,22 +8337,38 @@ mod tests {
         // to Unknown — sound); a false negative keeps the refutable encoding,
         // so the positive set must cover every minted shape.
         for name in [
-            "_0_discr",
-            "result_discr",
-            "_0_value",
-            "_0_value_sign",
-            "_0_value.__trust_ok_0",
-            "c_sign",
-            "_0_discr#s1_0",
-            "my_value",
+            "_0__discr",
+            "result__discr",
+            "_0__value",
+            "_0__value__sign",
+            "_0__value.__trust_ok_0",
+            "c__sign",
+            "_0__discr#s1_0",
+            "my__value",
         ] {
             assert!(is_spec_model_var(name), "{name} must classify as a spec-model term");
         }
         // Negatives: ordinary locals, params, field projections (`p.value` is
         // the FIELD-projection spec var, grounded by MIR Adt-field extraction),
-        // and near-miss suffixes.
-        for name in ["_0", "x", "arr_len", "design", "signal", "discriminant", "p.value", "x_signs"]
-        {
+        // near-miss suffixes, and the single-underscore USER spellings the
+        // minted `__` family deliberately no longer captures (`arr_len`,
+        // `x_discr`, `max_value`, `c_sign` are ordinary bindings).
+        for name in [
+            "_0",
+            "x",
+            "arr_len",
+            "max_len",
+            "x_discr",
+            "max_value",
+            "c_sign",
+            "_0_discr",
+            "_0_value_sign",
+            "design",
+            "signal",
+            "discriminant",
+            "p.value",
+            "x_signs",
+        ] {
             assert!(!is_spec_model_var(name), "{name} must NOT classify as a spec-model term");
         }
     }
@@ -6659,6 +8787,52 @@ mod tests {
             "a wrapping u8 transition",
         );
 
+        let mut wrong_width_arithmetic_literal = transition.clone();
+        let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+            &mut wrong_width_arithmetic_literal.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        *rhs = Operand::Constant(ConstValue::Uint(1, 16));
+        assert_no_e4(
+            &wrong_width_arithmetic_literal,
+            "a u16-tagged literal cannot enter a u8 arithmetic transition",
+        );
+
+        let mut wrong_width_comparison_literal = feedback_loop_function();
+        wrong_width_comparison_literal.body.locals[1].ty = Ty::u8();
+        wrong_width_comparison_literal.body.locals[2].ty = Ty::u8();
+        let Statement::Assign { rvalue: Rvalue::BinaryOp(BinOp::Gt, _, rhs), .. } =
+            &mut wrong_width_comparison_literal.body.blocks[1].stmts[0]
+        else {
+            unreachable!()
+        };
+        *rhs = Operand::Constant(ConstValue::Uint(0, 16));
+        assert_no_e4(
+            &wrong_width_comparison_literal,
+            "a same-valued u16 literal cannot authenticate a u8 loop guard",
+        );
+
+        let mut mixed_principal_domains = feedback_loop_function();
+        mixed_principal_domains.body.locals[1].ty = Ty::i16();
+        mixed_principal_domains.body.locals[2].ty = Ty::u8();
+        mixed_principal_domains.body.blocks[0].stmts.clear();
+        mixed_principal_domains.contracts[0].body = "bb1: n <= 10 && i + 1 >= i".to_string();
+        assert_no_e4(
+            &mixed_principal_domains,
+            "ordinary copy/arithmetic state cannot mix i16 and u8 principal domains",
+        );
+
+        let mut non_rust_width = feedback_loop_function();
+        non_rust_width.body.locals[1].ty = Ty::Int { width: 7, signed: false };
+        non_rust_width.body.locals[2].ty = Ty::Int { width: 7, signed: false };
+        non_rust_width.body.blocks[0].stmts.clear();
+        non_rust_width.contracts[0].body = "bb1: i + 1 >= i".to_string();
+        assert_no_e4(
+            &non_rust_width,
+            "a fabricated non-Rust integer width cannot enter Machine{w}",
+        );
+
         let mut precondition = feedback_loop_function();
         precondition.body.locals[1].ty = Ty::u8();
         precondition.body.locals[2].ty = Ty::u8();
@@ -6888,6 +9062,130 @@ mod tests {
     }
 
     #[test]
+    fn machine_width_boundaries_and_encoding_tampers_fail_closed() {
+        let domains = [
+            (8, false, "u8"),
+            (8, true, "i8"),
+            (16, false, "u16"),
+            (16, true, "i16"),
+            (32, false, "u32"),
+            (32, true, "i32"),
+            (64, false, "u64/usize"),
+            (64, true, "i64/isize"),
+            (128, false, "u128"),
+            (128, true, "i128"),
+        ];
+
+        for (width, signed, name) in domains {
+            assert!(rust_machine_width_supported(width));
+            if signed {
+                let min = if width == 128 { i128::MIN } else { -(1_i128 << (width - 1)) };
+                let max = if width == 128 { i128::MAX } else { (1_i128 << (width - 1)) - 1 };
+                assert!(machine_literal_pattern(min, width, true).is_some(), "{name} min");
+                assert!(machine_literal_pattern(max, width, true).is_some(), "{name} max");
+                assert_eq!(
+                    machine_unsigned_literal_pattern((max as u128) + 1, width, true),
+                    None,
+                    "{name}: first value above signed max must be refused",
+                );
+                if width < 128 {
+                    assert_eq!(
+                        machine_literal_pattern(min - 1, width, true),
+                        None,
+                        "{name}: first value below signed min must be refused",
+                    );
+                }
+            } else {
+                let max = if width == 128 { u128::MAX } else { (1_u128 << width) - 1 };
+                assert!(
+                    machine_unsigned_literal_pattern(max, width, false).is_some(),
+                    "{name} max",
+                );
+                assert_eq!(
+                    machine_literal_pattern(-1, width, false),
+                    None,
+                    "{name}: negative literals must be refused",
+                );
+                if width < 128 {
+                    assert_eq!(
+                        machine_unsigned_literal_pattern(max + 1, width, false),
+                        None,
+                        "{name}: first value above unsigned max must be refused",
+                    );
+                }
+            }
+        }
+        for width in [0, 1, 7, 24, 127, 129] {
+            assert!(!rust_machine_width_supported(width));
+            assert!(!machine_integer_ty(&Ty::Int { width, signed: false }));
+            if width == 0 || width > 128 {
+                assert_eq!(machine_literal_pattern(0, width, false), None);
+            }
+        }
+
+        let mut func = feedback_loop_function();
+        func.body.locals[1].ty = Ty::u8();
+        func.body.locals[2].ty = Ty::u8();
+        let i = || Formula::Var("i".into(), Sort::Int);
+        let n = || Formula::Var("n".into(), Sort::Int);
+        let malformed_shift = Formula::BvToInt(
+            Box::new(Formula::BvShl(
+                Box::new(Formula::IntToBv(Box::new(i()), 8)),
+                Box::new(Formula::BvAnd(
+                    Box::new(Formula::IntToBv(Box::new(n()), 8)),
+                    Box::new(Formula::BitVec { value: 3, width: 8 }),
+                    8,
+                )),
+                8,
+            )),
+            8,
+            false,
+        );
+        assert!(
+            machine_faithful_translate(&func, &malformed_shift, 8, false, true, Polarity::Value)
+                .is_none(),
+            "the shift mask must be exactly lhs_width - 1",
+        );
+
+        let wrong_bridge_width = Formula::BvToInt(
+            Box::new(Formula::BvAdd(
+                Box::new(Formula::IntToBv(Box::new(i()), 16)),
+                Box::new(Formula::IntToBv(Box::new(n()), 16)),
+                16,
+            )),
+            16,
+            false,
+        );
+        assert!(
+            machine_faithful_translate(
+                &func,
+                &wrong_bridge_width,
+                8,
+                false,
+                true,
+                Polarity::Value,
+            )
+            .is_none(),
+            "a widened body bridge must never be folded into an 8-bit source domain",
+        );
+
+        let wrong_bridge_sign = Formula::BvToInt(
+            Box::new(Formula::BvAdd(
+                Box::new(Formula::IntToBv(Box::new(i()), 8)),
+                Box::new(Formula::IntToBv(Box::new(n()), 8)),
+                8,
+            )),
+            8,
+            true,
+        );
+        assert!(
+            machine_faithful_translate(&func, &wrong_bridge_sign, 8, false, true, Polarity::Value,)
+                .is_none(),
+            "a signed body bridge must never be folded into an unsigned source domain",
+        );
+    }
+
+    #[test]
     fn rust_shift_counts_are_masked_and_keep_their_independent_integer_domain() {
         let mut heterogeneous = feedback_loop_function();
         heterogeneous.body.locals[1].ty = Ty::i16();
@@ -7000,6 +9298,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::u8(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -7420,6 +9719,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![Contract {
                 kind: ContractKind::Modifies,
@@ -7463,6 +9763,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![Contract {
                 kind: ContractKind::Modifies,

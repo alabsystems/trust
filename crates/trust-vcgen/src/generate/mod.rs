@@ -941,12 +941,12 @@ macro_rules! lenwitness_dbg {
 }
 
 // ======================================================================
-// Len-witness return grounding (b62): `_0_value.<i>.<j>…_len` model terms
+// Len-witness return grounding (b62): `_0__value.<i>.<j>…__len` model terms
 // ======================================================================
 //
 // The F5 matches!-guard lowering emits `#[ensures]` predicates over the
 // payload-component LENGTH terms the spec parser mints for
-// `result.unwrap().<i>.<j>.len()` — `_0_value.<i>.<j>_len` (`Sort::Int`) — and
+// `result.unwrap().<i>.<j>.len()` — `_0__value.<i>.<j>__len` (`Sort::Int`) — and
 // the spec-model split in `generate_v2_contract_vcs_impl` routes any
 // postcondition referencing them to the fail-closed SpecModelUngrounded
 // Unknown, because NO body fact grounds them (the ny-cert crown/crown_deep
@@ -957,7 +957,7 @@ macro_rules! lenwitness_dbg {
 // PAIR of length terms compared for (in)equality — and nothing else:
 //
 //  * WHICH pairs (the coverage gate, `len_pair_coverage`): only pairs of
-//    parseable `_0_value.<path>_len` names whose EVERY occurrence across EVERY
+//    parseable `_0__value.<path>__len` names whose EVERY occurrence across EVERY
 //    declared postcondition sits inside an `Eq(len_a, len_b)` atom (the parser
 //    lowers `!=` to `Not(Eq(..))`, so both polarities reduce to `Eq` atoms).
 //    A length term used in ANY other position (an arithmetic bound, a
@@ -970,10 +970,10 @@ macro_rules! lenwitness_dbg {
 //    whose `_0` resolves to the payload-variant in-body aggregate
 //    (`Ok(move src)` / `Some(move src)` — the same `resolve_enum_return_…`
 //    walk the discr pin uses), the equality fact
-//    `Eq(_0_value.<a>_len, _0_value.<b>_len)` — derived ONLY from the MIR
+//    `Eq(_0__value.<a>__len, _0__value.<b>__len)` — derived ONLY from the MIR
 //    construction chain, never from the contract — plus, when the equality
 //    was established by a length GUARD, the individual witness pins
-//    `Eq(_0_value.<a>_len, <len-call dest>)`. Two derivations:
+//    `Eq(_0__value.<a>__len, <len-call dest>)`. Two derivations:
 //      (1) GUARD lane (`dominating_len_equality_guard`): a `SwitchInt` on
 //          `Eq/Ne(<len of component a>, <len of component b>)` whose
 //          EQUALITY edge dominates the aggregate block (structural
@@ -1012,9 +1012,9 @@ macro_rules! lenwitness_dbg {
 // execution by the chain-coupling argument. A FALSE postcondition (e.g.
 // `ensures` that the lengths DIFFER over an equal-by-construction body)
 // stays refutable: the pins constrain the terms to their genuine values.
-/// A parsed `_0_value.<i>.<j>…_len` spec-model name: the exact var name the
+/// A parsed `_0__value.<i>.<j>…__len` spec-model name: the exact var name the
 /// parser mints plus the positional payload-component field path. Only paths
-/// STRICTLY under the payload parse (`_0_value_len` — a bare-payload length —
+/// STRICTLY under the payload parse (`_0__value__len` — a bare-payload length —
 /// stays fail-closed, matching the compiler lowering's strict-projection gate).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LenModelVar {
@@ -1023,14 +1023,14 @@ struct LenModelVar {
 }
 
 // ======================================================================
-// Ordering/sign-witness return grounding (b62 F4): `_0_value.__trust_ok_<i>`
-// pair terms + the `_0_value_sign` term
+// Ordering/sign-witness return grounding (b62 F4): `_0__value.__trust_ok_<i>`
+// pair terms + the `_0__value__sign` term
 // ======================================================================
 //
 // The F4 `matches!`-guard lowering emits `#[ensures]` predicates over the
 // payload-pair terms the spec parser mints for `Ok((d, c))` tuple binds
-// (`_0_value.__trust_ok_0/1`) and over the payload sign term it mints for
-// `result.unwrap().is_positive()` (`_0_value_sign`) — the ny-cert selfcheck /
+// (`_0__value.__trust_ok_0/1`) and over the payload sign term it mints for
+// `result.unwrap().is_positive()` (`_0__value__sign`) — the ny-cert selfcheck /
 // branch shapes, whose payloads are `Rat`: a Copy u32 ARENA HANDLE whose
 // ordering lives behind `<Rat as PartialOrd>` through a thread-local arena.
 // An Int reading of the handle bits is MEANINGLESS, so this lane NEVER
@@ -1039,10 +1039,10 @@ struct LenModelVar {
 // runtime-checked `ensures` fallback would execute on the same values:
 //
 //  * WHICH terms (the coverage gates, `ordering_pair_coverage` /
-//    `sign_var_covered`): a pair of `_0_value.__trust_ok_<i>` names is
+//    `sign_var_covered`): a pair of `_0__value.__trust_ok_<i>` names is
 //    covered only when EVERY occurrence of BOTH names across EVERY declared
 //    postcondition sits inside an ordering atom `Lt/Le/Gt/Ge/Eq(a, b)`
-//    BETWEEN the two names (no constants, no arithmetic); `_0_value_sign` is
+//    BETWEEN the two names (no constants, no arithmetic); `_0__value__sign` is
 //    covered only when its every occurrence sits in an ordering atom against
 //    the LITERAL 0. Any other occurrence keeps the term UNCREDITED, so a
 //    partially-constrained term can never turn today's honest Unknown into a
@@ -1108,7 +1108,7 @@ struct LenModelVar {
 // valid in EVERY total order — no Int-discreteness leak (see the coverage
 // gate above). A FALSE postcondition stays refutable: the single pinned atom
 // is TRUE of the actual returned values on that path, never credited.
-/// A parsed `_0_value.__trust_ok_<i>` spec-model name: the tuple-bind payload
+/// A parsed `_0__value.__trust_ok_<i>` spec-model name: the tuple-bind payload
 /// component var the compiler's `matches!(r, Ok((d, c)) if ..)` lowering
 /// mints. Any other shape (a trailing `.field`, non-numeric index, other
 /// bases) keeps today's fail-closed routing.
@@ -1229,6 +1229,7 @@ mod unwrap_panic;
 mod slice_conversion;
 mod discharge;
 mod callsite;
+mod callsite_replay;
 mod safety;
 mod alloc_bounds;
 mod panic_calls;
@@ -1236,13 +1237,16 @@ mod alloc_vcs;
 mod type_ranges;
 mod overflow_vc;
 mod assert_refutation;
+mod bmc_reduction;
 mod block_defs;
 mod checked_vcs;
 mod float_range;
 mod float_overflow;
 mod path_defs;
+pub(crate) mod callee_write_set;
 mod witness_grounding;
 mod contract_vcs;
+mod entry_hypothesis;
 
 use call_facts::*;
 use ite::*;
@@ -1260,6 +1264,7 @@ pub(crate) use unwrap_panic::*;
 use slice_conversion::*;
 pub use discharge::*;
 pub use callsite::*;
+pub use callsite_replay::*;
 pub use safety::*;
 pub(crate) use alloc_bounds::*;
 pub(crate) use panic_calls::*;
@@ -1267,6 +1272,7 @@ pub(crate) use alloc_vcs::*;
 pub(crate) use type_ranges::*;
 pub(crate) use overflow_vc::*;
 pub use assert_refutation::*;
+pub use bmc_reduction::*;
 pub(crate) use block_defs::*;
 pub(crate) use checked_vcs::*;
 pub use float_range::*;
@@ -1274,6 +1280,7 @@ use float_overflow::*;
 pub(crate) use path_defs::*;
 use witness_grounding::*;
 use contract_vcs::*;
+use entry_hypothesis::*;
 
 #[cfg(test)]
 mod clamp_upper_bound_tests;
@@ -1283,6 +1290,12 @@ mod recursion_decreases_production_variant_tests;
 mod call_arg_fact_token_tests;
 #[cfg(test)]
 mod summary_callsite_tests;
+// Callsite L0 replay (refutation-only): the substitution filter's
+// caller-scoped-only invariant and the composed-candidate producer's
+// fail-closed gates (sentinels, residual callee locals, σ-fresh vars,
+// missing extracted body, self-recursion).
+#[cfg(test)]
+mod callsite_replay_tests;
 #[cfg(test)]
 mod v2_path_guard_tests;
 #[cfg(test)]
@@ -1293,10 +1306,17 @@ mod contract_field_bound_tests;
 // denied the clause its `source_contract_index`.
 #[cfg(test)]
 mod clause_sort_match_tests;
+// A postcondition over a `&mut`-parameter place is versioned at the RETURN
+// block, where a multi-predecessor exit gives it the reaching-def JOIN token
+// (`self*.0.0#e_s1_0`) that no pin or block def ever spells. The join name was
+// FREE, so an early-return body's clause AND its exact negation were both
+// "refuted" — identical verdicts for P and !P.
+#[cfg(test)]
+mod early_return_postcondition_tests;
 #[cfg(test)]
 mod float_range_tests;
 #[cfg(test)]
-mod bounds_const_suppression_tests;
+mod bounds_const_index_tests;
 #[cfg(test)]
 mod round14_stability_tests;
 #[cfg(test)]
@@ -1338,6 +1358,27 @@ mod ptr_metadata_tests;
 //       JOIN block's own hypotheses (no regression of the merged-local recovery).
 #[cfg(test)]
 mod path_definition_map_tests;
+// The bounded-collect grant's two authenticators, measured on real
+// `-Ztrust-dump=mir` bundles rather than hand-built doubles:
+//   * `trusted_root_spoof_iter_producer_tests` — the CALLEE-path half, on the
+//     `--crate-name alloc` impersonation the extractor had already stamped;
+//   * `authenticated_std_iter_chain_tests` — the crate-free adaptor forgery that
+//     needs no impersonation at all, plus the real production chains whose sound
+//     bounded-source recovery must survive both authenticators;
+//   * `no_std_sysroot_impersonation_tests` — the `#![no_std]` graph in which the
+//     impersonator is UNIQUE, so the duplicate-crate-name rule never stamped it
+//     and both authenticators were handed a bare `std::` root. That is the case
+//     the producer-side IDENTITY rule exists for.
+#[cfg(test)]
+mod trusted_root_spoof_iter_producer_tests;
+#[cfg(test)]
+mod authenticated_std_iter_chain_tests;
+#[cfg(test)]
+mod no_std_sysroot_impersonation_tests;
+#[cfg(test)]
+mod bounded_source_value_tests;
+#[cfg(test)]
+mod refute3_rangefrom_tests;
 #[cfg(test)]
 mod capture_avoiding_tests;
 #[cfg(test)]
@@ -1416,6 +1457,8 @@ mod push_guard_elem_len_tests;
 /// a genuinely-overflowing 128-bit arithmetic safe.
 #[cfg(test)]
 mod widening_cast_128_tests;
+#[cfg(test)]
+mod zst_len_bound_tests;
 /// REM-bounded BV multiply: `(a % 100) * (b % 50)` is provably in-range
 /// (product <= 99*49 = 4851 << u32::MAX), yet the BV mul lane's fresh operand
 /// vars carried NO mod bound — the solver fabricated an internally inconsistent
@@ -1514,3 +1557,12 @@ mod per_arg_havoc_refinement_tests;
 // ======================================================================
 #[cfg(test)]
 mod float_bits_call_model_tests;
+// The postcondition lane assembles its VC over an entry state the assumption
+// gate left UNCONSTRAINED whenever it dropped the authored `requires`, so a TRUE
+// postcondition is "refuted" at an entry state the precondition forbids and the
+// verifier mints `verified_counterexample = true` against correct code. The
+// third silent-weakening tripwire fails such a row closed to the visible
+// unsupported shape — but only on an EXHIBITED model, so a provable row and a
+// genuinely-refutable one are both untouched.
+#[cfg(test)]
+mod entry_hypothesis_tests;

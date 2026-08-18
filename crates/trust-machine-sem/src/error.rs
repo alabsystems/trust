@@ -29,4 +29,14 @@ pub enum SemError {
     /// Register width mismatch in an operation.
     #[error("width mismatch: expected {expected}-bit, got {actual}-bit")]
     WidthMismatch { expected: u32, actual: u32 },
+
+    /// A condition code the model does not evaluate.
+    ///
+    /// Deliberately DISTINCT from [`Self::UnsupportedOpcode`]: the opcode is
+    /// modeled and only its condition field is not, and collapsing the two
+    /// would hide which half failed. Reaching this is fail-closed behaviour
+    /// replacing what used to be a silent `Formula::Bool(true)` — "a condition
+    /// I do not recognize is always taken".
+    #[error("unmodeled condition code: {detail}")]
+    UnmodeledCondition { detail: String },
 }

@@ -27,6 +27,7 @@ pub const CLEAN_TY_COUNTDOWN_SCHEMA_V2: &str = "trust.clean-ty-countdown/v2";
 
 /// Serialized type and value of one freshly elaborated Clean definition.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanDefinitionArtifact {
     pub type_expr: Vec<u8>,
     pub value_expr: Vec<u8>,
@@ -35,6 +36,7 @@ pub struct CleanDefinitionArtifact {
 /// A kernel-checked implication from the exact canonical engine claim to the
 /// exact proposition authored by the user.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanClaimTransport {
     pub engine_claim: Vec<u8>,
     pub authored_claim: Vec<u8>,
@@ -48,6 +50,7 @@ pub struct CleanClaimTransport {
 /// translation into `spec_src` is performed by this reviewed adapter and is TCB,
 /// not a kernel proof relating the two semantic representations.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanTyCountdownCertificate {
     pub schema: String,
     /// Byte-exact authored Clean source.
@@ -677,6 +680,23 @@ end Example
         CERTIFICATE.get_or_init(|| certify(SOURCE).expect("baseline countdown must certify"))
     }
 
+    fn raw_with_unknown_field(raw: &str, pointer: &str) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(raw).expect("producer evidence must be JSON");
+        let layer = if pointer.is_empty() {
+            &mut value
+        } else {
+            value
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing authority layer at JSON pointer `{pointer}`"))
+        };
+        layer
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("authority layer at `{pointer}` must be an object"))
+            .insert("future_authority".to_owned(), serde_json::Value::Bool(true));
+        serde_json::to_string(&value).expect("mutated evidence must serialize")
+    }
+
     #[test]
     fn serialized_authored_machine_and_applied_claims_route_to_exact_ty_claims() {
         let encoded =
@@ -702,6 +722,79 @@ end Example
         assert!(matches!(
             recheck_clean_countdown_with_ty(&wrong_source, SOURCE),
             Err(CleanTyCountdownError::ArtifactMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn v2_evidence_rejects_unknown_fields_at_every_authority_layer() {
+        fn assert_rejected(mut value: serde_json::Value, path: &[&str]) {
+            let mut object = &mut value;
+            for field in path {
+                object = object
+                    .get_mut(*field)
+                    .unwrap_or_else(|| panic!("missing object field `{field}` in test fixture"));
+            }
+            object
+                .as_object_mut()
+                .expect("authority layer must serialize as an object")
+                .insert("future_authority".to_owned(), serde_json::Value::Bool(true));
+            assert!(
+                serde_json::from_value::<CleanTyCountdownCertificate>(value).is_err(),
+                "unknown field was ignored at authority path {path:?}",
+            );
+        }
+
+        let baseline = serde_json::to_value(baseline_certificate())
+            .expect("countdown certificate must serialize");
+        for path in
+            [&[][..], &["start_artifact"][..], &["safety_transport"][..], &["safety_evidence"][..]]
+        {
+            assert_rejected(baseline.clone(), path);
+        }
+    }
+
+    #[test]
+    fn ty_raw_evidence_rejects_unknown_fields_in_actual_consumers() {
+        let certificate = baseline_certificate();
+
+        for pointer in ["/producer", "/counterexample/states/0"] {
+            let raw = raw_with_unknown_field(&certificate.buggy_counterexample_json, pointer);
+            assert!(
+                recheck_buggy_counterexample(
+                    &raw,
+                    &certificate.buggy_spec_src,
+                    &certificate.buggy_config_src,
+                )
+                .is_err(),
+                "counterexample consumer ignored unknown field at `{pointer}`"
+            );
+        }
+
+        for pointer in ["/explicit_fixpoint"] {
+            let raw =
+                raw_with_unknown_field(&certificate.safety_evidence.raw_certificate_json, pointer);
+            assert!(matches!(
+                recheck_certified_temporal_evidence(
+                    &raw,
+                    &certificate.spec_src,
+                    &certificate.config_src,
+                    &["Safe"],
+                    None,
+                ),
+                Err(CertifiedTemporalError::Malformed(_))
+            ));
+        }
+
+        let raw = raw_with_unknown_field(&certificate.liveness_evidence.raw_certificate_json, "");
+        assert!(matches!(
+            recheck_certified_temporal_evidence(
+                &raw,
+                &certificate.spec_src,
+                &certificate.config_src,
+                &["ReachesZero"],
+                Some("Measure"),
+            ),
+            Err(CertifiedTemporalError::Malformed(_))
         ));
     }
 

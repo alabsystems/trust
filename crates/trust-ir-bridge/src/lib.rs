@@ -65,7 +65,9 @@ pub use cache_key::module_stable_content_hash;
 pub use flip::{
     flip_contract_verdicts_to_spine, flip_contract_verdicts_with_module,
     flip_safety_verdicts_to_spine, flip_safety_verdicts_with_module,
-    generate_native_or_flip_safety_vcs, FlipDecision, FlipReport, NativeGenOutcome,
+    generate_native_or_flip_safety_vcs, generate_native_or_flip_safety_vcs_with_discharged,
+    l0_obligation_set_diff, l0_obligation_set_diff_with_discharged, FlipDecision, FlipReport,
+    NativeGenOutcome, ObligationKey, ObligationSetDiff,
 };
 pub use layout_evidence::{
     TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_FEATURE, TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_STAGE,
@@ -78,6 +80,7 @@ pub use lower::{
     SYMBOLIC_FORMULA_ATTR_DEBUG, SYMBOLIC_FORMULA_ATTR_JSON, SYMBOLIC_FORMULA_ATTR_SCHEMA,
     SYMBOLIC_FORMULA_ATTR_SMTLIB, SYMBOLIC_FORMULA_ATTR_SORT, SYMBOLIC_FORMULA_DIALECT,
     SYMBOLIC_FORMULA_OP, SYMBOLIC_MEMORY_STATE_OP, TRUST_OBLIGATION_SOURCE_SCHEMA,
+    CoroutineResumeContractModuleEvidence, coroutine_resume_contract_module_evidence,
     generate_native_safety_vcs, lower_functions_to_trust_ir, lower_to_trust_ir,
     lower_to_trust_ir_function, lower_to_trust_ir_functions,
     lower_to_trust_ir_functions_with_abi_total_context,
@@ -88,6 +91,8 @@ pub use lower::{
 };
 #[cfg(feature = "compiler-context")]
 pub use lower::lower_to_trust_ir_functions_with_compiler_context;
+pub use lower::is_panicking_primitive_int_div_method;
+pub use lower::is_diverging_panic_site_obligation_description;
 // Explicit names for production call sites that still require the MIR migration
 // adapter. The historical short names remain for API compatibility, but new
 // compiler code should make this boundary visible in its spelling.

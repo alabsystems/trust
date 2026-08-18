@@ -55,6 +55,21 @@ def submodule_paths(repo: Path) -> list[str]:
     return [line.split(" ", 1)[1] for line in out.splitlines() if " " in line]
 
 
+def submodule_git_dir(repo: Path, path: str) -> Path | None:
+    """Return Git's per-worktree object store for an initialized submodule.
+
+    A linked worktree has a ``.git`` *file*, not a ``.git`` directory.  Asking
+    Git to resolve ``modules/<path>`` therefore matters: spelling the location
+    as ``repo/.git/modules/<path>`` silently classifies every initialized
+    submodule in a linked worktree as absent.
+    """
+    resolved = git(
+        repo,
+        ["rev-parse", "--path-format=absolute", "--git-path", f"modules/{path}"],
+    ).strip()
+    return Path(resolved) if resolved else None
+
+
 def pins_for(repo: Path, path: str) -> set[str]:
     """Every gitlink value this path has ever held in HEAD's history.
 
@@ -222,8 +237,8 @@ def main() -> int:
     fragile: list[tuple[str, str]] = []
 
     for path in paths:
-        git_dir = repo / ".git" / "modules" / path
-        if not git_dir.is_dir():
+        git_dir = submodule_git_dir(repo, path)
+        if git_dir is None or not git_dir.is_dir():
             print(f"{path:<22} gitdir absent — not materialized, skipped")
             continue
         if args.fetch:

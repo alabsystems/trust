@@ -297,10 +297,13 @@ impl<'a> State<'a> {
                 self.end(cb);
             }
             ast::ItemKind::CleanIsland(_) => {
-                // Trust: span-only Clean island — the body is not reproducible
-                // from the AST (same policy as opaque contract clauses); print
-                // a placeholder that is NOT valid vanilla Rust so elision is
-                // visible rather than silently round-trippable.
+                // Trust: the island body is deliberately NOT reproduced (same
+                // policy as opaque contract clauses); print a placeholder that
+                // is NOT valid vanilla Rust so elision is visible rather than
+                // silently round-trippable. The payload does now carry the
+                // island text (ruling v7/D1), so faithful printing has become
+                // possible — it is withheld as a policy choice, not a
+                // limitation.
                 let (cb, ib) = self.head("clean");
                 self.word(" { /* Clean island (span-only) */ }");
                 self.end(ib);

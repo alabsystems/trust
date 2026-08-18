@@ -277,6 +277,7 @@ mod tests {
                 blocks,
                 arg_count,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],

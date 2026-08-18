@@ -2,6 +2,61 @@
 # Generate fresh Trust MIR dumps for the checksum-pinned lambda_calculus 3.5.0
 # source intake.  Scratch output is the default evidence path; replacing the
 # checked-in core dumps requires an explicit --replace-committed opt-in.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# DO NOT REGENERATE THIS CORPUS YET — MEASURED 2026-08-05, THREE DEFECTS
+#
+# Running `--replace-committed` today DELETES all 90 committed dumps and writes
+# 317 differently-named ones. That was measured, then reverted; the corpus below
+# is untouched at its 90 committed files. Three separate defects are involved and
+# a migration must answer all three. A fix was drafted and also reverted, because
+# it introduced two regressions of its own (see the last paragraph).
+#
+#  1. THE `core` FILTER IS DEAD, so `core` == `full`. Selection is
+#     `[[ "$name" != *data__* ]]` over the dump FILENAME, but `trustc` has
+#     written every dump content-addressed (`mir_dump_filename` ->
+#     `trust-mir-<fingerprint>.json`) since 2026-07-10 `2c9fdb1dd5` — BEFORE this
+#     script was written. A hash filename can never contain `data__`, so the
+#     predicate is vacuously true. Apply the rule to each dump's own `def_path`
+#     as a SEGMENT test and today's crate yields 125 core rows — not 317, and not
+#     90. The "explicitly replaced N committed core-module dumps" message is
+#     wrong for a second reason: it prints what it WROTE, never what was
+#     committed.
+#  2. THE IDENTITY MOVED, totally, under `bd2d6ed1fc`'s crate-qualified
+#     definition-site rendering. All 90 rows have exactly one counterpart and
+#     nothing is lost, but only half is mechanical: `REQUALIFY_OWNER_CRATE=lib`
+#     maps 58/90 (measured), and the remaining 32 are `<Self as Trait>::m` forms
+#     where the visible-re-export -> definition-site flip (`std::cmp` ->
+#     `core::cmp`, `std::vec::Vec` -> `alloc::vec::Vec`) happens INSIDE the
+#     qualified path. Note the crate segment is `lib`, not `lambda_calculus`,
+#     because the recipe compiles `SOURCE/src/lib.rs` with no `--crate-name` —
+#     migrating as-is would pin a meaningless crate identity into every
+#     assertion in the consuming test. Fix the crate name first.
+#  3. THE `::`->`__` FILENAME CONVENTION IS NOT INJECTIVE on a case-insensitive
+#     filesystem, and both this repo's FS and TMPDIR are (probed).
+#     `lib::combinators::I`/`::i` and `::O`/`::o` collide. A rename-in-place
+#     attempt silently lost two bodies (317 in, 315 out) before it was caught.
+#     Any migration MUST detect a case-only collision and fail closed.
+#
+# The +35 rows (13 `combinators::*` free functions, 22 derive-generated impls)
+# are unexplained from this tree: a body that `verification_decision` returns
+# `Skip(TreatedAsAssumption(..))` for is never dumped, so the population moves
+# whenever `trust_mir_extract::supportability` gains coverage — confirming that
+# for the July compiler needs the July compiler. Unexplained ⇒ not migrated.
+#
+# WHY THE DRAFTED FIX WAS REVERTED (do not just re-apply it): correcting the
+# filter makes `core` (125) a strict subset of `full` (317), which trips
+# `scripts/collect_lambda_calculus_diagnostic.py`'s `expected_core` check — that
+# check passes today ONLY because the same broken predicate makes the two sets
+# equal, and it runs BEFORE the argv check. And reading `def_path` from every
+# top-level `*.json` raises an uncaught `KeyError` on a non-dump file, which
+# breaks `test_regenerate_output_root_is_non_destructive` (it plants a sentinel
+# `legacy.json` and asserts exit 0) and contradicts this script's own promise
+# that `--output-root` "gates neither ... never edits the fixture". Fix the
+# collector's predicate and the non-dump path TOGETHER with the filter, or not
+# at all.
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # Author: Andrew Yates | Copyright 2026 Andrew Yates | Apache-2.0 OR MIT
 set -euo pipefail
 

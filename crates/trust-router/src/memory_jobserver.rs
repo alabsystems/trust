@@ -170,6 +170,86 @@ pub(crate) fn set_test_token_path(path: Option<PathBuf>) {
     TEST_TOKEN_PATH.with(|c| *c.borrow_mut() = path);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread override of observed physical memory.
+    ///
+    /// Without it, every test body guarded on `total > 0` / `budget > 0` is
+    /// VACUOUS on a host where `machine_budget_bytes()` returns 0 — which is
+    /// every bare-metal cgroup-v2 Linux box, because the visible cgroup root
+    /// has no `memory.max` and `linux_visible_cgroup_limit_with` fails closed
+    /// (deliberately). Those tests then pass while asserting nothing at all.
+    /// Injecting the total makes the guarded bodies actually execute.
+    ///
+    /// Per-thread, matching `TEST_TOKEN_PATH`: a test that reads the budget on
+    /// a SPAWNED thread will not see the override and silently reverts to the
+    /// host value. Every current caller reads it on the test thread.
+    static TEST_TOTAL_MEMORY: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: set (or clear) this thread's observed-total-memory override.
+#[cfg(test)]
+pub(crate) fn set_test_total_memory(bytes: Option<u64>) {
+    TEST_TOTAL_MEMORY.with(|c| c.set(bytes));
+}
+
+/// RAII holder for the override. Restores the PREVIOUS value on drop, panic
+/// included.
+///
+/// A bare setter is not enough: libtest reuses pool threads, so an override left
+/// set by one test is still set for the next test that lands on that thread, and
+/// the budget it leaks into changes admission decisions. That failure is
+/// order-dependent and therefore intermittent — strictly worse than the vacuous
+/// tests this override exists to fix.
+#[cfg(test)]
+pub(crate) struct TestTotalMemory {
+    previous_override: Option<u64>,
+    previous_cache: u64,
+}
+
+#[cfg(test)]
+impl TestTotalMemory {
+    /// Callers MUST already hold `ENV_TEST_LOCK`. The override itself is
+    /// per-thread, but the budget it produces lands in `BUDGET_BYTES_CACHE`,
+    /// which is a process-global atomic — so an injection is visible to every
+    /// other thread until restored, and without serialization a parallel test
+    /// reads a budget it never asked for.
+    pub(crate) fn set(bytes: u64) -> Self {
+        let previous_override = TEST_TOTAL_MEMORY.with(std::cell::Cell::get);
+        let previous_cache = BUDGET_BYTES_CACHE.load(Ordering::Acquire);
+        set_test_total_memory(Some(bytes));
+        // The cache keeps a monotonic conservative floor, so a stale smaller
+        // value would pin the budget below the injected total. Clear it.
+        BUDGET_BYTES_CACHE.store(0, Ordering::Release);
+        Self { previous_override, previous_cache }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTotalMemory {
+    fn drop(&mut self) {
+        set_test_total_memory(self.previous_override);
+        BUDGET_BYTES_CACHE.store(self.previous_cache, Ordering::Release);
+    }
+}
+
+/// The total this process should act on: the test override when one is set,
+/// otherwise the real host reading. Production compiles to the plain call.
+#[cfg(test)]
+fn effective_total_physical_memory_bytes() -> u64 {
+    match TEST_TOTAL_MEMORY.with(std::cell::Cell::get) {
+        Some(bytes) => bytes,
+        None => total_physical_memory_bytes(),
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn effective_total_physical_memory_bytes() -> u64 {
+    total_physical_memory_bytes()
+}
+
 /// Fail-closed error from an explicitly configured file coordinator.
 ///
 /// Callers must surface this as a verification failure before starting a solver;
@@ -401,7 +481,7 @@ fn checked_reserved_bytes(lines: &[TokenLine]) -> Result<u64, String> {
 /// [`MemoryJobserverError::BudgetUnavailable`].
 #[must_use]
 pub fn machine_budget_bytes() -> u64 {
-    let total = total_physical_memory_bytes();
+    let total = effective_total_physical_memory_bytes();
     let observed = ((u128::from(total) * u128::from(DEFAULT_BUDGET_NUMERATOR))
         / u128::from(DEFAULT_BUDGET_DENOMINATOR)) as u64;
     if observed == 0 {
@@ -1770,9 +1850,25 @@ mod tests {
 
     impl TestDirectory {
         fn new(label: &str) -> Self {
-            let base = std::env::current_dir()
-                .expect("test cwd")
-                .join("target")
+            // Root under $HOME, NOT `cwd/target`.
+            //
+            // The ledger rejects a token whose ANCESTOR chain is group/other
+            // writable, and it is right to. Under the common `umask 0002` every
+            // directory in a checked-out repo is 0775, so a fixture beneath
+            // `cwd/target` can never satisfy that check however private its own
+            // directories are — which is why the defect reads as puzzling: the
+            // leaf is 0700 (set below) and everything above it is not. `/tmp` is
+            // no better here: it is 1777, and this check has no root-owned-sticky
+            // exemption. `$HOME` is 0750 owner-only on a normal account, so it is
+            // the one chain available that the check accepts.
+            //
+            // Falls back to the temp dir when HOME is unset (CI containers), which
+            // reproduces the old failure rather than silently skipping — a token
+            // path nobody validated is the thing this check exists to catch.
+            let base = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cache")
                 .join("trust-memory-jobserver-tests");
             std::fs::create_dir_all(&base).expect("create memory-jobserver test root");
             #[cfg(unix)]
@@ -1827,18 +1923,42 @@ mod tests {
 
     #[test]
     fn machine_budget_is_fraction_of_total() {
-        let total = total_physical_memory_bytes();
-        // BUDGET cache may be set by another test; clear it for a clean read.
-        BUDGET_BYTES_CACHE.store(0, Ordering::Relaxed);
-        let budget = machine_budget_bytes();
-        if total > 0 {
-            assert!(budget > 0, "budget must be derivable when total RAM is known");
-            assert!(budget < total, "budget must leave headroom below total RAM");
-            // Exact integer fraction, rounded down without floating-point drift.
-            let expected = ((u128::from(total) * u128::from(DEFAULT_BUDGET_NUMERATOR))
-                / u128::from(DEFAULT_BUDGET_DENOMINATOR)) as u64;
-            assert_eq!(budget, expected);
+        // WAS VACUOUS. This body used to sit behind `if total > 0`, and on any
+        // bare-metal cgroup-v2 Linux host `total` is 0 — the visible cgroup root
+        // has no `memory.max` and `linux_visible_cgroup_limit_with` fails closed
+        // by design — so the test asserted NOTHING and still reported pass. It
+        // also recomputed the implementation verbatim (the same
+        // `total * NUM / DEN` expression as `machine_budget_bytes`), so it would
+        // have moved silently with any change to the policy it exists to pin.
+        //
+        // Injecting the total makes the arithmetic run everywhere, and the
+        // expectations below are LITERALS, computed by hand from the 70/100
+        // policy. If that policy is retuned these must be updated with it —
+        // which is the point.
+        for (total, expected) in [
+            (0u64, 0u64),                          // nothing observable -> no budget
+            (1, 0),                                // rounds DOWN, never up to 1
+            (10, 7),                               // 10 * 70/100
+            (1_073_741_824, 751_619_276),          // 1 GiB
+            (u64::MAX, 12_912_720_851_596_686_130), // no overflow via the u128 widening
+        ] {
+            set_test_total_memory(Some(total));
+            BUDGET_BYTES_CACHE.store(0, Ordering::Relaxed);
+            let budget = machine_budget_bytes();
+            assert_eq!(budget, expected, "budget for total={total}");
+            if total > 1 {
+                assert!(budget < total, "budget must leave headroom below total RAM");
+            }
         }
+        set_test_total_memory(None);
+
+        // The constants the literals above were derived from, pinned so a
+        // retune cannot leave them stale without also failing here.
+        assert_eq!(
+            (DEFAULT_BUDGET_NUMERATOR, DEFAULT_BUDGET_DENOMINATOR),
+            (70, 100),
+            "the expected values above are hand-computed for 70/100"
+        );
     }
 
     #[test]
@@ -2023,6 +2143,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reservation_drop_uses_frozen_authority_not_current_environment() {
+        // See `machine_budget_is_fraction_of_total`: without an injected total
+        // the early return below fires on this host and the test asserts nothing.
+        // The lock is required by `TestTotalMemory` — the budget cache is global.
+        let _env = super::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _total = TestTotalMemory::set(8 * 1024 * 1024 * 1024);
         let original = TestDirectory::new("frozen-drop-original");
         let replacement = TestDirectory::new("frozen-drop-replacement");
         let original_path = original.token_path();
@@ -2144,6 +2269,12 @@ mod tests {
     #[test]
     fn end_to_end_reserve_and_release_under_token_file() {
         let _env = super::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Inject a total so the guarded body below actually RUNS. Without it
+        // this test is vacuous on any bare-metal cgroup-v2 Linux host, where
+        // `machine_budget_bytes()` is 0 and the guard is never taken. The RAII
+        // holder restores the prior value so it cannot leak to the next test on
+        // this pool thread.
+        let _total = TestTotalMemory::set(8 * 1024 * 1024 * 1024);
         let fixture = TestDirectory::new("reserve-release");
         let path = fixture.token_path();
         // Per-thread token-path override (NOT the process-global env): isolates
@@ -2185,6 +2316,12 @@ mod tests {
     #[test]
     fn over_budget_acquire_blocks_until_deadline_then_fails_closed() {
         let _env = super::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Inject a total so the guarded body below actually RUNS. Without it
+        // this test is vacuous on any bare-metal cgroup-v2 Linux host, where
+        // `machine_budget_bytes()` is 0 and the guard is never taken. The RAII
+        // holder restores the prior value so it cannot leak to the next test on
+        // this pool thread.
+        let _total = TestTotalMemory::set(8 * 1024 * 1024 * 1024);
         // A request that fits the budget on its own but does NOT fit alongside an
         // already-held reservation must BLOCK up to the (short, env-overridden)
         // deadline and then fail — bounded, never a deadlock or unreserved spawn.

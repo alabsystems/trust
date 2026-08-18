@@ -151,6 +151,19 @@ pub(super) fn for_each_element_fixed_array_bound(
 /// own (unsigned `fixed_array_elem_bound`, or the signed-aware reduction range). Only a
 /// fixed-size array (static `LEN`) qualifies; a slice or other shape yields None.
 pub(super) fn for_each_array_elem_ty(func: &VerifiableFunction, x_local: usize) -> Option<(Ty, u64)> {
+    for_each_array_source(func, x_local).map(|(elem, len, _)| (elem, len))
+}
+
+/// [`for_each_array_elem_ty`] plus the ITERATED OPERAND itself (`C` in
+/// `for &x in C`). The BMC refutation lane (`bmc_reduction`) needs it to check
+/// that the array is an unconstrained function INPUT — without that check its
+/// per-iteration free variables would misdescribe a literal/const array, which
+/// would be a FALSE refutation. The bound-fact lane never needs it, so
+/// `for_each_array_elem_ty` keeps its two-value shape.
+pub(super) fn for_each_array_source(
+    func: &VerifiableFunction,
+    x_local: usize,
+) -> Option<(Ty, u64, Operand)> {
     const FUEL: u32 = 16;
     // x = *deref_src
     let deref_src = match crate::unique_whole_local_def(func, x_local)? {
@@ -176,9 +189,9 @@ pub(super) fn for_each_array_elem_ty(func: &VerifiableFunction, x_local: usize) 
     // some_local = next() result; trace its receiver to the iterated array operand.
     let array_op = next_call_to_array_operand(func, some_local, FUEL)?;
     match crate::operand_ty(func, &array_op)? {
-        Ty::Array { elem, len } => Some((*elem, len)),
+        Ty::Array { elem, len } => Some((*elem, len, array_op)),
         Ty::Ref { inner, .. } => match *inner {
-            Ty::Array { elem, len } => Some((*elem, len)),
+            Ty::Array { elem, len } => Some((*elem, len, array_op)),
             _ => None,
         },
         _ => None,

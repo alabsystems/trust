@@ -169,6 +169,19 @@ pub const TRUSTIR_BINOP_LSHR: &str = "Trust.TrustIr.BinOp.LShr";
 /// `F::Pred("Int.land", [a,b])` arm (the BITWISE SHAPE LANE's registered
 /// opaque-application carrier established for MirSem, reused here unchanged).
 pub const TRUSTIR_BINOP_AND: &str = "Trust.TrustIr.BinOp.And";
+/// Trust: OR/XOR ANCHOR (2026-08-11) — bitwise OR, the eighth (nullary) constructor.
+pub const TRUSTIR_BINOP_OR: &str = "Trust.TrustIr.BinOp.Or";
+/// Trust: OR/XOR ANCHOR — bitwise XOR, the ninth (nullary) constructor.
+pub const TRUSTIR_BINOP_XOR: &str = "Trust.TrustIr.BinOp.Xor";
+/// Trust: SHL ANCHOR (2026-08-12) — left shift, the tenth (nullary) constructor.
+pub const TRUSTIR_BINOP_SHL: &str = "Trust.TrustIr.BinOp.Shl";
+/// Trust (#53): the BOOLEAN CONNECTIVES. Distinct from `And`/`Or`/`Xor` above,
+/// which denote the OPAQUE `Int.land`/`Int.lor`/`Int.xor` and therefore say
+/// nothing about a symbolic operand. These denote the genuine connective on the
+/// Bool 0/1 carrier, so an obligation stated over them REDUCES.
+pub const TRUSTIR_BINOP_BAND: &str = "Trust.TrustIr.BinOp.BAnd";
+pub const TRUSTIR_BINOP_BOR: &str = "Trust.TrustIr.BinOp.BOr";
+pub const TRUSTIR_BINOP_BXOR: &str = "Trust.TrustIr.BinOp.BXor";
 pub const TRUSTIR_BINOP_REC: &str = "Trust.TrustIr.BinOp.rec";
 
 /// `Trust.TrustIr.evalBin : Env → BinOp → Nat → Nat → Int` — the Clean
@@ -204,6 +217,42 @@ pub const TRUSTIR_OPERAND_INDEX: &str = "Trust.TrustIr.Operand.Index";
 /// Trust: ptr-spine call-arg leaf — `Len : Operand → Operand`, RECURSIVE in its one
 /// field. Mirrors `Trust.MirSem.Operand.Len`. See [`IrOperand::Len`]'s doc.
 pub const TRUSTIR_OPERAND_LEN: &str = "Trust.TrustIr.Operand.Len";
+/// Trust: DELTA-2 (2026-08-03) — `PreOpNotAt : Operand → Nat → Operand`, the bitwise
+/// NOT of an operand AT a width. RECURSIVE in its first field. Carries the width
+/// because `!x` is width-dependent (`!0u8 == 255`, `!0u32 == 4294967295`); a
+/// width-free `bnot` could not distinguish them. See [`IrOperand::PreOpNotAt`].
+pub const TRUSTIR_OPERAND_PREOP_NOT_AT: &str = "Trust.TrustIr.Operand.PreOpNotAt";
+/// Trust: DELTA-2 — `CastU : Operand → Nat → Operand`, an integer cast to the UNSIGNED
+/// destination of the given width. RECURSIVE in its first field.
+/// The OFF-WHITELIST cast default — an opaque, so an unadmitted width fails closed
+/// rather than reducing to the value unchanged (which is the cast-as-identity forgery).
+pub const TRUSTIR_CAST_UNSUPPORTED: &str = "Trust.TrustIr.castUnsupported";
+pub const TRUSTIR_OPERAND_CAST_U: &str = "Trust.TrustIr.Operand.CastU";
+/// Trust: DELTA-2 — `CastS : Operand → Nat → Operand`, an integer cast to the SIGNED
+/// destination of the given width. RECURSIVE in its first field.
+pub const TRUSTIR_OPERAND_CAST_S: &str = "Trust.TrustIr.Operand.CastS";
+/// Trust: DELTA-2 — `bnotAt : Int → Int → Int`, the OPAQUE total bitwise-NOT-at-width.
+/// `Declaration::Opaque`, so a term naming it gains NO axiom dependency (the
+/// `idxElem`/`sliceLen` precedent). Deliberately UNINTERPRETED: `!x` is a bitvector
+/// operation and this fragment has no bitvector value theory, so the certificate
+/// claims only that the result is SOME Int determined by (value, width) — never a
+/// numeric identity. Distinct from the width-free `bnot` so the width cannot be lost.
+pub const TRUSTIR_BNOT_AT: &str = "Trust.TrustIr.bnotAt";
+/// Trust: DELTA-2 — `castU : Int → Int → Int` (value, width), the EXACT unsigned cast.
+/// A reducible Definition, NOT an opaque: see `register_bnot_at_and_casts`.
+pub const TRUSTIR_CAST_U: &str = "Trust.TrustIr.castU";
+/// Trust: DELTA-2 — `castS : Int → Int → Int` (value, width), the EXACT signed cast.
+pub const TRUSTIR_CAST_S: &str = "Trust.TrustIr.castS";
+/// Trust: DELTA-4 (2026-08-05) — `Discr : Nat → Operand`, an enum TAG READ on a
+/// parameter. Mirrors `Trust.MirSem.Operand.Discriminant`, on trust-ir's OWN `idxElem`
+/// opaque. See [`IrOperand::Discr`].
+pub const TRUSTIR_OPERAND_DISCR: &str = "Trust.TrustIr.Operand.Discr";
+/// Trust: DELTA-4 — the RESERVED `idxElem` key an enum tag read is denoted at, mirroring
+/// `mirsem::MIRSEM_DISCRIMINANT_TAG_KEY`. NEGATIVE by construction, and every real
+/// `Field` key is a `u64` (so `>= 0`) — the two carriers are therefore provably disjoint
+/// BY CONSTRUCTION, not by convention. A body that reads BOTH `(*self).0` and the
+/// discriminant of the same receiver can never have the two conflated.
+pub const TRUSTIR_DISCRIMINANT_TAG_KEY: i128 = -1;
 pub const TRUSTIR_OPERAND_REC: &str = "Trust.TrustIr.Operand.rec";
 /// `Trust.TrustIr.evalOperand : Env → Operand → Int` (Var i → e i; Const c → c;
 /// Field paramIdx fld → idxElem (e paramIdx) (Int.ofNat fld) — Trust: field-read leaf;
@@ -927,11 +976,62 @@ pub enum TrustIrBinOp {
     /// carrier `mirsem::register_int_bitwise`'s `BitAnd` arm registers on the
     /// MirSem side.
     And,
+    /// `trust_ir::BinOp::Or` (Trust: OR/XOR ANCHOR, 2026-08-11 — bitwise OR; MIR's
+    /// `BinOp::BitOr` opcode maps here). Grounds to the Opaque `Int.lor`
+    /// (registered by [`register_int_lor_xor`]), matching `ground_int`'s
+    /// `F::Pred("Int.lor", [a,b])` BITWISE SHAPE LANE arm — the SAME opaque carrier
+    /// `mirsem::register_int_bitwise` registers on the MirSem side, and the SAME
+    /// carrier the bridge's `bridge_or` agreement theorem is stated over.
+    Or,
+    /// `trust_ir::BinOp::Xor` (Trust: OR/XOR ANCHOR — bitwise XOR; MIR's
+    /// `BinOp::BitXor` opcode maps here). Grounds to the Opaque `Int.xor`, same
+    /// discipline as `Or`; the bridge's `bridge_xor` is stated over the same carrier.
+    Xor,
+    /// `trust_ir::BinOp::Shl` (Trust: SHL ANCHOR, 2026-08-12 — left shift; MIR's
+    /// `BinOp::Shl` opcode maps here). Grounds to the Opaque `Int.shiftLeft`
+    /// (registered by [`register_int_shl`]), matching `ground_int`'s
+    /// `F::Pred("Int.shiftLeft", [a,b])` BITWISE SHAPE LANE arm — the SAME opaque
+    /// carrier `mirsem::register_int_bitwise` registers on the MirSem side, and the
+    /// bridge's `bridge_shl` is stated over the same carrier. APPENDED tenth, NOT
+    /// inserted at trust-ir's own declaration position (inst.rs has `Shl` before
+    /// `LShr`): appending is what preserves every prior recursor minor position and
+    /// ι-reduction; the bijection is by NAME, not by index.
+    ///
+    /// HONESTY: `Int.shiftLeft` denotes with NO width truncation (`a * 2^n`
+    /// mathematically, and opaquely here) — sound only because truncation/overflow is
+    /// a separately-emitted safety VC, so `Shl` may be admitted ONLY on lanes that
+    /// conjoin `function_safety_vcs_all_discharged`. Both straight-line lanes do.
+    Shl,
+    /// `trust_ir::BinOp::BAnd` (Trust #53, 2026-08-14 — the BOOLEAN conjunction).
+    ///
+    /// DISTINCT from `And` above, and the distinction is the whole point. MIR
+    /// spells `BinOp::BitAnd` for the Bool connective and the integer operator
+    /// alike, separating them only by operand TYPE, while `And` denotes the
+    /// OPAQUE `Int.land` — which on SYMBOLIC operands asserts nothing at all, so
+    /// a Bool connective routed there yields a refinement that closes by `rfl`
+    /// and a certificate no consumer contract (`ensures r == (a && b)`) can
+    /// discharge against. That is why `bitwise_operands_are_int` gates bool out
+    /// of `And`/`Or`/`Xor`, and why those bodies previously had NO trust-ir
+    /// denotation.
+    ///
+    /// This one is BUILT rather than opaque (see [`bool_connective_minor`]): it
+    /// reduces on closed arguments. APPENDED eleventh — the bijection is by NAME,
+    /// not index, and appending preserves every prior recursor minor position and
+    /// ι-reduction.
+    ///
+    /// MODEL-ONLY: [`IrRvalue::to_formula`] reflects it to a `Pred` the live
+    /// grounder does not recognise (as `Not`/`bnot` is), so it closes through the
+    /// MODEL refinement disjunct, never by claiming a live `Int.*` carrier.
+    BAnd,
+    /// `trust_ir::BinOp::BOr` — the BOOLEAN disjunction. See [`TrustIrBinOp::BAnd`].
+    BOr,
+    /// `trust_ir::BinOp::BXor` — the BOOLEAN exclusive-or. See [`TrustIrBinOp::BAnd`].
+    BXor,
 }
 
 impl TrustIrBinOp {
-    /// All seven supported ops (for the exhaustive POC).
-    pub const ALL: [TrustIrBinOp; 7] = [
+    /// All thirteen supported ops (for the exhaustive POC).
+    pub const ALL: [TrustIrBinOp; 13] = [
         TrustIrBinOp::Add,
         TrustIrBinOp::Sub,
         TrustIrBinOp::Mul,
@@ -939,6 +1039,12 @@ impl TrustIrBinOp {
         TrustIrBinOp::SRem,
         TrustIrBinOp::LShr,
         TrustIrBinOp::And,
+        TrustIrBinOp::Or,
+        TrustIrBinOp::Xor,
+        TrustIrBinOp::Shl,
+        TrustIrBinOp::BAnd,
+        TrustIrBinOp::BOr,
+        TrustIrBinOp::BXor,
     ];
 
     /// The Clean constructor name — keyed to the trust-ir variant name.
@@ -951,6 +1057,12 @@ impl TrustIrBinOp {
             TrustIrBinOp::SRem => TRUSTIR_BINOP_SREM,
             TrustIrBinOp::LShr => TRUSTIR_BINOP_LSHR,
             TrustIrBinOp::And => TRUSTIR_BINOP_AND,
+            TrustIrBinOp::Or => TRUSTIR_BINOP_OR,
+            TrustIrBinOp::Xor => TRUSTIR_BINOP_XOR,
+            TrustIrBinOp::Shl => TRUSTIR_BINOP_SHL,
+            TrustIrBinOp::BAnd => TRUSTIR_BINOP_BAND,
+            TrustIrBinOp::BOr => TRUSTIR_BINOP_BOR,
+            TrustIrBinOp::BXor => TRUSTIR_BINOP_BXOR,
         }
     }
 
@@ -964,6 +1076,12 @@ impl TrustIrBinOp {
             TrustIrBinOp::SRem => "SRem",
             TrustIrBinOp::LShr => "LShr",
             TrustIrBinOp::And => "And",
+            TrustIrBinOp::Or => "Or",
+            TrustIrBinOp::Xor => "Xor",
+            TrustIrBinOp::Shl => "Shl",
+            TrustIrBinOp::BAnd => "BAnd",
+            TrustIrBinOp::BOr => "BOr",
+            TrustIrBinOp::BXor => "BXor",
         }
     }
 
@@ -992,6 +1110,27 @@ impl TrustIrBinOp {
             // discipline as `LShr`, BYTE-IDENTICAL to `mirsem::SemRvalue::Bin(
             // SemBinOp::BitAnd, ..)`'s `to_formula` arm.
             TrustIrBinOp::And => F::Pred(trust_types::Symbol::intern("Int.land"), vec![*a, *b]),
+            // Trust: OR/XOR ANCHOR — the same opaque-application carrier discipline;
+            // `ground_int` already carries matching `Pred("Int.lor")`/`Pred("Int.xor")`
+            // arms in its BITWISE SHAPE LANE, so these are grounder-connected exactly
+            // as `And` is.
+            TrustIrBinOp::Or => F::Pred(trust_types::Symbol::intern("Int.lor"), vec![*a, *b]),
+            TrustIrBinOp::Xor => F::Pred(trust_types::Symbol::intern("Int.xor"), vec![*a, *b]),
+            // Trust: SHL ANCHOR — same carrier discipline; `ground_int` already has the
+            // matching `Pred("Int.shiftLeft")` arm, so Shl is grounder-connected.
+            TrustIrBinOp::Shl => {
+                F::Pred(trust_types::Symbol::intern("Int.shiftLeft"), vec![*a, *b])
+            }
+            // Trust (#53): MODEL-ONLY `Pred`s, matching `IrRvalue::to_formula`.
+            TrustIrBinOp::BAnd => {
+                F::Pred(trust_types::Symbol::intern("Trust.TrustIr.band"), vec![*a, *b])
+            }
+            TrustIrBinOp::BOr => {
+                F::Pred(trust_types::Symbol::intern("Trust.TrustIr.bor"), vec![*a, *b])
+            }
+            TrustIrBinOp::BXor => {
+                F::Pred(trust_types::Symbol::intern("Trust.TrustIr.bxor"), vec![*a, *b])
+            }
         }
     }
 
@@ -1095,11 +1234,54 @@ pub enum IrOperand {
     /// honestly MODEL-ONLY. Asserts NOTHING about the element's VALUE, only that it
     /// denotes SOME Int stably determined by (s, i) — no content claim.
     Index(Box<IrOperand>, Box<IrOperand>),
-    /// Trust: ptr-spine call-arg leaf — `Len s` — a SLICE-LENGTH `s.len()`, RECURSIVE in
-    /// its one field. Mirrors `Trust.MirSem.Operand.Len`. REUSES the opaque total
+    /// Trust: ptr-spine call-arg leaf; since 2026-08-11 ALSO a straight-line-BODY
+    /// operand (the chain lane's `UnOp::PtrMetadata` arm mints `Len(Var param)` for the
+    /// `slice::is_empty` shape) — `Len s` — a SLICE-LENGTH `s.len()`, RECURSIVE in its
+    /// one field. Mirrors `Trust.MirSem.Operand.Len`. REUSES the opaque total
     /// `sliceLen` selector (see [`TRUSTIR_SLICE_LEN`]). NOT grounder-connected — same
-    /// MODEL-ONLY tier as `Index`/`Field`.
+    /// MODEL-ONLY tier as `Index`/`Field`. The body producer mints `Len` over a
+    /// PARAMETER exclusively; `inline_operand_denotation`'s `_` arm is correct for
+    /// exactly that case (params are env-invariant) and a Len-over-temp would FAIL
+    /// CLOSED there — do not "fix" that with a recursion arm unless the base really is
+    /// threaded.
     Len(Box<IrOperand>),
+    /// Trust: DELTA-2 (2026-08-03) — `PreOpNotAt base width` — a bitwise NOT of an
+    /// operand AT a width, the `count_zeros` shape's call argument
+    /// (`_2 = UnaryOp(Not, Copy _1)` then `count_ones(_2)`).
+    ///
+    /// Denoted by the OPAQUE total `bnotAt` (see [`TRUSTIR_BNOT_AT`]): this fragment
+    /// has no bitvector value theory, so the certificate asserts only that `!x` is SOME
+    /// Int determined by `(base, width)` — never a numeric identity. MODEL-ONLY tier
+    /// (`is_grounder_connected` is false), the same honesty split `Field`/`Index` carry.
+    ///
+    /// The WIDTH is load-bearing and not decoration: `!0u8 == 255` while
+    /// `!0u32 == 4294967295`, so a width-free carrier would silently conflate the eight
+    /// bitmethod widths into one term.
+    PreOpNotAt(Box<IrOperand>, u32),
+    /// Trust: DELTA-2 — `CastU base width` — an integer cast to the UNSIGNED
+    /// destination of `width`. Denoted by the EXACT reducible `castU`, never an
+    /// identity: `swap_bytes(i32)` really does `i32 -> u32 -> call -> u32 -> i32`, and
+    /// treating that as identity is false for every value with the top bit set.
+    CastU(Box<IrOperand>, u32),
+    /// Trust: DELTA-2 — `CastS base width` — the SIGNED destination twin of
+    /// [`IrOperand::CastU`], denoted by the exact reducible `castS`.
+    CastS(Box<IrOperand>, u32),
+    /// Trust: DELTA-4 (2026-08-05) — `Discr paramIdx` — an enum TAG READ on parameter
+    /// `paramIdx` (`Rvalue::Discriminant`), the `is_some`/`is_ok`/`is_break`/`is_eq`
+    /// predicate shape's first statement.
+    ///
+    /// Denoted by REUSE of trust-ir's OWN `idxElem` opaque at the RESERVED negative key
+    /// [`TRUSTIR_DISCRIMINANT_TAG_KEY`] — the trust-ir analogue of
+    /// `mirsem::SemOperand::Discriminant`'s reuse, on trust-ir's own symbol, never
+    /// referencing `Trust.MirSem.*`. Asserts NOTHING about the tag's bit pattern, only
+    /// that it is SOME Int stably determined by the receiver — which is the right
+    /// abstraction, because the soundness of a discriminant-guarded predicate rests on
+    /// the COMPARISON structure, never on the tag's concrete value.
+    ///
+    /// The reserved key is negative and every `Field` key is a `u64`, so the two can
+    /// never collide: a body reading both `(*self).0` and `discriminant(self)` keeps
+    /// them provably distinct BY CONSTRUCTION.
+    Discr(u64),
 }
 
 impl IrOperand {
@@ -1118,6 +1300,22 @@ impl IrOperand {
                 Expr::apps(cst(TRUSTIR_OPERAND_INDEX), [s.to_operand_expr(), i.to_operand_expr()])
             }
             IrOperand::Len(s) => Expr::app(cst(TRUSTIR_OPERAND_LEN), s.to_operand_expr()),
+            // Trust: DELTA-2 — operand FIRST, width SECOND (as `Nat`), matching the
+            // constructor arity registered on the inductive.
+            IrOperand::PreOpNotAt(b, w) => Expr::apps(cst(TRUSTIR_OPERAND_PREOP_NOT_AT), [
+                b.to_operand_expr(),
+                Expr::nat_lit(u64::from(*w)),
+            ]),
+            IrOperand::CastU(b, w) => Expr::apps(cst(TRUSTIR_OPERAND_CAST_U), [
+                b.to_operand_expr(),
+                Expr::nat_lit(u64::from(*w)),
+            ]),
+            IrOperand::CastS(b, w) => Expr::apps(cst(TRUSTIR_OPERAND_CAST_S), [
+                b.to_operand_expr(),
+                Expr::nat_lit(u64::from(*w)),
+            ]),
+            // Trust: DELTA-4 — non-recursive, one Nat payload (the parameter index).
+            IrOperand::Discr(p) => Expr::app(cst(TRUSTIR_OPERAND_DISCR), Expr::nat_lit(*p)),
         }
     }
 
@@ -1130,6 +1328,26 @@ impl IrOperand {
     fn to_formula(&self) -> trust_types::Formula {
         use trust_types::{Formula as F, Sort};
         match self {
+            // Trust: DELTA-2 — the pre-op/cast carriers have NO live-grounder
+            // counterpart at all (the live `Formula` language has no bnotAt/castU/castS
+            // head), so they are MODEL-ONLY by construction. `is_grounder_connected`
+            // returns false for them, so no call site reaches a live kernel check
+            // through here; the arm exists only to keep this fold total. Reflecting the
+            // BASE alone would be a LIE — it would drop the NOT/cast entirely — so
+            // reflect a fresh opaque Select keyed on the base instead, which matches
+            // nothing live and can never be mistaken for the operand's value.
+            IrOperand::PreOpNotAt(b, w) | IrOperand::CastU(b, w) | IrOperand::CastS(b, w) => {
+                F::Select(Box::new(b.to_formula()), Box::new(F::Int(i128::from(*w))))
+            }
+            // Trust: DELTA-4 — mirrors `Field`'s treatment exactly, at the RESERVED
+            // negative key. Documentation parity only: like `Field` this is never
+            // live-groundable to a MATCHING term (trust-ir's `idxElem` is a DIFFERENT
+            // opaque from the live grounder's `Trust.MirSem.idx_elem`), and every call
+            // site that might reach it is gated by `is_grounder_connected` first.
+            IrOperand::Discr(p) => F::Select(
+                Box::new(F::Var(param_name(*p), Sort::Int)),
+                Box::new(F::Int(TRUSTIR_DISCRIMINANT_TAG_KEY)),
+            ),
             IrOperand::Var(i) => F::Var(param_name(*i), Sort::Int),
             IrOperand::Const(c) => F::Int(*c),
             IrOperand::Field(p, fld) => F::Select(
@@ -1154,12 +1372,19 @@ impl IrOperand {
     /// SAME recursive contribution `mirsem::SemOperand::Index`/`Len::var_indices` make).
     fn var_indices(&self, out: &mut Vec<u64>) {
         match self {
-            IrOperand::Var(i) | IrOperand::Field(i, _) => {
+            // Trust: DELTA-4 — `Discr p` contributes `p` for the same reason `Field`'s
+            // base does: the reserved key is a fixed payload, not a bound index.
+            IrOperand::Var(i) | IrOperand::Field(i, _) | IrOperand::Discr(i) => {
                 if !out.contains(i) {
                     out.push(*i);
                 }
             }
             IrOperand::Const(_) => {}
+            // Trust: DELTA-2 — recurse into the base; the width is a fixed payload, not
+            // a bound index (the same treatment `Field`'s key gets).
+            IrOperand::PreOpNotAt(b, _) | IrOperand::CastU(b, _) | IrOperand::CastS(b, _) => {
+                b.var_indices(out);
+            }
             IrOperand::Index(s, i) => {
                 s.var_indices(out);
                 i.var_indices(out);
@@ -1252,6 +1477,34 @@ impl IrRvalue {
             // LANE `Pred("Int.land",_)` arm.
             IrRvalue::Bin(TrustIrBinOp::And, a, b) => {
                 F::Pred(trust_types::Symbol::intern("Int.land"), vec![*bx(a), *bx(b)])
+            }
+            // Trust: OR/XOR ANCHOR — same BITWISE SHAPE LANE arms as `And`.
+            IrRvalue::Bin(TrustIrBinOp::Or, a, b) => {
+                F::Pred(trust_types::Symbol::intern("Int.lor"), vec![*bx(a), *bx(b)])
+            }
+            IrRvalue::Bin(TrustIrBinOp::Xor, a, b) => {
+                F::Pred(trust_types::Symbol::intern("Int.xor"), vec![*bx(a), *bx(b)])
+            }
+            // Trust: SHL ANCHOR.
+            IrRvalue::Bin(TrustIrBinOp::Shl, a, b) => {
+                F::Pred(trust_types::Symbol::intern("Int.shiftLeft"), vec![*bx(a), *bx(b)])
+            }
+            // Trust (#53): the BOOLEAN CONNECTIVES reflect to `Pred`s the live grounder
+            // does NOT recognise, exactly as `Not`/`bnot` does. `live_ground_int`
+            // returns `None` — the fail-closed signal that these are not
+            // grounder-connected — and the denotation is instead proven against the
+            // trust-ir model via `IrRvalue::denotation`, which is why the
+            // straight-line lane's MODEL refinement disjunct is what closes them.
+            // Naming them after the anchor's own constructors keeps that honest: there
+            // is no live `Int.*` carrier being implied.
+            IrRvalue::Bin(TrustIrBinOp::BAnd, a, b) => {
+                F::Pred(trust_types::Symbol::intern("Trust.TrustIr.band"), vec![*bx(a), *bx(b)])
+            }
+            IrRvalue::Bin(TrustIrBinOp::BOr, a, b) => {
+                F::Pred(trust_types::Symbol::intern("Trust.TrustIr.bor"), vec![*bx(a), *bx(b)])
+            }
+            IrRvalue::Bin(TrustIrBinOp::BXor, a, b) => {
+                F::Pred(trust_types::Symbol::intern("Trust.TrustIr.bxor"), vec![*bx(a), *bx(b)])
             }
             IrRvalue::Un(TrustIrUnOp::Neg, a) => F::Neg(bx(a)),
             // `Not` reflects to the canonical opaque-keyed Pred; the live grounder
@@ -1449,14 +1702,30 @@ fn inline_operand_formula(
         return None;
     }
     match op {
+        // Trust: DELTA-2 (G13) — a HARD DECLINE, not a best-effort reflection. This is
+        // the LIVE-grounder fold; the live `Formula` language has no bnotAt/castU/castS
+        // head, so there is no faithful reflection to give. Returning anything here —
+        // the base alone, or a Select — would hand the live grounder a term that is not
+        // this operand's value. `None` fail-closes the whole fold instead.
+        IrOperand::PreOpNotAt(..) | IrOperand::CastU(..) | IrOperand::CastS(..) => None,
+        // Trust: DELTA-4 — `Discr` takes `Field`'s treatment rather than the hard
+        // decline above: a live `Formula::Select` head DOES exist for it, so returning
+        // its (non-live-matching) `to_formula` keeps this fold total, and the
+        // `is_grounder_connected` gate keeps it off every live kernel check. The
+        // bnotAt/cast heads get `None` instead precisely because the live language has
+        // no counterpart at all — the two cases are different, not inconsistent.
+        IrOperand::Discr(_) => Some(op.to_formula()),
         // Trust: field-read leaf — `Field` is never truly live-groundable (see
         // `IrOperand::Field`'s doc), but this LIVE-grounder path is gated by
         // `IrBody::is_grounder_connected` at every call site that matters
         // (`body_refinement_statement`); returning its (non-live-matching) `to_formula`
         // here keeps this fold total without ever reaching a live kernel check. Trust:
-        // ptr-spine call-arg leaf — `Index`/`Len` are NEVER produced inside a straight-line
-        // BODY (they are call-arg-only, built by `prove::sem_call_arg_to_ir`), but this
-        // match must stay exhaustive; they carry the SAME never-live-matching treatment.
+        // ptr-spine call-arg leaf — `Index` is never produced inside a straight-line
+        // BODY (call-arg-only, built by `prove::sem_call_arg_to_ir`); `Len` HAS been a
+        // body operand since 2026-08-11 (the chain lane's `PtrMetadata` arm), but only
+        // ever over a PARAMETER, and this LIVE-grounder fold is gated by
+        // `is_grounder_connected` before any live kernel check regardless — both carry
+        // the SAME never-live-matching treatment.
         IrOperand::Const(_) | IrOperand::Field(..) | IrOperand::Index(..) | IrOperand::Len(_) => {
             Some(op.to_formula())
         }
@@ -1492,6 +1761,28 @@ fn inline_rvalue_formula(
         // Trust: M6 rung 9, ANCHOR BitAnd.
         IrRvalue::Bin(TrustIrBinOp::And, a, b) => {
             F::Pred(trust_types::Symbol::intern("Int.land"), vec![g(a)?, g(b)?])
+        }
+        // Trust: OR/XOR ANCHOR.
+        IrRvalue::Bin(TrustIrBinOp::Or, a, b) => {
+            F::Pred(trust_types::Symbol::intern("Int.lor"), vec![g(a)?, g(b)?])
+        }
+        IrRvalue::Bin(TrustIrBinOp::Xor, a, b) => {
+            F::Pred(trust_types::Symbol::intern("Int.xor"), vec![g(a)?, g(b)?])
+        }
+        // Trust (#53): the BOOLEAN CONNECTIVES — MODEL-ONLY `Pred`s, byte-identical
+        // to `IrRvalue::to_formula`'s arms so the two reflections cannot diverge.
+        IrRvalue::Bin(TrustIrBinOp::BAnd, a, b) => {
+            F::Pred(trust_types::Symbol::intern("Trust.TrustIr.band"), vec![g(a)?, g(b)?])
+        }
+        IrRvalue::Bin(TrustIrBinOp::BOr, a, b) => {
+            F::Pred(trust_types::Symbol::intern("Trust.TrustIr.bor"), vec![g(a)?, g(b)?])
+        }
+        IrRvalue::Bin(TrustIrBinOp::BXor, a, b) => {
+            F::Pred(trust_types::Symbol::intern("Trust.TrustIr.bxor"), vec![g(a)?, g(b)?])
+        }
+        // Trust: SHL ANCHOR.
+        IrRvalue::Bin(TrustIrBinOp::Shl, a, b) => {
+            F::Pred(trust_types::Symbol::intern("Int.shiftLeft"), vec![g(a)?, g(b)?])
         }
         IrRvalue::Un(TrustIrUnOp::Neg, a) => F::Neg(Box::new(g(a)?)),
         IrRvalue::Un(TrustIrUnOp::Not, a) => {
@@ -1537,6 +1828,30 @@ fn inline_operand_denotation(
             // chain — see `inlined_return_denotation`'s doc).
             None => Some(operand_denotation(op, env)),
         },
+        // Trust: CAST-IN-CHAIN (2026-08-11) — RECURSE into the cast's base rather than
+        // handing the whole operand to `operand_denotation`. On the LHS `evalOperand`
+        // runs under the THREADED env, so a `CastU(Var t, w)` over an assigned temp `t`
+        // reduces to `castU <the threaded value of t> w`; the `_` arm below would
+        // instead denote `t` as `env t`, and `env` binds only PARAMETER indices. The
+        // two sides then disagree and the refinement fails closed — correct, but it
+        // means no body carrying a cast over a temp could ever close, which is every
+        // body in this family (`_3 := <read>; _2 := _3 as u32; _0 := _2 <= 127`).
+        // Substituting an equal argument into `castU`/`castS` is sound for the same
+        // reason it is for `Bin`/`Cmp`/`Un`, which `inline_rvalue_denotation` already
+        // does: they are plain functions of their arguments.
+        //
+        // `PreOpNotAt` deliberately stays on the `_` arm: it is CALL-ARG-ONLY, never
+        // built inside a straight-line body, so the arm would be dead code — and its
+        // current behaviour (denote, mismatch, fail closed) is the safe direction if
+        // that ever stops being true.
+        IrOperand::CastU(b, w) => Some(Expr::apps(cst(TRUSTIR_CAST_U), [
+            inline_operand_denotation(b, defs, env, depth + 1)?,
+            int_lit(i128::from(*w)),
+        ])),
+        IrOperand::CastS(b, w) => Some(Expr::apps(cst(TRUSTIR_CAST_S), [
+            inline_operand_denotation(b, defs, env, depth + 1)?,
+            int_lit(i128::from(*w)),
+        ])),
         _ => Some(operand_denotation(op, env)),
     }
 }
@@ -1565,6 +1880,14 @@ fn inline_rvalue_denotation(
 /// `Formula::{Add,Sub,Mul,Div,Rem}` grounding (and to `evalBin`'s reduct).
 fn int_binop_expr(op: TrustIrBinOp, a: Expr, b: Expr) -> Expr {
     let head = match op {
+        // Trust (#53): the BOOLEAN CONNECTIVES take a DIVERGING arm rather than a head
+        // entry, because they are not head-applications of an `Int.*` symbol at all --
+        // they are built `Bool.rec` terms (see `bool_connective_minor`). That is the
+        // point: any head entry here would necessarily name an OPAQUE carrier, which
+        // is exactly the denotation these constructors exist to avoid.
+        TrustIrBinOp::BAnd => return bool_connective_minor(BoolConnective::And, a, b),
+        TrustIrBinOp::BOr => return bool_connective_minor(BoolConnective::Or, a, b),
+        TrustIrBinOp::BXor => return bool_connective_minor(BoolConnective::Xor, a, b),
         TrustIrBinOp::Add => "Int.add",
         TrustIrBinOp::Sub => "Int.sub",
         TrustIrBinOp::Mul => "Int.mul",
@@ -1581,6 +1904,11 @@ fn int_binop_expr(op: TrustIrBinOp, a: Expr, b: Expr) -> Expr {
         // `mirsem::register_int_bitwise`'s `BitAnd` arm registers on the MirSem
         // side).
         TrustIrBinOp::And => "Int.land",
+        // Trust: OR/XOR ANCHOR — the same Opaque carriers the grounder and the bridge use.
+        TrustIrBinOp::Or => "Int.lor",
+        TrustIrBinOp::Xor => "Int.xor",
+        // Trust: SHL ANCHOR.
+        TrustIrBinOp::Shl => "Int.shiftLeft",
     };
     Expr::apps(cst(head), [a, b])
 }
@@ -1634,6 +1962,51 @@ fn bool_as_int(b: Expr) -> Expr {
     Expr::apps(bool_rec, [motive, int_lit(0), int_lit(1), b])
 }
 
+/// Which boolean connective [`bool_connective_minor`] should build.
+#[derive(Clone, Copy)]
+pub(crate) enum BoolConnective {
+    And,
+    Or,
+    Xor,
+}
+
+/// Trust (#53): one `evalBin` minor premise for a boolean connective, on the Bool
+/// 0/1 `Int` carrier.
+///
+/// Built, never opaque. `Bool.rec` with an `Int` motive dispatches on `a != 0`,
+/// and each branch lands on a literal `0`/`1` or on the canonical 0/1 value of
+/// `b` — so the term REDUCES on closed arguments instead of blocking on an
+/// uninterpreted symbol, which is the entire reason these constructors exist.
+///
+/// Uses the same `Int.beq` / `Bool.not` primitives as [`cmp_bool_expr`] and the
+/// same `Bool.rec` shape as [`bool_as_int`], so no new prelude dependency is
+/// introduced.
+pub(crate) fn bool_connective_minor(which: BoolConnective, a: Expr, b: Expr) -> Expr {
+    let bd = || BinderData::from(BinderInfo::Default);
+    // `x != 0` as a Bool.
+    let nonzero =
+        |x: Expr| Expr::app(cst("Bool.not"), Expr::apps(cst("Int.beq"), [x, int_lit(0)]));
+    // `Bool.rec.{1} (λ_:Bool. Int) <false-case> <true-case> <scrutinee>` — minor
+    // order follows the `Bool` constructor order (`false`, then `true`), exactly
+    // as `bool_as_int` relies on.
+    let dispatch = |false_case: Expr, true_case: Expr, scrutinee: Expr| {
+        let bool_rec =
+            Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
+        let motive = Expr::lam(bd(), cst("Bool"), int_ty());
+        Expr::apps(bool_rec, [motive, false_case, true_case, scrutinee])
+    };
+    let b_as_int = bool_as_int(nonzero(b.clone()));
+    let not_b_as_int = bool_as_int(Expr::app(cst("Bool.not"), nonzero(b)));
+    match which {
+        // a ? (b ? 1 : 0) : 0
+        BoolConnective::And => dispatch(int_lit(0), b_as_int, nonzero(a)),
+        // a ? 1 : (b ? 1 : 0)
+        BoolConnective::Or => dispatch(b_as_int, int_lit(1), nonzero(a)),
+        // a ? (b ? 0 : 1) : (b ? 1 : 0)
+        BoolConnective::Xor => dispatch(b_as_int, not_b_as_int, nonzero(a)),
+    }
+}
+
 /// The trust-ir-MODEL denotation of an operand under env `e_ref`: `Var i → e i`,
 /// `Const c → int_lit c`, `Field paramIdx fld → idxElem (e paramIdx) (int_lit fld)`
 /// (Trust: field-read leaf) — the exact reduct of `evalOperand e (Var i)` /
@@ -1643,6 +2016,29 @@ fn bool_as_int(b: Expr) -> Expr {
 /// recursive `operand_denotation` call on that sub-operand).
 fn operand_denotation(op: &IrOperand, e_ref: &Expr) -> Expr {
     match op {
+        // Trust: DELTA-2 — the EXACT reducts of the three new `evalOperand` minors.
+        // Each minor is `λ(s:Operand). λ(w:Nat). λ(ih_s:Int). <head> ih_s (Int.ofNat w)`,
+        // and with the constant `Int` motive the IH IS `evalOperand e s` — so the reduct
+        // is the head applied to the recursive denotation and the width as an `Int`.
+        // These MUST stay byte-identical to those minors or the refinement cannot close.
+        IrOperand::PreOpNotAt(b, w) => Expr::apps(cst(TRUSTIR_BNOT_AT), [
+            operand_denotation(b, e_ref),
+            int_lit(i128::from(*w)),
+        ]),
+        IrOperand::CastU(b, w) => Expr::apps(cst(TRUSTIR_CAST_U), [
+            operand_denotation(b, e_ref),
+            int_lit(i128::from(*w)),
+        ]),
+        IrOperand::CastS(b, w) => Expr::apps(cst(TRUSTIR_CAST_S), [
+            operand_denotation(b, e_ref),
+            int_lit(i128::from(*w)),
+        ]),
+        // Trust: DELTA-4 — the exact reduct of the `Discr` minor:
+        // `idxElem (e p) (Int RESERVED)`. Must stay byte-identical to that minor.
+        IrOperand::Discr(p) => Expr::apps(cst(TRUSTIR_IDX_ELEM), [
+            Expr::app(e_ref.clone(), Expr::nat_lit(*p)),
+            int_lit(TRUSTIR_DISCRIMINANT_TAG_KEY),
+        ]),
         IrOperand::Var(i) => Expr::app(e_ref.clone(), Expr::nat_lit(*i)),
         IrOperand::Const(c) => int_lit(*c),
         IrOperand::Field(p, fld) => Expr::apps(
@@ -1995,6 +2391,71 @@ impl IrCfg {
     fn is_grounder_connected(&self) -> bool {
         self.blocks.iter().all(|b| b.stmts.iter().all(|s| s.rvalue.is_grounder_connected()))
     }
+
+    /// Trust: B3 (2026-08-12) — the `Expr`-level MODEL denotation of the CFG's return,
+    /// the branch-lane analogue of [`IrBody::inlined_return_denotation`]. Built for a
+    /// CFG that is NOT grounder-connected (a `Discr`-guarded switch — the
+    /// `w_result_is_ok` family), where [`IrCfg::inlined_return_formula`] cannot feed
+    /// the live grounder.
+    ///
+    /// BYTE-DISCIPLINE: at each `Switch` this constructs
+    /// `Bool.rec (λ_.Int) <else> <then> <cond>` with the cond dispatched through
+    /// [`cmp_bool_expr`] — the SAME per-op spellings `register_eval_cond`'s minors
+    /// carry (`decide`+`Int.decLt/Le`, `Int.beq` for `Eq`, `Bool.not ∘ Int.beq` for
+    /// `Ne`, and the SWAPPED operands for `Gt`/`Ge`), and the SAME (false, true) minor
+    /// order `register_eval_cfg`'s switch minor uses. Leaves inline through
+    /// [`inline_operand_denotation`] under the OUTER env — sound for the same reason
+    /// the chain lane's builder is: `evalBody`'s threading touches only TEMP indices,
+    /// structurally disjoint from parameter slots, so the env is invariant at every
+    /// depth.
+    ///
+    /// Fail-closed (`None`): out of fuel (a cycle), a missing block, an undefined
+    /// temp, or a `CallReturn` arm — the opaque call result has a denotation only on
+    /// the call-instance lane, and minting one here would double-model it.
+    fn inlined_return_denotation(&self, env: &Expr) -> Option<Expr> {
+        let mut defs: std::collections::HashMap<u64, &IrRvalue> = std::collections::HashMap::new();
+        for blk in &self.blocks {
+            for s in &blk.stmts {
+                defs.insert(s.idx, &s.rvalue);
+            }
+        }
+        self.walk_return_denotation(self.entry, &defs, env, self.fuel)
+    }
+
+    /// Walk from block `bb`, inlining its terminator into the model `Expr`.
+    fn walk_return_denotation(
+        &self,
+        bb: u64,
+        defs: &std::collections::HashMap<u64, &IrRvalue>,
+        env: &Expr,
+        fuel: u64,
+    ) -> Option<Expr> {
+        if fuel == 0 {
+            return None; // out of fuel — a cycle / loop, fail closed.
+        }
+        let blk = self.block_at(bb)?;
+        match &blk.term {
+            IrTerm::Goto(tgt) => self.walk_return_denotation(*tgt, defs, env, fuel - 1),
+            IrTerm::Return(op) => inline_operand_denotation(op, defs, env, 0),
+            IrTerm::CallReturn { .. } => None, // see the doc above — fail closed.
+            IrTerm::Switch(cond, then_bb, else_bb) => {
+                let a = inline_operand_denotation(&cond.a, defs, env, 0)?;
+                let b = inline_operand_denotation(&cond.b, defs, env, 0)?;
+                let cond_b = cmp_bool_expr(cond.op, a, b);
+                let then_v = self.walk_return_denotation(*then_bb, defs, env, fuel - 1)?;
+                let else_v = self.walk_return_denotation(*else_bb, defs, env, fuel - 1)?;
+                let bd = BinderData::from(BinderInfo::Default);
+                let int_motive = Expr::lam(bd, cst("Bool"), int_ty());
+                let bool_rec = Expr::const_(
+                    Name::from_string("Bool.rec"),
+                    vec![Level::succ(Level::zero())],
+                );
+                // Bool.rec minor order is (false, true): FALSE ↦ else, TRUE ↦ then —
+                // the SAME order `register_eval_cfg`'s switch minor uses.
+                Some(Expr::apps(bool_rec, [int_motive, else_v, then_v, cond_b]))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2287,6 +2748,21 @@ fn register_binop_inductive(env: &mut Environment) -> Result<(), String> {
                 nullary(TRUSTIR_BINOP_LSHR),
                 // Trust: M6 rung 9, ANCHOR BitAnd — the seventh (nullary) constructor.
                 nullary(TRUSTIR_BINOP_AND),
+                // Trust: OR/XOR ANCHOR — the eighth and ninth (nullary) constructors,
+                // APPENDED so every prior recursor minor keeps its position and every
+                // prior ι-reduction is byte-preserved.
+                nullary(TRUSTIR_BINOP_OR),
+                nullary(TRUSTIR_BINOP_XOR),
+                // Trust: SHL ANCHOR — the tenth (nullary) constructor, APPENDED.
+                nullary(TRUSTIR_BINOP_SHL),
+                // Trust (#53): the BOOLEAN CONNECTIVES — eleventh/twelfth/thirteenth,
+                // APPENDED for the same reason every predecessor was: every prior
+                // recursor minor keeps its position and every prior ι-reduction stays
+                // byte-preserved. Mirrors `trust_ir::BinOp::{BAnd,BOr,BXor}`, whose own
+                // wire tags were likewise appended (20/21/22 after FMax=19).
+                nullary(TRUSTIR_BINOP_BAND),
+                nullary(TRUSTIR_BINOP_BOR),
+                nullary(TRUSTIR_BINOP_BXOR),
             ],
         }],
     };
@@ -2343,6 +2819,52 @@ fn register_int_land(env: &mut Environment) -> Result<(), String> {
         value: placeholder,
     })
     .map_err(|e| format!("add_decl(Int.land): {e:?}"))?;
+    Ok(())
+}
+
+/// Register the Opaque `Int.lor` / `Int.xor : Int → Int → Int` constants (idempotent) —
+/// Trust: OR/XOR ANCHOR. Same honesty tier and same name/type/placeholder discipline as
+/// [`register_int_shr`] / [`register_int_land`]: opaque, total, asserts nothing about the
+/// value. These are the anchor's own copies of the SAME carriers
+/// `mirsem::register_int_bitwise` registers on the MirSem side and `ground_int`'s
+/// BITWISE SHAPE LANE grounds to. Must run before `register_binop_inductive` /
+/// `register_eval_bin` / `register_eval_rvalue` so both names are resolvable constants
+/// by the time the minors reference them.
+fn register_int_lor_xor(env: &mut Environment) -> Result<(), String> {
+    let bd = || BinderData::from(BinderInfo::Default);
+    for name in ["Int.lor", "Int.xor"] {
+        let int_binop_ty = Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()));
+        let placeholder = {
+            let zero = int_lit(0);
+            Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), zero))
+        };
+        env.add_decl_if_absent(Declaration::Opaque {
+            name: Name::from_string(name),
+            level_params: vec![],
+            type_: int_binop_ty,
+            value: placeholder,
+        })
+        .map_err(|e| format!("add_decl({name}): {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Register the Opaque `Int.shiftLeft : Int → Int → Int` constant (idempotent) —
+/// Trust: SHL ANCHOR. Same honesty tier and discipline as its three siblings above.
+fn register_int_shl(env: &mut Environment) -> Result<(), String> {
+    let bd = || BinderData::from(BinderInfo::Default);
+    let int_binop_ty = Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()));
+    let placeholder = {
+        let zero = int_lit(0);
+        Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), zero))
+    };
+    env.add_decl_if_absent(Declaration::Opaque {
+        name: Name::from_string("Int.shiftLeft"),
+        level_params: vec![],
+        type_: int_binop_ty,
+        value: placeholder,
+    })
+    .map_err(|e| format!("add_decl(Int.shiftLeft): {e:?}"))?;
     Ok(())
 }
 
@@ -2415,6 +2937,38 @@ fn register_eval_bin(env: &mut Environment) -> Result<(), String> {
             // Trust: M6 rung 9, ANCHOR BitAnd — the seventh minor premise (Opaque
             // `Int.land`).
             int_op("Int.land"),
+            // Trust: OR/XOR ANCHOR — the eighth and ninth minor premises, POSITIONAL:
+            // they must sit in the same order as the inductive's constructors or the
+            // recursor dispatches the WRONG op — a mistake the self-relating refinement
+            // would prove without complaint (both sides would carry the same wrong
+            // minor). The cross-op fail-closed probes below are what catch a swap.
+            int_op("Int.lor"),
+            int_op("Int.xor"),
+            // Trust: SHL ANCHOR — the tenth minor premise, POSITIONAL like its
+            // siblings; the SECOND site is register_eval_rvalue's bin_case below.
+            int_op("Int.shiftLeft"),
+            // Trust (#53): the BOOLEAN CONNECTIVES — eleventh/twelfth/thirteenth minor
+            // premises, POSITIONAL like every sibling above.
+            //
+            // NOT `int_op` of a fresh opaque. An opaque here would reintroduce exactly
+            // the defect these constructors exist to remove: on symbolic operands the
+            // refinement would close by `rfl` while asserting nothing a consumer
+            // contract could discharge against. These are BUILT terms that REDUCE.
+            //
+            // `nonzero x` is `Bool.not (Int.beq x 0)` — the same `Int.beq`/`Bool.not`
+            // primitives `cmp_bool_expr` already uses — and the dispatch is the
+            // `Bool.rec` idiom `bool_as_int` establishes, with an `Int` motive so each
+            // minor lands directly on the 0/1 carrier:
+            //   BAnd a b = if a≠0 then (if b≠0 then 1 else 0) else 0
+            //   BOr  a b = if a≠0 then 1 else (if b≠0 then 1 else 0)
+            //   BXor a b = if a≠0 then (if b≠0 then 0 else 1) else (if b≠0 then 1 else 0)
+            // Semantically identical to `semIntBinOp`'s
+            // `.ok (if (lhs != 0) && (rhs != 0) then 1 else 0)` family in
+            // `lean/trust_ir-semantics/TrustIr/Semantics/Arith.lean`, which is what the
+            // bridge's agreement theorem is stated over.
+            bool_connective_minor(BoolConnective::And, ei(), ej()),
+            bool_connective_minor(BoolConnective::Or, ei(), ej()),
+            bool_connective_minor(BoolConnective::Xor, ei(), ej()),
             Expr::bvar(2), // op
         ],
     );
@@ -2492,13 +3046,47 @@ fn register_operand_inductive(env: &mut Environment) -> Result<(), String> {
         name: Name::from_string(TRUSTIR_OPERAND_LEN),
         type_: Expr::pi(bd(), operand_ty(), operand_ty()),
     };
+    // Trust: DELTA-2 (2026-08-03) — the pre-op / cast call-argument carriers, APPENDED
+    // after `len_ctor` so every existing minor-premise position is unchanged and the
+    // Var/Const/Field/Index/Len reductions stay byte-for-byte identical.
+    //
+    // Each takes the operand FIRST and the width SECOND, and each is recursive in the
+    // operand field only. The width is a `Nat` payload, not a recursive field.
+    let preop_not_at_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_PREOP_NOT_AT),
+        type_: Expr::pi(bd(), operand_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
+    };
+    let cast_u_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_CAST_U),
+        type_: Expr::pi(bd(), operand_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
+    };
+    let cast_s_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_CAST_S),
+        type_: Expr::pi(bd(), operand_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
+    };
+    // Trust: DELTA-4 — `Discr (paramIdx : Nat) : Operand`, NON-recursive (the tag read
+    // is on a parameter directly, exactly like `Field`'s base).
+    let discr_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_DISCR),
+        type_: Expr::pi(bd(), nat_ty(), operand_ty()),
+    };
     let decl = InductiveDecl {
         level_params: vec![],
         num_params: 0,
         types: vec![InductiveType {
             name: name.clone(),
             type_: Expr::type_(),
-            constructors: vec![var_ctor, const_ctor, field_ctor, index_ctor, len_ctor],
+            constructors: vec![
+                var_ctor,
+                const_ctor,
+                field_ctor,
+                index_ctor,
+                len_ctor,
+                preop_not_at_ctor,
+                cast_u_ctor,
+                cast_s_ctor,
+                discr_ctor,
+            ],
         }],
     };
     env.add_inductive(decl).map_err(|e| format!("add_inductive(TrustIr.Operand): {e:?}"))?;
@@ -2592,10 +3180,54 @@ fn register_eval_operand(env: &mut Environment) -> Result<(), String> {
     // Operand.rec.{1} motive var_case const_case field_case index_case len_case op — the
     // `index_case`/`len_case` minors are APPENDED after the unchanged Var/Const/Field
     // minors, so those reductions are preserved byte-for-byte.
-    let rec_app = Expr::apps(
-        operand_rec,
-        [motive, var_case, const_case, field_case, index_case, len_case, Expr::bvar(0)],
-    );
+    // Trust: DELTA-2 — the three ADDITIVE minors, in constructor order. Each ctor has
+    // ONE recursive field (the operand) plus a NON-recursive `Nat` width, so the
+    // recursor binds: λ(s:Operand). λ(w:Nat). λ(ih_s:Int). <body>
+    // de-Bruijn at the body: ih_s = bvar(0), w = bvar(1), s = bvar(2).
+    //
+    // The width reaches the term as `Int.ofNat w` — the same `Int.ofNat` lift the
+    // `field_case` already uses for its `Nat` payload.
+    let width_int = || Expr::app(cst("Int.ofNat"), Expr::bvar(1));
+    let preop_not_at_case = {
+        // bnotAt (evalOperand e s) (Int.ofNat w) — OPAQUE, no numeric claim.
+        let body = Expr::apps(cst(TRUSTIR_BNOT_AT), [Expr::bvar(0), width_int()]);
+        Expr::lam(bd(), operand_ty(), Expr::lam(bd(), nat_ty(), Expr::lam(bd(), int_ty(), body)))
+    };
+    // The CAST minors are EXACT, not opaque: `castU`/`castS` are reducible Definitions
+    // built from the same Int.mod/Bool.rec recipe as `exact_int_cast_expr`. That is the
+    // whole point — a cast that did not compute would make the lane a fiction.
+    let cast_u_case = {
+        let body = Expr::apps(cst(TRUSTIR_CAST_U), [Expr::bvar(0), width_int()]);
+        Expr::lam(bd(), operand_ty(), Expr::lam(bd(), nat_ty(), Expr::lam(bd(), int_ty(), body)))
+    };
+    let cast_s_case = {
+        let body = Expr::apps(cst(TRUSTIR_CAST_S), [Expr::bvar(0), width_int()]);
+        Expr::lam(bd(), operand_ty(), Expr::lam(bd(), nat_ty(), Expr::lam(bd(), int_ty(), body)))
+    };
+    // Trust: DELTA-4 — `Discr p ↦ idxElem (e p) (Int -1)`. NON-recursive, so the minor
+    // binds only the Nat payload: λ(p:Nat). idxElem (e p) (Int RESERVED). p = bvar(0),
+    // and the env `e` is bvar(2) at this depth (the same position `field_case` reads it
+    // from, since that minor binds two Nats and this one binds one — see below).
+    let discr_case = {
+        let body = Expr::apps(cst(TRUSTIR_IDX_ELEM), [
+            Expr::app(Expr::bvar(2), Expr::bvar(0)),
+            int_lit(TRUSTIR_DISCRIMINANT_TAG_KEY),
+        ]);
+        Expr::lam(bd(), nat_ty(), body)
+    };
+    let rec_app = Expr::apps(operand_rec, [
+        motive,
+        var_case,
+        const_case,
+        field_case,
+        index_case,
+        len_case,
+        preop_not_at_case,
+        cast_u_case,
+        cast_s_case,
+        discr_case,
+        Expr::bvar(0),
+    ]);
     let val = Expr::lam(bd(), env_ty(), Expr::lam(bd(), operand_ty(), rec_app));
     env.add_decl(Declaration::Definition {
         name,
@@ -2638,6 +3270,160 @@ fn register_unop_inductive(env: &mut Environment) -> Result<(), String> {
 /// a `Declaration::Opaque` whose placeholder body the kernel never unfolds, so
 /// `bnot x ≡ bnot y` IFF `x ≡ y` (a fresh uninterpreted symbol). `Opaque` is NOT a
 /// `ConstantKind::Axiom`, so a term naming `bnot` gains no axiom dependency.
+/// Trust: DELTA-2 (2026-08-03) — register `bnotAt : Int → Int → Int` (value, width),
+/// the OPAQUE total bitwise-NOT-at-width, plus the two EXACT cast definitions
+/// `castU`/`castS : Int → Int → Int` (value, width).
+///
+/// `bnotAt` is `Declaration::Opaque` — uninterpreted, so a term naming it gains no
+/// axiom dependency and the certificate claims only that `!x` is SOME Int determined
+/// by (value, width). That is the honest tier: this fragment has no bitvector value
+/// theory, so any numeric claim about `!x` would be invented.
+///
+/// `castU`/`castS` are the OPPOSITE choice and deliberately so: they are REDUCIBLE
+/// Definitions wrapping the exact `Int.mod`/`Bool.rec` recipe, because a cast that did
+/// not compute would let `i32 -> u32 -> i32` masquerade as the identity — which is
+/// false for every value with the top bit set, and is the soundness crux of this lane.
+fn register_bnot_at_and_casts(env: &mut Environment) -> Result<(), String> {
+    let bd = || BinderData::from(BinderInfo::Default);
+    let binary_int = || Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()));
+    if env.get_const(&Name::from_string(TRUSTIR_BNOT_AT)).is_none() {
+        let placeholder =
+            Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), int_lit(0)));
+        env.add_decl(Declaration::Opaque {
+            name: Name::from_string(TRUSTIR_BNOT_AT),
+            level_params: vec![],
+            type_: binary_int(),
+            value: placeholder,
+        })
+        .map_err(|e| format!("add_decl(bnotAt): {e:?}"))?;
+    }
+    // castU/castS take the width as an `Int` operand, so the recipe is built under two
+    // binders: value = bvar(1), width = bvar(0). `exact_int_cast_expr` needs a STATIC
+    // width to pick the modulus, so these are registered per admitted width by
+    // `register_cast_at_width` below; the bare names are the dispatch heads.
+    // Trust: the off-whitelist cast default — OPAQUE by construction, so an
+    // unadmitted width can never reduce to a value (least of all to the identity).
+    if env.get_const(&Name::from_string(TRUSTIR_CAST_UNSUPPORTED)).is_none() {
+        let placeholder = Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), int_lit(0)));
+        env.add_decl(Declaration::Opaque {
+            name: Name::from_string(TRUSTIR_CAST_UNSUPPORTED),
+            level_params: vec![],
+            type_: binary_int(),
+            value: placeholder,
+        })
+        .map_err(|e| format!("add_decl(castUnsupported): {e:?}"))?;
+    }
+    for (name, signed) in [(TRUSTIR_CAST_U, false), (TRUSTIR_CAST_S, true)] {
+        if env.get_const(&Name::from_string(name)).is_some() {
+            continue;
+        }
+        // Width-dispatching definition: `λ v w. <exact cast at each admitted width>`,
+        // a DESCENDING `Bool.rec` ladder over `w <= <k>` for the four admitted widths,
+        // falling through to the value unchanged at an unadmitted width.
+        //
+        // Trust: CAST DISPATCH FIX (2026-08-11). The previous ladder ran ASCENDING with
+        // the guard `<k> <= w` and `Bool.rec`'s minors in (false, true) order, which put
+        // the WIDEST arm outermost on the FALSE branch: `castU x 8` resolved to the
+        // width-64 arm, i.e. `x as u64`, for EVERY width. Measured before the fix:
+        // `castU(300, 8)` reduced to `300` rather than `44`, and `castU(65600, 16)` to
+        // `65600` rather than `64`. Nothing caught it because every consumer checked the
+        // carrier with a SELF-RELATING refinement (`check_operand_refinement_model`,
+        // `check_body_refinement_model_chain`), which proves `castU x 8 = castU x 8`
+        // whatever `castU` computes. `trust_ir_cast_mapping_value_oracle` and
+        // `trustir_cast_dispatch_is_exact_per_width` are the value-level pins that do.
+        //
+        // `Bool.rec` minors are (false_case, true_case). Descending order makes each
+        // guard reachable only when every wider one failed, so on the whitelist
+        // {8,16,32,64} the ladder is EXACT rather than merely ordered; the outer
+        // `8 <= w` test keeps a sub-8 width off the width-8 arm instead of aliasing
+        // onto it. A width outside the whitelist cannot be built (`IntCastDest`), so
+        // the fall-through exists only to make the Definition total.
+        let motive = || Expr::lam(bd(), cst("Bool"), int_ty());
+        let bool_rec = || {
+            Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())])
+        };
+        // `decide (a <= b)`, the reducible form the rest of this module already uses.
+        let le = |a: Expr, b: Expr| {
+            Expr::apps(cst("decide"), [
+                Expr::apps(cst("Int.le"), [a.clone(), b.clone()]),
+                Expr::apps(cst("Int.decLe"), [a, b]),
+            ])
+        };
+        // Trust: CAST FALL-THROUGH FIX (2026-08-11, same day) — the off-whitelist
+        // default is the OPAQUE `castUnsupported`, NOT the value unchanged.
+        //
+        // The first version of this repair used `Expr::bvar(1)` (the identity) as the
+        // total-ing default, on the reasoning that `IntCastDest` makes an off-whitelist
+        // width unconstructible. But `IrOperand::CastU(_, u32)` takes ANY `u32` and the
+        // denotation path applies no whitelist check, so the invariant is enforced only
+        // at today's three construction sites. The identity is the single WORST default
+        // available: it is exactly the cast-as-identity forgery the value oracle exists
+        // to reject, so a fourth construction site that forgot `IntCastDest::new` would
+        // get a silently wrong denotation that every self-relating lane certifies. An
+        // opaque cannot prove any value, so the same slip fails closed instead.
+        //
+        // The ladder is also EXACT-BY-EQUALITY rather than ordered. The previous
+        // descending `w <= k` form was exact ON the whitelist but silently rounded UP
+        // between it (w = 9..15 took the width-16 arm), which is the same class of
+        // quiet-wrong-answer as the inverted dispatch it replaced. Each rung now tests
+        // `w <= k` AND `k <= w`.
+        let unsupported =
+            Expr::apps(cst(TRUSTIR_CAST_UNSUPPORTED), [Expr::bvar(1), Expr::bvar(0)]);
+        let mut body = unsupported;
+        for width in [64_u32, 32, 16, 8] {
+            let dest = IntCastDest::new(width, signed).expect("whitelisted");
+            let at_width = exact_int_cast_expr(Expr::bvar(1), dest);
+            let k = || int_lit(i128::from(width));
+            // w == width, spelled as the two `<=` the rest of this module already
+            // reduces: `w <= k ? (k <= w ? cast_k : rest) : rest`.
+            let inner = Expr::apps(bool_rec(), [
+                motive(),
+                body.clone(),
+                at_width,
+                le(k(), Expr::bvar(0)),
+            ]);
+            body = Expr::apps(bool_rec(), [
+                motive(),
+                body,
+                inner,
+                le(Expr::bvar(0), k()),
+            ]);
+        }
+        let value = Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), body));
+        env.add_decl(Declaration::Definition {
+            name: Name::from_string(name),
+            level_params: vec![],
+            type_: binary_int(),
+            value,
+            // Trust: CAST REDUCTION (2026-08-11) — `is_reducible: false`.
+            //
+            // THE MEASURED EFFECT, which is what this flag is set on: with the flag
+            // TRUE, `is_def_eq(evalOperand e (CastU (Const 300) 8), castU 300 8)` is
+            // FALSE; with it cleared, TRUE — reproduced with the width dispatch above
+            // ALREADY fixed, and with `PreOpNotAt` and `Discr` (both opaque heads)
+            // reducing correctly in the same run, which is what isolates the flag from
+            // the minor, the constructor order and the arity. `castU 300 8` still
+            // computes to `44` against a value either way, so this does NOT make the
+            // cast opaque.
+            //
+            // THE MECHANISM IS DELIBERATELY NOT CLAIMED HERE. An earlier version of
+            // this comment asserted that reducibility makes the definition unfold
+            // eagerly and PRE-EMPT iota. An adversarial review refuted that reading
+            // from the kernel source: `is_def_eq_core` runs `whnf_core_no_delta` on
+            // both sides before any delta step, and the delta path is reducibility-
+            // blind unless `honor_reducibility` is set (it is not). What the flag
+            // actually changes is lazy-delta unfold ORDER — `Regular` outranks
+            // `Reducible`, so only the `evalOperand` side unfolds. Scheduling, not
+            // pre-emption. The effect above is reproducible; the explanation for it
+            // was wrong, and a wrong explanation is how the next person flips this
+            // back on a false premise.
+            is_reducible: false,
+        })
+        .map_err(|e| format!("add_decl({name}): {e:?}"))?;
+    }
+    Ok(())
+}
+
 fn register_bnot(env: &mut Environment) -> Result<(), String> {
     let name = Name::from_string(TRUSTIR_BNOT);
     if env.get_const(&name).is_some() {
@@ -2773,6 +3559,29 @@ fn register_eval_rvalue(env: &mut Environment) -> Result<(), String> {
                 // Trust: M6 rung 9, ANCHOR BitAnd — the seventh minor premise (Opaque
                 // `Int.land`).
                 int_binop_expr(TrustIrBinOp::And, eval_a(), eval_b()),
+                // Trust: OR/XOR ANCHOR — the eighth and ninth minor premises. This is
+                // the SECOND positional `BinOp.rec` application in this file (the first
+                // is `register_eval_bin`); forgetting it makes the whole `trustir_env()`
+                // build fail — measured before this line landed: every directory's
+                // via_trustir collapsed to 0 and two trust-ir-only bodies fell out of
+                // `fully_faithful` entirely. A missing minor is a HARD env failure, not
+                // a quiet gap, which is the acceptable direction — but the census is
+                // the only thing that surfaces it, so: measure after EVERY constructor
+                // addition, before the suite.
+                int_binop_expr(TrustIrBinOp::Or, eval_a(), eval_b()),
+                int_binop_expr(TrustIrBinOp::Xor, eval_a(), eval_b()),
+                // Trust: SHL ANCHOR — the tenth minor of the SECOND positional site.
+                int_binop_expr(TrustIrBinOp::Shl, eval_a(), eval_b()),
+                // Trust (#53): the BOOLEAN CONNECTIVES — eleventh/twelfth/thirteenth
+                // minors of this SECOND positional site. Omitting them is exactly the
+                // failure the comment above describes, and it was reproduced here
+                // before this line landed: the kernel rejected `evalRvalue` with a
+                // TypeMismatch (the recursor consumed `op` as a missing minor), so
+                // every bool body reported KernelRejected rather than certifying.
+                // A missing minor is a HARD env failure, never a quiet gap.
+                int_binop_expr(TrustIrBinOp::BAnd, eval_a(), eval_b()),
+                int_binop_expr(TrustIrBinOp::BOr, eval_a(), eval_b()),
+                int_binop_expr(TrustIrBinOp::BXor, eval_a(), eval_b()),
                 Expr::bvar(2),
             ],
         );
@@ -8015,9 +8824,33 @@ pub(crate) fn cond_update_preservation_proof_ir(lp: &IrCondUpdateLoop) -> Expr {
     let m_idx = lp.m_idx;
     let i_idx = lp.i_idx;
     let c_lit = int_lit(lp.c);
-    // The select's update guard `i > m` ≡ `Cmp Gt (Var i)(Var m)`.
-    let upd_cond =
-        IrCond { op: TrustIrCmpOp::Gt, a: IrOperand::Var(i_idx), b: IrOperand::Var(m_idx) };
+    // Trust (#54, 2026-08-15): the update guard is READ FROM THE BODY, not
+    // synthesized. Max-scan carries `Sel(m, i>m, i, m)`; `memchr`'s `count_raw`
+    // carries `Sel(m, byte==needle, m+1, m)`. Both are `Sel` statements writing
+    // `m_idx`; only the condition and the TRUE branch differ, and the reduct's
+    // head is a `Bool.rec` over that condition either way (measured).
+    let (upd_cond, upd_true) = {
+        let mut found = None;
+        for st in &lp.body {
+            if let IrSStmt::Sel(idx, c, t, _f) = st
+                && *idx == m_idx
+            {
+                found = Some((c.clone(), t.clone()));
+            }
+        }
+        match found {
+            Some(pair) => pair,
+            // No `Sel` on `m` — not this shape. Keep the historical guard so the
+            // term is still well-formed; the instance check will reject it.
+            None => (
+                IrCond { op: TrustIrCmpOp::Gt, a: IrOperand::Var(i_idx), b: IrOperand::Var(m_idx) },
+                IrOperand::Var(i_idx),
+            ),
+        }
+    };
+    // Is the TRUE branch the counter itself (max-scan) or a computed increment
+    // (accumulate)? That decides which hypothesis discharges the true arm.
+    let true_is_counter = matches!(upd_true, IrOperand::Var(v) if v == i_idx);
 
     // The preservation hypothesis `pres` binder type (matches `preservation_hyp_type_s_ir`'s
     // outer shape — but here we build the proof term `λ e λ hI λ hg . …`).
@@ -8042,9 +8875,20 @@ pub(crate) fn cond_update_preservation_proof_ir(lp: &IrCondUpdateLoop) -> Expr {
 
     // The `iteI e (i>m) (e i)(e m)` term (the reduced `execS`-set of `m`), at the `λ e λ hI λ hg`
     // depth (e = 2).
+    // The TRUE branch of the select, at binder depth `d`: `e i` for max-scan,
+    // `(e m) + 1` for the accumulate shape. The motive, the `iteI` term and the
+    // true arm must ALL use this — changing only the arm is what the kernel
+    // rejected first, with the motive still claiming `e i`.
+    let true_term_at = |d: u32| {
+        if true_is_counter {
+            e_at(i_idx, d)
+        } else {
+            Expr::apps(cst("Int.add"), [e_at(m_idx, d), int_one()])
+        }
+    };
     let ite_term = Expr::apps(
         cst(TRUSTIR_ITE_I),
-        [Expr::bvar(2), upd_cond.to_cond_expr(), e_i.clone(), e_m.clone()],
+        [Expr::bvar(2), upd_cond.to_cond_expr(), true_term_at(2), e_m.clone()],
     );
     // The LEFT conjunct prop the reduced codomain carries: `Int.le c (iteI …)`.
     let prop_left = Expr::apps(cst("Int.le"), [c_lit.clone(), ite_term.clone()]);
@@ -8078,9 +8922,12 @@ pub(crate) fn cond_update_preservation_proof_ir(lp: &IrCondUpdateLoop) -> Expr {
             // cod (under `λ b` AND `Pi(eq_dom)`): Int.le c (Bool.rec (λ_.Int) (e m)(e i) b)
             //   e = bvar(4), b = bvar(1).
             let e_m4 = e_at(m_idx, 4);
-            let e_i4 = e_at(i_idx, 4);
-            let body_b =
-                Expr::apps(bool_rec_int(), [int_motive.clone(), e_m4, e_i4, Expr::bvar(1)]);
+            let body_b = Expr::apps(bool_rec_int(), [
+                int_motive.clone(),
+                e_m4,
+                true_term_at(4),
+                Expr::bvar(1),
+            ]);
             let cod = Expr::apps(cst("Int.le"), [c_lit.clone(), body_b]);
             let arrow = Expr::pi(bd(), eq_dom, cod);
             Expr::lam(bd(), cst("Bool"), arrow)
@@ -8108,15 +8955,35 @@ pub(crate) fn cond_update_preservation_proof_ir(lp: &IrCondUpdateLoop) -> Expr {
         let true_case = {
             let g_t = upd_guard_at(2);
             let eq_true = eq_bool_true(g_t);
-            let e_m3 = e_at(m_idx, 3);
+            let e_m3b = e_at(m_idx, 3);
             let e_i3 = e_at(i_idx, 3);
-            let and_lo_m3 = Expr::apps(cst("Int.le"), [c_lit.clone(), e_m3]);
+            let and_lo_m3 = Expr::apps(cst("Int.le"), [c_lit.clone(), e_m3b.clone()]);
             let and_lo_i3 = Expr::apps(cst("Int.le"), [c_lit.clone(), e_i3.clone()]);
-            let h_i3 = Expr::apps(
-                Expr::const_(Name::from_string("And.right"), vec![]),
-                [and_lo_m3, and_lo_i3, Expr::bvar(2)],
-            );
-            Expr::lam(bd(), eq_true, h_i3)
+            // MAX-SCAN: the true branch IS `e i`, discharged by `And.right hI`.
+            // ACCUMULATE (Trust #54): the true branch is `m + 1`, discharged by
+            // `c <= m <= m+1` — the SAME `le_trans`/`le_self_add_one` shape the
+            // RIGHT conjunct already uses, with `m` in place of `i`.
+            let arm = if true_is_counter {
+                Expr::apps(
+                    Expr::const_(Name::from_string("And.right"), vec![]),
+                    [and_lo_m3.clone(), and_lo_i3.clone(), Expr::bvar(2)],
+                )
+            } else {
+                let h_m3 = Expr::apps(
+                    Expr::const_(Name::from_string("And.left"), vec![]),
+                    [and_lo_m3.clone(), and_lo_i3.clone(), Expr::bvar(2)],
+                );
+                let m3_plus_one = Expr::apps(cst("Int.add"), [e_m3b.clone(), int_one()]);
+                let self_le_succ = Expr::app(cst("Int.le_self_add_one"), e_m3b.clone());
+                Expr::apps(cst("Int.le_trans"), [
+                    c_lit.clone(),
+                    e_m3b.clone(),
+                    m3_plus_one,
+                    h_m3,
+                    self_le_succ,
+                ])
+            };
+            Expr::lam(bd(), eq_true, arm)
         };
         let bool_rec0 = Expr::const_(Name::from_string("Bool.rec"), vec![Level::zero()]);
         let g = upd_guard_at(2); // at `λ e λ hI λ hg` depth, e = 2
@@ -8226,9 +9093,52 @@ pub fn check_cond_update_loop_instance(lp: &IrCondUpdateLoop) -> RefinementVerdi
         Some(IrSStmt::Assign(idx, IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(a), IrOperand::Const(1))))
             if *idx == lp.i_idx && *a == lp.i_idx
     );
-    if lp.body.len() != 2 || !ok_sel || !ok_inc {
+    let max_scan_ok = lp.body.len() == 2 && ok_sel && ok_inc;
+
+    // Trust (#54, 2026-08-15): the ACCUMULATE shape, `memchr::One::count_raw`:
+    //
+    //   _t := Add(Var m, 1)          // the incremented candidate, a FRESH temp
+    //   m  := Sel(<any cond>, _t, m) // take it, or keep m
+    //   i  := Add(Var i, 1)
+    //
+    // Gated exactly as tightly as the max-scan arm above, because this predicate
+    // is what guarantees the proof term matches the body:
+    //   * the temp must be FRESH (neither the accumulator nor the counter), so the
+    //     `Sel`'s true branch cannot alias either of the invariant's subjects;
+    //   * the temp must be `m + 1` — the increment is on the ACCUMULATOR, not on
+    //     something else that happens to be in scope;
+    //   * the `Sel` must write `m` and its FALSE branch must be `m` itself, so the
+    //     not-taken path provably preserves the bound;
+    //   * the counter increment is the same `i := i + 1` the max-scan arm requires.
+    // The `Sel`'s CONDITION is unconstrained on purpose: the invariant `c <= m` is
+    // preserved on BOTH branches regardless of which is taken, which is exactly
+    // why the `Bool.rec` case-split in the proof discharges without knowing it.
+    let accumulate_ok = {
+        let inc_tmp = match lp.body.first() {
+            Some(IrSStmt::Assign(t, IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(a), IrOperand::Const(1))))
+                if *a == lp.m_idx && *t != lp.m_idx && *t != lp.i_idx =>
+            {
+                Some(*t)
+            }
+            _ => None,
+        };
+        let sel_ok = matches!(
+            (inc_tmp, lp.body.get(1)),
+            (Some(t), Some(IrSStmt::Sel(idx, _cond, IrOperand::Var(a), IrOperand::Var(b))))
+                if *idx == lp.m_idx && *a == t && *b == lp.m_idx
+        );
+        let inc2_ok = matches!(
+            lp.body.get(2),
+            Some(IrSStmt::Assign(idx, IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(a), IrOperand::Const(1))))
+                if *idx == lp.i_idx && *a == lp.i_idx
+        );
+        lp.body.len() == 3 && inc_tmp.is_some() && sel_ok && inc2_ok
+    };
+
+    if !max_scan_ok && !accumulate_ok {
         return RefinementVerdict::KernelRejected(
-            "cond-update: body is not the recognized `m := Sel(i>m) i m; i := i+1` shape"
+            "cond-update: body is not the recognized `m := Sel(i>m) i m; i := i+1` \
+             (max-scan) or `t := m+1; m := Sel(_) t m; i := i+1` (accumulate) shape"
                 .to_string(),
         );
     }
@@ -8747,6 +9657,12 @@ fn trustir_env_uncached() -> Result<Environment, String> {
     // reasoning: `Int.land` must be resolvable before `register_eval_bin`/
     // `register_eval_rvalue` reference it.
     register_int_land(&mut env)?;
+    // Trust: OR/XOR ANCHOR — same reasoning, same position: resolvable before the
+    // evalBin/evalRvalue minors reference them.
+    register_int_lor_xor(&mut env)?;
+    // Trust: SHL ANCHOR — same reasoning. The anchor env does NOT inherit MirSem's
+    // `Int.shiftLeft` registration (fresh from `with_prelude()`), so it needs its own.
+    register_int_shl(&mut env)?;
     // POC scalar BinOp anchor.
     register_binop_inductive(&mut env)?;
     register_eval_bin(&mut env)?;
@@ -8774,6 +9690,12 @@ fn trustir_env_uncached() -> Result<Environment, String> {
     // modulo-3 preserved (`idx_elem_prime` Opaque, `set_key_eq` axiom-free Definition).
     register_field_set_surface_ir(&mut env)?;
     // Straight-line fragment.
+    // Trust: DELTA-2 — MUST precede `register_operand_inductive`/`register_eval_operand`:
+    // the new evalOperand minors syntactically reference `bnotAt`/`castU`/`castS`, so
+    // those constants have to resolve first (the `register_int_shr`-first convention).
+    // Landing it after instead made every trustir_env() build fail — caught by the
+    // exact-cast pins, which is what they are for.
+    register_bnot_at_and_casts(&mut env)?;
     register_operand_inductive(&mut env)?;
     register_eval_operand(&mut env)?;
     register_unop_inductive(&mut env)?;
@@ -9634,7 +10556,7 @@ pub fn check_body_refinement_model_chain(body: &IrBody) -> RefinementVerdict {
 /// the statement, register the theorem, and audit its axiom closure via the kernel's
 /// own `axiom_deps`. `None` statement/proof (the live grounder declined the formula)
 /// is fail-closed `KernelRejected`.
-fn check_refinement_decl(
+pub(crate) fn check_refinement_decl(
     decl_name: &str,
     statement: Option<Expr>,
     proof: Option<Expr>,
@@ -9805,6 +10727,158 @@ pub fn check_branch_refinement(cfg: &IrCfg) -> RefinementVerdict {
         "Trust.TrustIr.Refinement.branch_adequacy",
         branch_refinement_statement(cfg, None),
         branch_refinement_proof(cfg),
+    )
+}
+
+/// Trust: B3 — the MODEL-ONLY branch refinement statement: LHS the SAME `evalCfg`
+/// application the grounder-connected statement uses; RHS the Rust-computed
+/// fully-inlined MODEL denotation ([`IrCfg::inlined_return_denotation`]) instead of
+/// the live-grounded formula. No `is_grounder_connected` gate — this is the lane a
+/// `Discr`-guarded CFG certifies on.
+pub(crate) fn branch_model_refinement_statement(cfg: &IrCfg, claimed: Option<&Expr>) -> Option<Expr> {
+    let bd = || BinderData::from(BinderInfo::Default);
+    let indices = cfg.param_indices();
+    let n = indices.len();
+    let env = refinement_env(&indices);
+    let lhs = Expr::apps(
+        cst(TRUSTIR_EVAL_CFG),
+        [env.clone(), cfg.to_cfg_expr(), Expr::nat_lit(cfg.fuel), Expr::nat_lit(cfg.entry)],
+    );
+    let rhs = match claimed {
+        Some(e) => e.clone(),
+        None => cfg.inlined_return_denotation(&env)?,
+    };
+    let eq = Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]);
+    let mut stmt = Expr::apps(eq, [int_ty(), lhs, rhs]);
+    for _ in 0..n {
+        stmt = Expr::pi(bd(), int_ty(), stmt);
+    }
+    Some(stmt)
+}
+
+pub(crate) fn branch_model_refinement_proof(cfg: &IrCfg) -> Option<Expr> {
+    let bd = || BinderData::from(BinderInfo::Default);
+    let indices = cfg.param_indices();
+    let n = indices.len();
+    let env = refinement_env(&indices);
+    let rhs = cfg.inlined_return_denotation(&env)?;
+    let eq_refl = Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]);
+    let mut refl = Expr::apps(eq_refl, [int_ty(), rhs]);
+    for _ in 0..n {
+        refl = Expr::lam(bd(), int_ty(), refl);
+    }
+    Some(refl)
+}
+
+/// Trust: B3 — check the MODEL-ONLY BRANCH refinement, modulo 3: the branch-lane
+/// sibling of [`check_body_refinement_model_chain`], and the owner-ruled closure of
+/// the asymmetry that shaped this campaign (the chain lane had a model variant, the
+/// branch lane did not, so a MODEL-ONLY carrier — `Discr` — could close there but
+/// never here).
+///
+/// GENUINE (the LHS runs the SAME `evalCfg` operational fold over the ACTUAL CFG; the
+/// RHS is the fully-inlined model term, provably — not merely claimed — equal to it by
+/// kernel reduction), fail-closed, and SELF-RELATING like every model lane: statement
+/// and proof are built from the same `IrCfg`, so a WRONG TRANSLATION (swapped
+/// polarity, cross-wired arms, a mis-mapped comparison op) still proves. The value
+/// oracle `trust_ir_branch_model_value_oracle` is what defends the translation, on
+/// the value-decidable fragment; the honesty pin records that a `Discr`-guarded CFG's
+/// certificate asserts STRUCTURAL correspondence only (the tag is opaque, so no arm
+/// choice is ever decided at values).
+#[must_use]
+pub fn check_branch_refinement_model(cfg: &IrCfg) -> RefinementVerdict {
+    check_refinement_decl(
+        "Trust.TrustIr.Refinement.branch_model",
+        branch_model_refinement_statement(cfg, None),
+        branch_model_refinement_proof(cfg),
+    )
+}
+
+/// Trust: SET_BIT M1 (2026-08-12) — check the CELL-POST branch model, modulo 3: the
+/// SAME statement/proof builders as [`check_branch_refinement_model`], registered
+/// under a DISTINCT claim name so the certificate FAMILY is auditable from the decl
+/// alone. The `IrCfg` here is a MUTATOR model (built only by
+/// `prove::divergence_guarded_rmw_mutator_ir_cfg`): each arm `Return`s a FRESH
+/// post slot holding the recv cell's post-value, so the theorem's "return value" IS
+/// the cell-post equation — a CELL-POST adequacy claim, not return-value adequacy.
+/// The `&mut Self` return, the frame, and the panic exclusion live in the walk's
+/// W-gates, not in this statement; the kernel tier contributes structure and
+/// cross-opaque-head rejection only (the arms carry opaque `Int.lor`/`Int.land`/
+/// `bnot` heads, so no kernel value tier exists — the B/C oracle is the value
+/// defense).
+#[must_use]
+pub fn check_cell_post_branch_model(cfg: &IrCfg) -> RefinementVerdict {
+    check_refinement_decl(
+        "Trust.TrustIr.Refinement.cell_post_branch_model",
+        branch_model_refinement_statement(cfg, None),
+        branch_model_refinement_proof(cfg),
+    )
+}
+
+/// Trust: W19 ADT-CELL (2026-08-14) — check the ADT-cell STORE-OF-CALL model,
+/// modulo 3: the same statement/proof builders, a DISTINCT claim name because the
+/// claim is DIFFERENT IN KIND from the scalar cell-post family. The cell here is
+/// an ADT, and its value never enters the model as a number: the model is the
+/// IDENTITY trace `post := Use(Var(r))` with `r` the call result as a fresh
+/// Pi-bound slot — the theorem states only "the cell's post-value is exactly the
+/// value the callee returned", the pure DATAFLOW of a store-of-call-result. The
+/// `Int` sort on the slot is an opaque token here (the Discr precedent: the value
+/// is never computed on, so no scalar reading is asserted); everything
+/// substantive — the store is the last write, `r`'s only def is the call, the
+/// frame, the callee's isolation — lives in the walk's gates
+/// (`prove::adt_cell_post_store_ir_cfg`), the family's value/frame split. Unlike
+/// the opaque bitwise heads, the identity trace IS value-decided at the kernel
+/// tier (`Use` reduces): closing `r` at 7 proves 7 and rejects 8, which the pins
+/// exercise.
+#[must_use]
+pub fn check_adt_cell_post_store_model(cfg: &IrCfg) -> RefinementVerdict {
+    check_refinement_decl(
+        "Trust.TrustIr.Refinement.adt_cell_post_store_model",
+        branch_model_refinement_statement(cfg, None),
+        branch_model_refinement_proof(cfg),
+    )
+}
+
+/// Trust: PAIR RETURN (2026-08-16) — component 0 of a whole-pair checked return
+/// (`overflowing_add`'s `(wrapped_sum, flag)`): the model is the CHAIN body
+/// `[t := Bin(op, a, b); post := Use(CastU/S(t, W))]` — the cast lane's recipe IS
+/// `wrap_W`, so the theorem states the component-0 value is the WRAPPED sum, the
+/// exact reading the retraction refused to approximate with unbounded `Int.add`.
+/// On the CHAIN lane (`evalBody`) deliberately: that is where the cast heads are
+/// exercised and value-pinned; the branch lane's `evalCfg` path is not (measured:
+/// the first draft's `evalCfg`+CastS statement type-mismatched on the closed i32
+/// row). Value-decided: `castU`/`castS` compute on closed literals, so
+/// `200+100 @ u8` proves 44 and rejects 45.
+#[must_use]
+pub fn check_pair_component0_wrap_model(body: &IrBody) -> RefinementVerdict {
+    check_refinement_decl(
+        "Trust.TrustIr.Refinement.pair_component0_wrap_model",
+        body_model_chain_refinement_statement(body, None),
+        body_model_chain_refinement_proof(body),
+    )
+}
+
+/// The row form of [`check_pair_component0_wrap_model`] — the closed numeric
+/// claims (`claimed` literal RHS) the tests pin.
+#[must_use]
+pub fn check_pair_component0_wrap_row(body: &IrBody, claimed: &Expr) -> RefinementVerdict {
+    check_refinement_decl(
+        "Trust.TrustIr.Refinement.pair_component0_wrap_row",
+        body_model_chain_refinement_statement(body, Some(claimed)),
+        body_model_chain_refinement_proof(body),
+    )
+}
+
+/// Trust: PAIR RETURN (2026-08-16) — component 1 (the overflow FLAG, bool-as-int
+/// 0/1): unsigned = `Cmp(Gt, sum, MAX)`; signed = the two-sided Switch
+/// (`Lt(sum, MIN)` then-arm 1, else-arm `Cmp(Gt, sum, MAX)`). `decide`-backed
+/// comparisons compute on closed literals, so the flag rows are value-decided too.
+#[must_use]
+pub fn check_pair_component1_overflow_model(cfg: &IrCfg) -> RefinementVerdict {
+    check_refinement_decl(
+        "Trust.TrustIr.Refinement.pair_component1_overflow_model",
+        branch_model_refinement_statement(cfg, None),
+        branch_model_refinement_proof(cfg),
     )
 }
 
@@ -9987,6 +11061,824 @@ mod exact_cast_tests {
         }
     }
 
+    /// Trust: DELTA-2 (2026-08-03) — THE CARRIER PIN. An operand built from the three
+    /// new constructors must certify on the MODEL lane, and its denotation must be the
+    /// exact reduct of the corresponding `evalOperand` minor. If the minor and
+    /// `operand_denotation` ever drift apart, the refinement silently stops closing and
+    /// every body using these carriers falls back to the MirSem lane — a coverage loss
+    /// that would look like "the recognizer declined" rather than a bug here.
+    #[test]
+    fn delta2_operand_carriers_certify_on_the_model_lane() {
+        use super::{IrOperand, check_operand_refinement_model};
+        use crate::trustir_anchor::RefinementVerdict;
+        for op in [
+            IrOperand::PreOpNotAt(Box::new(IrOperand::Var(0)), 8),
+            IrOperand::PreOpNotAt(Box::new(IrOperand::Var(0)), 64),
+            IrOperand::CastU(Box::new(IrOperand::Var(0)), 32),
+            IrOperand::CastS(Box::new(IrOperand::Var(0)), 32),
+            IrOperand::CastU(Box::new(IrOperand::Var(1)), 8),
+            IrOperand::CastS(Box::new(IrOperand::Var(1)), 64),
+        ] {
+            assert_eq!(
+                check_operand_refinement_model(&op),
+                RefinementVerdict::ProvenModulo3,
+                "{op:?} must certify modulo 3 on the model lane"
+            );
+        }
+    }
+
+    /// Trust: COMPARE-AS-VALUE (2026-08-08) — **THE G1 GATE**, and the only thing in the
+    /// tree that can catch a MIR→trust-ir comparison op-mapping or operand-swap error.
+    ///
+    /// WHY A NORMAL REFINEMENT TEST CANNOT DO THIS. `check_body_refinement` relates the
+    /// trust-ir body TO ITSELF — statement and proof are both built from the same
+    /// `IrBody` — so a mis-mapping (`Gt` ↦ `Lt`, or swapped operands) still closes
+    /// modulo 3. Self-consistency is exactly what makes the kernel blind here, the same
+    /// shape of blindness that let a non-injective literal encoder produce a live false
+    /// accept earlier in this campaign.
+    ///
+    /// SO THIS IS AN END-TO-END VALUE DIFFERENTIAL. It runs the REAL recognizer
+    /// (`straight_line_ir_body`) on REAL MIR carrying a REAL `trust_types::BinOp`, closes
+    /// the resulting body at concrete values, and requires the kernel to BOTH prove the
+    /// true claim AND reject the negated one — with the truth computed by matching on
+    /// `trust_types::BinOp` directly, NEVER on `TrustIrCmpOp`. Matching on the trust-ir
+    /// op would just restate the mapping and prove nothing.
+    ///
+    /// The six-op anchor pin elsewhere in this file is ANCHOR coverage (each op certifies),
+    /// not OP-MAPPING coverage. If this test is deleted or stops reducing, the comparison
+    /// arm in `prove::straight_line_ir_body` is unmitigated TCB.
+    #[test]
+    fn straight_line_cmp_op_mapping_value_oracle() {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+
+        use super::{IrBody, IrOperand, IrRvalue, IrStmt};
+        use crate::trustir_anchor::RefinementVerdict;
+
+        // `fn f(p: i64) -> bool { p <bop> k }` — a TYPED parameter body, because two
+        // widthless `Const` operands are refused upstream by `operands_compatible`, so
+        // the recognizer would never see them. The OP therefore still comes from the real
+        // recognizer running on real MIR; only the operand is substituted afterwards.
+        let synth = |bop: BinOp, k: i128| -> VerifiableFunction {
+            VerifiableFunction {
+                name: "f".into(),
+                def_path: "SYNTH::f".into(),
+                span: SourceSpan::default(),
+                body: VerifiableBody {
+                    locals: vec![
+                        LocalDecl { index: 0, ty: Ty::Bool, name: Some("_0".into()) },
+                        LocalDecl {
+                            index: 1,
+                            ty: Ty::Int { width: 64, signed: true },
+                            name: Some("p".into()),
+                        },
+                    ],
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::BinaryOp(
+                                bop,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Int(k)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Return,
+                    }],
+                    arg_count: 1,
+                    return_ty: Ty::Bool,
+                    datatype_defs: Default::default(),
+                },
+                contracts: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+                spec: trust_types::FunctionSpec::default(),
+            }
+        };
+
+        let grid = [-2_i128, -1, 0, 1, 2, 127, -128];
+        for bop in [BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge] {
+            for b_val in grid {
+                let func = synth(bop, b_val);
+                let ir = crate::prove::straight_line_ir_body(&func)
+                    .unwrap_or_else(|| panic!("{bop:?} single-statement body must be admitted"));
+                let IrRvalue::Cmp(op, IrOperand::Var(0), IrOperand::Const(k)) =
+                    ir.stmts[0].rvalue.clone()
+                else {
+                    panic!("expected Cmp(_, Var(0), Const(_)), got {:?}", ir.stmts[0].rvalue)
+                };
+                assert_eq!(k, b_val, "the recognizer must carry the literal through");
+
+                for a_val in grid {
+                    // Close the body: Var(0) -> Const(a_val). The OP is untouched.
+                    let closed = IrBody {
+                        stmts: vec![IrStmt {
+                            idx: ir.stmts[0].idx,
+                            rvalue: IrRvalue::Cmp(
+                                op,
+                                IrOperand::Const(a_val),
+                                IrOperand::Const(b_val),
+                            ),
+                        }],
+                        ret: ir.ret,
+                    };
+                    // THE ORACLE: truth from `trust_types::BinOp`, never from the trust-ir op.
+                    let truth = match bop {
+                        BinOp::Eq => a_val == b_val,
+                        BinOp::Ne => a_val != b_val,
+                        BinOp::Lt => a_val < b_val,
+                        BinOp::Le => a_val <= b_val,
+                        BinOp::Gt => a_val > b_val,
+                        BinOp::Ge => a_val >= b_val,
+                        _ => unreachable!(),
+                    };
+                    let claim = |t: bool| int_lit(i128::from(t));
+                    assert_eq!(
+                        super::check_refinement_decl(
+                            "Trust.TrustIr.Refinement.cmp_value_oracle",
+                            super::body_refinement_statement(&closed, Some(&claim(truth))),
+                            super::body_refinement_proof(&closed),
+                        ),
+                        RefinementVerdict::ProvenModulo3,
+                        "{bop:?}({a_val}, {b_val}) must prove {truth}"
+                    );
+                    assert!(
+                        matches!(
+                            super::check_refinement_decl(
+                                "Trust.TrustIr.Refinement.cmp_value_oracle_neg",
+                                super::body_refinement_statement(&closed, Some(&claim(!truth))),
+                                super::body_refinement_proof(&closed),
+                            ),
+                            RefinementVerdict::KernelRejected(_)
+                        ),
+                        "{bop:?}({a_val}, {b_val}): the NEGATED claim must be REJECTED — \
+                         without this half the oracle proves nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE CHAIN LANE'S COMPARISON-OP ORACLE.
+    ///
+    /// `straight_line_mir_binop_to_ir_cmpop` (the SINGLE-statement mapping) carries the
+    /// warning that it "is TCB the kernel structurally cannot defend ... the ONLY thing
+    /// in the tree that can catch an error here is the end-to-end VALUE ORACLE". That
+    /// oracle drives `straight_line_ir_body` and never touches the chain lane's OWN
+    /// copy of the mapping (`to_ir_cmpop`, inside `straight_line_ir_body_chain`) — a
+    /// second, independent transcription of the same six-way correspondence, which the
+    /// 2026-08-10 change widened from the final statement to EVERY statement position.
+    /// Found by adversarial review; this is that copy's oracle.
+    ///
+    /// Same construction as the single-statement one: the REAL recognizer on REAL MIR
+    /// carrying a REAL `trust_types::BinOp`, closed at concrete values, kernel required
+    /// to prove the true claim AND reject the negation, truth computed by matching on
+    /// `trust_types::BinOp` and never on `TrustIrCmpOp`.
+    #[test]
+    fn trust_ir_chain_cmp_op_mapping_value_oracle() {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+
+        use super::{IrBody, IrOperand, IrRvalue, IrStmt};
+        use crate::trustir_anchor::RefinementVerdict;
+
+        // `fn f(p: i64) -> bool { let t = p; t <bop> k }` — two statements, so the
+        // CHAIN recognizer is the one that runs.
+        let synth = |bop: BinOp, k: i128| -> VerifiableFunction {
+            VerifiableFunction {
+                name: "f".into(),
+                def_path: "SYNTH::f".into(),
+                span: SourceSpan::default(),
+                body: VerifiableBody {
+                    locals: vec![
+                        LocalDecl { index: 0, ty: Ty::Bool, name: Some("_0".into()) },
+                        LocalDecl {
+                            index: 1,
+                            ty: Ty::Int { width: 64, signed: true },
+                            name: Some("p".into()),
+                        },
+                        LocalDecl {
+                            index: 2,
+                            ty: Ty::Int { width: 64, signed: true },
+                            name: Some("t".into()),
+                        },
+                    ],
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![
+                            Statement::Assign {
+                                place: Place::local(2),
+                                rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                                span: SourceSpan::default(),
+                            },
+                            Statement::Assign {
+                                place: Place::local(0),
+                                rvalue: Rvalue::BinaryOp(
+                                    bop,
+                                    Operand::Copy(Place::local(2)),
+                                    Operand::Constant(ConstValue::Int(k)),
+                                ),
+                                span: SourceSpan::default(),
+                            },
+                        ],
+                        terminator: Terminator::Return,
+                    }],
+                    arg_count: 1,
+                    return_ty: Ty::Bool,
+                    datatype_defs: Default::default(),
+                },
+                contracts: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+                spec: trust_types::FunctionSpec::default(),
+            }
+        };
+
+        let grid = [-2_i128, -1, 0, 1, 2, 127, -128];
+        for bop in [BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge] {
+            for b_val in grid {
+                let func = synth(bop, b_val);
+                let ir = crate::prove::straight_line_ir_body_chain(&func)
+                    .unwrap_or_else(|| panic!("{bop:?} chain body must be admitted"));
+                let IrRvalue::Cmp(op, _, IrOperand::Const(k)) = ir.stmts[1].rvalue.clone()
+                else {
+                    panic!("expected a Cmp final statement, got {:?}", ir.stmts[1].rvalue)
+                };
+                assert_eq!(k, b_val, "the recognizer must carry the literal through");
+
+                for a_val in grid {
+                    // Close the body at both operands; the OP is untouched.
+                    let closed = IrBody {
+                        stmts: vec![
+                            IrStmt {
+                                idx: ir.stmts[0].idx,
+                                rvalue: IrRvalue::Use(IrOperand::Const(a_val)),
+                            },
+                            IrStmt {
+                                idx: ir.stmts[1].idx,
+                                rvalue: IrRvalue::Cmp(
+                                    op,
+                                    IrOperand::Const(a_val),
+                                    IrOperand::Const(b_val),
+                                ),
+                            },
+                        ],
+                        ret: ir.ret,
+                    };
+                    // THE ORACLE: truth from `trust_types::BinOp`, never from trust-ir.
+                    let truth = match bop {
+                        BinOp::Eq => a_val == b_val,
+                        BinOp::Ne => a_val != b_val,
+                        BinOp::Lt => a_val < b_val,
+                        BinOp::Le => a_val <= b_val,
+                        BinOp::Gt => a_val > b_val,
+                        BinOp::Ge => a_val >= b_val,
+                        _ => unreachable!(),
+                    };
+                    let claim = |t: bool| int_lit(i128::from(t));
+                    assert_eq!(
+                        super::check_refinement_decl(
+                            "Trust.TrustIr.Refinement.chain_cmp_value_oracle",
+                            super::body_model_chain_refinement_statement(
+                                &closed,
+                                Some(&claim(truth))
+                            ),
+                            super::body_model_chain_refinement_proof(&closed),
+                        ),
+                        RefinementVerdict::ProvenModulo3,
+                        "chain {bop:?}({a_val}, {b_val}) must prove {truth}"
+                    );
+                    assert!(
+                        matches!(
+                            super::check_refinement_decl(
+                                "Trust.TrustIr.Refinement.chain_cmp_value_oracle_neg",
+                                super::body_model_chain_refinement_statement(
+                                    &closed,
+                                    Some(&claim(!truth))
+                                ),
+                                super::body_model_chain_refinement_proof(&closed),
+                            ),
+                            RefinementVerdict::KernelRejected(_)
+                        ),
+                        "chain {bop:?}({a_val}, {b_val}): the NEGATED claim must be REJECTED"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE DISPATCH PIN — `castU`/`castS` must compute the cast AT THE WIDTH THEY ARE
+    /// GIVEN, one row per admitted width, plus the off-whitelist behaviour.
+    ///
+    /// RESTORED 2026-08-11 after an adversarial review found it MISSING: commit
+    /// 19bd64f449 cited this test by name in two places and claimed "Both are now
+    /// pinned by value rows", but the test had been deleted along with a scratch probe
+    /// in the same edit. Half the citation was fictional and nothing caught it — a
+    /// cited-but-absent pin is worse than an absent one, because the citation stops
+    /// the next reviewer from looking.
+    ///
+    /// It exists because the shipped definition did NOT dispatch correctly. Its ladder
+    /// ran ascending with `Bool.rec`'s minors in (false, true) order, which put the
+    /// width-64 arm outermost on the false branch. Every consumer checked these
+    /// carriers with a SELF-RELATING refinement, which proves `castU x 8 = castU x 8`
+    /// whatever `castU` computes — and proves it by congruence, without ever unfolding
+    /// the definition. Value rows are the only thing that could have caught it.
+    #[test]
+    fn trustir_cast_dispatch_is_exact_per_width() {
+        use super::{Expr, cst};
+        let env = trustir_env().expect("anchor env");
+        let tc = TypeChecker::new(&env);
+        for (v, w) in [
+            (0_i128, 8_u32), (300, 8), (255, 8), (256, 8), (-1, 8),
+            (300, 16), (65_600, 16), (-1, 16),
+            (4_294_967_296, 32), (-1, 32),
+            (-1, 64), (18_446_744_073_709_551_617, 64),
+        ] {
+            let modulus = 1_i128 << w;
+            let unsigned = v.rem_euclid(modulus);
+            let signed_v =
+                if unsigned >= (1_i128 << (w - 1)) { unsigned - modulus } else { unsigned };
+            for (name, truth) in
+                [(super::TRUSTIR_CAST_U, unsigned), (super::TRUSTIR_CAST_S, signed_v)]
+            {
+                let term = Expr::apps(cst(name), [int_lit(v), int_lit(i128::from(w))]);
+                assert!(
+                    tc.is_def_eq(&term, &int_lit(truth)),
+                    "{name}({v}, {w}) must reduce to {truth}"
+                );
+                // AND NOT to the same cast at a DIFFERENT width. An equality-only check
+                // passes whenever two widths happen to agree at the probe value, which
+                // is exactly how the inverted ladder stayed invisible.
+                for other in [8_u32, 16, 32, 64] {
+                    if other == w {
+                        continue;
+                    }
+                    let om = 1_i128 << other;
+                    let ou = v.rem_euclid(om);
+                    let ot = if name == super::TRUSTIR_CAST_S && ou >= (1_i128 << (other - 1)) {
+                        ou - om
+                    } else {
+                        ou
+                    };
+                    if ot != truth {
+                        assert!(
+                            !tc.is_def_eq(&term, &int_lit(ot)),
+                            "{name}({v}, {w}) must NOT reduce to the width-{other} result \
+                             {ot} — that is the dispatch bug"
+                        );
+                    }
+                }
+            }
+        }
+        // OFF-WHITELIST: the default must be NON-COMPUTING, not the identity and not a
+        // rounded-up neighbour. `IntCastDest` makes these widths unconstructible today,
+        // but only at the three call sites that use it — the denotation path applies no
+        // whitelist check, so the default is what a fourth site would silently get.
+        for w in [0_u32, 7, 9, 15, 31, 63, 65, 128] {
+            for name in [super::TRUSTIR_CAST_U, super::TRUSTIR_CAST_S] {
+                let term = Expr::apps(cst(name), [int_lit(300), int_lit(i128::from(w))]);
+                assert!(
+                    !tc.is_def_eq(&term, &int_lit(300)),
+                    "{name}(300, {w}) must NOT be the IDENTITY — that is the cast-as-\
+                     identity forgery, and it must fail closed at an unadmitted width"
+                );
+                for k in [8_u32, 16, 32, 64] {
+                    let rounded = 300_i128.rem_euclid(1_i128 << k);
+                    if rounded != 300 {
+                        assert!(
+                            !tc.is_def_eq(&term, &int_lit(rounded)),
+                            "{name}(300, {w}) must NOT round to the width-{k} result"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE ORACLE THAT DEFENDS THE CAST ARM — a DIFFERENT obligation from
+    /// [`exact_int_cast_reduces_to_rust_as_semantics`], which pins the CONSTRUCTOR.
+    /// That test says `exact_int_cast_expr(v, u8)` reduces to `v as u8`. It says
+    /// nothing about whether the RECOGNIZER hands the constructor THIS body's real
+    /// destination — and width and signedness are exactly what decide the modulus and
+    /// the sign fix-up. The chain lane's refinement relates the IrBody to itself and
+    /// closes by `Eq.refl`, so a wrong width still proves modulo 3.
+    ///
+    /// So: the REAL recognizer runs on REAL MIR carrying a REAL `trust_types::Ty`
+    /// destination, the body is closed at concrete source values, and the kernel must
+    /// BOTH prove the true result AND reject the negation. The truth is computed by
+    /// performing the cast in RUST from the `trust_types::Ty` — never from the trust-ir
+    /// operand, which would just restate the mapping under test.
+    #[test]
+    fn trust_ir_cast_mapping_value_oracle() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+
+        use super::{IrBody, IrOperand, IrRvalue, IrStmt};
+        use crate::trustir_anchor::RefinementVerdict;
+
+        // `fn f(p: i64) -> <dest> { let t = p; t as <dest> }` — two statements, the
+        // shape the chain lane sees (`_3 := <read>; _2 := _3 as uN; …`).
+        let synth = |dest: Ty| -> VerifiableFunction {
+            VerifiableFunction {
+                name: "f".into(),
+                def_path: "SYNTH::f".into(),
+                span: SourceSpan::default(),
+                body: VerifiableBody {
+                    locals: vec![
+                        LocalDecl { index: 0, ty: dest.clone(), name: Some("_0".into()) },
+                        LocalDecl {
+                            index: 1,
+                            ty: Ty::Int { width: 64, signed: true },
+                            name: Some("p".into()),
+                        },
+                        LocalDecl {
+                            index: 2,
+                            ty: Ty::Int { width: 64, signed: true },
+                            name: Some("t".into()),
+                        },
+                    ],
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![
+                            Statement::Assign {
+                                place: Place::local(2),
+                                rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                                span: SourceSpan::default(),
+                            },
+                            Statement::Assign {
+                                place: Place::local(0),
+                                rvalue: Rvalue::Cast(
+                                    Operand::Move(Place::local(2)),
+                                    dest.clone(),
+                                ),
+                                span: SourceSpan::default(),
+                            },
+                        ],
+                        terminator: Terminator::Return,
+                    }],
+                    arg_count: 1,
+                    return_ty: dest,
+                    datatype_defs: Default::default(),
+                },
+                contracts: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+                spec: trust_types::FunctionSpec::default(),
+            }
+        };
+
+        // THE ORACLE: the cast performed in Rust, keyed on the `trust_types::Ty`.
+        let rust_as = |v: i128, width: u32, signed: bool| -> i128 {
+            let modulus = 1_i128 << width;
+            let residue = v.rem_euclid(modulus);
+            if signed && residue >= (1_i128 << (width - 1)) { residue - modulus } else { residue }
+        };
+
+        let claim = |t: i128| int_lit(t);
+        let grid = [0_i128, 1, 127, 128, 255, 256, -1, -128, -129, 65_535, 4_294_967_295];
+        for width in [8_u32, 16, 32, 64] {
+            for signed in [false, true] {
+                let func = synth(Ty::Int { width, signed });
+                let ir = crate::prove::straight_line_ir_body_chain(&func).unwrap_or_else(|| {
+                    panic!("the `as {}{width}` chain must be admitted", if signed { 'i' } else { 'u' })
+                });
+                // The recognizer must have chosen the carrier — and the WIDTH — that
+                // the destination local declares. Read it back rather than assume it.
+                let (carrier_signed, carrier_width) = match &ir.stmts[1].rvalue {
+                    IrRvalue::Use(IrOperand::CastS(_, w)) => (true, *w),
+                    IrRvalue::Use(IrOperand::CastU(_, w)) => (false, *w),
+                    other => panic!("expected a cast carrier, got {other:?}"),
+                };
+                assert_eq!(
+                    (carrier_signed, carrier_width),
+                    (signed, width),
+                    "the recognizer must carry the DESTINATION's own width and signedness"
+                );
+
+                for v in grid {
+                    // Close the body: the parameter read becomes a literal. The CAST
+                    // — the thing under test — is left as the recognizer produced it.
+                    let closed = IrBody {
+                        stmts: vec![
+                            IrStmt {
+                                idx: ir.stmts[0].idx,
+                                rvalue: IrRvalue::Use(IrOperand::Const(v)),
+                            },
+                            ir.stmts[1].clone(),
+                        ],
+                        ret: ir.ret,
+                    };
+                    let truth = rust_as(v, width, signed);
+                    assert_eq!(
+                        super::check_refinement_decl(
+                            "Trust.TrustIr.Refinement.cast_value_oracle",
+                            super::body_model_chain_refinement_statement(
+                                &closed,
+                                Some(&claim(truth))
+                            ),
+                            super::body_model_chain_refinement_proof(&closed),
+                        ),
+                        RefinementVerdict::ProvenModulo3,
+                        "{v} as {}{width} must prove {truth}",
+                        if signed { 'i' } else { 'u' }
+                    );
+                    assert!(
+                        matches!(
+                            super::check_refinement_decl(
+                                "Trust.TrustIr.Refinement.cast_value_oracle_neg",
+                                super::body_model_chain_refinement_statement(
+                                    &closed,
+                                    Some(&claim(truth + 1))
+                                ),
+                                super::body_model_chain_refinement_proof(&closed),
+                            ),
+                            RefinementVerdict::KernelRejected(_)
+                        ),
+                        "{v} as {}{width}: the WRONG value must be REJECTED — without \
+                         this half the oracle proves nothing",
+                        if signed { 'i' } else { 'u' }
+                    );
+                }
+            }
+        }
+
+        // THE FORGERIES. Both are mistakes the self-relating refinement check cannot
+        // see, so each is shown to (a) still prove against itself and (b) fail the
+        // oracle at a value that distinguishes it.
+        let func = synth(Ty::Int { width: 8, signed: false });
+        let ir = crate::prove::straight_line_ir_body_chain(&func).expect("builds");
+        let forge = |v: i128, rv: IrRvalue| IrBody {
+            stmts: vec![
+                IrStmt { idx: ir.stmts[0].idx, rvalue: IrRvalue::Use(IrOperand::Const(v)) },
+                IrStmt { idx: ir.stmts[1].idx, rvalue: rv },
+            ],
+            ret: ir.ret,
+        };
+        let base = IrOperand::Var(ir.stmts[0].idx);
+        // EACH FORGERY CARRIES ITS OWN PROBE VALUE, because a single value does not
+        // separate them: at 300 the wrong-signedness body is INDISTINGUISHABLE from the
+        // correct one (`300 as i8` is 44, exactly like `300 as u8` — the signed
+        // reinterpretation only bites at a residue >= 128), and at 200 the identity
+        // body is indistinguishable (`200 as u8` is 200). A forgery row probed at a
+        // value that cannot separate it is a test that passes for no reason.
+        for (what, v, forged) in [
+            // CAST-AS-IDENTITY — the simplification that would make the whole lane a
+            // fiction. `300 as u8` is 44, not 300.
+            ("identity", 300_i128, forge(300, IrRvalue::Use(base.clone()))),
+            // THE WRONG WIDTH — `300 as u16` is 300, not 44.
+            (
+                "wrong width",
+                300,
+                forge(300, IrRvalue::Use(IrOperand::CastU(Box::new(base.clone()), 16))),
+            ),
+            // THE WRONG SIGNEDNESS — `200 as i8` is -56, not 200.
+            (
+                "wrong signedness",
+                200,
+                forge(200, IrRvalue::Use(IrOperand::CastS(Box::new(base.clone()), 8))),
+            ),
+        ] {
+            assert_eq!(
+                super::check_body_refinement_model_chain(&forged),
+                RefinementVerdict::ProvenModulo3,
+                "the {what} forgery PROVES against itself — this is the blindness the \
+                 value oracle exists to cover"
+            );
+            assert!(
+                matches!(
+                    super::check_refinement_decl(
+                        "Trust.TrustIr.Refinement.cast_forgery",
+                        super::body_model_chain_refinement_statement(
+                            &forged,
+                            Some(&claim(rust_as(v, 8, false)))
+                        ),
+                        super::body_model_chain_refinement_proof(&forged),
+                    ),
+                    RefinementVerdict::KernelRejected(_)
+                ),
+                "the {what} forgery must FAIL the value oracle ({v} as u8 = {})",
+                rust_as(v, 8, false)
+            );
+        }
+    }
+
+    /// THE ORACLE THAT DEFENDS THE BOOL-`Not` MAPPING — and the forgery that shows why
+    /// a refinement test could not.
+    ///
+    /// MIR's `UnOp::Not` is OVERLOADED: bitwise complement on an integer, LOGICAL
+    /// negation on a `bool`. `TrustIrUnOp::Not` means the FORMER (the opaque
+    /// `Trust.TrustIr.bnot`). Mapping a Bool `Not` onto it denotes `!false` as
+    /// `bnot 0` instead of `1` — and `check_body_refinement_model_chain` STILL PROVES
+    /// IT, because that check relates the IrBody to itself and closes by `Eq.refl`.
+    /// Self-consistency is what makes the kernel blind here, not what makes it safe;
+    /// the same blindness is documented on the comparison op mapping, and an earlier
+    /// non-injective literal encoder rode it into a live false accept.
+    ///
+    /// So this is an END-TO-END VALUE DIFFERENTIAL, not a refinement test: it runs the
+    /// REAL recognizer on REAL MIR carrying a REAL `trust_types::UnOp`, closes the
+    /// resulting body at each concrete Bool value, and requires the kernel to BOTH
+    /// prove the true claim AND REJECT the negated one. The truth is computed by
+    /// matching on `trust_types::UnOp` — never on the trust-ir side, which would just
+    /// restate the mapping being tested.
+    #[test]
+    fn trust_ir_bool_not_mapping_value_oracle() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, UnOp, VerifiableBody, VerifiableFunction,
+        };
+
+        use super::{IrBody, IrOperand, IrRvalue, IrStmt, TrustIrUnOp};
+        use crate::trustir_anchor::RefinementVerdict;
+
+        // `fn f(p: bool) -> bool { let t = p; !t }` — two statements, because the
+        // chain lane is the multi-statement one. The `Not` is the FINAL statement,
+        // exactly as `is_none`/`is_err`/`is_pending` spell it.
+        let func = VerifiableFunction {
+            name: "f".into(),
+            def_path: "SYNTH::f".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: Some("_0".into()) },
+                    LocalDecl { index: 1, ty: Ty::Bool, name: Some("p".into()) },
+                    LocalDecl { index: 2, ty: Ty::Bool, name: Some("t".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::UnaryOp(UnOp::Not, Operand::Move(Place::local(2))),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: trust_types::FunctionSpec::default(),
+        };
+
+        let ir = crate::prove::straight_line_ir_body_chain(&func)
+            .expect("the Bool-`Not` chain must be admitted by the REAL recognizer");
+        assert_eq!(ir.stmts.len(), 2);
+
+        let claim = |t: bool| int_lit(i128::from(t));
+        for p_val in [false, true] {
+            // Close the body: the parameter read becomes a literal. The `Not` MAPPING
+            // — the thing under test — is left exactly as the recognizer produced it.
+            let closed = IrBody {
+                stmts: vec![
+                    IrStmt {
+                        idx: ir.stmts[0].idx,
+                        rvalue: IrRvalue::Use(IrOperand::Const(i128::from(p_val))),
+                    },
+                    ir.stmts[1].clone(),
+                ],
+                ret: ir.ret,
+            };
+            // THE ORACLE: truth from `trust_types::UnOp`, never from the trust-ir side.
+            let truth = match UnOp::Not {
+                UnOp::Not => !p_val,
+                UnOp::Neg => unreachable!(),
+                // `UnOp` is `#[non_exhaustive]`: a NEW unary op must land here
+                // deliberately, not inherit Bool-`Not` semantics by falling through.
+                _ => unreachable!("a new UnOp needs its own oracle row"),
+            };
+            assert_eq!(
+                super::check_refinement_decl(
+                    "Trust.TrustIr.Refinement.bool_not_value_oracle",
+                    super::body_model_chain_refinement_statement(&closed, Some(&claim(truth))),
+                    super::body_model_chain_refinement_proof(&closed),
+                ),
+                RefinementVerdict::ProvenModulo3,
+                "!{p_val} must prove {truth}"
+            );
+            assert!(
+                matches!(
+                    super::check_refinement_decl(
+                        "Trust.TrustIr.Refinement.bool_not_value_oracle_neg",
+                        super::body_model_chain_refinement_statement(
+                            &closed,
+                            Some(&claim(!truth))
+                        ),
+                        super::body_model_chain_refinement_proof(&closed),
+                    ),
+                    RefinementVerdict::KernelRejected(_)
+                ),
+                "!{p_val}: the NEGATED claim must be REJECTED — without this half the \
+                 oracle proves nothing"
+            );
+
+            // THE FORGERY, and the point of the whole test: the mapping a careless
+            // reading of `UnOp::Not` would produce — `TrustIrUnOp::Not`, i.e. the
+            // BITWISE `bnot`.
+            let forged = IrBody {
+                stmts: vec![
+                    IrStmt {
+                        idx: ir.stmts[0].idx,
+                        rvalue: IrRvalue::Use(IrOperand::Const(i128::from(p_val))),
+                    },
+                    IrStmt {
+                        idx: ir.stmts[1].idx,
+                        rvalue: IrRvalue::Un(
+                            TrustIrUnOp::Not,
+                            IrOperand::Var(ir.stmts[0].idx),
+                        ),
+                    },
+                ],
+                ret: ir.ret,
+            };
+            // (a) THE KERNEL DOES NOT CATCH IT. The self-relating refinement check
+            //     proves the forged body modulo 3, exactly as it proves the correct
+            //     one. A refinement test here would have passed and taught nothing.
+            assert_eq!(
+                super::check_body_refinement_model_chain(&forged),
+                RefinementVerdict::ProvenModulo3,
+                "the bnot mis-mapping PROVES against itself — this is the blindness the \
+                 value oracle exists to cover, and if this assert ever fails the comment \
+                 above it is stale, not the code"
+            );
+            // (b) THE ORACLE DOES. `bnot` is opaque and reduces to neither Bool value,
+            //     so the forged body cannot prove the TRUE result.
+            assert!(
+                matches!(
+                    super::check_refinement_decl(
+                        "Trust.TrustIr.Refinement.bool_not_forgery",
+                        super::body_model_chain_refinement_statement(
+                            &forged,
+                            Some(&claim(truth))
+                        ),
+                        super::body_model_chain_refinement_proof(&forged),
+                    ),
+                    RefinementVerdict::KernelRejected(_)
+                ),
+                "the bnot mis-mapping must FAIL the value oracle at p={p_val}"
+            );
+        }
+    }
+
+    /// Trust: DELTA-4 (2026-08-05) — the enum-tag carrier certifies, and its reserved
+    /// key is provably disjoint from every real field key.
+    #[test]
+    fn delta4_discr_carrier_certifies_and_key_is_disjoint() {
+        use super::{IrOperand, TRUSTIR_DISCRIMINANT_TAG_KEY, check_operand_refinement_model};
+        use crate::trustir_anchor::RefinementVerdict;
+        for op in [IrOperand::Discr(0), IrOperand::Discr(1), IrOperand::Discr(7)] {
+            assert_eq!(
+                check_operand_refinement_model(&op),
+                RefinementVerdict::ProvenModulo3,
+                "{op:?} must certify modulo 3 on the model lane"
+            );
+            assert!(!op.is_grounder_connected(), "{op:?} is MODEL-ONLY");
+        }
+        // The disjointness is BY CONSTRUCTION, not convention: the tag key is negative
+        // and every `Field` key is a u64. A body reading both `(*self).0` and the
+        // discriminant of the same receiver can never conflate them.
+        assert!(
+            TRUSTIR_DISCRIMINANT_TAG_KEY < 0,
+            "the reserved tag key must be NEGATIVE — every real Field key is a u64"
+        );
+        assert_ne!(
+            IrOperand::Discr(0).to_operand_expr(),
+            IrOperand::Field(0, 0).to_operand_expr(),
+            "a tag read and field 0 of the same param must be DISTINCT terms"
+        );
+    }
+
+    /// The carriers are MODEL-ONLY: they must never claim grounder connection, because
+    /// the live `Formula` language has no bnotAt/castU/castS head. If this ever flips
+    /// true, `check_operand_refinement` (the LIVE lane) would be used instead and would
+    /// be comparing against a term the grounder cannot produce.
+    #[test]
+    fn delta2_operand_carriers_are_never_grounder_connected() {
+        use super::IrOperand;
+        for op in [
+            IrOperand::PreOpNotAt(Box::new(IrOperand::Var(0)), 8),
+            IrOperand::CastU(Box::new(IrOperand::Var(0)), 32),
+            IrOperand::CastS(Box::new(IrOperand::Var(0)), 32),
+        ] {
+            assert!(!op.is_grounder_connected(), "{op:?} must stay MODEL-ONLY");
+        }
+    }
+
     /// G1 — width 128 is refused AT CONSTRUCTION. It is computationally inert rather
     /// than unsound: `int_pow2_expr(128)` is `Int.mul (2^64) (2^64)`, and the native
     /// `reduce_int_mod` reads its operands with `get_int_val`, which needs a reduced
@@ -10015,15 +11907,66 @@ mod tests {
         assert_eq!(pin_trustir_anchor(), AnchorVerdict::Modulo3);
     }
 
-    /// Every supported op's refinement kernel-checks modulo 3 — the trust-ir
-    /// denotation agrees with the live grounder.
+    /// Every GROUNDER-CONNECTED op's refinement kernel-checks modulo 3 — the
+    /// trust-ir denotation agrees with the live grounder.
+    ///
+    /// Trust (#53): the BOOLEAN CONNECTIVES are excluded here and asserted
+    /// separately below, and the exclusion is a STATEMENT, not a waiver. They are
+    /// MODEL-ONLY by construction: [`IrRvalue::to_formula`] reflects them to
+    /// `Pred("Trust.TrustIr.b{and,or,xor}", _)`, which `ground_int` does not
+    /// recognise, so `live_ground_int` returns `None` — the same fail-closed
+    /// signal `Not`/`bnot` carries. Asserting grounder-connection for them would
+    /// therefore be asserting something FALSE about what the certificate covers.
     #[test]
-    fn trustir_refinement_all_ops_modulo3() {
+    fn trustir_refinement_all_grounder_connected_ops_modulo3() {
         for op in TrustIrBinOp::ALL {
+            if matches!(op, TrustIrBinOp::BAnd | TrustIrBinOp::BOr | TrustIrBinOp::BXor) {
+                continue; // model-only; see `bool_connectives_are_model_only` below.
+            }
             assert_eq!(
                 check_trustir_refinement(op),
                 RefinementVerdict::ProvenModulo3,
                 "op {op:?} ({}) did not prove modulo 3",
+                op.trust_ir_name(),
+            );
+        }
+    }
+
+    /// Trust (#53): the boolean connectives are MODEL-ONLY, and this pins BOTH
+    /// halves of that claim so neither can drift silently.
+    ///
+    /// The live grounder must DECLINE them — if it ever started grounding these,
+    /// the exclusion above would become a silent under-assertion. And the model
+    /// path must ACCEPT them — otherwise the exclusion would be hiding a lane
+    /// that does not work at all, which is exactly how "machinery that reads as
+    /// coverage while running nothing" gets in.
+    #[test]
+    fn bool_connectives_are_model_only() {
+        for op in [TrustIrBinOp::BAnd, TrustIrBinOp::BOr, TrustIrBinOp::BXor] {
+            assert_ne!(
+                check_trustir_refinement(op),
+                RefinementVerdict::ProvenModulo3,
+                "op {} must NOT be grounder-connected — if it is, the exclusion in \
+                 `trustir_refinement_all_grounder_connected_ops_modulo3` is now \
+                 under-asserting",
+                op.trust_ir_name(),
+            );
+        }
+        // The MODEL path is what actually certifies them. A two-parameter body
+        // `_2 := Bin(op, Var 0, Var 1)` is the shape `w_and_op`/`w_or_op`/`w_xor_op`
+        // reduce to.
+        for op in [TrustIrBinOp::BAnd, TrustIrBinOp::BOr, TrustIrBinOp::BXor] {
+            let body = IrBody {
+                stmts: vec![IrStmt {
+                    idx: 2,
+                    rvalue: IrRvalue::Bin(op, IrOperand::Var(0), IrOperand::Var(1)),
+                }],
+                ret: 2,
+            };
+            assert_eq!(
+                check_body_refinement_model(&body),
+                RefinementVerdict::ProvenModulo3,
+                "op {} must prove on the MODEL path",
                 op.trust_ir_name(),
             );
         }
@@ -10057,7 +12000,17 @@ mod tests {
     #[test]
     fn trustir_binop_names_are_canonical() {
         let names: Vec<&str> = TrustIrBinOp::ALL.iter().map(|o| o.trust_ir_name()).collect();
-        assert_eq!(names, vec!["Add", "Sub", "Mul", "SDiv", "SRem", "LShr", "And"]);
+        assert_eq!(
+            names,
+            vec![
+                "Add", "Sub", "Mul", "SDiv", "SRem", "LShr", "And", "Or", "Xor", "Shl",
+                // Trust (#53): the BOOLEAN CONNECTIVES, APPENDED. The order is the
+                // constructor order of the registered inductive, so this list is also
+                // the recursor's minor-premise order -- appending is what keeps every
+                // prior minor position and ι-reduction byte-preserved.
+                "BAnd", "BOr", "BXor",
+            ]
+        );
         // The Clean constructor names embed the same identifiers.
         for op in TrustIrBinOp::ALL {
             assert!(op.ctor_name().ends_with(op.trust_ir_name()));
@@ -10111,6 +12064,59 @@ mod tests {
             ),
             "WRONG refinement (SDiv≟LShr-grounding) was NOT rejected — soundness hole",
         );
+    }
+
+    /// Trust: SHL ANCHOR — the fail-closed probes. `Shl` vs `LShr` is the sharpest
+    /// pair: BOTH ground to opaque shift `Pred`s, and what distinguishes them is the
+    /// DISTINCT opaque heads (`Int.shiftLeft` vs `Int.shiftRight`) — the kernel never
+    /// delta-unfolds an `Opaque`, so their identical placeholder bodies are
+    /// irrelevant and a cross-claim cannot unify. A transposed minor in either
+    /// `BinOp.rec` site would make exactly these cross-claims prove.
+    #[test]
+    fn trustir_shl_refinement_fail_closed_and_swap_detected() {
+        for (a, b) in [
+            (TrustIrBinOp::Shl, TrustIrBinOp::LShr),
+            (TrustIrBinOp::LShr, TrustIrBinOp::Shl),
+            (TrustIrBinOp::Shl, TrustIrBinOp::Xor),
+            (TrustIrBinOp::Xor, TrustIrBinOp::Shl),
+            (TrustIrBinOp::Shl, TrustIrBinOp::SDiv),
+        ] {
+            assert!(
+                matches!(
+                    check_trustir_refinement_inner(a, Some(b)),
+                    RefinementVerdict::KernelRejected(_)
+                ),
+                "WRONG refinement ({a:?} claiming {b:?}'s grounding) was NOT rejected",
+            );
+        }
+    }
+
+    /// Trust: OR/XOR ANCHOR — the fail-closed probes, and specifically the SWAPPED-MINOR
+    /// detector. `Or` and `Xor` are ADJACENT new minors in `evalBin`'s recursor; if the
+    /// two `int_op` premises were transposed, `evalBin`'s `Or` would denote `Int.xor`
+    /// and vice versa — and the self-relating refinement would prove both without
+    /// complaint, because BOTH sides of each check would carry the same wrong minor.
+    /// The cross-op probe is what catches the swap: `Or` claiming `Xor`'s grounding
+    /// must be KernelRejected, and under a transposition it would instead PROVE.
+    /// Both directions, plus the `SDiv` control each sibling op carries.
+    #[test]
+    fn trustir_or_xor_refinement_fail_closed_and_swap_detected() {
+        for (a, b) in [
+            (TrustIrBinOp::Or, TrustIrBinOp::Xor),
+            (TrustIrBinOp::Xor, TrustIrBinOp::Or),
+            (TrustIrBinOp::Or, TrustIrBinOp::SDiv),
+            (TrustIrBinOp::Xor, TrustIrBinOp::SDiv),
+            (TrustIrBinOp::Or, TrustIrBinOp::And),
+            (TrustIrBinOp::Xor, TrustIrBinOp::And),
+        ] {
+            assert!(
+                matches!(
+                    check_trustir_refinement_inner(a, Some(b)),
+                    RefinementVerdict::KernelRejected(_)
+                ),
+                "WRONG refinement ({a:?} claiming {b:?}'s grounding) was NOT rejected",
+            );
+        }
     }
 
     /// Trust: M6 rung 9, ANCHOR BitAnd — the AND-specific FAIL-CLOSED probe: claiming
@@ -11957,5 +13963,122 @@ mod tests {
             residue.is_empty(),
             "expected modulo-3 Index/Len call-arg closure, got {closure:?}"
         );
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod accumulate_loop_family_tests {
+    //! Trust (#54): the ACCUMULATE cond-update body, and the gates that keep the
+    //! widened shape predicate honest.
+    //!
+    //! The predicate in `check_cond_update_loop_instance` is what guarantees the
+    //! proof term matches the body, so each of its clauses gets a mutation here.
+    //! A permissive shape gate would let the max-scan proof be applied to a body
+    //! it does not describe.
+
+    use super::*;
+
+    fn accumulate(inc_tmp: u64, inc_src: u64, sel_true: u64, sel_false: u64) -> IrCondUpdateLoop {
+        IrCondUpdateLoop {
+            cond: IrCond { op: TrustIrCmpOp::Lt, a: IrOperand::Var(5), b: IrOperand::Var(2) },
+            body: vec![
+                IrSStmt::Assign(
+                    inc_tmp,
+                    IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(inc_src), IrOperand::Const(1)),
+                ),
+                IrSStmt::Sel(
+                    6,
+                    IrCond { op: TrustIrCmpOp::Eq, a: IrOperand::Var(11), b: IrOperand::Var(13) },
+                    IrOperand::Var(sel_true),
+                    IrOperand::Var(sel_false),
+                ),
+                IrSStmt::Assign(
+                    5,
+                    IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(5), IrOperand::Const(1)),
+                ),
+            ],
+            m_idx: 6,
+            c: 0,
+            i_idx: 5,
+        }
+    }
+
+    /// POSITIVE CONTROL — `memchr::One::count_raw`'s real shape. Without it every
+    /// rejection below could be the gate refusing the whole family.
+    #[test]
+    fn accumulate_body_proves_modulo_3() {
+        assert_eq!(
+            check_cond_update_loop_instance(&accumulate(9, 6, 9, 6)),
+            RefinementVerdict::ProvenModulo3
+        );
+    }
+
+    /// REGRESSION — the max-scan shape the lane was originally written for must
+    /// still prove. The widening must not have been a replacement.
+    #[test]
+    fn max_scan_body_still_proves_modulo_3() {
+        let ms = IrCondUpdateLoop {
+            cond: IrCond { op: TrustIrCmpOp::Lt, a: IrOperand::Var(1), b: IrOperand::Var(0) },
+            body: vec![
+                IrSStmt::Sel(
+                    2,
+                    IrCond { op: TrustIrCmpOp::Gt, a: IrOperand::Var(1), b: IrOperand::Var(2) },
+                    IrOperand::Var(1),
+                    IrOperand::Var(2),
+                ),
+                IrSStmt::Assign(
+                    1,
+                    IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(1), IrOperand::Const(1)),
+                ),
+            ],
+            m_idx: 2,
+            c: 0,
+            i_idx: 1,
+        };
+        assert_eq!(check_cond_update_loop_instance(&ms), RefinementVerdict::ProvenModulo3);
+    }
+
+    /// The increment must be on the ACCUMULATOR. `t := i + 1` then
+    /// `m := Sel(_) t m` assigns the counter's successor into the accumulator —
+    /// a different function, and `c <= m` is not what preserves it.
+    #[test]
+    fn increment_of_a_non_accumulator_declines() {
+        assert!(!matches!(
+            check_cond_update_loop_instance(&accumulate(9, 5, 9, 6)),
+            RefinementVerdict::ProvenModulo3
+        ));
+    }
+
+    /// The select's FALSE branch must be `m` itself. If the not-taken path writes
+    /// something else, the invariant is not preserved by it.
+    #[test]
+    fn false_branch_that_is_not_the_accumulator_declines() {
+        assert!(!matches!(
+            check_cond_update_loop_instance(&accumulate(9, 6, 9, 5)),
+            RefinementVerdict::ProvenModulo3
+        ));
+    }
+
+    /// The select's TRUE branch must be the temp the increment wrote. Taking some
+    /// other local means the proof's `m + 1` is not the value stored.
+    #[test]
+    fn true_branch_that_is_not_the_increment_temp_declines() {
+        assert!(!matches!(
+            check_cond_update_loop_instance(&accumulate(9, 6, 11, 6)),
+            RefinementVerdict::ProvenModulo3
+        ));
+    }
+
+    /// The temp must be FRESH. Aliasing it to the counter would let the `Sel`'s
+    /// true branch write a value the invariant reasons about separately.
+    #[test]
+    fn increment_temp_aliasing_the_counter_declines() {
+        assert!(!matches!(
+            check_cond_update_loop_instance(&accumulate(5, 6, 5, 6)),
+            RefinementVerdict::ProvenModulo3
+        ));
     }
 }

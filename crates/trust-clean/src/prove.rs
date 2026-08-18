@@ -37,6 +37,11 @@ pub struct ProveScorecard {
     pub proven: Vec<String>,
     /// `def_path: reason` of each kernel rejection (should stay empty).
     pub rejections: Vec<String>,
+    /// Trust (#54): the def-paths of the MirSem-only (strangler-fallback) rows.
+    /// The exit criterion is `fully_faithful_mirsem_fallback == 0`; naming the
+    /// members is what makes a non-zero count workable. MUST be extended wherever
+    /// that counter is merged, or the aggregate silently drops it.
+    pub mirsem_fallback_rows: Vec<String>,
     /// FULL obligation accounting via `trust_vcgen::generate_vcs` — the TRUE §6
     /// scope. `total_obligations` counts every VC (overflow, bounds, div-by-zero,
     /// casts, preconditions, *and* postconditions); `postcondition_obligations`
@@ -467,6 +472,11 @@ impl ProveScorecard {
         self.structural_containers += frag.structural_containers;
         self.fully_faithful_via_trustir += frag.fully_faithful_via_trustir;
         self.fully_faithful_mirsem_fallback += frag.fully_faithful_mirsem_fallback;
+        // Trust (#54): carry the NAMES with the counter. An aggregate assembled by
+        // explicit field-wise merge silently drops a new field, which is
+        // indistinguishable from instrumenting the wrong site -- it cost three
+        // attempts to notice.
+        self.mirsem_fallback_rows.extend(frag.mirsem_fallback_rows.iter().cloned());
         self.proven.extend(frag.proven);
         self.rejections.extend(frag.rejections);
     }
@@ -5346,6 +5356,12 @@ fn return_reads_counter(func: &VerifiableFunction, counter_local: usize) -> bool
 /// FAITHFUL here precisely because the SYNTHESIZED `i <= n` / `0 <= i` discharges their
 /// postconditions modulo 3.
 fn synth_loop_function_fully_faithful(func: &VerifiableFunction) -> bool {
+    // Trust: FAMILY-WIDE G8 (2026-08-17) — the loop lane's chokepoint (see
+    // `body_has_live_cleanup_path`): the loop walks and the ranking argument run
+    // on normal edges only.
+    if body_has_live_cleanup_path(&func.body) || !all_block_ids_unique(&func.body) {
+        return false;
+    }
     let Some(synth_lf) = extract_synth_loop_function(func) else { return false };
     // (a) the synthesized loop's partial + total certificates kernel-check modulo 3.
     if !crate::mirsem::loop_refinement_witness(&synth_lf).is_some_and(|c| c.is_modulo_3()) {
@@ -5518,18 +5534,63 @@ fn sem_operand_to_ir(op: &crate::mirsem::SemOperand) -> Option<crate::trustir_an
     match op {
         S::Var(i) => Some(I::Var(*i)),
         S::Const(c) => Some(I::Const(*c)),
+        // Trust: DELTA-4 (2026-08-05) — the enum TAG READ, formerly a named residue here
+        // ("trust-ir's `IrOperand` has no opaque-projection carrier this increment").
+        // It has one now: `IrOperand::Discr`, denoted by trust-ir's OWN `idxElem` at the
+        // reserved negative key. Admitted ONLY on a bare parameter base, mirroring
+        // `mirsem::SemOperand::Discriminant`'s own shape — a discriminant of anything
+        // else is not this predicate family and declines.
+        S::Discriminant(base) => match base.as_ref() {
+            S::Var(i) => Some(I::Discr(*i)),
+            _ => None,
+        },
+        // Trust (#53, 2026-08-13) — CAST-TEMP GUARD READ, formerly a named residue
+        // in this very arm ("trust-ir's `IrOperand` has no opaque-projection
+        // carrier this increment"). That statement is STALE: the anchor grew
+        // `IrOperand::{CastU,CastS}`, which `straight_line_ir_body_chain` already
+        // emits for an arbitrary-width `Rvalue::Cast` and which
+        // `trust_ir_cast_mapping_value_oracle` pins with both mis-mappings carried
+        // as forgeries. So the leaf no longer has to stay MirSem-fallback.
+        //
+        // THE SHAPE: the `ascii_utils` `char` predicates, whose guards compare a
+        // TRUNCATING `char as u8` temp (`_3 := Cast(_1, u8)`, source `u32`) rather
+        // than the parameter itself — see that corpus's PROVENANCE.md, which names
+        // exactly these four (`is_control`/`is_printable`/`is_us_ascii`/
+        // `is_extended`) as the ones carrying the cast.
+        //
+        // THIS IS A STRICTLY STRONGER CLAIM than the MirSem twin, not a weaker one.
+        // `mirsem::SemOperand::Cast` is an OPAQUE per-(width, signedness) selector
+        // whose own docs say it "does NOT assert the cast's numeric relationship
+        // (e.g. `cast_value == base mod 256`)". `CastU(base, w)` denotes the real
+        // width-`w` truncation, which is what MIR's `as` actually computes. Moving
+        // these rows to trust-ir therefore sharpens the model rather than trading
+        // it away — the opposite of the bool-connective case, where the only
+        // available trust-ir carrier would have been the weaker one.
+        //
+        // Gated to a BARE PARAMETER base, mirroring `S::Discriminant`'s gate right
+        // above: a cast of a slice element, a field, or a nested cast is not this
+        // predicate family and declines. `IntCastDest::new` is the same width/
+        // signedness whitelist the chain lane and the pinned call-arg lane use, so
+        // the three carriers cannot disagree about which widths are covered.
+        S::Cast(base, dest_width, dest_signed) => {
+            let S::Var(i) = base.as_ref() else { return None };
+            let dest_width = u32::try_from(*dest_width).ok()?;
+            crate::trustir_anchor::IntCastDest::new(dest_width, *dest_signed)?;
+            let base_ir = Box::new(I::Var(*i));
+            Some(if *dest_signed {
+                I::CastS(base_ir, dest_width)
+            } else {
+                I::CastU(base_ir, dest_width)
+            })
+        }
         // Slice element / length / nested moves / (Trust: field-read leaf) struct
-        // field reads / (Trust: discriminant-guard leaf) enum-tag reads / (Trust:
-        // CAST-TEMP GUARD READ) cast-temp reads are not in the trust-ir loop
-        // fragment — trust-ir's `IrOperand` has no opaque-projection carrier this
-        // increment (named residue: the leaf stays MirSem-fallback, not
-        // trust-ir-primary).
+        // field reads are not in the trust-ir loop fragment — trust-ir's
+        // `IrOperand` has no opaque-projection carrier for them (named residue:
+        // the leaf stays MirSem-fallback, not trust-ir-primary).
         S::Move(_)
         | S::Index(_, _)
         | S::Len(_)
         | S::Field(_, _)
-        | S::Discriminant(_)
-        | S::Cast(..)
         // Pre-operation call arguments are outside the trust-ir loop operand
         // fragment; the MirSem witness remains the only authority path.
         | S::PreOp(..)
@@ -5566,6 +5627,28 @@ fn sem_binop_to_ir(op: crate::mirsem::SemBinOp) -> Option<crate::trustir_anchor:
         // trust-ir LOOP fragment.
         S::BitAnd | S::BitOr | S::BitXor | S::Shl | S::Shr => return None,
     })
+}
+
+/// Trust (#53): the BITWISE trio for a LEAF ARM, deliberately separate from
+/// [`sem_binop_to_ir`].
+///
+/// That function declines `BitAnd`/`BitOr`/`BitXor` and scopes the decline to the
+/// trust-ir LOOP fragment. Widening it would newly admit bitwise ops into the loop
+/// encoding, which is a different question and is not being answered here. A leaf
+/// arm is a `Return`-terminated block, and its value grounds through the SAME
+/// `Int.land`/`Int.lor`/`Int.xor` BITWISE SHAPE LANE arms `ground_int` already
+/// applies on the straight-line lanes — so this is parity, not a new claim.
+fn sem_leaf_bitwise_binop_to_ir(
+    op: crate::mirsem::SemBinOp,
+) -> Option<crate::trustir_anchor::TrustIrBinOp> {
+    use crate::mirsem::SemBinOp as S;
+    use crate::trustir_anchor::TrustIrBinOp as I;
+    match op {
+        S::BitAnd => Some(I::And),
+        S::BitOr => Some(I::Or),
+        S::BitXor => Some(I::Xor),
+        _ => None,
+    }
 }
 
 /// Translate a `SemCmpOp` onto the trust-ir `TrustIrCmpOp` (the universal-IR `ICmp`
@@ -5928,7 +6011,17 @@ fn cond_update_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
     use crate::mirsem::{SemCmpOp, SemCondTree, SemRvalue, SynthInvariant};
     use crate::trustir_anchor::{IrCondUpdateLoop, IrRvalue, IrSStmt, RefinementVerdict};
 
-    let Some(clf) = extract_cond_update_loop_function(func) else { return false };
+    // Trust (#54, 2026-08-15): the ACCUMULATE shape reaches this lane too.
+    // `extract_cond_update_loop_function` recognizes the max-scan form; memchr's
+    // `count_raw` is the accumulate form, which `extract_synth_loop_function`
+    // accepts. The kernel adjudicates either way --
+    // `check_cond_update_loop_instance` builds conclusion and proof FROM THE
+    // INSTANCE and type-checks them, so a body it cannot prove is REJECTED here.
+    let Some(clf) = extract_cond_update_loop_function(func)
+        .or_else(|| extract_synth_loop_function(func))
+    else {
+        return false;
+    };
     // The guard must be a single `Lt(i, n)` leaf comparison.
     let SemCondTree::Leaf(cond) = &clf.cond else { return false };
     if cond.op != SemCmpOp::Lt {
@@ -5936,7 +6029,16 @@ fn cond_update_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
     }
     let Some(ir_cond) = sem_cond_leaf_to_ir(&clf.cond) else { return false };
     // The synthesized invariant must be the conditional-update `0 ≤ m ∧ 0 ≤ i`.
-    let Some(SynthInvariant::CondUpdateGeConst { m_idx, c, i_idx, .. }) = clf.synth_inv else {
+    // Both conditional-accumulator invariant forms; `IrCondUpdateLoop`'s `m_idx`
+    // is documented as "the conditionally-updated ACCUMULATOR env index", so
+    // `count_idx` maps onto it directly.
+    let Some((m_idx, c, i_idx)) = (match clf.synth_inv {
+        Some(SynthInvariant::CondUpdateGeConst { m_idx, c, i_idx, .. }) => Some((m_idx, c, i_idx)),
+        Some(SynthInvariant::CondIncrGeConst { count_idx, c, i_idx, .. }) => {
+            Some((count_idx, c, i_idx))
+        }
+        _ => None,
+    }) else {
         return false;
     };
     // Translate the `Sel`-bodied loop onto `IrCondUpdateLoop` (the body is `[m := Sel(i>m) i m;
@@ -7455,6 +7557,43 @@ fn ir_field_read_operand(
                     if fields
                         .get(*fld)
                         .is_some_and(|(_, ty)| matches!(ty, Ty::Int { .. } | Ty::Bool)) => {}
+                // Trust: CLOSURE-UPVAR LEAF (2026-08-11) — the upvar read `_1.k` on the
+                // Closure-typed ENV parameter (`cap_and::{closure#0}`'s sole blocker).
+                // DELEGATED WHOLESALE to `mirsem::sem_field_read_operand`, whose W6
+                // closure arm carries the capture-specific gates a re-transcription
+                // here would have to get right a second time: upvar index IN RANGE,
+                // `Fn`/`FnOnce` call kinds ONLY (`FnMut` declines — a mutable-env
+                // closure can rebind its captures between calls, so the entry-time
+                // upvar value is not a stable denotation), no projected write to the
+                // env, no call-dest write, no mutable alias, env not reassigned. The
+                // returned `Field(Var(idx), fld)` maps onto the SAME model-only
+                // `IrOperand::Field(idx, fld)` selector the ADT arms use, and the slot
+                // comes from the recognizer, never re-derived here.
+                //
+                // ONE GATE THE DELEGATE DOES NOT CARRY, checked here: the upvar's TYPE
+                // must be scalar (`Int`/`Bool`), the same clause the ADT arm above
+                // applies to its field. MirSem's closure arm checks the index and the
+                // call kind but not the type — tolerable there (its opaque selector is
+                // total over the env value), but this lane's `Field` denotes an `Int`,
+                // and minting an Int-sorted "value" for a struct-typed capture would be
+                // a claim about nothing. Well-typed MIR cannot reach it (the assigned
+                // place's own scalar gate fires first); an adversarial dump could.
+                Some(Ty::Closure { upvars, .. }) => {
+                    if !upvars
+                        .get(*fld)
+                        .is_some_and(|ty| matches!(ty, Ty::Int { .. } | Ty::Bool))
+                    {
+                        return None; // a non-scalar (or absent) capture — fail closed.
+                    }
+                    return match crate::mirsem::sem_field_read_operand(body, op, &param_index) {
+                        Some(crate::mirsem::SemOperand::Field(base, sem_fld))
+                            if matches!(base.as_ref(), crate::mirsem::SemOperand::Var(i) if *i == idx) =>
+                        {
+                            Some(crate::trustir_anchor::IrOperand::Field(idx, sem_fld))
+                        }
+                        _ => None,
+                    };
+                }
                 _ => return None, // not a by-value ADT param — outside this arm.
             }
             if crate::mirsem::param_reassigned_by_stmt(body, p.local) {
@@ -7813,6 +7952,108 @@ fn straight_line_ir_return_spine(
 /// `rustc_mir_three_way_differential`): LEG B executes the EXACT `IrBody` this LIVE
 /// witness translation produces (translated 1:1 onto a real `trust_ir::Function`) in
 /// the trust-ir reference interpreter.
+/// Trust: COMPARE-AS-VALUE (2026-08-08) — map a MIR comparison `BinOp` onto the
+/// trust-ir `TrustIrCmpOp` for the SINGLE-STATEMENT straight-line return shape
+/// (`_0 := <cmp>(a, b); Return` — `is_negative`/`is_positive` and friends).
+///
+/// **THIS MAPPING IS TCB THE KERNEL STRUCTURALLY CANNOT DEFEND.** `check_body_refinement`
+/// relates the trust-ir body TO ITSELF: both the statement and the proof are built from
+/// the same `IrBody`, so a mis-mapping (`Gt` ↦ `Lt`, or swapped operands) still closes
+/// modulo 3. The refinement is self-consistent regardless of whether this function is
+/// right — the same shape of blindness that let an earlier non-injective literal encoder
+/// produce a live false accept in this campaign.
+///
+/// The ONLY thing in the tree that can catch an error here is the end-to-end VALUE
+/// ORACLE `straight_line_cmp_op_mapping_value_oracle` (trustir_anchor.rs tests), which
+/// runs THIS function on real MIR, closes the resulting body at concrete values, and
+/// checks the kernel both PROVES the true claim and REJECTS the negated one — with the
+/// truth computed from `trust_types::BinOp` directly, never from `TrustIrCmpOp`. The
+/// six-row table pin beside it is a readability aid, not the gate; and the anchor pin at
+/// `trustir_anchor.rs` (all six ops certify) is ANCHOR coverage, not op-mapping coverage.
+/// If that oracle is ever removed or stops reducing, this arm is unmitigated.
+///
+/// BOOL-TYPED OPERAND GATE: the comparison's operands must NOT be `bool`-typed. MIR uses
+/// the same `BinOp::Eq`/`Ne` for `bool == bool`, whose trust-ir denotation is the Int
+/// comparison of two 0/1 values — a different claim from an integer comparison, and not
+/// this fragment.
+fn straight_line_mir_binop_to_ir_cmpop(
+    body: &trust_types::VerifiableBody,
+    bop: trust_types::BinOp,
+    a: &trust_types::Operand,
+    b: &trust_types::Operand,
+) -> Option<crate::trustir_anchor::TrustIrCmpOp> {
+    use crate::trustir_anchor::TrustIrCmpOp as C;
+    if crate::mirsem::mir_operand_is_bool_typed(body, a)
+        || crate::mirsem::mir_operand_is_bool_typed(body, b)
+    {
+        return None;
+    }
+    match bop {
+        trust_types::BinOp::Eq => Some(C::Eq),
+        trust_types::BinOp::Ne => Some(C::Ne),
+        trust_types::BinOp::Lt => Some(C::Lt),
+        trust_types::BinOp::Le => Some(C::Le),
+        trust_types::BinOp::Gt => Some(C::Gt),
+        trust_types::BinOp::Ge => Some(C::Ge),
+        _ => None,
+    }
+}
+
+/// Trust (#53, 2026-08-13): the BOOL EXCLUSION for the bitwise/shift opcodes,
+/// shared by BOTH straight-line trust-ir lanes.
+///
+/// MIR spells `BitAnd`/`BitOr`/`BitXor` for the Bool CONNECTIVE and the integer
+/// bitwise operator alike, distinguishing them only by operand TYPE. On genuine
+/// Int operands the trust-ir `And`/`Or`/`Xor` (the opaque `Int.land`/`Int.lor`/
+/// `Int.xor`) is exact parity with what MirSem's own `SemRvalue::Bin` denotes. On
+/// BOOL operands it is a MIS-DENOTATION: `Int.lor` is opaque, so a symbolic
+/// bool-or degenerates to a refl-provable identity that reads as a certified
+/// boolean `or` while asserting nothing a consumer could use — and MirSem routes
+/// Bool `BitOr`/`BitAnd` to its genuine connective forms instead, so admitting it
+/// here would also make the two lanes disagree.
+///
+/// Factored out of the chain lane, where it lived as a local closure. It is now
+/// ONE definition rather than two, because a transcribed gate is how the lanes
+/// drift apart — the same reason the signum lane delegates rather than
+/// re-derives.
+/// Trust (#53, 2026-08-14): the BOOL admission for the bitwise opcodes — the
+/// positive twin of [`bitwise_operands_are_int`].
+///
+/// Requires BOTH operands to be provably `Ty::Bool`. "Not an integer" is NOT good
+/// enough: a float or an unmodelled carrier would satisfy the negation of the int
+/// gate and must still decline, so this asks the positive question.
+fn bitwise_operands_are_bool(
+    body: &trust_types::VerifiableBody,
+    a: &trust_types::Operand,
+    b: &trust_types::Operand,
+) -> bool {
+    use trust_types::{Operand, Ty};
+    let scalar_is_bool = |op: &Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) => {
+            crate::assignment_types::place_type(body, p).is_some_and(|t| t == Ty::Bool)
+        }
+        Operand::Constant(trust_types::ConstValue::Bool(_)) => true,
+        _ => false,
+    };
+    scalar_is_bool(a) && scalar_is_bool(b)
+}
+
+fn bitwise_operands_are_int(
+    body: &trust_types::VerifiableBody,
+    a: &trust_types::Operand,
+    b: &trust_types::Operand,
+) -> bool {
+    use trust_types::{Operand, Ty};
+    let scalar_is_bool = |op: &Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) => {
+            crate::assignment_types::place_type(body, p).is_some_and(|t| t == Ty::Bool)
+        }
+        Operand::Constant(trust_types::ConstValue::Bool(_)) => true,
+        _ => false,
+    };
+    !scalar_is_bool(a) && !scalar_is_bool(b)
+}
+
 pub(crate) fn straight_line_ir_body(
     func: &VerifiableFunction,
 ) -> Option<crate::trustir_anchor::IrBody> {
@@ -7907,7 +8148,51 @@ pub(crate) fn straight_line_ir_body(
             {
                 Some(TrustIrBinOp::LShr)
             }
-            _ => None, // cmp / signed-or-unproven shifts / bitwise — not the simple fragment
+            // Trust (#53, 2026-08-13) — INTEGER BITWISE, gated NON-BOOL by the shared
+            // `bitwise_operands_are_int`. The chain lane has carried these three since
+            // 2026-08-11; this lane's `_ => None` sent every SINGLE-statement bitwise
+            // body (`map_and3`/`map_or1`'s `_0 := BitAnd(_2, 3)`) to the MirSem
+            // fallback even though the identical two-statement body certified.
+            //
+            // Exact parity with MirSem, not a weakening: its own recognizer denotes a
+            // genuine-Int `BitAnd`/`BitOr`/`BitXor` as `SemRvalue::Bin` over the same
+            // opaque `Int.land`/`Int.lor`/`Int.xor` carriers these ground to. A BOOL
+            // operand is a different question and stays out — see the gate's doc.
+            //
+            // `Shl` is deliberately NOT added: the chain lane admits it, but no body
+            // in this corpus exercises it from the single-statement lane, and an
+            // untested arm is not parity worth having.
+            trust_types::BinOp::BitAnd if bitwise_operands_are_int(body, a, b) => {
+                Some(TrustIrBinOp::And)
+            }
+            trust_types::BinOp::BitOr if bitwise_operands_are_int(body, a, b) => {
+                Some(TrustIrBinOp::Or)
+            }
+            trust_types::BinOp::BitXor if bitwise_operands_are_int(body, a, b) => {
+                Some(TrustIrBinOp::Xor)
+            }
+            // Trust (#53, 2026-08-14) — the BOOL half, landed once trust-ir grew a
+            // genuine boolean connective (`BinOp::{BAnd,BOr,BXor}`, trust-ir 4b06918).
+            //
+            // Same MIR opcode as the three arms above, opposite denotation, decided
+            // purely by operand TYPE — which is the only thing MIR itself uses to tell
+            // a Bool connective from an integer operator. Until the connectives
+            // existed these bodies had to DECLINE: the only available mapping was onto
+            // `And`/`Or`/`Xor`, whose opaque `Int.land`/`Int.lor` say nothing about a
+            // symbolic operand, so the refinement would have closed by `rfl` while
+            // reading as a certified boolean `or`. That is why the decline was correct
+            // then and why admitting them now is correct rather than a relaxation: the
+            // model got a carrier, the gate did not get weaker.
+            trust_types::BinOp::BitAnd if bitwise_operands_are_bool(body, a, b) => {
+                Some(TrustIrBinOp::BAnd)
+            }
+            trust_types::BinOp::BitOr if bitwise_operands_are_bool(body, a, b) => {
+                Some(TrustIrBinOp::BOr)
+            }
+            trust_types::BinOp::BitXor if bitwise_operands_are_bool(body, a, b) => {
+                Some(TrustIrBinOp::BXor)
+            }
+            _ => None, // cmp / signed-or-unproven shifts / bool bitwise — not the simple fragment
         }
     };
     // The simple straight-line return: the FINAL reachable `_0 := rvalue` whose rvalue is a direct
@@ -7938,14 +8223,106 @@ pub(crate) fn straight_line_ir_body(
                 Some(return_statement),
             )?;
             let Rvalue::CheckedBinaryOp(bop, a, b) = checked else { return None };
+            // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — the trust-ir twin now
+            // carries the ASSERT LICENSE too (the adversarial round found this
+            // chase mirrored only the sole-assignment half of the mirsem gate: an
+            // assert-less `.0` read certified via_ir with BOTH safety pillars
+            // vacuous, the fixed hole's un-fixed twin).
+            if !crate::mirsem::checked_pair_int_reading_licensed(body, p.local, *bop) {
+                return None;
+            }
             IrRvalue::Bin(to_ir_binop(bop, a, b)?, to_ir_operand(a)?, to_ir_operand(b)?)
         }
         Rvalue::Use(op) => IrRvalue::Use(to_ir_operand(op)?),
-        Rvalue::BinaryOp(bop, a, b) | Rvalue::CheckedBinaryOp(bop, a, b) => {
-            IrRvalue::Bin(to_ir_binop(bop, a, b)?, to_ir_operand(a)?, to_ir_operand(b)?)
+        // Trust: COMPARE-AS-VALUE (2026-08-08) — an UNCHECKED `BinaryOp` may be a
+        // COMPARISON returning `bool` (`_0 := p < 0; Return` — `is_negative` and its
+        // family). Try the comparison mapping FIRST, and ONLY on `BinaryOp`: a
+        // `CheckedBinaryOp` is arithmetic-with-overflow-flag and never a comparison, so
+        // splitting the arms keeps that impossible by construction rather than by the
+        // mapping happening to decline.
+        //
+        // `IrRvalue::Cmp` is NOT new — it already existed and already certified for all
+        // six ops. The gap was only that this SINGLE-STATEMENT recognizer had no
+        // comparison arm, so these bodies fell to the MirSem lane. See
+        // `straight_line_mir_binop_to_ir_cmpop` for why its mapping is TCB the kernel
+        // cannot defend, and which test is the actual gate.
+        Rvalue::BinaryOp(bop, a, b) => {
+            if let Some(cmp) = straight_line_mir_binop_to_ir_cmpop(body, *bop, a, b) {
+                IrRvalue::Cmp(cmp, to_ir_operand(a)?, to_ir_operand(b)?)
+            } else {
+                IrRvalue::Bin(to_ir_binop(bop, a, b)?, to_ir_operand(a)?, to_ir_operand(b)?)
+            }
         }
+        // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — the direct
+        // `_0 := CheckedBinaryOp` is the WHOLE-PAIR return; the scalar `Int`
+        // reading erased the flag, the tuple, and the wrap. Shielded from
+        // well-typed dumps by this lane's Int/Bool return-type gate, but the
+        // conflation is never a license — decline by construction (the mirsem
+        // direct arm's split, twinned).
+        Rvalue::CheckedBinaryOp(..) => return None,
         Rvalue::UnaryOp(trust_types::UnOp::Neg, a) => {
             IrRvalue::Un(TrustIrUnOp::Neg, to_ir_operand(a)?)
+        }
+        // Trust (#53, 2026-08-13) — DISCRIMINANT AS THE WHOLE RETURN. `Ordering`'s
+        // `as_raw`/`ord_to_i8` are `_0 := Discriminant(_1)` with nothing else to do,
+        // so they never reached the chain lane's own `Rvalue::Discriminant` arm
+        // (which requires >= 2 statements) and this lane had no arm at all.
+        //
+        // DELEGATED to `sem_discriminant_base_of_mir`, exactly as the chain twin,
+        // so this arm inherits every gate that recognizer carries rather than a
+        // transcription of them: the base must be a MODELED enum, `&self` must be
+        // IMMUTABLE, no write may reach through the reference, and the parameter
+        // must still hold its entry-time value.
+        //
+        // The use site passed here is REAL, and that is the material difference
+        // from the chain twin, which passes `None` and documents its
+        // address-of-temp shape as unreachable. `as_raw` IS that shape
+        // (`_2 := &_1; _0 := Discriminant((*_2))`), and a real use site is what
+        // lets the recognizer resolve through the borrow temp — the same reason
+        // the slice-length arm below passes one.
+        //
+        // MODEL-ONLY, like the chain twin: `IrOperand::Discr` is denoted by
+        // trust-ir's own `idxElem` at a reserved negative key, so the kernel
+        // asserts only that the value is some Int stably determined by the
+        // entry-time enum. "It is THE tag" lives in this mapping, not in the logic
+        // — which is why the MODEL refinement disjunct is what closes it.
+        Rvalue::Discriminant(place) => {
+            let base = crate::mirsem::sem_discriminant_base_of_mir(
+                body,
+                place,
+                &param_index,
+                Some((return_block, Some(return_statement))),
+            )?;
+            let crate::mirsem::SemOperand::Var(idx) = base else {
+                return None; // a non-parameter base — outside this fragment.
+            };
+            IrRvalue::Use(crate::trustir_anchor::IrOperand::Discr(idx))
+        }
+        // Trust: SLICE-LENGTH, single-statement lane (2026-08-11) — the same
+        // W-LEN-ISEMPTY delegation as the chain lane's arm, with one material
+        // difference: the use site passed here is REAL (`return_block`,
+        // `return_statement`), which activates the resolver's vetted SAME-fat-pointer
+        // cast-passthrough branch — `str::len`'s `_t := (&str as &[u8]); _0 :=
+        // PtrMetadata(_t)` resolves through the temp under the resolver's own
+        // dominance check, a shape the chain lane structurally cannot admit (its walk
+        // declines the Ref-typed cast temp). `w_slice_len`'s direct
+        // `_0 := PtrMetadata(_1)` is the simple case. Both fail closed through the
+        // delegate: `&mut [T]`, a non-slice referent, a reassigned parameter, and a
+        // size-changing reinterpret cast all decline. MODEL-ONLY `Len` carrier —
+        // the kernel asserts only "SOME Int stably determined by the entry-time
+        // slice"; the-length-ness lives in the recognizer mapping.
+        Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, a) => {
+            let sem = crate::mirsem::resolve_ptr_metadata_slice_len(
+                body,
+                a,
+                &param_index,
+                (return_block, Some(return_statement)),
+            )?;
+            let crate::mirsem::SemOperand::Len(base) = sem else { return None };
+            let crate::mirsem::SemOperand::Var(idx) = *base else { return None };
+            IrRvalue::Use(crate::trustir_anchor::IrOperand::Len(Box::new(
+                crate::trustir_anchor::IrOperand::Var(idx),
+            )))
         }
         // Trust: field-read+cast leaf — a SOUND WIDENING cast becomes the
         // IDENTITY `Use(<resolved source>)`; the source may itself be a
@@ -8078,6 +8455,2453 @@ fn eval_literal_cmp(bop: &trust_types::BinOp, a: i128, b: i128) -> Option<bool> 
     })
 }
 
+/// Every LOCAL an rvalue READS, appended to `out`. Scoped deliberately to the
+/// rvalue forms [`straight_line_ir_body_chain`] translates plus the ones it
+/// declines outright — a form this does not enumerate contributes NO locals, which
+/// is only safe because the translation loop rejects it a few lines later anyway.
+/// Used for the use-after-`StorageDead` check, where under-reporting a read would
+/// be the unsound direction.
+fn straight_line_rvalue_read_locals(rvalue: &trust_types::Rvalue, out: &mut Vec<usize>) {
+    use trust_types::{Operand, Rvalue};
+    let mut push = |op: &Operand| {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            out.push(p.local);
+        }
+    };
+    match rvalue {
+        Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => push(a),
+        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+            push(a);
+            push(b);
+        }
+        Rvalue::Discriminant(place) | Rvalue::Ref { place, .. } => out.push(place.local),
+        _ => {}
+    }
+}
+
+/// A STABLE guard operand — usable in a cross-block ESTABLISHED FACT. Only a bare,
+/// never-reassigned PARAMETER or an integer constant qualifies: anything else (a temp,
+/// a projected place) could denote different values at the switch and at the assert,
+/// so it never becomes a fact. Factored out of `straight_line_ir_body_chain` for the
+/// W19 mutator walk (Trust: SET_BIT M1, 2026-08-12) — SHARED, not re-transcribed.
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum GuardOp {
+    Param(usize),
+    ConstI(i128),
+}
+
+fn stable_guard_operand(
+    body: &trust_types::VerifiableBody,
+    op: &trust_types::Operand,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<GuardOp> {
+    use trust_types::Operand;
+    match op {
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+            if param_index(p.local).is_some()
+                && !crate::mirsem::param_reassigned_by_stmt(body, p.local)
+            {
+                Some(GuardOp::Param(p.local))
+            } else {
+                None
+            }
+        }
+        Operand::Constant(trust_types::ConstValue::Int(k)) => Some(GuardOp::ConstI(*k)),
+        Operand::Constant(trust_types::ConstValue::Uint(k, _)) => {
+            i128::try_from(*k).ok().map(GuardOp::ConstI)
+        }
+        _ => None,
+    }
+}
+
+/// The UNIQUE `Return` block, or `None` (more than one, or none, is outside every
+/// straight-line fragment). Factored alongside [`stable_guard_operand`].
+fn unique_return_block_id(body: &trust_types::VerifiableBody) -> Option<trust_types::BlockId> {
+    use trust_types::Terminator;
+    let mut it = body.blocks.iter().filter(|b| matches!(b.terminator, Terminator::Return));
+    let first = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(first.id)
+}
+
+/// Trust: SET_BIT M1 (2026-08-12) — the DIVERGENCE-GUARDED RMW MUTATOR walk: the
+/// `<uN/iN as BitField>::set_bit` family,
+///
+/// ```text
+/// bb0: _g := Lt(bit, W); SwitchInt(_g) [0 → panic] else bb1     (divergence guard)
+/// bb1: SwitchInt(value) [0 → else_arm] else then_arm            (the W7 value fork)
+/// then: _t := Shl(1, bit); (*self) := BitOr((*self), _t); Goto join
+/// else: _t := Shl(1, bit); _u := Not(_t); (*self) := BitAnd((*self), _u); Goto join
+/// join: _0 := Copy(self); Return                                 (W5 return-self)
+/// ```
+///
+/// Produces the CELL-POST model `IrCfg`: the deref-write SSA-renamed to a per-arm
+/// FRESH post slot, each arm `Return`ing its own slot — the model's "return value" IS
+/// the cell's post-value, a CELL-POST claim, not a return-value claim. The `&mut Self`
+/// return is a separate STRUCTURAL fact (W5), never a kernel claim on the Int carrier.
+///
+/// THE CLAIM FAMILY, stated precisely (the W19 discipline): partial correctness of the
+/// cell — IF the function returns normally, the recv cell's post-value equals the
+/// selected arm's expression over the ENTRY cell value and the arguments. The bounds
+/// guard's divergence is outside the claim (the get_bit precedent); the frame ("nothing
+/// else written") is carried by the W2/W3 gates below, NOT by the kernel statement.
+///
+/// WHY THE PRE-VALUE MAY BE `Var(recv_slot)`: the read-side GAP-DEREF-SELF arm refuses
+/// `&mut` BY DESIGN (a write could intervene between read and use). Here the walk
+/// itself enumerates EVERY write in the body (W2) and every alias (W3): the only
+/// deref-writes are the admitted arm writes, each reading the cell exactly once, in
+/// its own RHS, BEFORE writing it — so the RHS read is the entry value by the walk's
+/// own gates, not by delegation. That is why these gates are new (W1–W7) rather than
+/// borrowed from the read lane.
+///
+/// Fail-closed gates:
+///   W1 shape — `return_ty == Ty::Ref{mutable:true, inner: Int}`; the recv is a
+///        parameter of the SAME type; every other parameter scalar (`Int`/`Bool`).
+///   W2 write enumeration — every projected write in the WHOLE body is one of the
+///        admitted arm writes `(*recv) := <bitwise-op>(Copy((*recv)), operand)`; the
+///        recv local is never written bare; `_0`'s sole write is the join's
+///        `Copy(recv)`.
+///   W3 no-alias — no `Ref{mutable:true}`/`AddressOf(true)` of recv or `_0` anywhere;
+///        the may-alias helper for the READ lane follows only immutable copies, so
+///        this lane carries its own dual scan.
+///   W4 read-order — in an arm, the ONLY deref-read of recv is the write's own RHS
+///        first operand.
+///   W5 return-self — the join block is exactly `_0 := Copy(recv); Return`.
+///   W6 fresh post slots — one per arm, allocated past every local; NEVER shared
+///        (the RHS builders inline over a global SSA def map, and a shared slot
+///        cross-inlines the arms silently).
+///   W7 the value fork — a `SwitchInt` on a bare, never-reassigned BOOL parameter,
+///        both successors reaching the unique Return, modeled as `Ne(value, 0)`.
+///   WRAP-vs-INT — the write op is BITWISE ONLY (`BitOr`/`BitAnd`/`BitXor`): an
+///        UNCHECKED `Add`/`Sub`/`Mul` write wraps in release and the mathematical
+///        reading would be a live false claim; bitwise ops have no wrap divergence.
+///        Arm temps may additionally use `Shl` (behind its own Assert, discharged via
+///        the established-fact discipline) and the integer `Not` (the model-only
+///        `bnot` — which is exactly why the certificate rides the MODEL tier).
+///
+/// Guard/assert defs are EXCLUDED AT COLLECT TIME (they are consumed by terminators,
+/// never part of the value trace) — which also keeps `IrRvalue::Cmp` out of the arm
+/// blocks for the LEG-B interpreter emitter, and avoids any `ordered.remove` /
+/// `dead_at` interaction by never collecting them at all.
+pub(crate) fn divergence_guarded_rmw_mutator_ir_cfg(
+    func: &VerifiableFunction,
+) -> Option<crate::trustir_anchor::IrCfg> {
+    use trust_types::{BinOp, Operand, Projection, Rvalue, Statement, Terminator, Ty, UnOp};
+
+    use crate::trustir_anchor::{
+        IrBlock, IrCfg, IrCond, IrOperand, IrRvalue, IrStmt, IrTerm, TrustIrBinOp,
+        TrustIrCmpOp, TrustIrUnOp,
+    };
+
+    let body = &func.body;
+    let arg_count = body.arg_count;
+    let param_index = |local: usize| -> Option<u64> {
+        (1..=arg_count).contains(&local).then(|| u64::try_from(local - 1).ok()).flatten()
+    };
+    // Trust: W19 CALL-RMW audit — no in-CFG unwind successors, unique block ids.
+    // The diverging panic call's `unwind: Cleanup(join)` would otherwise create a
+    // normally-returning path where the cell was NEVER WRITTEN, invisible to the
+    // normal-edge reachability this walk's divergence classification runs on.
+    if body_has_cleanup_unwind_edge(body) || !all_block_ids_unique(body) {
+        return None;
+    }
+    // W1 — the shape.
+    let Ty::Ref { mutable: true, inner: ret_inner } = &body.return_ty else { return None };
+    let Ty::Int { .. } = ret_inner.as_ref() else { return None };
+    // The recv: the unique parameter with the return's own type.
+    let mut recv = None;
+    for l in 1..=arg_count {
+        let ty = &body.locals.get(l)?.ty;
+        if let Ty::Ref { mutable: true, inner } = ty {
+            if inner == ret_inner {
+                if recv.is_some() {
+                    return None; // two candidate receivers — ambiguous, fail closed.
+                }
+                recv = Some(l);
+            } else {
+                return None; // a second mutable ref param — outside this fragment.
+            }
+        } else if !matches!(ty, Ty::Int { .. } | Ty::Bool) {
+            return None; // a non-scalar non-recv param — outside this fragment.
+        }
+    }
+    let recv = recv?;
+    // NOTE deliberately NO `param_reassigned_by_stmt(recv)` here: that helper counts
+    // ANY write whose place.local is the param — including the projected deref-write
+    // that is this walk's entire subject (`stmt_writes_local` ignores projections).
+    // The soundness it provides on the read lanes is carried here by the walk's own
+    // gates instead: W2's global cross-check declines any BARE rebind of the recv
+    // local, and W3's dual scan declines any mutable alias of it.
+    let return_block = unique_return_block_id(body)?;
+
+    // W3 — the alias dual scan (the read lane's helper follows only IMMUTABLE copies).
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue, .. } = st {
+                match rvalue {
+                    Rvalue::Ref { mutable: true, place }
+                        if place.local == recv || place.local == 0 =>
+                    {
+                        return None;
+                    }
+                    Rvalue::AddressOf(_, place) if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // A tiny local operand translator for ARM temps: bare param, int const, or a
+    // temp defined earlier IN THE SAME ARM — and NOT storage-dead at the read
+    // (Trust: W19 M1 marker discipline, 2026-08-13 — the dead_at class, per-arm
+    // form: a read after `StorageDead` is indeterminate in MIR while this model
+    // hands back the defined value). The deref pre-read is handled at the write
+    // site only.
+    let xlate_operand = |op: &Operand,
+                         defined: &std::collections::HashSet<usize>,
+                         dead: &std::collections::HashSet<usize>|
+     -> Option<IrOperand> {
+        match op {
+            Operand::Constant(trust_types::ConstValue::Int(k)) => Some(IrOperand::Const(*k)),
+            Operand::Constant(trust_types::ConstValue::Uint(k, _)) => {
+                i128::try_from(*k).ok().map(IrOperand::Const)
+            }
+            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+                if dead.contains(&p.local) {
+                    return None; // a read of storage-dead contents — never a value.
+                }
+                if let Some(idx) = param_index(p.local) {
+                    if p.local == recv || crate::mirsem::param_reassigned_by_stmt(body, p.local)
+                    {
+                        return None; // the recv handle itself is not an Int operand.
+                    }
+                    return Some(IrOperand::Var(idx));
+                }
+                defined.contains(&p.local).then(|| u64::try_from(p.local).ok().map(IrOperand::Var))?
+            }
+            _ => None,
+        }
+    };
+    let arm_binop = |op: &BinOp| -> Option<TrustIrBinOp> {
+        match op {
+            BinOp::Shl => Some(TrustIrBinOp::Shl),
+            BinOp::Shr => Some(TrustIrBinOp::LShr),
+            BinOp::BitAnd => Some(TrustIrBinOp::And),
+            BinOp::BitOr => Some(TrustIrBinOp::Or),
+            BinOp::BitXor => Some(TrustIrBinOp::Xor),
+            _ => None, // WRAP-vs-INT: no unchecked arithmetic in a mutator arm.
+        }
+    };
+
+    // ---- the walk --------------------------------------------------------------
+    // Entry: the divergence guard. Reuse the factored stable-operand + polarity
+    // discipline, specialized to this fixed 2-level shape.
+    let entry = body.blocks.first()?;
+    if entry.id != trust_types::BlockId(0) {
+        return None;
+    }
+    // The entry block: exactly one guard def, consumed by the switch.
+    let [Statement::Assign { place: gp, rvalue: grv, .. }] = entry.stmts.as_slice() else {
+        return None;
+    };
+    if !gp.projections.is_empty() || !local_has_only_n_bare_assignments(body, gp.local, 1) {
+        return None;
+    }
+    let Rvalue::BinaryOp(gbop, ga, gb) = grv else { return None };
+    let (Some(fka), Some(fkb)) = (
+        stable_guard_operand(body, ga, &param_index),
+        stable_guard_operand(body, gb, &param_index),
+    ) else {
+        return None;
+    };
+    let Terminator::SwitchInt { discr, targets, otherwise, .. } = &entry.terminator else {
+        return None;
+    };
+    let (Operand::Copy(dp) | Operand::Move(dp)) = discr else { return None };
+    if dp.local != gp.local || !dp.projections.is_empty() {
+        return None;
+    }
+    let [(0, zero_edge)] = targets.as_slice() else { return None };
+    let reach_zero = crate::mirsem::cfg_reachable_from(body, *zero_edge)?;
+    let reach_other = crate::mirsem::cfg_reachable_from(body, *otherwise)?;
+    let (fork_bb, guard_polarity) =
+        match (reach_zero.contains(&return_block), reach_other.contains(&return_block)) {
+            (true, false) => (*zero_edge, false),
+            (false, true) => (*otherwise, true),
+            _ => return None,
+        };
+    let fact = (*gbop, fka, fkb, guard_polarity);
+
+    // The W7 value fork.
+    let fork = body.blocks.iter().find(|b| b.id == fork_bb)?;
+    if !fork.stmts.is_empty() {
+        return None; // the fork block carries no defs in this fragment.
+    }
+    let Terminator::SwitchInt { discr, targets, otherwise, .. } = &fork.terminator else {
+        return None;
+    };
+    let (Operand::Copy(vp) | Operand::Move(vp)) = discr else { return None };
+    let Some(value_slot) = param_index(vp.local) else { return None };
+    if !vp.projections.is_empty()
+        || !matches!(body.locals.get(vp.local).map(|l| &l.ty), Some(Ty::Bool))
+        || crate::mirsem::param_reassigned_by_stmt(body, vp.local)
+    {
+        return None;
+    }
+    let [(0, else_bb)] = targets.as_slice() else { return None };
+    let then_bb = *otherwise;
+    let else_bb = *else_bb;
+
+    // ---- per-arm walk ----------------------------------------------------------
+    // Returns (stmts, post_slot_rvalue) — the arm's temp defs plus the write's RHS,
+    // with the deref pre-read as Var(recv_slot). Also records the write statement
+    // pointer for the W2 global cross-check.
+    let recv_slot = u64::try_from(recv - 1).ok()?;
+    let mut admitted_writes: Vec<*const Statement> = Vec::new();
+    let mut visited: std::collections::HashSet<trust_types::BlockId> =
+        [trust_types::BlockId(0), fork_bb].into_iter().collect();
+    let mut walk_arm = |start: trust_types::BlockId,
+                        visited: &mut std::collections::HashSet<trust_types::BlockId>,
+                        admitted_writes: &mut Vec<*const Statement>|
+     -> Option<(Vec<IrStmt>, IrRvalue, trust_types::BlockId)> {
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        let mut defined: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Trust: W19 M1 marker discipline (2026-08-13) — the per-arm dead set,
+        // POSITION-AWARE along the arm's own linear trace (the straight-line
+        // lane's `dead_at` shaped to the fork walk: each arm is a linear path, so
+        // per-arm tracking IS path tracking). Markers were previously skipped
+        // unconditionally; measured 2026-08-13, the family's committed dumps
+        // carry ZERO markers, so the tightening moves nothing — it exists for
+        // marker-carrying intake, where real MIR's `Live` before a def and
+        // `Dead` after the last use must ADMIT while a kill or resurrection
+        // inside the def→use window must DECLINE.
+        let mut dead: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Assert-consumed guard locals (adversarial round, 2026-08-13): the guard
+        // def is EXCLUDED from `defined` by design (it emits no IrStmt, and
+        // widening `defined` would widen xlate's read admission onto an undefined
+        // model slot) — which made BOTH marker rules blind exactly there: a bare
+        // `StorageLive(guard)` after its def (resurrection keyed on `defined`)
+        // and the `StorageDead(guard); StorageLive(guard)` launder (the Live
+        // un-kills the dead set, defeating the Assert's own dead-check) were
+        // ADMITTED, certifying a body whose every returning path asserts on
+        // freshly reallocated, uninitialized storage. The fix: once a def is
+        // claimed by its block's Assert, ANY later marker naming it declines.
+        // (Markers BEFORE the def stay lawful: `Live` is bracketing, `Dead`
+        // trips the def-into-dead rule.)
+        let mut assert_guards: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut write_rv: Option<IrRvalue> = None;
+        let mut cur = start;
+        loop {
+            if !visited.insert(cur) {
+                return None; // a cycle, or re-entering a shared block mid-arm.
+            }
+            let blk = body.blocks.iter().find(|b| b.id == cur)?;
+            for st in &blk.stmts {
+                let Statement::Assign { place, rvalue, .. } = st else {
+                    match st {
+                        Statement::StorageLive(l) | Statement::StorageDead(l)
+                            if *l != 0 && *l != recv =>
+                        {
+                            // A marker naming a PARAM is outside real MIR (params
+                            // carry no storage markers) — fail closed rather than
+                            // reason about a dead parameter read. A marker naming
+                            // an assert-consumed guard AFTER its def is the
+                            // launder/resurrection hole — same decline.
+                            if param_index(*l).is_some() || assert_guards.contains(l) {
+                                return None;
+                            }
+                            match st {
+                                Statement::StorageDead(_) => {
+                                    dead.insert(*l);
+                                }
+                                Statement::StorageLive(_) => {
+                                    if defined.contains(l) {
+                                        return None; // resurrection: contents fresh
+                                                     // and indeterminate, while the
+                                                     // model keeps the old value.
+                                    }
+                                    dead.remove(l);
+                                }
+                                _ => unreachable!(),
+                            }
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                };
+                if place.projections.is_empty() {
+                    // A guard def (consumed by this block's Assert) or an arm temp.
+                    if write_rv.is_some() {
+                        return None; // no defs after the write in this fragment.
+                    }
+                    if dead.contains(&place.local) {
+                        return None; // a def into storage already killed.
+                    }
+                    if !matches!(
+                        body.locals.get(place.local).map(|l| &l.ty),
+                        Some(Ty::Int { .. } | Ty::Bool)
+                    ) || !local_has_only_n_bare_assignments(body, place.local, 1)
+                        || param_index(place.local).is_some()
+                    {
+                        return None;
+                    }
+                    // Is this def the block's OWN assert guard? If so, exclude it at
+                    // collect time (checked against the fact when the Assert is seen).
+                    let consumed_by_assert = matches!(
+                        &blk.terminator,
+                        Terminator::Assert { cond: Operand::Copy(cp) | Operand::Move(cp), .. }
+                            if cp.local == place.local && cp.projections.is_empty()
+                    );
+                    if consumed_by_assert {
+                        assert_guards.insert(place.local);
+                        continue;
+                    }
+                    let ir_rv = match rvalue {
+                        Rvalue::BinaryOp(bop, a, b) => IrRvalue::Bin(
+                            arm_binop(bop)?,
+                            xlate_operand(a, &defined, &dead)?,
+                            xlate_operand(b, &defined, &dead)?,
+                        ),
+                        Rvalue::UnaryOp(UnOp::Not, a) => {
+                            // The INTEGER complement — `!(1 << bit)`. Model-only bnot;
+                            // a Bool operand cannot occur (arm temps are Int-typed
+                            // mask arithmetic; a Bool temp would fail xlate below).
+                            if !matches!(
+                                body.locals.get(place.local).map(|l| &l.ty),
+                                Some(Ty::Int { .. })
+                            ) {
+                                return None;
+                            }
+                            IrRvalue::Un(TrustIrUnOp::Not, xlate_operand(a, &defined, &dead)?)
+                        }
+                        Rvalue::Use(a) => IrRvalue::Use(xlate_operand(a, &defined, &dead)?),
+                        _ => return None,
+                    };
+                    stmts.push(IrStmt { idx: u64::try_from(place.local).ok()?, rvalue: ir_rv });
+                    defined.insert(place.local);
+                } else {
+                    // W2/W4 — THE deref write: exactly `(*recv) := bitop(Copy((*recv)), t)`.
+                    if write_rv.is_some() {
+                        return None; // a second write in one arm — outside the fragment.
+                    }
+                    if place.local != recv
+                        || place.projections.as_slice() != [Projection::Deref]
+                    {
+                        return None;
+                    }
+                    let Rvalue::BinaryOp(wop, wa, wb) = rvalue else { return None };
+                    let w_ir = match wop {
+                        BinOp::BitOr => TrustIrBinOp::Or,
+                        BinOp::BitAnd => TrustIrBinOp::And,
+                        BinOp::BitXor => TrustIrBinOp::Xor,
+                        _ => return None, // WRAP-vs-INT: bitwise writes only.
+                    };
+                    // W4 — the pre-read is the FIRST operand, exactly Copy((*recv)).
+                    let Operand::Copy(ra) = wa else { return None };
+                    if ra.local != recv || ra.projections.as_slice() != [Projection::Deref] {
+                        return None;
+                    }
+                    let rhs = xlate_operand(wb, &defined, &dead)?;
+                    write_rv =
+                        Some(IrRvalue::Bin(w_ir, IrOperand::Var(recv_slot), rhs));
+                    admitted_writes.push(st as *const Statement);
+                }
+            }
+            match &blk.terminator {
+                Terminator::Goto(t) => {
+                    if write_rv.is_some() {
+                        // The arm is complete; `t` must be the join.
+                        return Some((stmts, write_rv?, *t));
+                    }
+                    cur = *t;
+                }
+                Terminator::Assert { cond, expected, target, .. } => {
+                    let (Operand::Copy(cp) | Operand::Move(cp)) = cond else { return None };
+                    if !cp.projections.is_empty()
+                        || !local_has_only_n_bare_assignments(body, cp.local, 1)
+                        || dead.contains(&cp.local)
+                    {
+                        return None; // (the dead check: an assert reading killed
+                                     // storage — the guard's discharge would rest
+                                     // on an indeterminate value.)
+                    }
+                    // The guard def must be THIS block's excluded def, matching the
+                    // established fact with the right polarity.
+                    let def = blk.stmts.iter().find_map(|s| match s {
+                        Statement::Assign { place, rvalue, .. }
+                            if place.local == cp.local && place.projections.is_empty() =>
+                        {
+                            Some(rvalue)
+                        }
+                        _ => None,
+                    })?;
+                    let Rvalue::BinaryOp(abop, aa, ab) = def else { return None };
+                    let (Some(aka), Some(akb)) = (
+                        stable_guard_operand(body, aa, &param_index),
+                        stable_guard_operand(body, ab, &param_index),
+                    ) else {
+                        return None;
+                    };
+                    let (fbop, fa, fb, fpol) = fact;
+                    if *abop != fbop || aka != fa || akb != fb || fpol != *expected {
+                        return None;
+                    }
+                    cur = *target;
+                }
+                _ => return None,
+            }
+        }
+    };
+
+    let (then_stmts, then_write, then_join) =
+        walk_arm(then_bb, &mut visited, &mut admitted_writes)?;
+    let (else_stmts, else_write, else_join) =
+        walk_arm(else_bb, &mut visited, &mut admitted_writes)?;
+    if then_join != else_join {
+        return None;
+    }
+
+    // W5 — the join: exactly `_0 := Copy(recv); Return`.
+    let join = body.blocks.iter().find(|b| b.id == then_join)?;
+    if join.id != return_block || !visited.insert(join.id) {
+        return None;
+    }
+    let [Statement::Assign { place: jp, rvalue: jrv, .. }] = join.stmts.as_slice() else {
+        return None;
+    };
+    if jp.local != 0 || !jp.projections.is_empty() {
+        return None;
+    }
+    let Rvalue::Use(Operand::Copy(jsrc) | Operand::Move(jsrc)) = jrv else { return None };
+    if jsrc.local != recv || !jsrc.projections.is_empty() {
+        return None;
+    }
+    if !matches!(join.terminator, Terminator::Return) {
+        return None;
+    }
+
+    // Completeness: every unvisited block must be unable to reach Return.
+    for blk in &body.blocks {
+        if visited.contains(&blk.id) {
+            continue;
+        }
+        let reach = crate::mirsem::cfg_reachable_from(body, blk.id)?;
+        if reach.contains(&return_block) {
+            return None;
+        }
+    }
+    // W2 global cross-check: every projected write in the body is an admitted one,
+    // and `_0`/recv are never written elsewhere.
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { place, .. } = st {
+                if !place.projections.is_empty()
+                    && !admitted_writes.contains(&(st as *const Statement))
+                {
+                    return None;
+                }
+                if place.projections.is_empty() && (place.local == 0 || place.local == recv) {
+                    // `_0`'s sole write is the join's (already matched); recv bare-
+                    // written anywhere is a rebind.
+                    if place.local == recv {
+                        return None;
+                    }
+                    if blk.id != join.id {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- the model -------------------------------------------------------------
+    // W6 — per-arm FRESH post slots, past every local.
+    let post_then = u64::try_from(body.locals.len()).ok()?;
+    let post_else = post_then + 1;
+    let mut then_blk_stmts = then_stmts;
+    then_blk_stmts.push(IrStmt { idx: post_then, rvalue: then_write });
+    let mut else_blk_stmts = else_stmts;
+    else_blk_stmts.push(IrStmt { idx: post_else, rvalue: else_write });
+    Some(IrCfg {
+        blocks: vec![
+            IrBlock {
+                stmts: vec![],
+                term: IrTerm::Switch(
+                    IrCond {
+                        op: TrustIrCmpOp::Ne,
+                        a: IrOperand::Var(value_slot),
+                        b: IrOperand::Const(0),
+                    },
+                    1,
+                    2,
+                ),
+            },
+            IrBlock { stmts: then_blk_stmts, term: IrTerm::Return(IrOperand::Var(post_then)) },
+            IrBlock { stmts: else_blk_stmts, term: IrTerm::Return(IrOperand::Var(post_else)) },
+        ],
+        entry: 0,
+        fuel: 4,
+    })
+}
+
+/// Trust: W19 M3 (2026-08-12) — the STRAIGHT-LINE whole-primitive mutator walk: the
+/// sibling of [`divergence_guarded_rmw_mutator_ir_cfg`] for the un-forked,
+/// un-guarded shapes,
+///
+/// ```text
+/// store:    (*self) := v;                                        Return
+/// bitwise:  (*self) := BitOp(Copy((*self)), rhs);                Return
+/// checked:  _t := CheckedBinaryOp(op, Copy((*self)), rhs);
+///           Assert(!_t.1, Overflow(op)) → next;
+///           (*self) := Use(Move(_t.0));                          Return
+/// ```
+///
+/// CAPABILITY WORK, stated on the tin: the committed corpus has ZERO bodies this walk
+/// admits (measured — the "73-body whole-primitive population" in the M2 report was a
+/// WRITE-STATEMENT count over 43 mostly loop/call-heavy bodies; the walkable subset at
+/// HEAD is empty, and the M2 framing is corrected in the M3 report). It exists so the
+/// claim family is COMPLETE over the three honest write classes before any fixture
+/// intake, with every gate pinned on hand-built shapes.
+///
+/// THE WRITE-OP RULINGS (WRAP-vs-INT, the load-bearing table):
+///   * plain store `(*recv) := Use(param|const)` — always sound (no arithmetic), gated
+///     on ZERO deref-reads of recv anywhere (a store body that also reads the cell is
+///     a different dataflow and fails closed);
+///   * bitwise RMW — the set_bit precedent verbatim (no wrap divergence);
+///   * checked arithmetic — the `Int.<op>` reading is licensed ONLY by the
+///     `CheckedBinaryOp` + `Assert(cond = _t.1, expected = false, Overflow(op))` +
+///     store-of-`_t.0` spine (partial correctness under the discharged no-overflow
+///     side condition — the inc-1.5 discipline). The (d)-gates: the tuple temp is
+///     sole-written, its `.1` consumed ONLY by the assert, its `.0` ONLY by the store,
+///     and the temp NEVER escapes whole (a bare `Copy`/`Move` of `_t` anywhere is the
+///     G-TEMP escape — the wrapped tuple flowing elsewhere would put unaudited uses
+///     under the claim); the assert's message must be `Overflow(<the same op>)`.
+///   * an UNCHECKED `Add`/`Sub`/`Mul` write DECLINES at the op match, as in M1.
+///
+/// RETURN SHAPES: `&mut Self` passthrough (the M1 W5 join, `_0 := Copy(recv)`) OR
+/// unit (`return_ty == Unit` and `_0` NEVER written anywhere — the nonmax/eval
+/// finding: a unit mutator's `_0` is never assigned, so the gate is global absence,
+/// not a join statement).
+///
+/// Gates W2/W3/W4 are the M1 gates verbatim (cited per site); the
+/// `param_reassigned_by_stmt(recv)` removal carries over with the same rationale
+/// (the helper is projection-blind — the deref-write itself would count).
+pub(crate) fn straight_line_mutator_ir_cfg(
+    func: &VerifiableFunction,
+) -> Option<crate::trustir_anchor::IrCfg> {
+    use trust_types::{
+        AssertMessage, BinOp, Operand, Projection, Rvalue, Statement, Terminator, Ty,
+    };
+
+    use crate::trustir_anchor::{
+        IrBlock, IrCfg, IrOperand, IrRvalue, IrStmt, IrTerm, TrustIrBinOp,
+    };
+
+    let body = &func.body;
+    let arg_count = body.arg_count;
+    let param_index = |local: usize| -> Option<u64> {
+        (1..=arg_count).contains(&local).then(|| u64::try_from(local - 1).ok()).flatten()
+    };
+    // Trust: W19 CALL-RMW audit — no in-CFG unwind successors, unique block ids
+    // (see the helpers' docs; the walk's reachability reasoning needs both).
+    if body_has_cleanup_unwind_edge(body) || !all_block_ids_unique(body) {
+        return None;
+    }
+    // W1 — the shape: recv is the unique `&mut {int}` parameter; every other param
+    // scalar; the return is EITHER the recv passthrough OR unit.
+    let mut recv = None;
+    for l in 1..=arg_count {
+        let ty = &body.locals.get(l)?.ty;
+        if let Ty::Ref { mutable: true, inner } = ty {
+            if !matches!(inner.as_ref(), Ty::Int { .. }) {
+                return None;
+            }
+            if recv.is_some() {
+                return None; // two candidate receivers — ambiguous, fail closed.
+            }
+            recv = Some(l);
+        } else if !matches!(ty, Ty::Int { .. } | Ty::Bool) {
+            return None;
+        }
+    }
+    let recv = recv?;
+    let recv_ty = &body.locals.get(recv)?.ty;
+    let unit_return = match &body.return_ty {
+        Ty::Unit => true,
+        ret @ Ty::Ref { mutable: true, .. } if ret == recv_ty => false,
+        _ => return None,
+    };
+    let return_block = unique_return_block_id(body)?;
+
+    // W3 — the alias dual scan (M1 verbatim: the read lane's helper follows only
+    // immutable copies).
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue, .. } = st {
+                match rvalue {
+                    Rvalue::Ref { mutable: true, place }
+                        if place.local == recv || place.local == 0 =>
+                    {
+                        return None;
+                    }
+                    Rvalue::AddressOf(_, place) if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let recv_slot = u64::try_from(recv - 1).ok()?;
+    let xlate = |op: &Operand| -> Option<IrOperand> {
+        match op {
+            Operand::Constant(trust_types::ConstValue::Int(k)) => Some(IrOperand::Const(*k)),
+            Operand::Constant(trust_types::ConstValue::Uint(k, _)) => {
+                i128::try_from(*k).ok().map(IrOperand::Const)
+            }
+            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+                let idx = param_index(p.local)?;
+                if p.local == recv || crate::mirsem::param_reassigned_by_stmt(body, p.local) {
+                    return None;
+                }
+                Some(IrOperand::Var(idx))
+            }
+            _ => None,
+        }
+    };
+
+    // The linear walk: Goto-tolerant, one write, then the return block.
+    let mut cur = trust_types::BlockId(0);
+    let mut visited: std::collections::HashSet<trust_types::BlockId> =
+        std::collections::HashSet::new();
+    let mut post_rv: Option<IrRvalue> = None;
+    let mut checked_temp: Option<usize> = None;
+    // Trust: W19 FIELD-POST audit (2026-08-13) — the ORDER gate the original walk
+    // was missing: nothing required the overflow assert to EXIST. A spine of
+    // `_t := CheckedAdd(..); (*recv) := Move(_t.0); Return` walked clean and modeled
+    // an assert-less add as `Int.add` — the WRAP-vs-INT trap, shipped inert only
+    // because the committed corpus has zero admitted bodies. The store now requires
+    // `checked_asserted`, pinning def -> assert -> store.
+    let mut checked_asserted = false;
+    let mut admitted_writes: Vec<*const Statement> = Vec::new();
+    loop {
+        if !visited.insert(cur) {
+            return None;
+        }
+        let blk = body.blocks.iter().find(|b| b.id == cur)?;
+        for st in &blk.stmts {
+            let Statement::Assign { place, rvalue, .. } = st else {
+                match st {
+                    Statement::StorageLive(l) | Statement::StorageDead(l)
+                        if *l != 0 && *l != recv =>
+                    {
+                        // Trust: W19 CALL-RMW audit — a marker naming the checked
+                        // temp inside the def→store window makes the stored value
+                        // indeterminate while the model hands back the defined one
+                        // (the straight-line lane's dead_at rule, single-carrier
+                        // form). Before the def and after the store, markers are
+                        // real MIR's normal bracketing and stay admitted.
+                        if checked_temp == Some(*l) && admitted_writes.is_empty() {
+                            return None;
+                        }
+                        continue;
+                    }
+                    _ => return None,
+                }
+            };
+            match place.projections.as_slice() {
+                [] => {
+                    // The ONLY bare defs this fragment admits: the checked tuple temp,
+                    // and the join's `_0 := Copy(recv)` IN the return block (validated
+                    // by the W5 gate after the walk — skipping it here rather than
+                    // declining is what lets the gate ever see it).
+                    if place.local == 0 {
+                        if blk.id == return_block {
+                            continue;
+                        }
+                        return None; // a `_0` write outside the return block.
+                    }
+                    if post_rv.is_some() || checked_temp.is_some() {
+                        return None;
+                    }
+                    let Rvalue::CheckedBinaryOp(op, a, b) = rvalue else { return None };
+                    let ir_op = match op {
+                        BinOp::Add => TrustIrBinOp::Add,
+                        BinOp::Sub => TrustIrBinOp::Sub,
+                        BinOp::Mul => TrustIrBinOp::Mul,
+                        _ => return None,
+                    };
+                    // The pre-read: first operand exactly `Copy((*recv))`.
+                    let Operand::Copy(ra) = a else { return None };
+                    if ra.local != recv || ra.projections.as_slice() != [Projection::Deref] {
+                        return None;
+                    }
+                    let rhs = xlate(b)?;
+                    if !local_has_only_n_bare_assignments(body, place.local, 1)
+                        || param_index(place.local).is_some()
+                    {
+                        return None;
+                    }
+                    checked_temp = Some(place.local);
+                    post_rv = Some(IrRvalue::Bin(ir_op, IrOperand::Var(recv_slot), rhs));
+                }
+                [Projection::Deref] => {
+                    // THE write.
+                    if place.local != recv || admitted_writes.iter().count() > 0 {
+                        return None;
+                    }
+                    match rvalue {
+                        // (store) — zero deref-reads of recv anywhere (checked below).
+                        Rvalue::Use(v) => {
+                            if checked_temp.is_some() {
+                                // (checked) — the store must be `Use(Move(_t.0))`.
+                                let (Operand::Copy(sp) | Operand::Move(sp)) = v else {
+                                    return None;
+                                };
+                                let t = checked_temp?;
+                                if sp.local != t
+                                    || sp.projections.as_slice() != [Projection::Field(0)]
+                                    || !checked_asserted
+                                {
+                                    return None;
+                                }
+                                // post_rv already holds the value-half Bin.
+                            } else {
+                                if post_rv.is_some() {
+                                    return None;
+                                }
+                                post_rv = Some(IrRvalue::Use(xlate(v)?));
+                            }
+                        }
+                        // (bitwise) — M1's W4 verbatim.
+                        Rvalue::BinaryOp(wop, wa, wb) => {
+                            if post_rv.is_some() || checked_temp.is_some() {
+                                return None;
+                            }
+                            let w_ir = match wop {
+                                BinOp::BitOr => TrustIrBinOp::Or,
+                                BinOp::BitAnd => TrustIrBinOp::And,
+                                BinOp::BitXor => TrustIrBinOp::Xor,
+                                _ => return None, // WRAP-vs-INT: unchecked arithmetic declines.
+                            };
+                            let Operand::Copy(ra) = wa else { return None };
+                            if ra.local != recv
+                                || ra.projections.as_slice() != [Projection::Deref]
+                            {
+                                return None;
+                            }
+                            post_rv = Some(IrRvalue::Bin(
+                                w_ir,
+                                IrOperand::Var(recv_slot),
+                                xlate(wb)?,
+                            ));
+                        }
+                        _ => return None,
+                    }
+                    admitted_writes.push(st as *const Statement);
+                }
+                _ => return None,
+            }
+        }
+        match &blk.terminator {
+            Terminator::Goto(t) => cur = *t,
+            // (checked) — the overflow assert: cond = `_t.1`, expected FALSE, message
+            // Overflow(<the same op>). The flag field is consumed HERE and nowhere
+            // else (checked globally below).
+            Terminator::Assert { cond, expected, msg, target, .. } => {
+                let t = checked_temp?;
+                if post_rv.is_none() || checked_asserted {
+                    return None; // the checked def must precede its (single) assert.
+                }
+                let (Operand::Copy(cp) | Operand::Move(cp)) = cond else { return None };
+                if cp.local != t
+                    || cp.projections.as_slice() != [Projection::Field(1)]
+                    || *expected
+                {
+                    return None;
+                }
+                let Some(IrRvalue::Bin(ir_op, _, _)) = &post_rv else { return None };
+                let msg_ok = matches!(
+                    (msg, ir_op),
+                    (AssertMessage::Overflow(BinOp::Add), TrustIrBinOp::Add)
+                        | (AssertMessage::Overflow(BinOp::Sub), TrustIrBinOp::Sub)
+                        | (AssertMessage::Overflow(BinOp::Mul), TrustIrBinOp::Mul)
+                );
+                if !msg_ok {
+                    return None; // a mismatched overflow message — wrong spine.
+                }
+                checked_asserted = true;
+                cur = *target;
+            }
+            Terminator::Return => {
+                if blk.id != return_block {
+                    return None;
+                }
+                break;
+            }
+            _ => return None,
+        }
+    }
+    let write_rv = post_rv?;
+    if admitted_writes.is_empty() {
+        return None;
+    }
+
+    // The return-shape gate.
+    let join = body.blocks.iter().find(|b| b.id == return_block)?;
+    if unit_return {
+        // W5-UNIT: `_0` is NEVER written anywhere (no Assign, no Call dest).
+        for blk in &body.blocks {
+            for st in &blk.stmts {
+                if let Statement::Assign { place, .. } = st {
+                    if place.local == 0 {
+                        return None;
+                    }
+                }
+            }
+            if let Terminator::Call { dest, .. } = &blk.terminator {
+                if dest.local == 0 {
+                    return None;
+                }
+            }
+        }
+    } else {
+        // W5: the return block carries exactly `_0 := Copy(recv)` as its final def.
+        let Some(Statement::Assign { place: jp, rvalue: jrv, .. }) = join.stmts.last() else {
+            return None;
+        };
+        if jp.local != 0 || !jp.projections.is_empty() {
+            return None;
+        }
+        let Rvalue::Use(Operand::Copy(jsrc) | Operand::Move(jsrc)) = jrv else { return None };
+        if jsrc.local != recv || !jsrc.projections.is_empty() {
+            return None;
+        }
+    }
+
+    // Completeness + W2 global cross-check (M1 verbatim): every block visited or
+    // unable to reach Return; every projected write admitted; recv never bare-rebound;
+    // the checked temp's fields used ONLY as audited, and the temp NEVER escapes whole.
+    for blk in &body.blocks {
+        if !visited.contains(&blk.id) {
+            let reach = crate::mirsem::cfg_reachable_from(body, blk.id)?;
+            if reach.contains(&return_block) {
+                return None;
+            }
+        }
+        for st in &blk.stmts {
+            if let Statement::Assign { place, rvalue, .. } = st {
+                if !place.projections.is_empty()
+                    && !admitted_writes.contains(&(st as *const Statement))
+                {
+                    return None;
+                }
+                if place.projections.is_empty() && place.local == recv {
+                    return None; // a bare rebind of the recv.
+                }
+                // G-TEMP escape: a bare whole-tuple read of the checked temp anywhere
+                // outside the audited store/assert is an escape.
+                if let Some(t) = checked_temp {
+                    let escapes = |op: &Operand| {
+                        matches!(op, Operand::Copy(p) | Operand::Move(p)
+                            if p.local == t && p.projections.is_empty())
+                    };
+                    let rv_escapes = match rvalue {
+                        Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => {
+                            escapes(a)
+                        }
+                        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                            escapes(a) || escapes(b)
+                        }
+                        _ => false,
+                    };
+                    if rv_escapes {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    // (store) — zero deref-reads of recv anywhere. For the RMW forms the single
+    // pre-read inside the write's own RHS was already audited; any OTHER deref-read
+    // is outside every form's claim.
+    let mut deref_reads = 0usize;
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue, .. } = st {
+                let reads = |op: &Operand| {
+                    matches!(op, Operand::Copy(p) | Operand::Move(p)
+                        if p.local == recv && p.projections.as_slice() == [Projection::Deref])
+                };
+                let n = match rvalue {
+                    Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => {
+                        usize::from(reads(a))
+                    }
+                    Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                        usize::from(reads(a)) + usize::from(reads(b))
+                    }
+                    _ => 0,
+                };
+                deref_reads += n;
+            }
+        }
+    }
+    let expected_reads = match &write_rv {
+        IrRvalue::Use(_) => 0,
+        _ => 1,
+    };
+    if deref_reads != expected_reads {
+        return None;
+    }
+
+    let post = u64::try_from(body.locals.len()).ok()?;
+    Some(IrCfg {
+        blocks: vec![IrBlock {
+            stmts: vec![IrStmt { idx: post, rvalue: write_rv }],
+            term: IrTerm::Return(IrOperand::Var(post)),
+        }],
+        entry: 0,
+        fuel: 2,
+    })
+}
+
+/// Trust: W19 FIELD-POST (2026-08-13) — the FIELD-SETTER walk: per-WRITTEN-FIELD
+/// cell-post certificates for the `set_x` / `set_both` / `bump` family,
+///
+/// ```text
+/// set_x:    (*self).0 := v;                                     Return   (unit)
+/// set_both: (*self).0 := a; (*self).1 := b;                     Return   (unit)
+/// bump:     _t := CheckedAdd(Copy((*self).0), 1);
+///           Assert(!_t.1, Overflow(Add)) → next;
+///           (*self).0 := Use(Move(_t.0));                       Return   (unit)
+/// ```
+///
+/// THE CLAIM SHAPE — one certificate PER WRITTEN FIELD: for field `k`, a 1-block
+/// model whose post slot holds field `k`'s new value; the function's verdict is the
+/// CONJUNCTION (every written field's model certifies). The model env's `recv` slot
+/// denotes THE CERTIFICATE'S OWN FIELD's pre-value — sound only under FS4 below
+/// (the body reads no OTHER field of the recv), the per-field twin of the M1
+/// pre-read argument. The FRAME over sibling fields is the FS2 write enumeration
+/// (a field not in the written set is untouched — a WALK fact, never a kernel
+/// claim), exactly the value/frame split of every mutator certificate in this
+/// family, and the trust-ir realization of what W19 inc-1's T-FRAME carried on the
+/// inert MirSem surface.
+///
+/// FS-gates (fail-closed):
+///   FS1 shape — recv is the unique `&mut Adt` parameter; the Adt is
+///        **`adt_kind == Some(Struct)`** — the stamp is REQUIRED, never inferred
+///        from `variants == []` (the legacy encoding cannot distinguish a struct
+///        from a union, and a UNION field write aliases every sibling — the
+///        G-STRUCT-KIND precedent, inherited whole); the written fields' types are
+///        scalar `Int`/`Bool`; return is UNIT with `_0` never written (this family's
+///        committed shapes are all unit — the `&mut Self` passthrough variant can be
+///        added when a body exists).
+///   FS2 write enumeration — every projected write in the body is `(*recv).k := …`
+///        for an ADMITTED k (each k at most once); recv never bare-rebound; the
+///        pointer-identity global cross-check as in M1/M3.
+///   FS3 alias — the M1 dual scan verbatim (no `&mut`/`AddressOf` of recv or `_0`).
+///   FS4 read-isolation — every deref-field READ of recv in the body is of the ONE
+///        field the surrounding certificate claims (for the checked-RMW arm, the
+///        pre-read is the write's own field, exactly once, in the spine's first
+///        operand); a body reading a sibling field fails closed.
+///   FS5 the write arms — plain store `Use(param|const)` or the checked-arith spine
+///        with the M3 (d)-gates verbatim (tuple temp sole-written, `.1` only to the
+///        assert with `expected == false` and the matching `Overflow(op)` message,
+///        `.0` only to the store, no whole-tuple escape). Bitwise field-RMW joins
+///        when a body exists; unchecked arithmetic declines at the op match.
+///
+/// Returns one `(field_key, IrCfg)` per written field, in field order.
+pub(crate) fn field_post_mutator_ir_cfgs(
+    func: &VerifiableFunction,
+) -> Option<Vec<(u64, crate::trustir_anchor::IrCfg)>> {
+    use trust_types::{
+        AdtKind, AssertMessage, BinOp, Operand, Projection, Rvalue, Statement, Terminator, Ty,
+    };
+
+    use crate::trustir_anchor::{
+        IrBlock, IrCfg, IrOperand, IrRvalue, IrStmt, IrTerm, TrustIrBinOp,
+    };
+
+    let body = &func.body;
+    let arg_count = body.arg_count;
+    let param_index = |local: usize| -> Option<u64> {
+        (1..=arg_count).contains(&local).then(|| u64::try_from(local - 1).ok()).flatten()
+    };
+    // Trust: W19 CALL-RMW audit — no in-CFG unwind successors, unique block ids
+    // (an Assert's `unwind: Cleanup(store_block)` would store the WRAPPED value on
+    // the overflow path and return normally — the checked spine's certificate
+    // broken by an edge the walk never reads).
+    if body_has_cleanup_unwind_edge(body) || !all_block_ids_unique(body) {
+        return None;
+    }
+    // FS1 — the shape.
+    if !matches!(body.return_ty, Ty::Unit) {
+        return None;
+    }
+    let mut recv = None;
+    for l in 1..=arg_count {
+        let ty = &body.locals.get(l)?.ty;
+        if let Ty::Ref { mutable: true, inner } = ty {
+            let Ty::Adt { adt_kind, fields, variants, .. } = inner.as_ref() else {
+                return None;
+            };
+            // THE STAMP, required: `Some(Struct)` or fail closed. The legacy
+            // `variants == []` reading cannot exclude a union.
+            if *adt_kind != Some(AdtKind::Struct) || !variants.is_empty() {
+                return None;
+            }
+            if recv.is_some() {
+                return None;
+            }
+            recv = Some((l, fields.clone()));
+        } else if !matches!(ty, Ty::Int { .. } | Ty::Bool) {
+            return None;
+        }
+    }
+    let (recv, recv_fields) = recv?;
+    let return_block = unique_return_block_id(body)?;
+
+    // FS3 — the alias dual scan (M1 verbatim).
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue, .. } = st {
+                match rvalue {
+                    Rvalue::Ref { mutable: true, place }
+                        if place.local == recv || place.local == 0 =>
+                    {
+                        return None;
+                    }
+                    Rvalue::AddressOf(_, place) if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // W5-UNIT — `_0` never written (M3 verbatim).
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { place, .. } = st {
+                if place.local == 0 {
+                    return None;
+                }
+                if place.projections.is_empty() && place.local == recv {
+                    return None; // a bare rebind of the recv.
+                }
+            }
+        }
+        if let Terminator::Call { dest, .. } = &blk.terminator {
+            if dest.local == 0 {
+                return None;
+            }
+        }
+    }
+
+    let xlate = |op: &Operand| -> Option<IrOperand> {
+        match op {
+            Operand::Constant(trust_types::ConstValue::Int(k)) => Some(IrOperand::Const(*k)),
+            Operand::Constant(trust_types::ConstValue::Uint(k, _)) => {
+                i128::try_from(*k).ok().map(IrOperand::Const)
+            }
+            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+                let idx = param_index(p.local)?;
+                if p.local == recv || crate::mirsem::param_reassigned_by_stmt(body, p.local) {
+                    return None;
+                }
+                Some(IrOperand::Var(idx))
+            }
+            _ => None,
+        }
+    };
+    let field_of_place = |pl: &trust_types::Place| -> Option<usize> {
+        if pl.local != recv {
+            return None;
+        }
+        match pl.projections.as_slice() {
+            [Projection::Deref, Projection::Field(k)] => Some(*k),
+            _ => None,
+        }
+    };
+
+    // The linear walk: collect per-field writes (store or checked spine).
+    let recv_slot = u64::try_from(recv - 1).ok()?;
+    let mut cur = trust_types::BlockId(0);
+    let mut visited: std::collections::HashSet<trust_types::BlockId> =
+        std::collections::HashSet::new();
+    // (field, post rvalue, the write stmt ptr)
+    let mut writes: Vec<(usize, IrRvalue)> = Vec::new();
+    let mut admitted: Vec<*const Statement> = Vec::new();
+    // in-flight checked spine: (temp local, field being RMW'd, ir op, ASSERTED) +
+    // its rhs. The `asserted` bool is the ORDER gate: def -> assert -> store. The
+    // store arm requires it, so a spine whose store lands before any overflow
+    // assert — or with none at all — declines rather than modeling an unchecked
+    // add as `Int.add` (the WRAP-vs-INT trap; M3's (d)-gates carry the same
+    // existence requirement as ".1 consumed only by the assert").
+    let mut checked: Option<(usize, usize, TrustIrBinOp, bool)> = None;
+    let mut checked_rhs: Option<IrOperand> = None;
+    loop {
+        if !visited.insert(cur) {
+            return None;
+        }
+        let blk = body.blocks.iter().find(|b| b.id == cur)?;
+        for st in &blk.stmts {
+            let Statement::Assign { place, rvalue, .. } = st else {
+                match st {
+                    Statement::StorageLive(l) | Statement::StorageDead(l)
+                        if *l != 0 && *l != recv =>
+                    {
+                        // Trust: W19 CALL-RMW audit — the def→store window rule,
+                        // as in M3 (this walk clears `checked` at the store, so
+                        // the in-flight spine IS the window).
+                        if let Some((t, ..)) = &checked {
+                            if l == t {
+                                return None;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => return None,
+                }
+            };
+            if place.projections.is_empty() {
+                // Only the checked tuple temp is an admitted bare def.
+                if checked.is_some() {
+                    return None;
+                }
+                let Rvalue::CheckedBinaryOp(op, a, b) = rvalue else { return None };
+                let ir_op = match op {
+                    BinOp::Add => TrustIrBinOp::Add,
+                    BinOp::Sub => TrustIrBinOp::Sub,
+                    BinOp::Mul => TrustIrBinOp::Mul,
+                    _ => return None,
+                };
+                // FS4/FS5 — the pre-read: `Copy((*recv).k)`, the spine's own field.
+                let Operand::Copy(ra) = a else { return None };
+                let k = field_of_place(ra)?;
+                let rhs = xlate(b)?;
+                if !local_has_only_n_bare_assignments(body, place.local, 1)
+                    || param_index(place.local).is_some()
+                {
+                    return None;
+                }
+                if writes.iter().any(|(wk, _)| *wk == k) {
+                    return None; // an RMW after this field was already written.
+                }
+                checked = Some((place.local, k, ir_op, false));
+                checked_rhs = Some(rhs); // staged; consumed when the store lands.
+            } else {
+                // A projected write: must be a recv field.
+                let Some(k) = field_of_place(place) else { return None };
+                if writes.iter().any(|(wk, _)| *wk == k) {
+                    return None; // each field at most once.
+                }
+                // The field's type must be scalar (FS1).
+                if !recv_fields
+                    .get(k)
+                    .is_some_and(|(_, ty)| matches!(ty, Ty::Int { .. } | Ty::Bool))
+                {
+                    return None;
+                }
+                match (rvalue, &checked) {
+                    (Rvalue::Use(v), Some((t, ck, ir_op, asserted))) => {
+                        // The checked store: `Use(Move(_t.0))` of the SAME field,
+                        // and ONLY after the overflow assert was walked.
+                        let (Operand::Copy(sp) | Operand::Move(sp)) = v else { return None };
+                        if sp.local != *t
+                            || sp.projections.as_slice() != [Projection::Field(0)]
+                            || *ck != k
+                            || !*asserted
+                        {
+                            return None;
+                        }
+                        let rhs = checked_rhs.take()?;
+                        writes.push((
+                            k,
+                            IrRvalue::Bin(*ir_op, IrOperand::Var(recv_slot), rhs),
+                        ));
+                        checked = None;
+                    }
+                    (Rvalue::Use(v), None) => {
+                        writes.push((k, IrRvalue::Use(xlate(v)?)));
+                    }
+                    _ => return None,
+                }
+                admitted.push(st as *const Statement);
+            }
+        }
+        match &blk.terminator {
+            Terminator::Goto(t) => cur = *t,
+            Terminator::Assert { cond, expected, msg, target, .. } => {
+                let Some((t, _k, ir_op, asserted)) = checked.as_mut() else { return None };
+                let (Operand::Copy(cp) | Operand::Move(cp)) = cond else { return None };
+                if cp.local != *t
+                    || cp.projections.as_slice() != [Projection::Field(1)]
+                    || *expected
+                    || *asserted
+                {
+                    return None;
+                }
+                let msg_ok = matches!(
+                    (msg, ir_op),
+                    (AssertMessage::Overflow(BinOp::Add), TrustIrBinOp::Add)
+                        | (AssertMessage::Overflow(BinOp::Sub), TrustIrBinOp::Sub)
+                        | (AssertMessage::Overflow(BinOp::Mul), TrustIrBinOp::Mul)
+                );
+                if !msg_ok {
+                    return None;
+                }
+                *asserted = true;
+                cur = *target;
+            }
+            Terminator::Return => {
+                if blk.id != return_block || checked.is_some() {
+                    return None;
+                }
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if writes.is_empty() {
+        return None;
+    }
+
+    // Completeness + FS2 global cross-check + FS4 read-isolation + G-TEMP escape.
+    for blk in &body.blocks {
+        if !visited.contains(&blk.id) {
+            let reach = crate::mirsem::cfg_reachable_from(body, blk.id)?;
+            if reach.contains(&return_block) {
+                return None;
+            }
+        }
+        for st in &blk.stmts {
+            if let Statement::Assign { place, rvalue, .. } = st {
+                if !place.projections.is_empty()
+                    && !admitted.contains(&(st as *const Statement))
+                {
+                    return None;
+                }
+                // FS4: every deref-field READ of recv is of a WRITTEN field that the
+                // read's own spine claims — with the single-RMW discipline above, that
+                // reduces to: every read field is in the written set. (A pure store
+                // body has no reads; bump reads its own field.)
+                let check_read = |op: &Operand| -> bool {
+                    match op {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            if p.local == recv && !p.projections.is_empty() {
+                                match p.projections.as_slice() {
+                                    [Projection::Deref, Projection::Field(k)] => {
+                                        writes.iter().any(|(wk, _)| wk == k)
+                                    }
+                                    _ => false,
+                                }
+                            } else {
+                                true
+                            }
+                        }
+                        _ => true,
+                    }
+                };
+                let ok = match rvalue {
+                    Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => check_read(a),
+                    Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                        check_read(a) && check_read(b)
+                    }
+                    _ => true,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+    }
+
+    // The per-field models: 1-block cfgs, W6 fresh slots.
+    let post_base = u64::try_from(body.locals.len()).ok()?;
+    let mut out = Vec::with_capacity(writes.len());
+    for (i, (k, rv)) in writes.into_iter().enumerate() {
+        let post = post_base + u64::try_from(i).ok()?;
+        out.push((
+            u64::try_from(k).ok()?,
+            IrCfg {
+                blocks: vec![IrBlock {
+                    stmts: vec![IrStmt { idx: post, rvalue: rv }],
+                    term: IrTerm::Return(IrOperand::Var(post)),
+                }],
+                entry: 0,
+                fuel: 2,
+            },
+        ));
+    }
+    Some(out)
+}
+
+/// Trust: W19 CALL-RMW audit (2026-08-13) — TRUE iff any terminator anywhere in the
+/// body carries an in-CFG unwind successor (`UnwindEdge::Cleanup`). The mutator
+/// walks (M1/M3/FS/call-RMW) model NO unwind semantics: their reachability gates
+/// run `cfg_reachable_from`, which follows only normal edges, so a Cleanup edge
+/// pointing at (or chaining into) a walked block creates a NORMALLY-RETURNING path
+/// the model never saw — the adversarial round's confirmed false-certificate:
+/// `unwind: Cleanup(write_block)` on the call admits, and on the panic path the
+/// write executes with the call result never assigned. `Cleanup` is "a real in-CFG
+/// successor the verifier must reach and check" (the `UnwindEdge` doc), and the G6
+/// loop-region walk already declines it; every mutator walk now does too, body-wide
+/// — blanket by design (these families' entire committed corpus carries zero
+/// Cleanup edges, measured 2026-08-13), so the blunt rule costs nothing and closes
+/// the chained variants that a per-site check would have to closure over.
+fn body_has_cleanup_unwind_edge(body: &trust_types::VerifiableBody) -> bool {
+    use trust_types::Terminator;
+    body.blocks.iter().any(|b| {
+        match &b.terminator {
+            Terminator::Call { unwind, .. }
+            | Terminator::Assert { unwind, .. }
+            | Terminator::Drop { unwind, .. } => unwind.cleanup_target().is_some(),
+            _ => false,
+        }
+    })
+}
+
+/// Trust: FAMILY-WIDE G8 (2026-08-17) — TRUE iff some `Cleanup` unwind target can
+/// reach a `Return` block (over the COMPLETE successor relation, unwind edges
+/// included). This is the REFINED form of [`body_has_cleanup_unwind_edge`]'s
+/// blunt rule, and the universally sound one for the whole certified surface:
+///
+///   * a Cleanup target that reaches Return is a NORMALLY-RETURNING path no
+///     recognizer's normal-edge walk ever saw — the wrap-return audit's proven
+///     false-certificate channel (`unwind: Cleanup(write_block)`), fatal to any
+///     claim over "every returning path";
+///   * a TERMINAL landing pad (Resume/Abort/Unreachable — no path to Return) is
+///     the diverging panic path, outside every partial-correctness claim, and
+///     ADMITTING it is what keeps this gate free: measured 2026-08-17, all 53
+///     Cleanup-carrying corpus bodies are terminal — the refined gate moves ZERO
+///     rows, where the mutator walks' blunt rule would have required retraction
+///     analysis on every one of them.
+///
+/// Applied at the CHOKEPOINTS (the via-trustir chain entry, the MirSem witness
+/// composition, the loop lane) so every current and FUTURE lane inherits it —
+/// the audit's "unpatched half of the call family" is closed as a class, not
+/// per-disjunct. The mutator walks keep their own stricter blunt gate (monotone).
+pub(crate) fn body_has_live_cleanup_path(body: &trust_types::VerifiableBody) -> bool {
+    use trust_types::Terminator;
+    let blocks: std::collections::HashMap<_, _> =
+        body.blocks.iter().map(|b| (b.id, b)).collect();
+    let mut cleanup_targets = Vec::new();
+    for b in &body.blocks {
+        match &b.terminator {
+            Terminator::Call { unwind, .. }
+            | Terminator::Assert { unwind, .. }
+            | Terminator::Drop { unwind, .. } => {
+                if let Some(t) = unwind.cleanup_target() {
+                    cleanup_targets.push(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut work = cleanup_targets;
+    while let Some(cur) = work.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        let Some(blk) = blocks.get(&cur) else { continue };
+        match &blk.terminator {
+            Terminator::Return => return true,
+            Terminator::Goto(t) => work.push(*t),
+            Terminator::SwitchInt { targets, otherwise, .. } => {
+                work.extend(targets.iter().map(|(_, t)| *t));
+                work.push(*otherwise);
+            }
+            Terminator::Call { target, unwind, .. } => {
+                if let Some(t) = target {
+                    work.push(*t);
+                }
+                if let Some(t) = unwind.cleanup_target() {
+                    work.push(t);
+                }
+            }
+            Terminator::Assert { target, unwind, .. } => {
+                work.push(*target);
+                if let Some(t) = unwind.cleanup_target() {
+                    work.push(t);
+                }
+            }
+            Terminator::Drop { target, unwind, .. } => {
+                work.push(*target);
+                if let Some(t) = unwind.cleanup_target() {
+                    work.push(t);
+                }
+            }
+            // An OPAQUE terminator's successors are declared, not understood —
+            // follow them all (dropping them would UNDER-approximate
+            // reachability, the unsound direction for this gate).
+            Terminator::Opaque { targets, .. } => work.extend(targets.iter().copied()),
+            // Unreachable/Resume/Terminate-class: no successors.
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Trust: W19 CALL-RMW audit — block ids must be UNIQUE: every walk keys block
+/// lookup, visitation, and the second-call-dest / reachability gates on id
+/// EQUALITY (`find(|b| b.id == cur)` takes the first match), so a duplicate id
+/// lets an imposter block shadow a walked one past every id-keyed gate.
+pub(crate) fn all_block_ids_unique(body: &trust_types::VerifiableBody) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    body.blocks.iter().all(|b| seen.insert(b.id))
+}
+
+/// Trust: W19 CALL-RMW audit — TRUE iff the type is transitively POINTER-FREE
+/// (no `Ref`, no `RawPtr`, nothing that can carry an address). The call-RMW
+/// isolation argument ("the callee can never reach the cell") is a statement
+/// about VALUES the callee receives: a by-value param or borrow source whose type
+/// carries a pointer field could have been constructed BY THE CALLER to point at
+/// the very cell the certificate claims (safe code suffices for `&`-derived raw
+/// pointers), and the callee could then write the cell during the call.
+/// FAIL-CLOSED default: unknown/unhandled type constructors return false.
+fn ty_is_pointer_free(ty: &trust_types::Ty) -> bool {
+    use trust_types::Ty;
+    match ty {
+        Ty::Bool | Ty::Char | Ty::Unit | Ty::Never => true,
+        Ty::Int { .. } | Ty::Float { .. } => true,
+        Ty::Tuple(ts) => ts.iter().all(ty_is_pointer_free),
+        Ty::Array { elem, .. } => ty_is_pointer_free(elem),
+        Ty::Adt { fields, variants, .. } => {
+            fields.iter().all(|(_, t)| ty_is_pointer_free(t))
+                && variants
+                    .iter()
+                    .all(|v| v.fields.iter().all(|(_, t)| ty_is_pointer_free(t)))
+        }
+        // Ref, RawPtr, PtrSizedInt (address-width by design), Slice/Str (fat
+        // pointers at the use site), Bv, Closure, Datatype, SymArray, everything
+        // future: fail closed.
+        _ => false,
+    }
+}
+
+/// Trust: W19 CALL-RMW (2026-08-13) — the CALL-COMPOSITION mutator walk: the M3
+/// bitwise-RMW class with the RHS produced by a CALL, the `nonmax bitand_assign`
+/// (+1) deferred by the M3 report with exactly this design:
+///
+/// ```text
+/// bb0:  _t := Use(Copy((*recv)));            -- the HOISTED pre-read
+///       _b := &_p;                           -- 0+ shared borrows of non-recv locals
+///       Call { f, args ⊆ {params, _b…}, dest: _r } → bb1   (unwind = divergence)
+/// bb1:  (*recv) := BitOp(Move(_t), Move(_r));             Return   (unit)
+/// ```
+///
+/// THE CLAIM — the call result is a FRESH UNIVERSALLY-QUANTIFIED slot: the model is
+/// `Bin(op, Var(recv), Var(r))` with `r` never SSA-assigned in the model cfg, so
+/// `param_indices()` collects it and the statement Pi-binds it alongside the recv
+/// pre-value: ∀ pre ∀ r, post = op(pre, r). That is sound for WHATEVER the callee
+/// returns — no callee registry, no fact about `f` is used or needed — because the
+/// walk pins the DATAFLOW: the written value is the machine's `op` of the pre-read
+/// and the call's destination, nothing else. What makes the quantification honest:
+///   * the callee can NEVER reach the cell — no call argument may name recv, `_0`,
+///     `_t`, or `_r` (args are value params or admitted shared borrows of BY-VALUE
+///     non-recv locals; a borrow of a local copy cannot reach the cell even through
+///     interior mutability), and the alias scans decline every borrow of recv,
+///     mutable OR shared;
+///   * the call's divergence (panic/unwind) is outside the claim — partial
+///     correctness over the normally-returning path, the family constant;
+///   * `_r` has the call as its ONLY def (zero statement-assigns anywhere), and both
+///     `_t` and `_r` are consumed EXACTLY once, by the write.
+///
+/// Bitwise ops only (`BitAnd|BitOr|BitXor`) — the WRAP-vs-INT table's safe tier; an
+/// arithmetic write with a call RHS would need the checked spine, and no such body
+/// exists to shape it against. Non-recv params may be by-value `Adt` here (the
+/// nonmax `rhs: NonMaxU8` — it feeds only the call, never the model) but must be
+/// transitively POINTER-FREE, as must every borrow source — a pointer inside a
+/// by-value payload could have been aimed at the cell by the caller
+/// (`ty_is_pointer_free`; Ref/RawPtr params are the degenerate case). Body-wide:
+/// no `Cleanup` unwind edges, unique block ids (see the audit helpers' docs).
+/// Unit return only (`_0` never written) — the
+/// `&mut Self` passthrough joins when a body exists. The whole-Adt-cell
+/// `bitand_assign` siblings (NonMaxU8 receiver) stay OUTSIDE: the cell there is an
+/// Adt, and this family's scalar-cell gate is load-bearing (an opaque-valued cell
+/// claim is a different design, not a smaller gate).
+pub(crate) fn call_rmw_mutator_ir_cfg(
+    func: &VerifiableFunction,
+) -> Option<crate::trustir_anchor::IrCfg> {
+    use trust_types::{BinOp, Operand, Rvalue, Statement, Terminator, Ty};
+
+    use crate::trustir_anchor::{
+        IrBlock, IrCfg, IrOperand, IrRvalue, IrStmt, IrTerm, TrustIrBinOp,
+    };
+
+    let body = &func.body;
+    let arg_count = body.arg_count;
+    let param_index = |local: usize| -> Option<u64> {
+        (1..=arg_count).contains(&local).then(|| u64::try_from(local - 1).ok()).flatten()
+    };
+    // C1 — the shape: recv is the unique `&mut {int}` parameter (scalar cell);
+    // every other param by VALUE with a transitively POINTER-FREE type (an Adt
+    // param feeds only the call — but a pointer INSIDE it could have been aimed
+    // at the cell by the caller, so Ref/RawPtr/pointer-carrying types all
+    // decline); return is UNIT. Unwind edges and block-id uniqueness first: the
+    // walk's reachability reasoning is meaningless without both.
+    if body_has_cleanup_unwind_edge(body) || !all_block_ids_unique(body) {
+        return None;
+    }
+    if !matches!(body.return_ty, Ty::Unit) {
+        return None;
+    }
+    let mut recv = None;
+    for l in 1..=arg_count {
+        let ty = &body.locals.get(l)?.ty;
+        if let Ty::Ref { mutable: true, inner } = ty {
+            if !matches!(inner.as_ref(), Ty::Int { .. }) {
+                return None;
+            }
+            if recv.is_some() {
+                return None;
+            }
+            recv = Some(l);
+        } else if !ty_is_pointer_free(ty) {
+            return None;
+        }
+    }
+    let recv = recv?;
+    let return_block = unique_return_block_id(body)?;
+
+    // C2 — the alias dual scan, EXTENDED: M1's mutable/AddressOf rule verbatim,
+    // PLUS shared borrows of recv/_0 decline (this walk ADMITS `Ref{mutable:false}`
+    // defs, so the shared case is no longer excluded by the statement grammar the
+    // way it is in M1/M3/FS).
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue, .. } = st {
+                match rvalue {
+                    Rvalue::Ref { place, .. } if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    Rvalue::AddressOf(_, place) if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let recv_slot = u64::try_from(recv - 1).ok()?;
+
+    // The walk: bb0 (pre-read, borrows, the call), then the write block, Return.
+    let entry = body.blocks.iter().find(|b| b.id == trust_types::BlockId(0))?;
+    let mut pre_temp: Option<usize> = None;
+    let mut borrow_temps: Vec<usize> = Vec::new();
+    let mut borrow_srcs: Vec<usize> = Vec::new();
+    // Storage-marker discipline (the straight-line lane's dead_at rule, shaped to
+    // this walk's rigid grammar): a marker on one of the claim's own CARRIERS in
+    // the def→consumption window makes the consumed value indeterminate while the
+    // model hands back the defined one — decline. `StorageLive` BEFORE a def and
+    // `StorageDead` AFTER the final write are real MIR's normal bracketing and
+    // stay admitted.
+    let mut entry_dead: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for st in &entry.stmts {
+        let Statement::Assign { place, rvalue, .. } = st else {
+            match st {
+                Statement::StorageDead(l) if *l != 0 && *l != recv => {
+                    // Killing an already-defined carrier before its use — decline.
+                    if pre_temp == Some(*l) || borrow_temps.contains(l) {
+                        return None;
+                    }
+                    entry_dead.insert(*l);
+                    continue;
+                }
+                Statement::StorageLive(l) if *l != 0 && *l != recv => {
+                    // Resurrection of a defined carrier — indeterminate contents.
+                    if pre_temp == Some(*l) || borrow_temps.contains(l) {
+                        return None;
+                    }
+                    continue;
+                }
+                _ => return None,
+            }
+        };
+        if !place.projections.is_empty() {
+            return None; // no writes of any projected place before the call.
+        }
+        if param_index(place.local).is_some() || place.local == 0 {
+            return None;
+        }
+        if entry_dead.contains(&place.local) {
+            return None; // a def into storage already killed — not a value model.
+        }
+        match rvalue {
+            // The hoisted pre-read — exactly once, FIRST among the defs.
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                if p.local == recv && p.projections.as_slice() == [trust_types::Projection::Deref] =>
+            {
+                if pre_temp.is_some() || !borrow_temps.is_empty() {
+                    return None;
+                }
+                if !local_has_only_n_bare_assignments(body, place.local, 1) {
+                    return None;
+                }
+                pre_temp = Some(place.local);
+            }
+            // A shared borrow of a BY-VALUE non-recv local (the call-arg conduit).
+            Rvalue::Ref { mutable: false, place: src } => {
+                if !src.projections.is_empty() || src.local == recv || src.local == 0 {
+                    return None;
+                }
+                // Never a borrow of the claim's own carriers — `&_t` would hand
+                // the callee the pre-read and `&_r` its own destination.
+                if pre_temp == Some(src.local) || borrow_srcs.contains(&src.local) {
+                    return None;
+                }
+                // The borrowed local's type must be transitively pointer-free —
+                // same argument as the params: a pointer inside the borrowed
+                // value could have been aimed at the cell by the caller.
+                if !ty_is_pointer_free(&body.locals.get(src.local)?.ty) {
+                    return None;
+                }
+                if !local_has_only_n_bare_assignments(body, place.local, 1) {
+                    return None;
+                }
+                borrow_temps.push(place.local);
+                borrow_srcs.push(src.local);
+            }
+            _ => return None,
+        }
+    }
+    let pre_temp = pre_temp?;
+    // The call. A diverging call (`target: None`) has no returning edge to claim
+    // over — decline. Foreign / unsafe-signature / atomic callees decline too:
+    // the no-path-to-the-cell argument is a SAFE-RUST argument (an FFI callee
+    // holding any pointer can reach arbitrary memory), and the one committed
+    // body is a plain safe call.
+    let Terminator::Call {
+        args,
+        dest,
+        target: Some(target),
+        atomic,
+        is_foreign,
+        is_unsafe_sig,
+        ..
+    } = &entry.terminator
+    else {
+        return None;
+    };
+    if *is_foreign || *is_unsafe_sig || atomic.is_some() {
+        return None;
+    }
+    if !dest.projections.is_empty() {
+        return None;
+    }
+    let call_dest = dest.local;
+    if call_dest == 0 || call_dest == recv || call_dest == pre_temp
+        || param_index(call_dest).is_some()
+        || borrow_temps.contains(&call_dest)
+        || borrow_srcs.contains(&call_dest)
+        || entry_dead.contains(&call_dest)
+    {
+        return None;
+    }
+    // `_r`'s ONLY def is this call: `local_complete_bare_assignment_count` cannot
+    // express that (a Call dest is `None` — a clobber — by its contract), so the
+    // no-other-writes half is enforced directly in the C3 global scan below
+    // (any `Assign`/`SetDiscriminant`/`Deinit`/`Retag`/`Drop` rooted at `_r`, or a
+    // SECOND call dest, declines).
+    // Every argument: a bare value param (not recv, not reassigned) or an admitted
+    // borrow temp. `_t`, `_r`, recv, `_0` never pass — the callee must have no path
+    // to the cell or the claim's own carriers.
+    let mut borrow_uses = vec![0usize; borrow_temps.len()];
+    for a in args {
+        let (Operand::Copy(p) | Operand::Move(p)) = a else { return None };
+        if !p.projections.is_empty() {
+            return None;
+        }
+        if let Some(pos) = borrow_temps.iter().position(|b| *b == p.local) {
+            borrow_uses[pos] += 1;
+        } else if param_index(p.local).is_some() {
+            if p.local == recv || crate::mirsem::param_reassigned_by_stmt(body, p.local) {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    if borrow_uses.iter().any(|n| *n != 1) {
+        return None; // each borrow temp feeds the call exactly once, and only it.
+    }
+
+    // The write block.
+    let wblk = body.blocks.iter().find(|b| b.id == *target)?;
+    if wblk.id == entry.id {
+        return None;
+    }
+    let mut write_rv: Option<IrRvalue> = None;
+    for st in &wblk.stmts {
+        let Statement::Assign { place, rvalue, .. } = st else {
+            match st {
+                Statement::StorageDead(l) if *l != 0 && *l != recv => {
+                    // A carrier's storage may die only AFTER the write consumed it.
+                    if write_rv.is_none()
+                        && (*l == pre_temp || *l == call_dest || borrow_temps.contains(l))
+                    {
+                        return None;
+                    }
+                    continue;
+                }
+                Statement::StorageLive(l) if *l != 0 && *l != recv => {
+                    // Resurrecting a carrier at ANY point here is indeterminate
+                    // contents under the model — decline.
+                    if *l == pre_temp || *l == call_dest || borrow_temps.contains(l) {
+                        return None;
+                    }
+                    continue;
+                }
+                _ => return None,
+            }
+        };
+        if write_rv.is_some() {
+            return None;
+        }
+        if place.local != recv
+            || place.projections.as_slice() != [trust_types::Projection::Deref]
+        {
+            return None;
+        }
+        let Rvalue::BinaryOp(op, a, b) = rvalue else { return None };
+        let ir_op = match op {
+            BinOp::BitAnd => TrustIrBinOp::And,
+            BinOp::BitOr => TrustIrBinOp::Or,
+            BinOp::BitXor => TrustIrBinOp::Xor,
+            _ => return None, // WRAP-vs-INT: arithmetic with a call RHS declines.
+        };
+        // Exactly: one operand the pre-read temp, the other the call result.
+        let is_local = |o: &Operand, l: usize| {
+            matches!(o, Operand::Copy(p) | Operand::Move(p)
+                if p.local == l && p.projections.is_empty())
+        };
+        let call_slot = u64::try_from(body.locals.len()).ok()?;
+        if is_local(a, pre_temp) && is_local(b, call_dest) {
+            write_rv =
+                Some(IrRvalue::Bin(ir_op, IrOperand::Var(recv_slot), IrOperand::Var(call_slot)));
+        } else if is_local(a, call_dest) && is_local(b, pre_temp) {
+            write_rv =
+                Some(IrRvalue::Bin(ir_op, IrOperand::Var(call_slot), IrOperand::Var(recv_slot)));
+        } else {
+            return None;
+        }
+    }
+    let write_rv = write_rv?;
+    if !matches!(wblk.terminator, Terminator::Return) || wblk.id != return_block {
+        return None;
+    }
+
+    // C3 — global completeness: every OTHER block unable to reach Return; no `_0`
+    // write anywhere (unit return); recv never bare-rebound; no projected write
+    // outside the admitted one; `_t`/`_r` consumed EXACTLY once each (the write);
+    // exactly ONE deref-read of recv (the hoisted pre-read).
+    let mut pre_temp_reads = 0usize;
+    let mut call_dest_reads = 0usize;
+    let mut recv_deref_reads = 0usize;
+    for blk in &body.blocks {
+        if blk.id != entry.id && blk.id != wblk.id {
+            let reach = crate::mirsem::cfg_reachable_from(body, blk.id)?;
+            if reach.contains(&return_block) {
+                return None;
+            }
+        }
+        if let Terminator::Call { dest, .. } = &blk.terminator {
+            if dest.local == 0 || (dest.local == call_dest && blk.id != entry.id) {
+                return None;
+            }
+        }
+        if let Terminator::Drop { place, .. } = &blk.terminator {
+            if place.local == call_dest || place.local == pre_temp {
+                return None;
+            }
+        }
+        for st in &blk.stmts {
+            match st {
+                Statement::SetDiscriminant { place, .. }
+                | Statement::Deinit { place }
+                | Statement::Retag { place }
+                    if place.local == call_dest || place.local == pre_temp =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+            let Statement::Assign { place, rvalue, .. } = st else { continue };
+            if place.local == call_dest {
+                return None; // the call is `_r`'s ONLY def — see the note above.
+            }
+            if place.local == 0 || (place.local == recv && place.projections.is_empty()) {
+                return None;
+            }
+            if place.local == recv
+                && place.projections.as_slice() != [trust_types::Projection::Deref]
+                && !place.projections.is_empty()
+            {
+                return None; // a projected recv write other than the cell itself.
+            }
+            let mut count = |op: &Operand| {
+                if let Operand::Copy(p) | Operand::Move(p) = op {
+                    if p.projections.is_empty() {
+                        if p.local == pre_temp {
+                            pre_temp_reads += 1;
+                        }
+                        if p.local == call_dest {
+                            call_dest_reads += 1;
+                        }
+                    }
+                    if p.local == recv
+                        && p.projections.as_slice() == [trust_types::Projection::Deref]
+                    {
+                        recv_deref_reads += 1;
+                    }
+                }
+            };
+            match rvalue {
+                Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => count(a),
+                Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                    count(a);
+                    count(b);
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Call { args, .. } = &blk.terminator {
+            for a in args {
+                if let Operand::Copy(p) | Operand::Move(p) = a {
+                    if p.projections.is_empty() {
+                        if p.local == pre_temp {
+                            pre_temp_reads += 1;
+                        }
+                        if p.local == call_dest {
+                            call_dest_reads += 1;
+                        }
+                    }
+                    if p.local == recv {
+                        return None; // recv (the pointer) must never reach a callee.
+                    }
+                }
+            }
+        }
+    }
+    if pre_temp_reads != 1 || call_dest_reads != 1 || recv_deref_reads != 1 {
+        return None;
+    }
+
+    let post = u64::try_from(body.locals.len()).ok()?.checked_add(1)?;
+    Some(IrCfg {
+        blocks: vec![IrBlock {
+            stmts: vec![IrStmt { idx: post, rvalue: write_rv }],
+            term: IrTerm::Return(IrOperand::Var(post)),
+        }],
+        entry: 0,
+        fuel: 2,
+    })
+}
+
+/// Trust: W19 ADT-CELL (2026-08-14) — the ADT-valued-cell STORE-OF-CALL walk: the
+/// two whole-Adt `bitand_assign` siblings the call-RMW landing pinned DECLINING,
+///
+/// ```text
+/// bb0:  _t := Use(Copy((*recv)));                 -- the whole-cell pre-read
+///       Call { f, args ⊆ {Move(_t), params}, dest: _r } → bb1
+/// bb1:  (*recv) := Use(Move(_r));                 Return   (unit)
+/// ```
+///
+/// THE CLAIM — post-cell = r, the call's result, as PURE DATAFLOW: the model is
+/// the identity trace `post := Use(Var(r))` with `r` a fresh Pi-bound slot, checked
+/// under its own claim name (`check_adt_cell_post_store_model`) because the cell's
+/// value is an OPAQUE token, never a number — no scalar reading is asserted, which
+/// is exactly why an Adt cell is admissible here and nowhere else in the family.
+///
+/// WHY THE CLAIM SURVIVES EVEN AN ADVERSARIAL CALLEE: the store is the LAST write
+/// on every returning path and it writes exactly `_r`, whose only def is the call.
+/// Whatever the callee does — even reaching the cell mid-call through a pointer
+/// the CALLER hid inside the pre-value — the final store overwrites the cell with
+/// `r`, and `r` is universally quantified. This is a strictly weaker claim than
+/// the scalar RMW families (it ties post to nothing but the call), which is why
+/// its gate set can be smaller; the gates that remain are the ones the claim
+/// actually rests on:
+///   * the store is the ONLY write to the cell and `_0` is never written; every
+///     returning path passes through it (the 2-block shape + the completeness
+///     sweep);
+///   * `_r`'s only def is the call (no other assign/deinit/retag/drop/second call
+///     dest anywhere), and its only read is the store;
+///   * `_t`'s only def is the pre-read, and its only reads are call arguments;
+///   * the recv HANDLE never reaches the callee (fail-closed posture, not a
+///     load-bearing leg — see above) and foreign/unsafe-signature/atomic callees
+///     decline (the family constant);
+///   * body-wide: no `Cleanup` unwind edges, unique block ids, and the marker
+///     discipline on the carriers (the audit inheritance, all three).
+///
+/// The recv Adt must be `adt_kind == Some(Struct)` — NOT because the claim needs
+/// it (a whole-cell store is layout-agnostic; a union or enum cell would be just
+/// as sound under this claim) but as the family's fail-closed default: widening
+/// to other kinds is a one-line decision to make against a real body, not a
+/// default to inherit silently. Both committed bodies are stamped Struct.
+pub(crate) fn adt_cell_post_store_ir_cfg(
+    func: &VerifiableFunction,
+) -> Option<crate::trustir_anchor::IrCfg> {
+    use trust_types::{AdtKind, Operand, Rvalue, Statement, Terminator, Ty};
+
+    use crate::trustir_anchor::{IrBlock, IrCfg, IrOperand, IrRvalue, IrStmt, IrTerm};
+
+    let body = &func.body;
+    let arg_count = body.arg_count;
+    let param_index = |local: usize| -> Option<u64> {
+        (1..=arg_count).contains(&local).then(|| u64::try_from(local - 1).ok()).flatten()
+    };
+    if body_has_cleanup_unwind_edge(body) || !all_block_ids_unique(body) {
+        return None;
+    }
+    if !matches!(body.return_ty, Ty::Unit) {
+        return None;
+    }
+    // A1 — recv: the unique `&mut Adt{Struct}` parameter. Other params by value
+    // (any non-Ref type — they feed only the call, and the claim does not rest on
+    // their contents; a Ref param stays declined as the family's posture).
+    let mut recv = None;
+    for l in 1..=arg_count {
+        let ty = &body.locals.get(l)?.ty;
+        if let Ty::Ref { mutable: true, inner } = ty {
+            let Ty::Adt { adt_kind, .. } = inner.as_ref() else { return None };
+            if *adt_kind != Some(AdtKind::Struct) || recv.is_some() {
+                return None;
+            }
+            recv = Some(l);
+        } else if matches!(ty, Ty::Ref { .. }) {
+            return None;
+        }
+    }
+    let recv = recv?;
+    let return_block = unique_return_block_id(body)?;
+
+    // A2 — the alias dual scan, shared-borrows included (as in call-RMW: this
+    // grammar admits no Ref defs at all, but unreachable blocks are scanned too).
+    for blk in &body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue, .. } = st {
+                match rvalue {
+                    Rvalue::Ref { place, .. } if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    Rvalue::AddressOf(_, place) if place.local == recv || place.local == 0 => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // The entry block: the pre-read def, then the call.
+    let entry = body.blocks.iter().find(|b| b.id == trust_types::BlockId(0))?;
+    let mut pre_temp: Option<usize> = None;
+    let mut entry_dead: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for st in &entry.stmts {
+        let Statement::Assign { place, rvalue, .. } = st else {
+            match st {
+                Statement::StorageDead(l) if *l != 0 && *l != recv => {
+                    if pre_temp == Some(*l) || param_index(*l).is_some() {
+                        return None;
+                    }
+                    entry_dead.insert(*l);
+                    continue;
+                }
+                Statement::StorageLive(l) if *l != 0 && *l != recv => {
+                    if pre_temp == Some(*l) || param_index(*l).is_some() {
+                        return None;
+                    }
+                    continue;
+                }
+                _ => return None,
+            }
+        };
+        // Exactly ONE def: the whole-cell pre-read into a fresh bare temp.
+        if pre_temp.is_some()
+            || !place.projections.is_empty()
+            || place.local == 0
+            || param_index(place.local).is_some()
+            || entry_dead.contains(&place.local)
+        {
+            return None;
+        }
+        let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rvalue else { return None };
+        if p.local != recv || p.projections.as_slice() != [trust_types::Projection::Deref] {
+            return None;
+        }
+        if !local_has_only_n_bare_assignments(body, place.local, 1) {
+            return None;
+        }
+        pre_temp = Some(place.local);
+    }
+    let pre_temp = pre_temp?;
+    let Terminator::Call {
+        args,
+        dest,
+        target: Some(target),
+        atomic,
+        is_foreign,
+        is_unsafe_sig,
+        ..
+    } = &entry.terminator
+    else {
+        return None;
+    };
+    if *is_foreign || *is_unsafe_sig || atomic.is_some() {
+        return None;
+    }
+    if !dest.projections.is_empty() {
+        return None;
+    }
+    let call_dest = dest.local;
+    if call_dest == 0
+        || call_dest == recv
+        || call_dest == pre_temp
+        || param_index(call_dest).is_some()
+        || entry_dead.contains(&call_dest)
+    {
+        return None;
+    }
+    // Args: bare `_t` or bare non-recv params. `_r`, recv, `_0` never pass.
+    for a in args {
+        let (Operand::Copy(p) | Operand::Move(p)) = a else { return None };
+        if !p.projections.is_empty() || p.local == recv || p.local == 0 || p.local == call_dest
+        {
+            return None;
+        }
+        if p.local != pre_temp && param_index(p.local).is_none() {
+            return None;
+        }
+    }
+
+    // The store block: exactly `(*recv) := Use(Move/Copy(_r))`, then Return.
+    let wblk = body.blocks.iter().find(|b| b.id == *target)?;
+    if wblk.id == entry.id || wblk.id != return_block {
+        return None;
+    }
+    let mut store_seen = false;
+    for st in &wblk.stmts {
+        let Statement::Assign { place, rvalue, .. } = st else {
+            match st {
+                Statement::StorageDead(l) if *l != 0 && *l != recv => {
+                    if !store_seen && (*l == pre_temp || *l == call_dest) {
+                        return None; // a carrier killed before the store consumed it.
+                    }
+                    continue;
+                }
+                Statement::StorageLive(l) if *l != 0 && *l != recv => {
+                    if *l == pre_temp || *l == call_dest {
+                        return None; // resurrection of a carrier.
+                    }
+                    continue;
+                }
+                _ => return None,
+            }
+        };
+        if store_seen {
+            return None;
+        }
+        if place.local != recv
+            || place.projections.as_slice() != [trust_types::Projection::Deref]
+        {
+            return None;
+        }
+        let Rvalue::Use(Operand::Copy(sp) | Operand::Move(sp)) = rvalue else { return None };
+        if sp.local != call_dest || !sp.projections.is_empty() {
+            return None;
+        }
+        store_seen = true;
+    }
+    if !store_seen || !matches!(wblk.terminator, Terminator::Return) {
+        return None;
+    }
+
+    // A3 — global completeness (the C3 pattern): every other block unable to reach
+    // Return; `_0` never written; recv never bare-rebound and never written outside
+    // the store; `_r` has NO other def of any kind and exactly one read (the
+    // store); `_t` is read ONLY by the entry call's args; exactly one deref-read
+    // of recv (the pre-read).
+    let mut pre_temp_reads = 0usize;
+    let mut call_dest_reads = 0usize;
+    let mut recv_deref_reads = 0usize;
+    for blk in &body.blocks {
+        if blk.id != entry.id && blk.id != wblk.id {
+            let reach = crate::mirsem::cfg_reachable_from(body, blk.id)?;
+            if reach.contains(&return_block) {
+                return None;
+            }
+        }
+        match &blk.terminator {
+            Terminator::Call { dest, .. } => {
+                if dest.local == 0 || (dest.local == call_dest && blk.id != entry.id) {
+                    return None;
+                }
+            }
+            Terminator::Drop { place, .. } => {
+                if place.local == call_dest || place.local == pre_temp {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        for st in &blk.stmts {
+            match st {
+                Statement::SetDiscriminant { place, .. }
+                | Statement::Deinit { place }
+                | Statement::Retag { place }
+                    if place.local == call_dest || place.local == pre_temp =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+            let Statement::Assign { place, rvalue, .. } = st else { continue };
+            if place.local == call_dest {
+                return None;
+            }
+            if place.local == 0 || (place.local == recv && place.projections.is_empty()) {
+                return None;
+            }
+            let mut count = |op: &Operand| {
+                if let Operand::Copy(p) | Operand::Move(p) = op {
+                    if p.projections.is_empty() {
+                        if p.local == pre_temp {
+                            pre_temp_reads += 1;
+                        }
+                        if p.local == call_dest {
+                            call_dest_reads += 1;
+                        }
+                    }
+                    if p.local == recv
+                        && p.projections.as_slice() == [trust_types::Projection::Deref]
+                    {
+                        recv_deref_reads += 1;
+                    }
+                }
+            };
+            match rvalue {
+                Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => count(a),
+                Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                    count(a);
+                    count(b);
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Call { args, .. } = &blk.terminator {
+            for a in args {
+                if let Operand::Copy(p) | Operand::Move(p) = a {
+                    if p.local == recv {
+                        return None;
+                    }
+                    if p.projections.is_empty() && p.local == call_dest {
+                        return None; // `_r` never feeds any call.
+                    }
+                    if p.projections.is_empty() && p.local == pre_temp && blk.id != entry.id {
+                        return None; // `_t` feeds only THE call.
+                    }
+                }
+            }
+        }
+    }
+    if pre_temp_reads != 0 || call_dest_reads != 1 || recv_deref_reads != 1 {
+        // (`_t`'s reads live in call ARGS, which the statement counter never
+        // sees — so its statement-read count must be ZERO; its arg uses are
+        // audited above.)
+        return None;
+    }
+
+    // The model: the identity trace over the fresh call slot.
+    let r_slot = u64::try_from(body.locals.len()).ok()?;
+    let post = r_slot.checked_add(1)?;
+    Some(IrCfg {
+        blocks: vec![IrBlock {
+            stmts: vec![IrStmt { idx: post, rvalue: IrRvalue::Use(IrOperand::Var(r_slot)) }],
+            term: IrTerm::Return(IrOperand::Var(post)),
+        }],
+        entry: 0,
+        fuel: 2,
+    })
+}
+
+/// Trust: PAIR RETURN (2026-08-16) — the whole-pair checked return family,
+/// the honest path back for the two rows the wrap-return audit RETRACTED
+/// (`core::num::<impl u8/i32>::overflowing_add`):
+///
+/// ```text
+/// bb0: _0 := CheckedBinaryOp(Add, Copy(_1), Copy(_2));   Return
+///      (return_ty = (Int{W,s}, Bool); params both Int{W,s})
+/// ```
+///
+/// THE CLAIM, component-wise (two kernel decls, conjunction verdict — the
+/// field-post precedent; no pair-valued denotation exists and none is needed):
+///   C0  `.0 = wrap_{W,s}(a + b)` — modeled as `[t := Bin(Add,a,b);
+///        post := Use(Cast{U,S}(t, W))]`: the cast lane's recipe IS the wrap,
+///        already kernel-checked and value-pinned per width.
+///   C1  `.1 = overflow_{W,s}(a,b)` as bool-as-int — unsigned: `Cmp(Gt, t, 2^W−1)`;
+///        signed: the two-sided Switch (`Lt(t, MIN)` → 1, else `Cmp(Gt, t, MAX)`).
+/// Both are value-decided at the kernel tier (castU/S and decide-backed Cmp
+/// compute on closed literals): `u8 200+100` proves `(44, 1)` and rejects
+/// `(45, 0)` — the exact counterexample the retracted certificate got wrong.
+///
+/// Gates: the audit inheritance (no Cleanup edges, unique ids); exactly ONE
+/// block; the sole statement is the checked op on the two params IN DECLARATION
+/// ORDER (operand order pinned — Sub would be order-sensitive and joins only
+/// with its own pins); both params and the tuple's Int component share
+/// `Int{W,s}` with W ∈ {8,16,32,64} (the cast lane's admitted widths); `Add`
+/// only — the measured population; Sub/Mul join against real bodies with their
+/// own MIN/MAX row pins.
+pub(crate) fn overflowing_pair_ir_cfgs(
+    func: &VerifiableFunction,
+) -> Option<(crate::trustir_anchor::IrBody, crate::trustir_anchor::IrCfg)> {
+    use trust_types::{BinOp, Operand, Rvalue, Statement, Terminator, Ty};
+
+    use crate::trustir_anchor::{
+        IrBlock, IrBody, IrCfg, IrCond, IrOperand, IrRvalue, IrStmt, IrTerm, TrustIrBinOp,
+        TrustIrCmpOp,
+    };
+
+    let body = &func.body;
+    if body_has_cleanup_unwind_edge(body) || !all_block_ids_unique(body) {
+        return None;
+    }
+    if body.arg_count != 2 || body.blocks.len() != 1 {
+        return None;
+    }
+    let Ty::Tuple(parts) = &body.return_ty else { return None };
+    let [Ty::Int { width, signed }, Ty::Bool] = parts.as_slice() else { return None };
+    let (w, s) = (*width, *signed);
+    if !matches!(w, 8 | 16 | 32 | 64) {
+        return None;
+    }
+    for l in 1..=2usize {
+        if !matches!(&body.locals.get(l)?.ty, Ty::Int { width: pw, signed: ps }
+            if *pw == w && *ps == s)
+        {
+            return None;
+        }
+    }
+    let blk = &body.blocks[0];
+    if !matches!(blk.terminator, Terminator::Return) {
+        return None;
+    }
+    let [Statement::Assign { place, rvalue, .. }] = blk.stmts.as_slice() else { return None };
+    if place.local != 0 || !place.projections.is_empty() {
+        return None;
+    }
+    let Rvalue::CheckedBinaryOp(BinOp::Add, a, b) = rvalue else { return None };
+    // Operand order pinned to declaration order: a = _1, b = _2, both bare.
+    let bare_param = |op: &Operand, l: usize| {
+        matches!(op, Operand::Copy(p) | Operand::Move(p)
+            if p.local == l && p.projections.is_empty())
+    };
+    if !bare_param(a, 1) || !bare_param(b, 2) {
+        return None;
+    }
+
+    // The models. Slots: params 0/1; t = 2; outputs 3.
+    let sum = IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(0), IrOperand::Var(1));
+    let cast = |t: IrOperand| {
+        if s {
+            IrOperand::CastS(Box::new(t), w)
+        } else {
+            IrOperand::CastU(Box::new(t), w)
+        }
+    };
+    // C0 rides the CHAIN lane (`evalBody`) — the cast heads' own, value-pinned
+    // lane; the branch lane's `evalCfg` path type-mismatches on closed cast rows
+    // (measured on the first draft's i32 row).
+    let c0 = IrBody {
+        stmts: vec![
+            IrStmt { idx: 2, rvalue: sum.clone() },
+            IrStmt { idx: 3, rvalue: IrRvalue::Use(cast(IrOperand::Var(2))) },
+        ],
+        ret: 3,
+    };
+    let c1 = if s {
+        let min = -(1i128 << (w - 1));
+        let max = (1i128 << (w - 1)) - 1;
+        IrCfg {
+            blocks: vec![
+                IrBlock {
+                    stmts: vec![IrStmt { idx: 2, rvalue: sum }],
+                    term: IrTerm::Switch(
+                        IrCond {
+                            op: TrustIrCmpOp::Lt,
+                            a: IrOperand::Var(2),
+                            b: IrOperand::Const(min),
+                        },
+                        1,
+                        2,
+                    ),
+                },
+                IrBlock {
+                    stmts: vec![IrStmt { idx: 3, rvalue: IrRvalue::Use(IrOperand::Const(1)) }],
+                    term: IrTerm::Return(IrOperand::Var(3)),
+                },
+                IrBlock {
+                    stmts: vec![IrStmt {
+                        idx: 4,
+                        rvalue: IrRvalue::Cmp(
+                            TrustIrCmpOp::Gt,
+                            IrOperand::Var(2),
+                            IrOperand::Const(max),
+                        ),
+                    }],
+                    term: IrTerm::Return(IrOperand::Var(4)),
+                },
+            ],
+            entry: 0,
+            fuel: 4,
+        }
+    } else {
+        let max = (1i128 << w) - 1;
+        IrCfg {
+            blocks: vec![IrBlock {
+                stmts: vec![
+                    IrStmt { idx: 2, rvalue: sum },
+                    IrStmt {
+                        idx: 3,
+                        rvalue: IrRvalue::Cmp(
+                            TrustIrCmpOp::Gt,
+                            IrOperand::Var(2),
+                            IrOperand::Const(max),
+                        ),
+                    },
+                ],
+                term: IrTerm::Return(IrOperand::Var(3)),
+            }],
+            entry: 0,
+            fuel: 2,
+        }
+    };
+    Some((c0, c1))
+}
+
+/// Trust: PAIR RETURN (2026-08-16) — the disjunct: BOTH component models must
+/// certify modulo 3 (conjunction — never a partial pair claim), plus the base
+/// safety bar (these bodies emit zero VCs; nothing is exempted).
+fn overflowing_pair_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
+    use crate::trustir_anchor::RefinementVerdict;
+    let Some((c0, c1)) = overflowing_pair_ir_cfgs(func) else { return false };
+    matches!(
+        crate::trustir_anchor::check_pair_component0_wrap_model(&c0),
+        RefinementVerdict::ProvenModulo3
+    ) && matches!(
+        crate::trustir_anchor::check_pair_component1_overflow_model(&c1),
+        RefinementVerdict::ProvenModulo3
+    ) && function_safety_vcs_all_discharged(func)
+}
+
 pub(crate) fn straight_line_ir_body_chain(
     func: &VerifiableFunction,
 ) -> Option<crate::trustir_anchor::IrBody> {
@@ -8101,6 +10925,18 @@ pub(crate) fn straight_line_ir_body_chain(
     // Fail-closed on a cycle, a dangling/unreachable block, any non-Assign
     // statement, or a projected write.
     let mut ordered: Vec<(usize, &Rvalue)> = Vec::new();
+    let guard_op = |op: &Operand| stable_guard_operand(body, op, &param_index);
+    let mut established: Vec<(trust_types::BinOp, GuardOp, GuardOp, bool)> = Vec::new();
+    let return_block = unique_return_block_id(body)?;
+    // Trust: STORAGE MARKERS (2026-08-09) — for each local killed by a
+    // `StorageDead`, the position in `ordered` at which its storage ends. A read
+    // at or after that position is UB in MIR (the storage is gone and the value
+    // indeterminate) while this lane's value model would happily hand back the
+    // last assigned value, so it is checked below and fails closed. Recording the
+    // POSITION rather than a bare "is dead" flag is what makes that check exact:
+    // the ordinary `StorageDead(_2)` that trails the last use of `_2` — which is
+    // what real MIR emits, and the whole reason this arm exists — must NOT decline.
+    let mut dead_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut cur = trust_types::BlockId(0);
     let mut visited = std::collections::HashSet::new();
     loop {
@@ -8109,6 +10945,41 @@ pub(crate) fn straight_line_ir_body_chain(
         }
         let blk = body.blocks.iter().find(|b| b.id == cur)?;
         for stmt in &blk.stmts {
+            // Trust: STORAGE MARKERS — `StorageLive`/`StorageDead` declare a local's
+            // storage extent. They write no value, so they are not statements of the
+            // trust-ir value trace and are SKIPPED rather than translated. Without
+            // this the entire `Ordering::is_lt`/`is_gt`/`is_eq`/… family declined,
+            // because `_2 := Discriminant(_1)` is bracketed by exactly these markers.
+            //
+            // Two fail-closed conditions, because "inert" is a claim about VALUES and
+            // not about the local's lifetime:
+            //   * `StorageDead(_0)` — killing the return place is not a shape this
+            //     lane models; decline rather than reason about it.
+            //   * a `StorageLive` RESURRECTING an already-dead local — the storage is
+            //     fresh and the contents indeterminate, so carrying the pre-death
+            //     value forward (which is what this builder's SSA model would do)
+            //     would be a fiction. Real MIR does not emit this for the recognized
+            //     family; declining costs nothing and closes the hole.
+            match stmt {
+                Statement::StorageDead(l) => {
+                    if *l == 0 {
+                        return None; // the return place's storage killed — out of scope.
+                    }
+                    // EARLIEST death wins (`or_insert`, not `insert`). A second
+                    // `StorageDead` for a live-again local is already declined by the
+                    // resurrection gate below, so a repeat here is a malformed body;
+                    // keeping the first position is the conservative reading.
+                    dead_at.entry(*l).or_insert(ordered.len());
+                    continue;
+                }
+                Statement::StorageLive(l) => {
+                    if dead_at.contains_key(l) {
+                        return None; // resurrected storage — the contents are indeterminate.
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             if !matches!(stmt, Statement::Assign { .. }) {
                 return None; // any non-Assign statement — outside this fragment.
             }
@@ -8119,9 +10990,37 @@ pub(crate) fn straight_line_ir_body_chain(
             if !crate::assignment_types::place_type(body, place)
                 .is_some_and(|ty| matches!(ty, Ty::Int { .. } | Ty::Bool))
             {
-                // Every trust-ir SSA value in this lane lives on the scalar Int/Bool
-                // carrier.  In particular, never reinterpret a typed Float temp as an
-                // `Int` merely because its MIR operator is spelled `Div`/`Add`/etc.
+                // Trust (#53, 2026-08-13) — THE FAT-POINTER RESHAPE TEMP, skipped
+                // rather than declined. `str::is_empty` lowers to
+                //   `_3 := Cast(_1, &[u8]); _2 := PtrMetadata(_3); _0 := Eq(_2, 0)`
+                // and `_3` is REF-typed, so this gate rejected the whole body. The
+                // arm's own comment used to record that consequence as a fact of
+                // nature ("that branch is UNREACHABLE from this lane"); it was only
+                // ever this gate.
+                //
+                // Skipping is SELF-PROTECTING, which is why it needs no extra
+                // liveness analysis: a skipped local is never added to `defined`, so
+                // any OTHER statement that reads it fails `to_ir_operand` and the
+                // whole chain declines. The only consumer that can succeed is the
+                // `PtrMetadata` arm, which does not consult `defined` at all — it
+                // re-resolves from the MIR through MirSem's own
+                // `resolve_ptr_metadata_slice_len`, inheriting that recognizer's
+                // same-fat-pointer gate (a SIZE-CHANGING reinterpret declines) rather
+                // than a transcription of it here.
+                //
+                // Deliberately narrow: a `Cast` only, to a sole-written non-parameter
+                // temp. Anything else on a non-scalar carrier still declines, which
+                // keeps the original rule — every trust-ir SSA value in this lane
+                // lives on the scalar Int/Bool carrier — true of everything that
+                // actually reaches the translation loop. In particular a typed Float
+                // temp is still never reinterpreted as an `Int` because its MIR
+                // operator is spelled `Div`/`Add`.
+                if matches!(rvalue, Rvalue::Cast(_, _))
+                    && param_index(place.local).is_none()
+                    && crate::prove::local_soundly_resolvable(body, place.local)
+                {
+                    continue;
+                }
                 return None;
             }
             ordered.push((place.local, rvalue));
@@ -8155,7 +11054,29 @@ pub(crate) fn straight_line_ir_body_chain(
                     return None; // not a comparison rvalue — outside this fragment.
                 };
                 let (Some(av), Some(bv)) = (literal_int_operand(a), literal_int_operand(b)) else {
-                    return None; // a non-literal guard operand — fail closed.
+                    // Trust: DIVERGENCE-GUARD SWITCH (2026-08-12) — the
+                    // ESTABLISHED-BY-TAKEN-GUARD admission: a non-literal assert guard
+                    // is followed IFF a dominating switch already established the SAME
+                    // comparison (same op, same STABLE operands) with a polarity that
+                    // makes `cond == expected` — `get_bit`'s compiler-inserted
+                    // checked-Shl assert repeats the source guard byte-for-byte.
+                    // Unlike the literal path, the guard statement is NOT dropped
+                    // (it is an ordinary dead `Cmp` def), so no fence shift occurs.
+                    // Anything short of an exact fact match fails closed.
+                    let (Some(ka), Some(kb)) = (guard_op(a), guard_op(b)) else {
+                        return None; // unstable operands — no fact can apply.
+                    };
+                    let fact = established
+                        .iter()
+                        .find(|(fb, fa2, fb2, _)| *fb == *bop && *fa2 == ka && *fb2 == kb);
+                    let Some((_, _, _, polarity)) = fact else {
+                        return None; // no dominating guard established this comparison.
+                    };
+                    if *polarity != *expected {
+                        return None; // the established polarity contradicts the claim.
+                    }
+                    cur = *target;
+                    continue;
                 };
                 let Some(holds) = eval_literal_cmp(bop, av, bv) else {
                     return None; // not a comparison op — outside this fragment.
@@ -8166,14 +11087,97 @@ pub(crate) fn straight_line_ir_body_chain(
                     // vacuous check to discharge and skip.
                     return None;
                 }
+                // Trust: FENCE ALIGNMENT (2026-08-11) — removing the discharged guard
+                // SHIFTS every later element of `ordered` down by one, and `dead_at`
+                // stores POSITIONS IN `ordered`. Left unadjusted, a death recorded at
+                // position `d > guard_pos` keeps comparing against a stale `d` while
+                // the reads it fences moved to `d-1`, so `dead_at <= i` goes FALSE
+                // where it should hold — the permissive direction, admitting a genuine
+                // use-after-`StorageDead`. Found by adversarial review, not by a test:
+                // the fence's own probes have no assert guard, so nothing exercised the
+                // interaction.
                 ordered.remove(guard_pos); // the discharged side obligation — not a value.
+                for d in dead_at.values_mut() {
+                    if *d > guard_pos {
+                        *d -= 1;
+                    }
+                }
                 cur = *target;
             }
-            _ => return None, // Call/SwitchInt/… — outside this straight-line fragment.
+            // Trust: DIVERGENCE-GUARD SWITCH (2026-08-12) — a `SwitchInt` whose OTHER
+            // edge cannot reach `Return` (the `assert!`-lowered panic arm of
+            // `bit_field::get_bit`). Mirrors the vetted sole-returning-successor rule
+            // of MirSem's `straight_line_return_spine` (return_lift.rs) — the SAME
+            // rule that makes these bodies fully-faithful on the MirSem lane today —
+            // with reachability delegated to `cfg_reachable_from`.
+            //
+            // THE VALUE MODEL IS PARTIAL-CORRECTNESS-SHAPED, exactly as MirSem's: the
+            // trace describes the RETURNING path; a run that takes the diverging edge
+            // never returns, so the claim is vacuous there, not false. What keeps the
+            // divergence honest is OUTSIDE this walk, unchanged: the panic's own
+            // VcKind::Assertion row, and the conjoined safety-VC discharge clause.
+            //
+            // Restricted to the Bool-switch lowering (`targets == [(0, b)]`,
+            // `otherwise`), with the discr resolved to a SOLE-WRITTEN prefix
+            // comparison temp over STABLE operands. The taken edge's polarity is
+            // recorded as an ESTABLISHED FACT for the Assert widening below (the
+            // compiler's checked-Shl assert repeats the switch's own comparison
+            // byte-for-byte). The guard statement is KEPT in the trace as an ordinary
+            // (dead) `Cmp` def — non-final comparisons model since 2026-08-10, and
+            // not dropping it means no second `ordered.remove` site and no new
+            // `dead_at` fence exposure.
+            Terminator::SwitchInt { discr, targets, otherwise, .. } => {
+                let (Operand::Copy(p) | Operand::Move(p)) = discr else {
+                    return None; // a constant discr — outside this fragment.
+                };
+                if !p.projections.is_empty()
+                    || !local_has_only_n_bare_assignments(body, p.local, 1)
+                {
+                    return None;
+                }
+                let Some(guard_pos) = ordered.iter().rposition(|(l, _)| *l == p.local) else {
+                    return None; // the guard temp isn't defined in this prefix.
+                };
+                let Rvalue::BinaryOp(bop, a, b) = ordered[guard_pos].1 else {
+                    return None; // not a comparison guard — outside this fragment.
+                };
+                let (Some(ka), Some(kb)) = (guard_op(a), guard_op(b)) else {
+                    return None; // an unstable guard operand — never a fact, fail closed.
+                };
+                let [(0, zero_edge)] = targets.as_slice() else {
+                    return None; // not the Bool-switch lowering — outside this fragment.
+                };
+                let reach_zero = crate::mirsem::cfg_reachable_from(body, *zero_edge)?;
+                let reach_other = crate::mirsem::cfg_reachable_from(body, *otherwise)?;
+                let zero_returns = reach_zero.contains(&return_block);
+                let other_returns = reach_other.contains(&return_block);
+                // EXACTLY ONE successor may reach Return: two is a genuine branch
+                // (the branch lane's job), zero is a function that never returns.
+                let (next, polarity) = match (zero_returns, other_returns) {
+                    (true, false) => (*zero_edge, false), // taken edge: discr == 0
+                    (false, true) => (*otherwise, true),  // taken edge: discr != 0
+                    _ => return None,
+                };
+                established.push((*bop, ka, kb, polarity));
+                cur = next;
+            }
+            _ => return None, // Call/… — outside this straight-line fragment.
         }
     }
     if visited.len() != body.blocks.len() {
-        return None; // an unreachable/dangling block exists — fail closed (defensive).
+        // Trust: DIVERGENCE-GUARD SWITCH — the panic arm's blocks are legitimately
+        // unvisited. Every unvisited block must be UNABLE to reach the unique Return;
+        // one that can reach it means the walk missed a genuine value path — fail
+        // closed, exactly the defensive posture the strict equality had.
+        for blk in &body.blocks {
+            if visited.contains(&blk.id) {
+                continue;
+            }
+            let reach = crate::mirsem::cfg_reachable_from(body, blk.id)?;
+            if reach.contains(&return_block) {
+                return None;
+            }
+        }
     }
     if ordered.len() < 2 {
         return None; // the single-statement fragment belongs to `straight_line_ir_body`.
@@ -8191,6 +11195,21 @@ pub(crate) fn straight_line_ir_body_chain(
         }
         if !local_has_only_n_bare_assignments(body, *l, 1) {
             return None; // sole-writer — a multiply-written temp declines.
+        }
+    }
+    // Trust: STORAGE MARKERS — USE-AFTER-DEAD, the one way skipping the markers
+    // could launder a real defect. `ordered` is in true execution order, so a
+    // statement at position `i` that mentions a local whose storage ended at
+    // `dead_at <= i` is reading (or writing) dead storage. That is UB, and this
+    // lane's model would silently denote it as the last assigned value — a
+    // certificate about a program the machine does not run. Fail closed.
+    if !dead_at.is_empty() {
+        for (i, (local, rvalue)) in ordered.iter().enumerate() {
+            let mut touched = vec![*local];
+            straight_line_rvalue_read_locals(rvalue, &mut touched);
+            if touched.iter().any(|l| dead_at.get(l).is_some_and(|d| *d <= i)) {
+                return None; // a use of storage already declared dead.
+            }
         }
     }
 
@@ -8219,9 +11238,57 @@ pub(crate) fn straight_line_ir_body_chain(
                     }
                     None
                 }
+                // Trust: BARE-DEREF SCALAR READ (2026-08-11) — `Copy((*_1))` where
+                // `_1 : &{int}`, the `char::is_ascii` / `u8::is_ascii` /
+                // `cmp::impls::<PartialOrd for u32>::lt` shape. `ir_field_read_operand`
+                // below handles `[Deref, Field]` and `[Field]` but not a BARE `[Deref]`,
+                // so these declined.
+                //
+                // DELEGATED to MirSem's GAP-DEREF-SELF recognizer, exactly as the
+                // `Rvalue::Discriminant` arm delegates to `sem_discriminant_base_of_mir`,
+                // and for a sharper reason than code reuse. The identification this arm
+                // makes — that a Deref'd reference parameter and a bare scalar parameter
+                // denote the SAME `Var(idx)` — is only sound under four gates
+                // (`param_reassigned_by_stmt`; an IMMUTABLE `&{int}`; no write reaching
+                // through the reference; and a genuine PARAMETER base). Re-transcribing
+                // them here is how one gets dropped.
+                //
+                // THE SLOT IS `param_index(p.local)`, NEVER `p.local`. The temp branch
+                // three lines above spells `Var(p.local)` because a temp's SSA index IS
+                // its local; a parameter's slot is `local - 1`. Copying the temp spelling
+                // would give `(*_1)` the slot `Var(1)` — for any two-argument function
+                // that is the SECOND parameter, a body that computes the wrong thing and
+                // that the self-relating refinement check would prove without complaint.
+                // Delegation is what makes that impossible: the recognizer returns the
+                // slot itself.
+                //
+                // `SemOperand::Move(..)` is NOT unwrapped — only a bare `Var` is admitted,
+                // mirroring both the discriminant delegation and `sem_operand_to_ir`'s own
+                // decline of `S::Move(_)`. The referent stays `Ty::Int` only (the delegate's
+                // gate); widening to `&bool` for symmetry with the bare-place arm above
+                // would assert something MirSem never vetted, and buys nothing — no
+                // bare-Deref read in the corpus has a Bool referent.
+                Operand::Copy(p) | Operand::Move(p)
+                    if matches!(p.projections.as_slice(), [trust_types::Projection::Deref]) =>
+                {
+                    match crate::mirsem::sem_operand_of_mir(body, op, &param_index) {
+                        Some(crate::mirsem::SemOperand::Var(idx)) => Some(IrOperand::Var(idx)),
+                        _ => None,
+                    }
+                }
                 _ => ir_field_read_operand(body, op, &param_index),
             }
         };
+    // Trust: BOOL-OPERAND GATE (2026-08-11) — re-applied from the single-statement
+    // sibling `straight_line_mir_binop_to_ir_cmpop`, which refuses a comparison whose
+    // operands are bool-typed: "MIR uses the same `BinOp::Eq`/`Ne` for `bool == bool`,
+    // whose trust-ir denotation is the Int comparison of two 0/1 values — a different
+    // claim from an integer comparison, and not this fragment." The chain copy took
+    // `bop` alone and so admitted what the single-statement lane refuses; widening the
+    // comparison arm to non-final positions extended that gap to every statement.
+    // This is the same discipline `Shr`'s unsigned gate already gets in both lanes.
+    let cmp_operands_are_int =
+        |a: &Operand, b: &Operand| -> bool { bitwise_operands_are_int(body, a, b) };
     let to_ir_binop =
         |bop: &trust_types::BinOp, a: &Operand, b: &Operand| -> Option<TrustIrBinOp> {
             match bop {
@@ -8236,8 +11303,42 @@ pub(crate) fn straight_line_ir_body_chain(
                 {
                     Some(TrustIrBinOp::LShr)
                 }
-                // Trust: M6 rung 9, ANCHOR BitAnd.
-                trust_types::BinOp::BitAnd => Some(TrustIrBinOp::And),
+                // Trust: M6 rung 9, ANCHOR BitAnd; OR/XOR ANCHOR (2026-08-11) — the
+                // opaque `Int.land`/`Int.lor`/`Int.xor` carriers, gated to NON-Bool
+                // operands.
+                //
+                // THE BOOL GATE, and the correction behind it. An earlier draft of this
+                // arm claimed Bool operands could ride the opaque tier because "the 65
+                // corpus Bool-`BitAnd` statements already certify on it" — MEASURED
+                // FALSE by adversarial review: ZERO Bool-operand bitwise statements
+                // reach this arm (they live in branch-shaped bodies), so nothing
+                // certifies on that tier and the gate costs zero coverage. And the
+                // vetted MirSem recognizer routes a Bool `BitOr`/`BitAnd` to its
+                // CONNECTIVE forms first, explicitly calling the `Int.lor` denotation
+                // of a Bool connective a MIS-denotation. Without the gate, a future
+                // straight-line Bool-`||` chain would be silently claimed as opaque
+                // `Int.lor` over 0/1 values — type-correct, refl-provable, uncaught.
+                trust_types::BinOp::BitAnd if cmp_operands_are_int(a, b) => {
+                    Some(TrustIrBinOp::And)
+                }
+                trust_types::BinOp::BitOr if cmp_operands_are_int(a, b) => {
+                    Some(TrustIrBinOp::Or)
+                }
+                trust_types::BinOp::BitXor if cmp_operands_are_int(a, b) => {
+                    Some(TrustIrBinOp::Xor)
+                }
+                // Trust: SHL ANCHOR (2026-08-12) — the opaque `Int.shiftLeft` carrier,
+                // gated non-Bool like its bitwise siblings. NO unsigned gate: the
+                // signed `get_bit` impls shift an iN-typed literal mask, MirSem's own
+                // recognizer admits `Shl` ungated (its unsigned gate is scoped to
+                // `Shr` alone), and the opaque asserts nothing a signedness could
+                // falsify — truncation/overflow is the separately-emitted safety VC
+                // that this lane's `function_safety_vcs_all_discharged` clause must
+                // refute (an unsigned-only gate here would decline all 6 signed
+                // target bodies for nothing).
+                trust_types::BinOp::Shl if cmp_operands_are_int(a, b) => {
+                    Some(TrustIrBinOp::Shl)
+                }
                 _ => None,
             }
         };
@@ -8260,19 +11361,19 @@ pub(crate) fn straight_line_ir_body_chain(
         let ir_rv = match rvalue {
             Rvalue::Use(op) => IrRvalue::Use(to_ir_operand(op, &defined)?),
             Rvalue::BinaryOp(bop, a, b) => {
-                // Trust: M6 rung 9, COMPARE-AS-VALUE — tried FIRST on the FINAL
-                // statement only, so a genuine comparison final op is never
-                // mis-denoted as an (undefined) arithmetic one.
-                if is_final {
-                    if let Some(cmp) = to_ir_cmpop(bop) {
-                        IrRvalue::Cmp(cmp, to_ir_operand(a, &defined)?, to_ir_operand(b, &defined)?)
-                    } else {
-                        IrRvalue::Bin(
-                            to_ir_binop(bop, a, b)?,
-                            to_ir_operand(a, &defined)?,
-                            to_ir_operand(b, &defined)?,
-                        )
-                    }
+                // Trust: M6 rung 9, COMPARE-AS-VALUE — a comparison is tried FIRST,
+                // falling back to the arithmetic mapping. Formerly restricted to the
+                // FINAL statement; that restriction was conservatism, not a
+                // constraint. `evalBody` threads statements uniformly and the model
+                // lane's inliner (`inline_rvalue_denotation`) is operand-driven, so a
+                // `Cmp` denotes identically wherever it sits. The restriction made an
+                // intermediate Bool-valued SSA temp — `_2 := Eq(tag, 0); _0 := !_2`,
+                // the shape of every `is_none`/`is_err`/`is_pending` — decline for no
+                // reason the theory can state. Widening it admits only shapes that
+                // previously DECLINED: `to_ir_binop` never mapped a comparison at all,
+                // so no body changes meaning.
+                if let Some(cmp) = to_ir_cmpop(bop).filter(|_| cmp_operands_are_int(a, b)) {
+                    IrRvalue::Cmp(cmp, to_ir_operand(a, &defined)?, to_ir_operand(b, &defined)?)
                 } else {
                     IrRvalue::Bin(
                         to_ir_binop(bop, a, b)?,
@@ -8284,7 +11385,175 @@ pub(crate) fn straight_line_ir_body_chain(
             Rvalue::UnaryOp(trust_types::UnOp::Neg, a) => {
                 IrRvalue::Un(TrustIrUnOp::Neg, to_ir_operand(a, &defined)?)
             }
-            _ => return None, // out of the modeled fragment (CheckedBinaryOp/Cast/…).
+            // Trust: SLICE-LENGTH IN CHAIN (2026-08-11) — `UnOp::PtrMetadata` on a
+            // slice reference, the first statement of `slice::is_empty`
+            // (`_2 := PtrMetadata(_1); _0 := Eq(_2, 0)`). DELEGATED to MirSem's
+            // W-LEN-ISEMPTY resolver, which gates fail-closed on: a bare IMMUTABLE
+            // `&[T]` PARAMETER (a `&mut` slice declines — same entry-time-value
+            // discipline as every sibling arm), the parameter not reassigned, and
+            // (its second branch) a one-level SAME-fat-pointer reinterpret cast.
+            //
+            // The `use_site` passed is SYNTHETIC (entry block, no statement), which
+            // is exact rather than merely safe: the resolver consults it only on its
+            // CAST-PASSTHROUGH branch, and that branch is UNREACHABLE from this lane
+            // — its defining `_t := Cast(<param slice>, _)` assigns a Ref-typed temp,
+            // and the block walk above (which completes in full before this
+            // translation loop runs) declines any assigned place that is not
+            // `Int`/`Bool`. Only the direct-parameter branch can fire here, and it
+            // never reads the use site.
+            //
+            // The result is the MODEL-ONLY `Len` carrier over the opaque `sliceLen`.
+            // STATED PRECISELY, because an earlier draft of this comment overstated
+            // it: the kernel theorem asserts only that the value is SOME Int stably
+            // determined by the entry-time slice operand — `sliceLen` is opaque, so
+            // "it is THE length" lives entirely in the (unproven) recognizer mapping,
+            // exactly as with `Field`/`Discr`. No numeric fact is established.
+            Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, a) => {
+                let sem = crate::mirsem::resolve_ptr_metadata_slice_len(
+                    body,
+                    a,
+                    &param_index,
+                    (trust_types::BlockId(0), None),
+                )?;
+                let crate::mirsem::SemOperand::Len(base) = sem else {
+                    return None; // the resolver only mints Len; anything else declines.
+                };
+                let crate::mirsem::SemOperand::Var(idx) = *base else {
+                    return None; // a non-parameter base — outside this fragment.
+                };
+                IrRvalue::Use(crate::trustir_anchor::IrOperand::Len(Box::new(
+                    crate::trustir_anchor::IrOperand::Var(idx),
+                )))
+            }
+            // Trust: BOOL NOT (2026-08-10) — MIR's `UnOp::Not` is OVERLOADED, and the
+            // two meanings are NOT interchangeable:
+            //   * on an INTEGER operand it is the bitwise complement, which is what
+            //     `TrustIrUnOp::Not` denotes (the opaque `Trust.TrustIr.bnot`);
+            //   * on a BOOL operand it is LOGICAL negation.
+            // Mapping a Bool `Not` onto `TrustIrUnOp::Not` would denote `!false` as
+            // `bnot 0`, not `1`. THE KERNEL CANNOT CATCH THAT: the chain lane's
+            // refinement relates the IrBody to ITSELF (statement and proof both built
+            // from the same body, closing by `Eq.refl`), so a wrong mapping still
+            // proves modulo 3 — the identical blindness documented for the comparison
+            // op mapping. `trust_ir_bool_not_mapping_value_oracle` is what actually
+            // defends this arm, and it carries the bnot mis-mapping as a forgery row.
+            //
+            // Logical negation on the Bool 0/1 carrier IS `x == 0`, so it is expressed
+            // with the already-grounder-connected `Cmp` rather than a new opaque. An
+            // INTEGER `Not` declines here: `bnot` is model-only and the three corpus
+            // bodies carrying it are a separate question, not this one.
+            Rvalue::UnaryOp(trust_types::UnOp::Not, a) => {
+                let (Operand::Copy(p) | Operand::Move(p)) = a else {
+                    return None; // a constant `Not` operand — outside this fragment.
+                };
+                if !crate::assignment_types::place_type(body, p)
+                    .is_some_and(|ty| matches!(ty, Ty::Bool))
+                {
+                    return None; // an INTEGER `Not` — the bitwise `bnot`, not this arm.
+                }
+                IrRvalue::Cmp(
+                    TrustIrCmpOp::Eq,
+                    to_ir_operand(a, &defined)?,
+                    crate::trustir_anchor::IrOperand::Const(0),
+                )
+            }
+            // Trust: DISCRIMINANT-IN-CHAIN (2026-08-08) — the enum TAG READ, the first
+            // statement of every `is_some`/`is_ok`/`is_break`/`is_continue`/`is_ready`
+            // predicate (`_t := Discriminant(p); _0 := cmp(_t, k); Return`). Formerly
+            // fell into the catch-all below, which is why those families sat at 0%
+            // trust-ir even though `IrRvalue::Cmp` already handled their SECOND
+            // statement.
+            //
+            // Uses `IrOperand::Discr`, landed earlier as prerequisite infrastructure
+            // that moved zero bodies on its own: it is denoted by trust-ir's OWN
+            // `idxElem` at a RESERVED NEGATIVE key, so it is MODEL-ONLY. That is exactly
+            // why it could never close on the BRANCH lane — `check_branch_refinement`
+            // has no model variant — but CAN close here, because this lane has
+            // `check_body_refinement_model_chain`. The distinction is the whole reason
+            // this arm works and the earlier one did not.
+            //
+            // BARE PARAMETER BASE ONLY, mirroring `mirsem::SemOperand::Discriminant`'s
+            // own shape: a discriminant of a temp, a field, or a projection is not this
+            // predicate family and declines fail-closed.
+            Rvalue::Discriminant(place) => {
+                // The BASE is resolved by MirSem's OWN vetted recognizer
+                // `sem_discriminant_base_of_mir` rather than a fresh transcription
+                // here, so this arm inherits every gate that recognizer already
+                // carries: the base must be a MODELED enum, `&self` must be
+                // IMMUTABLE (`&mut self` declines), no write may reach through the
+                // reference (`deref_write_exists`), and the parameter must still
+                // hold its entry-time value (`param_reassigned_by_stmt`). A bare
+                // `_1` and a `(*_1)` on an immutable enum reference both resolve to
+                // the SAME `Var(idx)` — `*(&x)` is the identity — which is why the
+                // `&self` receiver of `is_some`/`is_ok`/`is_break` is in scope.
+                //
+                // `use_site: None` is exact here rather than merely safe: the
+                // recognizer's third (address-of-temp) shape is UNREACHABLE from
+                // this lane, because its defining `_2 := &_1` statement is a
+                // `Ref`-typed write and the block walk above declines any assigned
+                // place that is not `Int`/`Bool`. Only the two PARAMETER shapes can
+                // arrive, and neither consults `use_site`.
+                let base = crate::mirsem::sem_discriminant_base_of_mir(
+                    body,
+                    place,
+                    &param_index,
+                    None,
+                )?;
+                let crate::mirsem::SemOperand::Var(idx) = base else {
+                    return None; // a non-parameter base — outside this fragment.
+                };
+                IrRvalue::Use(IrOperand::Discr(idx))
+            }
+            // Trust: CAST-IN-CHAIN (2026-08-11) — a Rust integer `as` conversion.
+            //
+            // THE DESTINATION IS RE-DERIVED FROM THE ASSIGNED LOCAL, and the cast's own
+            // declared target must AGREE with it. This is the G10 discipline from the
+            // post-call cast lane, and it is not ceremony: the width and signedness
+            // decide the modulus and the sign fix-up, so trusting the recognizer's
+            // transcription of them is exactly how an 8-bit wrap becomes kernel-
+            // acceptable for a 32-bit destination. Two independent readings that must
+            // match is cheap; being wrong here is not.
+            //
+            // `IntCastDest::new` enforces the computable width whitelist {8,16,32,64} —
+            // 128 is refused because `reduce_int_mod` cannot read an unreduced `Int.mul`
+            // modulus, so a 128-bit cast would be inert rather than wrong. A Bool source,
+            // a Bool/Float/pointer destination, and a non-place source all decline.
+            //
+            // The MAPPING is what needs defending, not the arithmetic: `exact_int_cast_expr`
+            // is already pinned row-by-row against Rust `as` semantics, but nothing there
+            // says the RECOGNIZER hands it this body's real destination. The chain lane's
+            // refinement relates the IrBody to itself, so a wrong width — or the classic
+            // cast-as-identity — still proves modulo 3. `trust_ir_cast_mapping_value_oracle`
+            // is what actually covers this arm, and it carries both mistakes as forgeries.
+            Rvalue::Cast(a, cast_ty) => {
+                let (Operand::Copy(sp) | Operand::Move(sp)) = a else {
+                    return None; // a constant/aggregate cast source — outside this fragment.
+                };
+                if !crate::assignment_types::place_type(body, sp)
+                    .is_some_and(|ty| matches!(ty, Ty::Int { .. }))
+                {
+                    return None; // a Bool (or non-integer) source — not this arm.
+                }
+                let Some(Ty::Int { width, signed }) =
+                    body.locals.get(*local).map(|l| l.ty.clone())
+                else {
+                    return None; // a non-integer destination local — decline.
+                };
+                let Ty::Int { width: declared_width, signed: declared_signed } = cast_ty else {
+                    return None; // casting to a non-integer type — outside this fragment.
+                };
+                if (*declared_width, *declared_signed) != (width, signed) {
+                    return None; // the two readings disagree — fail closed, never pick one.
+                }
+                let dest = crate::trustir_anchor::IntCastDest::new(width, signed)?;
+                let base = Box::new(to_ir_operand(a, &defined)?);
+                IrRvalue::Use(if dest.signed() {
+                    crate::trustir_anchor::IrOperand::CastS(base, dest.width())
+                } else {
+                    crate::trustir_anchor::IrOperand::CastU(base, dest.width())
+                })
+            }
+            _ => return None, // out of the modeled fragment (CheckedBinaryOp/…).
         };
         let idx = if is_final { fresh_ret_idx } else { u64::try_from(*local).ok()? };
         stmts.push(IrStmt { idx, rvalue: ir_rv });
@@ -8308,6 +11577,156 @@ pub(crate) fn straight_line_ir_body_chain(
 /// MirSem path. Fail-closed on every clause. The fallback is a NO-OP for every
 /// PRE-EXISTING grounder-connected shape: `check_body_refinement` already succeeds for
 /// them, so `||` short-circuits before `check_body_refinement_model` ever runs.
+/// Trust (#53, 2026-08-13): the compared operand `a` out of the VETTED MirSem
+/// signum witness, which is EXACTLY
+/// `ArithBin(Sub, Cmp(Gt, Use(a), Use(0)), Cmp(Lt, Use(a), Use(0)))`.
+///
+/// Deliberately a destructure of that recognizer's OUTPUT rather than a second
+/// walk of the MIR: `mirsem::resolve_signum_ordering_sign` /
+/// `resolve_signum_cast_rvalue` stay the ONE place the signum gates live (rhs
+/// must be the literal `0`; the flipped `Cmp(0, a)` declines; the `Ordering`
+/// discriminants must carry the exact `Less→-1`/`Equal→0`/`Greater→1` encoding
+/// at the carrier width; the cast must be a value-preserving signed widening).
+/// Reimplementing them here is what would let the two lanes drift apart, and
+/// `signum_forgeries_are_fail_closed` already pins that set against G1–G6.
+///
+/// Fail-closed by construction: a change to the witness shape makes this match
+/// fail and the lane decline, rather than silently lifting something else.
+fn signum_compared_operand(sem: &crate::mirsem::SemRvalue) -> Option<crate::mirsem::SemOperand> {
+    use crate::mirsem::{SemBinOp, SemCmpOp, SemOperand, SemRvalue};
+    let SemRvalue::ArithBin(SemBinOp::Sub, gt, lt) = sem else { return None };
+    let (SemRvalue::Cmp(SemCmpOp::Gt, gt_a, gt_z), SemRvalue::Cmp(SemCmpOp::Lt, lt_a, lt_z)) =
+        (&**gt, &**lt)
+    else {
+        return None;
+    };
+    let (SemRvalue::Use(gt_a), SemRvalue::Use(lt_a)) = (&**gt_a, &**lt_a) else { return None };
+    let (SemRvalue::Use(SemOperand::Const(0)), SemRvalue::Use(SemOperand::Const(0))) =
+        (&**gt_z, &**lt_z)
+    else {
+        return None; // both comparisons must be against the literal 0.
+    };
+    if gt_a != lt_a {
+        return None; // both comparisons must be of the SAME value.
+    }
+    Some(gt_a.clone())
+}
+
+/// Trust (#53): `signum`'s trust-ir body — the R4 port of the MirSem W-CMP-DISCR
+/// witness, which is why those 8 rows were `fully_faithful` yet `mirsem_fallback`.
+///
+/// The MIR is `_o := Cmp(a, 0); _d := Discriminant(_o)` plus, for every width
+/// except `i8`, a value-preserving `_0 := Cast(_d, iN)`. The modeled value is
+/// `(a > 0) - (a < 0)`, which needs THREE trust-ir statements: `IrRvalue::Bin`
+/// takes flat `IrOperand`s, so the two comparisons cannot be nested inside the
+/// subtraction and must be bound to their own SSA temps first.
+///
+/// SSA INDEX DISCIPLINE. The two comparison temps and the return temp have no
+/// MIR local to borrow (they are introduced by this modeling step, not read off
+/// the body), so all three are allocated PAST every real local —
+/// `body.locals.len()`, `+1`, `+2`. That keeps them disjoint from every
+/// parameter's `Var(local-1)` index and from every raw-local temp index the
+/// sibling chain lane uses, which is the same "fresh index past every parameter"
+/// rule `straight_line_ir_body` and `straight_line_ir_body_chain` already follow.
+fn signum_ir_body(func: &VerifiableFunction) -> Option<crate::trustir_anchor::IrBody> {
+    use trust_types::{Rvalue, Ty};
+
+    use crate::trustir_anchor::{IrBody, IrOperand, IrRvalue, IrStmt, TrustIrBinOp, TrustIrCmpOp};
+    let body = &func.body;
+    let arg_count = body.arg_count;
+    // The sign carrier must be a SIGNED int — an unsigned return cannot hold the
+    // `-1` `Less` tag. (The vetted recognizers re-check this; so does this lane,
+    // because it is the precondition for the `Const(0)` comparisons below.)
+    let Ty::Int { width, signed: true } = body.return_ty else { return None };
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+    let spine = straight_line_ir_return_spine(body)?;
+    let crate::mirsem::StraightLineReturnDefinition::Assignment {
+        rvalue: ret_rvalue,
+        block: return_block,
+        statement: return_statement,
+    } = crate::mirsem::straight_line_return_definition(body, &spine)?
+    else {
+        return None;
+    };
+    let use_site = Some((return_block, Some(return_statement)));
+    let sem = match ret_rvalue {
+        // `i8`: the `Discriminant` read writes `_0` directly, no cast.
+        Rvalue::Discriminant(ordering_place) => crate::mirsem::resolve_signum_ordering_sign(
+            body,
+            ordering_place,
+            u32::from(width),
+            true,
+            &param_index,
+            use_site,
+        )?,
+        // `i16`/`i32`/`i64`: the value-preserving signed widening of the tag read.
+        Rvalue::Cast(operand, dest_ty) => crate::mirsem::resolve_signum_cast_rvalue(
+            body,
+            operand,
+            dest_ty,
+            &param_index,
+            use_site,
+        )?,
+        _ => return None,
+    };
+    let a_ir = match signum_compared_operand(&sem)? {
+        crate::mirsem::SemOperand::Var(index) => IrOperand::Var(index),
+        crate::mirsem::SemOperand::Const(k) => IrOperand::Const(k),
+        // A slice/field/len leaf has no place in a sign witness — fail closed
+        // rather than widening this lane past what the MirSem twin models.
+        _ => return None,
+    };
+    let base = u64::try_from(body.locals.len()).ok()?;
+    let (gt_idx, lt_idx, ret) = (base, base + 1, base + 2);
+    Some(IrBody {
+        stmts: vec![
+            IrStmt {
+                idx: gt_idx,
+                rvalue: IrRvalue::Cmp(TrustIrCmpOp::Gt, a_ir.clone(), IrOperand::Const(0)),
+            },
+            IrStmt {
+                idx: lt_idx,
+                rvalue: IrRvalue::Cmp(TrustIrCmpOp::Lt, a_ir, IrOperand::Const(0)),
+            },
+            IrStmt {
+                idx: ret,
+                rvalue: IrRvalue::Bin(
+                    TrustIrBinOp::Sub,
+                    IrOperand::Var(gt_idx),
+                    IrOperand::Var(lt_idx),
+                ),
+            },
+        ],
+        ret,
+    })
+}
+
+/// Trust (#53): FULLY-FAITHFUL via the trust-ir signum witness. Mirrors
+/// [`straight_line_chain_fully_faithful_via_trustir`] exactly — multi-statement,
+/// so the MODEL-ONLY fallback is the chain-capable
+/// `check_body_refinement_model_chain` — and keeps the SAME safety gate, so the
+/// signum forgeries stay fail-closed on this lane too.
+fn signum_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
+    use crate::trustir_anchor::RefinementVerdict;
+    let Some(ir_body) = signum_ir_body(func) else { return false };
+    let refined = matches!(
+        crate::trustir_anchor::check_body_refinement(&ir_body),
+        RefinementVerdict::ProvenModulo3
+    ) || matches!(
+        crate::trustir_anchor::check_body_refinement_model_chain(&ir_body),
+        RefinementVerdict::ProvenModulo3
+    );
+    if !refined {
+        return false;
+    }
+    if !function_safety_vcs_all_discharged(func) {
+        return false;
+    }
+    true
+}
+
 fn straight_line_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
     use crate::trustir_anchor::RefinementVerdict;
     let Some(ir_body) = straight_line_ir_body(func) else { return false };
@@ -8374,7 +11793,91 @@ fn sem_leaf_arm_block(
     temp_idx: u64,
 ) -> Option<crate::trustir_anchor::IrBlock> {
     use crate::trustir_anchor::{IrBlock, IrOperand, IrRvalue, IrStmt, IrTerm};
-    let ir_rv = sem_rvalue_to_ir(rv)?;
+    // Trust: B4 (2026-08-12) — a COMPARISON-VALUED leaf arm (`is_ascii_digit`'s
+    // vintage lowers one range check into the arm itself, and wraps it in the
+    // `_t := Le(..); _0 := Ne(_t, false)` Bool-normalize shape). Widened HERE, not in
+    // `sem_rvalue_to_ir`: that translator is shared with the LOOP lane
+    // (`sem_stmt_to_ir`), and the Delta-2 confinement discipline applies — a
+    // lane-specific widening must not leak into the other consumers.
+    //
+    // The `Ne(x, false)`/`Eq(x, true)` wrapper is collapsed by DELEGATING to MirSem's
+    // `sem_rvalue_to_cond_tree` — the vetted BOOL-NORMALIZE that already serves the
+    // guard side — never re-transcribed. Only a LEAF result is admitted: an `And`/`Or`
+    // tree in ARM position is a conjunctive VALUE (`x && y` as 0/1), which is the
+    // `S::Or`/`S::And` residue, not this fragment. The op map is `sem_cmpop_to_ir`,
+    // the third live copy of the six-way correspondence; on this lane it is covered
+    // by `trust_ir_branch_model_value_oracle` (trustir_anchor tests), the same way
+    // the other two copies carry their own oracles.
+    if let crate::mirsem::SemRvalue::Cmp(cop, ra, rb) = rv
+        && let (crate::mirsem::SemRvalue::Bin(la, lb, lc), crate::mirsem::SemRvalue::Bin(ma, mb, mc)) =
+            (ra.as_ref(), rb.as_ref())
+        && let (Some(lop), Some(rop)) =
+            (sem_leaf_bitwise_binop_to_ir(*la), sem_leaf_bitwise_binop_to_ir(*ma))
+    {
+        // Trust (#53, 2026-08-15) — MULTI-STATEMENT LEAF. `eq_ignore_ascii_case`'s
+        // leaves are `Cmp(Eq, Bin(..), Bin(..))`, whose sides are COMPUTED.
+        // `sem_rvalue_to_cond_tree` (lift_mir.rs:2210) requires both sides be bare
+        // `Use(operand)`, and `IrRvalue::Cmp` takes `IrOperand`s -- so this cannot
+        // be one statement on either side. `IrBlock` already carries
+        // `stmts: Vec<IrStmt>`; only this builder was narrow.
+        //
+        // Three statements, each on its own fresh SSA index derived from the
+        // caller's per-leaf `temp_idx` so no two leaves collide.
+        let l_idx = temp_idx;
+        let r_idx = temp_idx + 1;
+        let c_idx = temp_idx + 2;
+        return Some(IrBlock {
+            stmts: vec![
+                IrStmt {
+                    idx: l_idx,
+                    rvalue: IrRvalue::Bin(lop, sem_operand_to_ir(lb)?, sem_operand_to_ir(lc)?),
+                },
+                IrStmt {
+                    idx: r_idx,
+                    rvalue: IrRvalue::Bin(rop, sem_operand_to_ir(mb)?, sem_operand_to_ir(mc)?),
+                },
+                IrStmt {
+                    idx: c_idx,
+                    rvalue: IrRvalue::Cmp(
+                        sem_cmpop_to_ir(*cop),
+                        IrOperand::Var(l_idx),
+                        IrOperand::Var(r_idx),
+                    ),
+                },
+            ],
+            term: IrTerm::Return(IrOperand::Var(c_idx)),
+        });
+    }
+
+    let ir_rv = if let crate::mirsem::SemRvalue::Cmp(..) = rv {
+        match crate::mirsem::sem_rvalue_to_cond_tree(rv)? {
+            crate::mirsem::SemCondTree::Leaf(cond) => IrRvalue::Cmp(
+                sem_cmpop_to_ir(cond.op),
+                sem_operand_to_ir(&cond.a)?,
+                sem_operand_to_ir(&cond.b)?,
+            ),
+            _ => return None, // a conjunctive/disjunctive arm VALUE — not this fragment.
+        }
+    } else if let crate::mirsem::SemRvalue::Bin(bop, a, b) = rv
+        && let Some(ir_op) = sem_leaf_bitwise_binop_to_ir(*bop)
+    {
+        // Trust (#53, 2026-08-14) — INTEGER BITWISE in a LEAF ARM.
+        //
+        // `sem_binop_to_ir` declines the bitwise trio, and its comment scopes that
+        // to the trust-ir LOOP fragment. A leaf arm is not the loop fragment: it
+        // is a `Return`-terminated block whose value the grounder handles through
+        // the SAME `Int.land`/`Int.lor`/`Int.xor` BITWISE SHAPE LANE arms it
+        // already grounds for the straight-line lanes. Kept as a SEPARATE mapping
+        // rather than widening the shared one, so the loop encoding is untouched.
+        //
+        // Reached by the bool-join lane, whose folded leaves are
+        // `Bin(BitOr|BitXor, <value>, Const(mask))` — genuine integers. A BOOL
+        // connective never arrives as `Bin`: MirSem routes Bool `BitOr`/`BitAnd`
+        // to its `Or`/`And` connective forms, which are a different `SemRvalue`.
+        IrRvalue::Bin(ir_op, sem_operand_to_ir(a)?, sem_operand_to_ir(b)?)
+    } else {
+        sem_rvalue_to_ir(rv)?
+    };
     Some(match ir_rv {
         IrRvalue::Use(op) => IrBlock { stmts: vec![], term: IrTerm::Return(op) },
         computed => IrBlock {
@@ -8416,7 +11919,12 @@ pub(crate) fn sem_branch_tree_to_ir_cfg(
         match t {
             T::Leaf(rv) => {
                 let temp = *next_temp;
-                *next_temp += 1;
+                // Trust (#53, 2026-08-15): reserve THREE indices per leaf, not one.
+                // A multi-statement leaf (`Cmp` over two computed sides) uses
+                // `temp`, `temp+1` and `temp+2`; bumping by one would alias the
+                // next leaf's def and silently break SSA. Single-statement leaves
+                // simply leave a gap, which is free.
+                *next_temp += 3;
                 let blk = sem_leaf_arm_block(rv, temp)?;
                 let id = u64::try_from(blocks.len()).ok()?;
                 blocks.push(blk);
@@ -8542,16 +12050,34 @@ fn branch_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
     // path's kernel evidence, so no MirSem branch certificate is minted here anymore.
     let tree = crate::mirsem::sem_cf_return_shape_of(func)
         .and_then(|r| sem_cf_return_to_branch_tree(&r))
-        .or_else(|| crate::mirsem::sem_nested_branch_shape_of(func));
+        .or_else(|| crate::mirsem::sem_nested_branch_shape_of(func))
+        // Trust (#49): the OR-CHAIN lane, LAST. It runs only after both existing
+        // recognizers declined, and its own wrapper re-checks that, so no body
+        // that certifies today can change lane.
+        .or_else(|| crate::mirsem::sem_or_chain_shape_of(func))
+        .or_else(|| crate::mirsem::sem_bool_join_tail_shape_of(func))
+        // Trust (#53): the BOOL-JOIN CHAIN, last of all.
+        .or_else(|| crate::mirsem::sem_bool_join_chain_shape_of(func));
     let Some(tree) = tree else { return false };
     let Some(ir_cfg) = sem_branch_tree_to_ir_cfg(&tree, func.body.arg_count) else {
         return false;
     };
-    // (a) the TRUST-IR branch refinement closes modulo 3 (the PRIMARY witness).
-    if !matches!(
+    // (a) the TRUST-IR branch refinement closes modulo 3 (the PRIMARY witness) — the
+    // GROUNDER-CONNECTED check first; Trust: B3 (2026-08-12, owner-ruled) — the
+    // MODEL-ONLY fallback second, the same grounded-first-then-model structure the
+    // chain lane carries. This is what lets a `Discr`-guarded switch (the
+    // `w_result_is_ok` family) certify: its guard operand is MODEL-ONLY, so the
+    // grounded statement builder declines it, and before this fallback existed
+    // nothing else carried the body — the exact asymmetry that kept Δ4's carrier
+    // from moving anything on this lane.
+    let refined = matches!(
         crate::trustir_anchor::check_branch_refinement(&ir_cfg),
         RefinementVerdict::ProvenModulo3
-    ) {
+    ) || matches!(
+        crate::trustir_anchor::check_branch_refinement_model(&ir_cfg),
+        RefinementVerdict::ProvenModulo3
+    );
+    if !refined {
         return false;
     }
     // (b) the SOUNDNESS GATE: every emitted safety VC is discharged modulo 3 (the SAME gate
@@ -8611,7 +12137,12 @@ pub(crate) fn sem_branch_call_tree_to_ir_cfg(
         match t {
             T::Leaf(rv) => {
                 let temp = *next_temp;
-                *next_temp += 1;
+                // Trust (#53, 2026-08-15): reserve THREE indices per leaf, not one.
+                // A multi-statement leaf (`Cmp` over two computed sides) uses
+                // `temp`, `temp+1` and `temp+2`; bumping by one would alias the
+                // next leaf's def and silently break SSA. Single-statement leaves
+                // simply leave a gap, which is free.
+                *next_temp += 3;
                 let blk = sem_leaf_arm_block(rv, temp)?;
                 let id = u64::try_from(blocks.len()).ok()?;
                 blocks.push(blk);
@@ -8692,6 +12223,128 @@ pub(crate) fn sem_branch_call_tree_to_ir_cfg(
 /// as its `end` argument resolves fully (both levels certify). Any sub-operand
 /// outside this fragment (anything `sem_call_arg_to_ir` itself declines) fails the
 /// whole `Index`/`Len` translation closed.
+/// Trust: DELTA-2 (2026-08-03) — the call-argument translator for the PINNED-TOTAL
+/// lane, admitting the pre-op / cast carriers that `sem_call_arg_to_ir` declines.
+///
+/// SEPARATE FUNCTION, DELIBERATELY. `sem_call_arg_to_ir` stays BYTE-UNCHANGED: it has
+/// five other consumers, and widening it would silently widen all of them. Only the two
+/// bitmethod lanes call this.
+///
+/// GATES (all mandatory, all fail-closed):
+///
+/// * **G6 — BASE IS A BARE INTEGER PARAMETER, NESTING DEPTH EXACTLY 1.** The base must
+///   be `Var i` with `i` a real parameter index whose declared local type is `Ty::Int`.
+///   No recursion: `Cast(Cast(x))`, `PreOp(Field(..))`, `Cast(Index(..))` all decline.
+///   The pinned bitmethod shape is one adaptation over one parameter and nothing else;
+///   admitting nesting would widen the lane far past what was measured and vetted.
+///
+/// * **G5 — NO WIDTH-CHANGING CALL-ARGUMENT CAST, source width RE-DERIVED.** The cast's
+///   source width is read from `body.locals`, NOT trusted from the carrier, and must
+///   EQUAL the destination width. Only a signedness REINTERPRETATION at equal width is
+///   admitted (`i32 -> u32`, which is what `swap_bytes`/`leading_zeros` actually do).
+///   A truncating or widening call-argument cast is a different claim about the callee's
+///   input and is not part of the measured 12; it declines rather than being modelled
+///   optimistically.
+///
+/// * **G7 — `SemPreOp::Neg` DECLINES.** `Not` is total at every width, so `bnotAt` is an
+///   honest total opaque. `Neg` is NOT: `0 - iN::MIN` overflows, so admitting it would
+///   need an overflow premise this carrier does not carry. Only `Not` is admitted.
+fn sem_call_arg_to_ir_pinned(
+    op: &crate::mirsem::SemOperand,
+    body: &trust_types::VerifiableBody,
+) -> Option<crate::trustir_anchor::IrOperand> {
+    use crate::mirsem::{SemOperand as S, SemPreOp};
+    use crate::trustir_anchor::IrOperand as I;
+
+    // G6 — the base, resolved to a bare integer PARAMETER, with its declared width and
+    // signedness re-derived from the body rather than taken on trust.
+    let param_int = |base: &S| -> Option<(u64, u32, bool)> {
+        let S::Var(i) = base else { return None };
+        // `SemOperand::Var` is 0-based over parameters; locals are 1-based with `_0` the
+        // return slot.
+        let local = usize::try_from(*i).ok()?.checked_add(1)?;
+        if local < 1 || local > body.arg_count {
+            return None;
+        }
+        match body.locals.get(local).map(|l| &l.ty) {
+            Some(trust_types::Ty::Int { width, signed }) => Some((*i, *width, *signed)),
+            _ => None,
+        }
+    };
+
+    match op {
+        S::Move(src) => sem_call_arg_to_ir_pinned(src, body),
+        S::PreOp(base, SemPreOp::Not) => {
+            let (i, width, _signed) = param_int(base)?;
+            // The width must be one the exact-cast whitelist also admits, so the two
+            // carriers cannot disagree about which widths this lane covers.
+            crate::trustir_anchor::IntCastDest::new(width, false)?;
+            Some(I::PreOpNotAt(Box::new(I::Var(i)), width))
+        }
+        // G7 — Neg is premise-carrying at iN::MIN and is NOT admitted.
+        S::PreOp(_, SemPreOp::Neg) => None,
+        S::Cast(base, dest_width, dest_signed) => {
+            // Trust (#56, 2026-08-16) — a cast over a PROJECTION base is not the
+            // pinned signedness-reinterpretation shape AT ALL, so this arm has
+            // nothing to say about it. It formerly swallowed the operand and failed
+            // closed, shadowing the general translator that DOES handle it -- the
+            // sole blocker on `Config::capped_count`, whose arg is
+            // `Cast(Field(Var 1, 1), u32)` (`buf.cap as u32`, a u64->u32 narrow).
+            //
+            // The deferral is a WHITELIST of projection bases, not "anything
+            // param_int rejected". A bare `Var` base that `param_int` declined is a
+            // NON-INTEGER parameter -- a bool, most importantly -- and must keep
+            // declining: `CastU(x, w)` denotes real width-`w` truncation of an
+            // INTEGER, so lifting a bool source onto it would be a mislift the
+            // kernel accepts. That refusal is pinned by
+            // `mirsem::tests::pinned_call_arg_translator_refusals`. G5/G6/G7 are
+            // likewise untouched for a param base: a width-CHANGING cast of a bare
+            // param still declines right below.
+            let Some((i, src_width, _src_signed)) = param_int(base) else {
+                let mut probe: &S = base;
+                while let S::Move(inner) = probe {
+                    probe = inner;
+                }
+                if !matches!(probe, S::Field(..) | S::Index(..) | S::Len(..)) {
+                    return None;
+                }
+                return sem_call_arg_to_ir(op);
+            };
+            let dest_width = u32::try_from(*dest_width).ok()?;
+            // G5 — signedness reinterpretation ONLY; equal widths, source re-derived.
+            if src_width != dest_width {
+                return None;
+            }
+            crate::trustir_anchor::IntCastDest::new(dest_width, *dest_signed)?;
+            let base_ir = Box::new(I::Var(i));
+            Some(if *dest_signed {
+                I::CastS(base_ir, dest_width)
+            } else {
+                I::CastU(base_ir, dest_width)
+            })
+        }
+        // Everything else defers to the UNCHANGED translator.
+        other => sem_call_arg_to_ir(other),
+    }
+}
+
+/// Trust: W19 M3 — test-only fixture builder re-export for the LEG-B differential in
+/// `clean_ground`'s test module (the canonical fixtures live in `prove::tests`).
+#[cfg(test)]
+pub(crate) fn straight_mutator_for_test(shape: &str) -> VerifiableFunction {
+    tests::straight_mutator(shape, false, "ok")
+}
+
+/// Test-only re-export so the G5/G6/G7 refusal pins can exercise the pinned translator
+/// directly instead of going through a whole recognized body.
+#[cfg(test)]
+pub(crate) fn sem_call_arg_to_ir_pinned_for_test(
+    op: &crate::mirsem::SemOperand,
+    body: &trust_types::VerifiableBody,
+) -> Option<crate::trustir_anchor::IrOperand> {
+    sem_call_arg_to_ir_pinned(op, body)
+}
+
 fn sem_call_arg_to_ir(op: &crate::mirsem::SemOperand) -> Option<crate::trustir_anchor::IrOperand> {
     use crate::mirsem::SemOperand as S;
     use crate::trustir_anchor::IrOperand as I;
@@ -8710,6 +12363,35 @@ fn sem_call_arg_to_ir(op: &crate::mirsem::SemOperand) -> Option<crate::trustir_a
             Some(I::Index(Box::new(s_ir), Box::new(i_ir)))
         }
         S::Len(s) => Some(I::Len(Box::new(sem_call_arg_to_ir(s)?))),
+        // Trust (#56, 2026-08-16) — a CAST call argument recurses through THIS
+        // function, not `sem_operand_to_ir`, whose own cast arm is gated to a bare
+        // `Var` base and so declines the `Field` read a call argument may legitimately
+        // be (`Config::capped_count` passes `Cast(Field(Var 1, 1), u32)`).
+        //
+        // The width-changing `CastU`/`CastS` CARRIER is not new here and is not
+        // weakened: `sem_operand_to_ir`'s arm already emits it for an arbitrary-width
+        // `Rvalue::Cast`, `straight_line_ir_body_chain` already emits it, and
+        // `trust_ir_cast_mapping_value_oracle` pins the mapping with both
+        // mis-mappings carried as forgeries. `CastU(base, w)` denotes the REAL
+        // width-`w` truncation MIR's `as` computes -- strictly sharper than
+        // `SemOperand::Cast`, which its own docs say asserts no numeric relationship.
+        // What widens is only the BASE: from a bare parameter to whatever a call
+        // argument may already be. Those bases (`Field`/`Index`/`Len`) are exactly
+        // the MODEL-ONLY tier clause (a) already routes through
+        // `check_operand_refinement_model`, so no operand reaches the
+        // grounder-connected check that could not before. `IntCastDest`'s
+        // width/signedness whitelist is inherited unchanged, keeping this carrier in
+        // agreement with the other three about which widths are covered.
+        S::Cast(base, dest_width, dest_signed) => {
+            let base_ir = Box::new(sem_call_arg_to_ir(base)?);
+            let dest_width = u32::try_from(*dest_width).ok()?;
+            crate::trustir_anchor::IntCastDest::new(dest_width, *dest_signed)?;
+            Some(if *dest_signed {
+                I::CastS(base_ir, dest_width)
+            } else {
+                I::CastU(base_ir, dest_width)
+            })
+        }
         _ => sem_operand_to_ir(op),
     }
 }
@@ -8774,8 +12456,70 @@ fn call_return_fully_faithful_via_trustir(
     // `check_operand_refinement_model` in clause (a) below) — so a ptr-spine
     // composition whose every OTHER clause holds now certifies TRUST-IR-PRIMARY
     // here instead of staying on the MirSem fallback.
+    // Trust: DELTA-1 (2026-08-03) — THE REGISTRY-FREE PINNED-INTRINSIC ENTRY.
+    //
+    // Measured motivation: `stdlib-leaf-bitmethods-2026-07-16` was 32 fully_faithful
+    // with ZERO on trust-ir — a whole shape family certifying only on the MirSem
+    // compatibility lane R4 is tearing down. The cause is NOT the operand model (that
+    // hypothesis was tested and refuted for these bodies): both recognizers below
+    // require a CERTIFIED-CALLEE REGISTRY hit, and a body-less compiler intrinsic like
+    // `intrinsics::bitreverse::<u8>` can never have one. MirSem closes exactly this
+    // with `sem_intrinsic_call_return_of_mir`, which had precisely ONE caller in the
+    // tree — the MirSem witness — so the trust-ir disjunction never reached it.
+    //
+    // `pinned` is threaded to clause (d): a pinned-total callee is admitted WITHOUT a
+    // registry entry, so there is no `#[requires]` to establish. See G2
+    // (`is_total_without_precondition`) for why that is sound rather than a hole.
+    let mut pinned: Option<crate::mirsem::PinnedTotalCallable> = None;
     let Some(call) = crate::mirsem::sem_call_return_of_mir(func, callees)
         .or_else(|| crate::mirsem::sem_ptr_spine_call_return_of_mir(func, callees))
+        .or_else(|| {
+            let call = crate::mirsem::sem_intrinsic_call_return_of_mir(func)?;
+            let kind = crate::mirsem::PinnedTotalCallable::classify(&call.callee)?;
+            // G2 — total, and carries no precondition (else clause (d) cannot be skipped).
+            if !kind.is_total_without_precondition() {
+                return None;
+            }
+            // G3 — the recognizer's transcription must AGREE with the classification:
+            // exact arity, actual argument count, and the synthetic callee id. A
+            // mismatch means one of the two is describing a different callable, so
+            // fail closed rather than trusting either.
+            //
+            // Trust: B2 (2026-08-11) — arity 2 ADMITTED, closing the saturating gap
+            // (15 corpus bodies whose sole blocker was this clause). The former
+            // comment called `arity() == 1` load-bearing; it was a SCOPE statement,
+            // not a soundness requirement, and the soundness analysis was already
+            // written on the MirSem side when the saturating pair joined that lane
+            // (mirsem/mod.rs, "ARITY-2 SOUNDNESS"): the transport lemma is a
+            // tautology `∀ post ∀ ret, post(call_result c) → post(call_result c)`,
+            // UNIVERSAL over the Call, so the certificate ties the result to NO
+            // argument — the `args.first()` tag clause (b) passes is semantically
+            // vacuous naming, identical for a binary callee and for the multi-arg
+            // REGISTRY callees that already ship it (the disclosed one-arg `Call.mk`
+            // residue #3, trustir_call.rs). Clause (a) still kernel-certifies EVERY
+            // actual arg individually. What keeps this honest is G2: every admitted
+            // arity-2 intrinsic is TOTAL (saturating ops clamp — no UB, no panic, no
+            // precondition); the partial siblings (`unchecked_*`, `*_nonzero`) are
+            // excluded by the classifier itself.
+            if !matches!(kind.arity(), 1 | 2)
+                || kind.arity() != call.args.len()
+                || kind.synthetic_callee_id() != call.callee_id
+            {
+                return None;
+            }
+            // G8 — a `Call` with a real `Cleanup` unwind successor has an in-CFG block
+            // this shape does not account for, and both MirSem recognizers destructure
+            // the terminator with `..`, silently swallowing it. Fail closed.
+            if func.body.blocks.iter().any(|b| {
+                matches!(&b.terminator,
+                    trust_types::Terminator::Call { unwind, .. }
+                        if unwind.cleanup_target().is_some())
+            }) {
+                return None;
+            }
+            pinned = Some(kind);
+            Some(call)
+        })
     else {
         return false;
     };
@@ -8788,7 +12532,12 @@ fn call_return_fully_faithful_via_trustir(
     // (`check_body_refinement_model`).
     let mut args = Vec::with_capacity(call.args.len());
     for a in &call.args {
-        let Some(ir) = sem_call_arg_to_ir(a) else { return false };
+        // Trust: DELTA-2 — the PINNED lane admits the pre-op / cast call-argument
+        // carriers (`count_zeros` passes `!x`; signed `leading_zeros` passes a
+        // same-width signedness reinterpretation). Every OTHER lane keeps the
+        // byte-unchanged `sem_call_arg_to_ir`, so this widening cannot leak into the
+        // five other consumers.
+        let Some(ir) = sem_call_arg_to_ir_pinned(a, &func.body) else { return false };
         let verdict = if ir.is_grounder_connected() {
             crate::trustir_anchor::check_operand_refinement(&ir)
         } else {
@@ -8818,11 +12567,19 @@ fn call_return_fully_faithful_via_trustir(
     // ESTABLISHED at this call site (actuals substituted, negation refuted modulo 3
     // under the caller's own preconditions + type bounds). Fail-closed: without it
     // the caller does not certify on this path (residue #2, closed).
-    let Some(fact) = callees.get(&call.callee) else {
-        return false; // unreachable (the recognizer resolved the key) — fail closed.
-    };
-    if !call_site_requires_established(func, &call, fact) {
-        return false;
+    // Trust: DELTA-1 — a PINNED-TOTAL callee is admitted without a registry entry, so
+    // there is no `#[requires]` to establish and nothing for this clause to check. That
+    // is licensed by G2 above (`is_total_without_precondition`), NOT by absence of
+    // evidence: the pinned set is closed, tiny, and every member is a pure total
+    // intrinsic (or the primitive inherent method whose body is one). Every OTHER
+    // callee still goes through the registry and the establishment check unchanged.
+    if pinned.is_none() {
+        let Some(fact) = callees.get(&call.callee) else {
+            return false; // unreachable (the recognizer resolved the key) — fail closed.
+        };
+        if !call_site_requires_established(func, &call, fact) {
+            return false;
+        }
     }
     true
 }
@@ -8885,7 +12642,12 @@ fn call_then_pureop_fully_faithful_via_trustir(
     // `call_return_fully_faithful_via_trustir`'s own clause (a).
     let mut args = Vec::with_capacity(call_then_op.call.args.len());
     for a in &call_then_op.call.args {
-        let Some(ir) = sem_call_arg_to_ir(a) else { return false };
+        // Trust: DELTA-2/3 — the SECOND bitmethod lane. Signed swap_bytes/reverse_bits
+        // carry BOTH adaptations: a same-width reinterpretation cast on the ARGUMENT
+        // and a cast on the RESULT. Wiring the pinned translator into the call-return
+        // lane alone left these 8 bodies on the MirSem fallback even after Delta-3 —
+        // the result-cast was admitted but the argument still declined.
+        let Some(ir) = sem_call_arg_to_ir_pinned(a, &func.body) else { return false };
         let verdict = if ir.is_grounder_connected() {
             crate::trustir_anchor::check_operand_refinement(&ir)
         } else {
@@ -8906,9 +12668,52 @@ fn call_then_pureop_fully_faithful_via_trustir(
         crate::mirsem::CallThenOp::Cmp(op) => {
             crate::trustir_call::TrustIrCallThenOp::Cmp(sem_cmpop_to_ir(op))
         }
-        // Result-cast authority stays on the MirSem kernel lane; trust-ir has no
-        // equivalent opaque cast wrapper in this fragment.
-        crate::mirsem::CallThenOp::Cast(..) => return false,
+        // Trust: DELTA-3 (2026-08-04) — the post-call result cast, formerly declined
+        // here ("trust-ir has no equivalent opaque cast wrapper"). It now has an EXACT
+        // one (`exact_int_cast_expr`), so the 8 signed reverse_bits/swap_bytes bodies
+        // can certify trust-ir-primary instead of resting on the MirSem lane.
+        crate::mirsem::CallThenOp::Cast(dest_width, dest_signed) => {
+            // G10 — RE-DERIVE the destination from the FUNCTION'S OWN RETURN LOCAL and
+            // require it to equal what the recognizer transcribed. Without this an
+            // 8-bit wrap is kernel-acceptable for a 32-bit return: the kernel would
+            // happily check a cast to whatever width it was handed, so the width has to
+            // be evidence from the body, not a claim from the carrier.
+            let Some(ret) = func.body.locals.first() else { return false };
+            let trust_types::Ty::Int { width: ret_width, signed: ret_signed } = ret.ty else {
+                return false;
+            };
+            let Ok(dw) = u32::try_from(dest_width) else { return false };
+            if dw != ret_width || dest_signed != ret_signed {
+                return false;
+            }
+            let Some(cast_dest) = crate::trustir_anchor::IntCastDest::new(dw, dest_signed) else {
+                return false; // width outside the exactly-encodable whitelist (G1).
+            };
+            // G9 — THE RECIPE PIN. Require the cast carrier itself to certify modulo 3
+            // before minting anything with it. This is what makes the instance
+            // non-tautological: if `exact_int_cast_expr`'s term ever stopped agreeing
+            // with the `castU`/`castS` definitions the evalOperand minors use, this
+            // check fails and the lane declines instead of proving something else.
+            let probe = crate::trustir_anchor::IrOperand::CastU(
+                Box::new(crate::trustir_anchor::IrOperand::Var(0)),
+                dw,
+            );
+            let probe = if dest_signed {
+                crate::trustir_anchor::IrOperand::CastS(
+                    Box::new(crate::trustir_anchor::IrOperand::Var(0)),
+                    dw,
+                )
+            } else {
+                probe
+            };
+            if !matches!(
+                crate::trustir_anchor::check_operand_refinement_model(&probe),
+                RefinementVerdict::ProvenModulo3
+            ) {
+                return false;
+            }
+            crate::trustir_call::TrustIrCallThenOp::Cast(cast_dest)
+        }
     };
     if !matches!(
         crate::trustir_call::check_call_then_pureop_instance(
@@ -8939,6 +12744,207 @@ fn call_then_pureop_fully_faithful_via_trustir(
     true
 }
 
+/// Trust: CALL-THEN-PROJECT twin (2026-08-17) — the pair-returning callee's field
+/// projection on the TRUST-IR lane: `_t := Call overflowing_add(a, b);
+/// _0 := _t.Field(i); Return` (the `w_*_overflowing_add_0` wrapper twins — the
+/// bodies that REOPENED the teardown 0 → 2 when the pair family certified their
+/// callee). Clause-for-clause the pureop disjunct's structure: (a) every actual
+/// arg certifies trust-ir-side; (b) the per-call `callThenProjectInstance`
+/// kernel-checks modulo 3 (the SAME proven transport, wrapped at
+/// `idxElem(x, field)` — shape-only by construction, exactly the MirSem lane's
+/// deliberate claim form for this callee); (c) the standard safety clauses;
+/// (d) call-requires establishment. The RECOGNIZER is `sem_call_then_project_of_mir`
+/// reused whole — the twin discipline every call lane follows.
+fn call_then_project_fully_faithful_via_trustir(
+    func: &VerifiableFunction,
+    callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+) -> bool {
+    use crate::trustir_anchor::RefinementVerdict;
+    // Trust: audit (2026-08-17) — the G8 unwind gate + unique ids, the mutator
+    // walks' inheritance: a `Cleanup` edge into the projection spine would create
+    // a normally-returning path where `_t` was never assigned, invisible to the
+    // recognizer's normal-edge walk. (The sibling call lanes predate this gate —
+    // recorded family-wide follow-up; THIS lane starts gated.)
+    if body_has_cleanup_unwind_edge(&func.body) || !all_block_ids_unique(&func.body) {
+        return false;
+    }
+    let Some(proj) = crate::mirsem::sem_call_then_project_of_mir(func, callees) else {
+        return false;
+    };
+    // (a) — per-arg certification, byte-identical to the pureop clause (a).
+    let mut args = Vec::with_capacity(proj.call.args.len());
+    for a in &proj.call.args {
+        let Some(ir) = sem_call_arg_to_ir_pinned(a, &func.body) else { return false };
+        let verdict = if ir.is_grounder_connected() {
+            crate::trustir_anchor::check_operand_refinement(&ir)
+        } else {
+            crate::trustir_anchor::check_operand_refinement_model(&ir)
+        };
+        if !matches!(verdict, RefinementVerdict::ProvenModulo3) {
+            return false;
+        }
+        args.push(ir);
+    }
+    let Some(first) = args.first() else { return false };
+    // (b) — the per-call instance.
+    if !matches!(
+        crate::trustir_call::check_call_then_project_instance(
+            proj.call.callee_id,
+            first,
+            proj.field,
+        ),
+        RefinementVerdict::ProvenModulo3
+    ) {
+        return false;
+    }
+    // (c) — the standard safety clauses.
+    if crate::mirsem::function_emits_unmodeled_safety_vc_pub(func) {
+        return false;
+    }
+    if !function_safety_vcs_all_discharged(func) {
+        return false;
+    }
+    // (d) — call-requires establishment (byte-identical clause).
+    let Some(fact) = callees.get(&proj.call.callee) else {
+        return false; // unreachable (the recognizer resolved the key) — fail closed.
+    };
+    if !call_site_requires_established(func, &proj.call, fact) {
+        return false;
+    }
+    true
+}
+
+/// Trust (#56, 2026-08-16) — CALL-RESULT-AWARE COMPOSITION via TRUST-IR: the LAST
+/// MirSem-fallback family in the R4 census. The bodies are
+/// `u8::to_ascii_{lower,upper}case`:
+///
+/// ```text
+/// bb0: _2 := *_1;  Call is_ascii_uppercase(_1) -> _5: bool      -> bb1
+/// bb1: _4 := Cast(Move _5, u8);  _6 := CheckedBinaryOp(Mul, _4, 32u8)
+///      Assert(!_6.1, Overflow(Mul))                             -> bb2
+/// bb2: _3 := Move _6.0;  _0 := BitOr(Move _2, Move _3);  Return
+/// ```
+///
+/// i.e. `*self | ((self.is_ascii_uppercase() as u8) * 32)`. Three separate things
+/// kept the trust-ir lane off this shape, and it is worth naming them because each
+/// one looks like the blocker until you check the next:
+///
+///  1. [`crate::mirsem::sem_call_then_pureop_of_mir`] cannot see the body at all —
+///     its terminator walk is `Goto | Return => {}`, `_ => return None`, and bb1
+///     ends in an **`Assert`**. The nearest existing recognizer declines on the
+///     overflow guard, before the fold is ever reached.
+///  2. The fold is a CHAIN, not one pure op: cast, then multiply by a constant,
+///     then combine with a DIFFERENT operand. `SemCallThenPureOp` models one op.
+///  3. The bool -> u8 cast has no trust-ir carrier and must not borrow `CastU`.
+///
+/// [`crate::mirsem::sem_call_chain_pureop_of_mir`] already recognizes exactly this
+/// (SHAPE-ONLY reuse here, Seam B: no MirSem certificate is minted on this path —
+/// `trustir_call::check_call_chain_pureop_instance` is this path's kernel
+/// evidence). It carries the gates that make (1) and (3) safe rather than ignored:
+/// the `Assert` is admitted because the overflow obligation is a SEPARATE,
+/// separately-discharged axis — clause (c) below still requires
+/// `function_safety_vcs_all_discharged`, and the u8 `Mul` overflow family it needs
+/// is exactly what `umul_overflow_family_tests` landed — and the cast hop is
+/// admitted only when the call's destination is a bare `Ty::Bool` temp sole-written
+/// by the call, making it the identity on the two-element image.
+///
+/// SCOPE mirrors [`call_then_pureop_fully_faithful_via_trustir`]: the non-call
+/// operand must be a CLOSED CONSTANT or a function PARAMETER. A field-read other
+/// operand is admitted on the call-then-pureop lane but NOT here, because
+/// `mirsem::call_chain_pureop_instance_verdict` does not admit it either and the
+/// two lanes must not disagree about what the shape covers.
+fn call_chain_pureop_fully_faithful_via_trustir(
+    func: &VerifiableFunction,
+    callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+) -> bool {
+    use crate::trustir_anchor::RefinementVerdict;
+    let Some(chain) = crate::mirsem::sem_call_chain_pureop_of_mir(func, callees) else {
+        return false;
+    };
+    // SCOPE gate, byte-parallel to the MirSem verdict's own: Const or Param only.
+    let other = match &chain.other {
+        crate::mirsem::SemOperand::Const(c) => crate::trustir_call::TrustIrOtherOperand::Const(*c),
+        crate::mirsem::SemOperand::Var(_) => crate::trustir_call::TrustIrOtherOperand::Param,
+        crate::mirsem::SemOperand::Move(inner)
+            if matches!(inner.as_ref(), crate::mirsem::SemOperand::Var(_)) =>
+        {
+            crate::trustir_call::TrustIrOtherOperand::Param
+        }
+        _ => return false,
+    };
+    // (a) every actual arg certifies on the trust-ir side — byte-identical to the
+    // sibling lanes: grounder-connected operands take the grounded check, the
+    // model-only tier (`Field`/`Index`/`Len`) takes the model check.
+    let mut args = Vec::with_capacity(chain.call.args.len());
+    for a in &chain.call.args {
+        let Some(ir) = sem_call_arg_to_ir(a) else { return false };
+        let verdict = if ir.is_grounder_connected() {
+            crate::trustir_anchor::check_operand_refinement(&ir)
+        } else {
+            crate::trustir_anchor::check_operand_refinement_model(&ir)
+        };
+        if !matches!(verdict, RefinementVerdict::ProvenModulo3) {
+            return false;
+        }
+        args.push(ir);
+    }
+    let Some(first) = args.first() else { return false };
+    // The INNER op is the recognizer's checked-arith multiply, so it takes the
+    // arithmetic converter; a bitwise inner op is not this shape and declines.
+    let Some(inner_op) = sem_binop_to_ir(chain.inner_op) else { return false };
+    // The OUTER op is `BitOr`/`BitXor` by the recognizer's own gate, and
+    // `sem_binop_to_ir` deliberately declines those -- it scopes its decline to the
+    // trust-ir LOOP fragment, which this is not. `sem_leaf_bitwise_binop_to_ir` is
+    // the carrier for exactly this position, grounding through the SAME
+    // `Int.land`/`Int.lor`/`Int.xor` BITWISE SHAPE LANE arms the straight-line lanes
+    // already use, so this is parity rather than a new claim.
+    //
+    // Reading these as BITWISE rather than as the boolean connectives is what the
+    // recognizer licenses: it rules the bool-connective shape out with
+    // `mir_operand_is_bool_typed`, so both operands here are genuine `Int`s. Getting
+    // that backwards would be a mislift the kernel accepts -- `Int.lor` and
+    // `bool_connective_minor(Or, ..)` are different functions that agree only on
+    // {0,1}.
+    let Some(outer_op) =
+        sem_leaf_bitwise_binop_to_ir(chain.outer_op).or_else(|| sem_binop_to_ir(chain.outer_op))
+    else {
+        return false;
+    };
+    // (b) the per-call trust-ir `callChainPureOpInstance` kernel-checks modulo 3.
+    if !matches!(
+        crate::trustir_call::check_call_chain_pureop_instance(
+            chain.call.callee_id,
+            first,
+            inner_op,
+            chain.inner_const,
+            chain.inner_call_is_lhs,
+            outer_op,
+            chain.outer_mul_is_lhs,
+            other,
+        ),
+        RefinementVerdict::ProvenModulo3
+    ) {
+        return false;
+    }
+    // (c) the SAME safety clauses as every other call path. This is what keeps the
+    // admitted `Assert(Overflow(Mul))` honest: the guard is not walked past, its
+    // obligation is discharged on the safety axis.
+    if crate::mirsem::function_emits_unmodeled_safety_vc_pub(func) {
+        return false;
+    }
+    if !function_safety_vcs_all_discharged(func) {
+        return false;
+    }
+    // (d) call-requires establishment (byte-identical clause).
+    let Some(fact) = callees.get(&chain.call.callee) else {
+        return false; // unreachable (the recognizer resolved the key) — fail closed.
+    };
+    if !call_site_requires_established(func, &chain.call, fact) {
+        return false;
+    }
+    true
+}
+
 /// Trust: CALL-OP-CALL — FULLY-FAITHFUL via the TRUST-IR call-op-call witness
 /// (closes the residue `sem_call_then_pureop_of_mir`'s own doc names — "BOTH
 /// operands being the call result ALSO declines — not this shape" — on the
@@ -8957,6 +12963,238 @@ fn call_then_pureop_fully_faithful_via_trustir(
 /// kernel-check modulo 3, every safety VC must be modeled and discharged, and
 /// BOTH callees' `#[requires]` must be established at their respective call
 /// sites.
+/// Trust: B1 — TWO-CALL CHAIN via TRUST-IR (2026-08-11). The SEQUENTIAL sibling of
+/// [`call_op_call_fully_faithful_via_trustir`] (which composes two calls feeding ONE
+/// pure op in PARALLEL): here the inner call's result temp flows, single-use and
+/// non-aliased, into the outer call that writes `_0` — `min_max`'s `a.min(b).max(c)`.
+///
+/// Mirrors the MirSem `TwoCallChainAdequacyCertificate` EVIDENCE-FOR-EVIDENCE so the
+/// lane move neither weakens nor overstates: that certificate is TWO per-call
+/// `callReturnInstance` transports plus per-operand Lemma-1A — there is NO composed
+/// sequential theorem on either side, and this consumer deliberately does not invent
+/// one. The transport lemma is universal over the Call (the first-arg tag is the
+/// disclosed vacuous naming, residue #3), so two independent instances are exactly
+/// what the MirSem lane already claims for these bodies.
+///
+/// Clause map, byte-parallel to the template above:
+///   (a) every INNER actual + every OUTER MODELED actual certifies per-operand
+///       (grounder-connected or model-only by carrier, the standard split). The
+///       intermediate `_t` is NOT an operand to certify — it is the recognizer-
+///       enforced single-use, non-aliased plumbing between the two instances.
+///   (b) TWO per-call `callReturnInstance` transports — inner keyed on its first
+///       modeled arg, outer on its first MODELED (non-intermediate) arg, the same
+///       vacuous-naming convention every other call lane uses.
+///   (c) the SAME safety clauses as every via-trustir path.
+///   (d) requires-establishment for BOTH callees, exactly as the MirSem lane's
+///       chain-aware clause does it: the inner over its fully modeled actuals, the
+///       outer via `two_call_chain_outer_requires_established`, whose intermediate-
+///       argument premise is the SOUND type-range fact carried in
+///       `chain.intermediate_bound`.
+///   (G8) a `Call` with a live cleanup successor fails closed — the chain recognizer
+///       destructures terminators with `..` exactly like the single-call ones, so
+///       the gate is applied here, not inherited.
+fn two_call_chain_fully_faithful_via_trustir(
+    func: &VerifiableFunction,
+    callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+) -> bool {
+    use crate::trustir_anchor::RefinementVerdict;
+    let Some(chain) = crate::mirsem::sem_two_call_chain_of_mir(func, callees) else {
+        return false;
+    };
+    // (G8) — see the doc above.
+    if func.body.blocks.iter().any(|b| {
+        matches!(&b.terminator,
+            trust_types::Terminator::Call { unwind, .. }
+                if unwind.cleanup_target().is_some())
+    }) {
+        return false;
+    }
+    // (a) — per-operand certification, byte-identical to the sibling's clause (a).
+    let cert = |a: &crate::mirsem::SemOperand| -> Option<crate::trustir_anchor::IrOperand> {
+        let ir = sem_call_arg_to_ir(a)?;
+        let verdict = if ir.is_grounder_connected() {
+            crate::trustir_anchor::check_operand_refinement(&ir)
+        } else {
+            crate::trustir_anchor::check_operand_refinement_model(&ir)
+        };
+        matches!(verdict, RefinementVerdict::ProvenModulo3).then_some(ir)
+    };
+    let mut inner_args = Vec::with_capacity(chain.inner.args.len());
+    for a in &chain.inner.args {
+        let Some(ir) = cert(a) else { return false };
+        inner_args.push(ir);
+    }
+    let mut outer_modeled = Vec::new();
+    for op in chain.outer_modeled_args() {
+        let Some(ir) = cert(&op) else { return false };
+        outer_modeled.push(ir);
+    }
+    let (Some(first_inner), Some(first_outer)) = (inner_args.first(), outer_modeled.first())
+    else {
+        return false; // the recognizer guarantees ≥1 modeled arg per call — fail closed.
+    };
+    // (b) — TWO transports, the same evidence the MirSem certificate mints.
+    if !matches!(
+        crate::trustir_call::check_call_return_instance(chain.inner.callee_id, first_inner),
+        RefinementVerdict::ProvenModulo3
+    ) {
+        return false;
+    }
+    if !matches!(
+        crate::trustir_call::check_call_return_instance(chain.outer_callee_id, first_outer),
+        RefinementVerdict::ProvenModulo3
+    ) {
+        return false;
+    }
+    // (c) — the standard safety clauses.
+    if crate::mirsem::function_emits_unmodeled_safety_vc_pub(func) {
+        return false;
+    }
+    if !function_safety_vcs_all_discharged(func) {
+        return false;
+    }
+    // (d) — requires establishment for both callees, chain-aware for the outer.
+    let Some(inner_fact) = callees.get(&chain.inner.callee) else { return false };
+    if !call_site_requires_established(func, &chain.inner, inner_fact) {
+        return false;
+    }
+    let Some(outer_fact) = callees.get(&chain.outer_callee) else { return false };
+    if !two_call_chain_outer_requires_established(func, &chain, outer_fact) {
+        return false;
+    }
+    true
+}
+
+/// Trust: SET_BIT M2 (2026-08-12) — the CELL-POST mutator verdict: the M1 walk + the
+/// M1 kernel check + the standard safety-discharge clause, wired as a via-trustir
+/// disjunct. THE METRIC CHANGE, on the tin: this is the first counted certificate
+/// whose claim is CELL-POST adequacy (the recv cell's post-value as a function of its
+/// entry value and the arguments, on the normally-returning path) rather than
+/// return-value adequacy. `fully_faithful` gains a claim family; the census's +12 on
+/// `bit_field` is NEW COVERAGE by design, not a lane move — the first intended
+/// `fully_faithful` increase of the campaign, and the report says so explicitly.
+///
+/// The clauses mirror `branch_fully_faithful_via_trustir`'s exactly: (a) the walk
+/// admits the shape (every W-gate), (b) the cell-post model certifies modulo 3,
+/// (c) every emitted safety VC is discharged (set_bit's two ShiftOverflow VCs
+/// discharge via the dominating-guard machinery, measured before this existed) —
+/// where "discharged" is the SPINE-AWARE bar of
+/// [`mutator_safety_vcs_discharged_modulo_spine_asserts`]: an `ArithmeticOverflow`
+/// row belonging to a walk-audited checked spine is the panic arm's divergence,
+/// not wrap, and the claim is conditioned on normal return (W19 FIELD-POST; the
+/// exemption is empty for the bitwise walks). The panic arm's divergence is its
+/// own non-safety Assertion row outside this bar — the get_bit precedent, same
+/// body family. No callee registry is involved: the only call is the diverging
+/// panic, which is outside the claim.
+/// Trust: W19 ADT-CELL audit (2026-08-14) — the UB-FREE-CALLEE clause for the
+/// call-admitting mutator branches. The cell-post claims are partial correctness
+/// over normally-returning executions, and the store-is-last / op-of-pre-and-r
+/// arguments are arguments INSIDE the UB-free MIR machine: a callee on the
+/// RETURNING path that reaches UB (an unestablished `#[requires]`, unverified
+/// internal unsafe) voids the machine the certificate quantifies over. Every
+/// sibling call-admitting lane conjoins registry membership + establishment;
+/// these branches now do too. (M1's panic call needs none of this — it sits on
+/// the DIVERGING path, outside the claim.)
+///
+/// The bar: the entry call's callee must be REGISTERED (i.e. itself certified
+/// fully faithful — the registry admits nothing else, and that certification is
+/// the UB-free evidence) with `requires` KNOWN EMPTY. A requires-CARRYING
+/// registered callee declines fail-closed: the substitution machinery
+/// (`call_site_requires_established`) can join when a mutator body with such a
+/// callee exists; today none does.
+///
+/// MEASURED CONSEQUENCE, stated plainly: `NonMaxU8::get` and the `BitAnd`
+/// impls are NOT certified at HEAD (`get` calls `NonZero::get`, outside the
+/// corpus registry), so this clause RETRACTS the nonmax family's certificates —
+/// the call-RMW +1 that shipped on 2026-08-13 and the Adt-cell +2 of this
+/// landing. The walks and their pins remain (capability, and the fixture tests
+/// certify against purpose-built registries); the counts return when the
+/// callees certify. Fail-closed over the metric.
+fn mutator_entry_callee_established(
+    callee: &str,
+    callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+) -> bool {
+    let Some(fact) = callees.get(callee) else { return false };
+    matches!(&fact.requires, Some(conjuncts) if conjuncts.is_empty())
+}
+
+fn mutator_cell_post_fully_faithful_via_trustir(
+    func: &VerifiableFunction,
+    callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+) -> bool {
+    use crate::trustir_anchor::RefinementVerdict;
+    // Trust: W19 M3 — the forked M1 walk first, then the straight-line sibling.
+    // The entry call's callee name, for the call-admitting branches' UB-free
+    // clause (both walks pin the call as bb0's terminator).
+    let entry_callee = || {
+        func.body
+            .blocks
+            .iter()
+            .find(|b| b.id == trust_types::BlockId(0))
+            .and_then(|b| match &b.terminator {
+                trust_types::Terminator::Call { func: name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+    };
+    // Clause (c) on every branch below is the SPINE-AWARE bar: identical to
+    // `function_safety_vcs_all_discharged` except that an `ArithmeticOverflow` row
+    // matching a walk-audited `CheckedBinaryOp` spine is divergence, not wrap —
+    // valid precisely BECAUSE a walk admission precedes it (see the function's
+    // soundness note). For the bitwise walks the exemption set is empty and the
+    // bar is unchanged.
+    if let Some(cfg) = divergence_guarded_rmw_mutator_ir_cfg(func)
+        .or_else(|| straight_line_mutator_ir_cfg(func))
+    {
+        return matches!(
+            crate::trustir_anchor::check_cell_post_branch_model(&cfg),
+            RefinementVerdict::ProvenModulo3
+        ) && mutator_safety_vcs_discharged_modulo_spine_asserts(func);
+    }
+    // Trust: W19 FIELD-POST — the per-field family: EVERY written field's model must
+    // certify (the conjunction is the verdict; one uncertified field fails the whole
+    // function — never a partial claim).
+    if let Some(cfgs) = field_post_mutator_ir_cfgs(func) {
+        return cfgs.iter().all(|(_, cfg)| {
+            matches!(
+                crate::trustir_anchor::check_cell_post_branch_model(cfg),
+                RefinementVerdict::ProvenModulo3
+            )
+        }) && mutator_safety_vcs_discharged_modulo_spine_asserts(func);
+    }
+    // Trust: W19 CALL-RMW — the call-composition sibling: the call result enters
+    // the model as a fresh universally-quantified slot (see the walk's doc). This
+    // branch uses the BASE bar deliberately, not the spine-aware one: the walk's
+    // grammar admits no checked spine in the WALKED blocks, but an
+    // unreachable-to-return block may still contain a `CheckedBinaryOp`, and the
+    // exemption keys on body-wide presence — the base bar cannot be widened by
+    // dead code (audit finding, 2026-08-13). The one committed body emits zero
+    // safety VCs, so nothing is given up.
+    if let Some(cfg) = call_rmw_mutator_ir_cfg(func) {
+        // Trust: W19 ADT-CELL audit — the returning-path callee must be
+        // registered + requires-free (see `mutator_entry_callee_established`).
+        return entry_callee()
+            .is_some_and(|name| mutator_entry_callee_established(name, callees))
+            && matches!(
+                crate::trustir_anchor::check_cell_post_branch_model(&cfg),
+                RefinementVerdict::ProvenModulo3
+            )
+            && function_safety_vcs_all_discharged(func);
+    }
+    // Trust: W19 ADT-CELL — the whole-Adt store-of-call family, under its OWN
+    // claim name (the cell is an opaque token, not a number — see the walk's
+    // doc). Base safety bar, as in call-RMW.
+    if let Some(cfg) = adt_cell_post_store_ir_cfg(func) {
+        return entry_callee()
+            .is_some_and(|name| mutator_entry_callee_established(name, callees))
+            && matches!(
+                crate::trustir_anchor::check_adt_cell_post_store_model(&cfg),
+                RefinementVerdict::ProvenModulo3
+            )
+            && function_safety_vcs_all_discharged(func);
+    }
+    false
+}
+
 fn call_op_call_fully_faithful_via_trustir(
     func: &VerifiableFunction,
     callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
@@ -9377,18 +13615,35 @@ fn via_trustir_shape_witnessed_with_bodies(
     {
         return false;
     }
+    // Trust: FAMILY-WIDE G8 (2026-08-17) — the chokepoint form: a live cleanup
+    // path (a Cleanup target reaching Return) is a normally-returning path no
+    // lane's normal-edge walk models, and duplicate block ids shadow every
+    // id-keyed gate. Every disjunct below inherits both. Zero corpus cost,
+    // measured (all 53 Cleanup-carrying bodies are terminal landing pads).
+    if body_has_live_cleanup_path(&func.body) || !all_block_ids_unique(&func.body) {
+        return false;
+    }
     straight_line_fully_faithful_via_trustir(func)
         // Trust: M6 rung 9 — ANCHOR BitAnd + COMPARE-AS-VALUE — the multi-statement
         // SSA-chain generalization (`ExprMeta::{has_fvar,has_level_param}`'s own
         // shape); a NO-OP for every shape the single-statement disjunct above
         // already resolves.
         || straight_line_chain_fully_faithful_via_trustir(func)
+        // Trust (#53): the R4 port of the MirSem W-CMP-DISCR signum witness. A
+        // NO-OP for every shape the two disjuncts above resolve — `signum_ir_body`
+        // admits ONLY a `Discriminant`/`Cast` return whose vetted MirSem
+        // recognizer accepts, and neither lane above translates either rvalue.
+        || signum_fully_faithful_via_trustir(func)
         || branch_fully_faithful_via_trustir(func)
         || synth_loop_fully_faithful_via_trustir(func)
         || break_loop_fully_faithful_via_trustir(func)
         || monotone_nested_fully_faithful_via_trustir(func)
         // LAST-2 increment — the STRATIFIED SStmt / XOperand layers close the final two:
         || cond_update_fully_faithful_via_trustir(func)
+        // Trust: PAIR RETURN (2026-08-16) — the whole-pair checked return, the
+        // honest recovery of the wrap-return retraction (component-wise wrap +
+        // overflow models; see the walk's doc):
+        || overflowing_pair_fully_faithful_via_trustir(func)
         || guarded_index_fully_faithful_via_trustir(func)
         // FALLBACK-CENSUS closure (2026-07-02) — the const-index `clamp_idx` shape, the
         // last measured MirSem-fallback function anywhere:
@@ -9445,10 +13700,26 @@ fn via_trustir_shape_witnessed_with_bodies(
         // Trust: CALL-THEN-PUREOP — closes the "Call-then-Compare" named residue
         // on the trust-ir lane (`is_empty`'s `len() == 0`, e.g.):
         || call_then_pureop_fully_faithful_via_trustir(func, callees)
+        // Trust: CALL-THEN-PROJECT twin (2026-08-17) — the pair-returning
+        // callee's field projection (the wrapper twins; closes the teardown
+        // reopening the pair family stated):
+        || call_then_project_fully_faithful_via_trustir(func, callees)
+        // Trust (#56, 2026-08-16) — CALL-RESULT-AWARE COMPOSITION, the last
+        // MirSem-fallback family in the R4 census (`u8::to_ascii_{lower,upper}case`):
+        || call_chain_pureop_fully_faithful_via_trustir(func, callees)
         // Trust: CALL-OP-CALL — closes the "BOTH operands are call results"
         // residue on the trust-ir lane too (`is_full`'s `len() == capacity()`,
         // e.g.):
         || call_op_call_fully_faithful_via_trustir(func, callees)
+        // Trust: B1 — TWO-CALL CHAIN (`min_max`'s `a.min(b).max(c)`): the
+        // SEQUENTIAL composition, mirrored evidence-for-evidence from the MirSem
+        // TwoCallChain certificate (two transports, no composed theorem):
+        || two_call_chain_fully_faithful_via_trustir(func, callees)
+        // Trust: SET_BIT M2 — the CELL-POST mutator family (`set_bit`'s
+        // divergence-guarded two-armed RMW): the first counted claim family whose
+        // adequacy is about a WRITE, not a return value. NEW COVERAGE, not a lane
+        // move — see the disjunct fn's doc for the metric note:
+        || mutator_cell_post_fully_faithful_via_trustir(func, callees)
         // Trust: M6 rung 8 — CALL-OR-CALL — the short-circuit `||`-of-TWO-CALLS
         // foundational primitive (the mission's ||-OF-CALLS item). A STRICT
         // shape (both `||` operands bare registered calls); a compare-embedded
@@ -10613,6 +14884,16 @@ fn find_checked_binop(
     let (Rvalue::CheckedBinaryOp(op, a, b) | Rvalue::BinaryOp(op, a, b)) = rvalue else {
         return None;
     };
+    // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — a CHECKED def's `.0` gets the
+    // `Int` reading only under the same-block overflow assert (the shared license;
+    // the loop lane was minting TOTAL-correctness certificates over an assert-less
+    // checked counter increment, false at the wrap boundary). Real loop-counter
+    // lowerings carry the assert, so the gate moves nothing measured.
+    if matches!(rvalue, Rvalue::CheckedBinaryOp(..))
+        && !crate::mirsem::checked_pair_int_reading_licensed(body, t, op.clone())
+    {
+        return None;
+    }
     Some((op.clone(), a.clone(), b.clone(), definition_block, definition_statement))
 }
 
@@ -11105,6 +15386,63 @@ fn exact_instantiator_ord_safety_discharge(
 /// `pub(crate)` for the M3 safety-VC-separation control (clean_ground.rs,
 /// `m3_unsafe_rem_reflects_but_safety_vcs_stay_open`): the LIVE gate itself must
 /// fail-close the unguarded `a % b` fixture even though its return now reflects.
+/// Trust: W19 FIELD-POST (2026-08-13) — clause (c) for WALK-ADMITTED mutator bodies:
+/// every safety VC must refute-discharge exactly as in
+/// [`function_safety_vcs_all_discharged`], EXCEPT an `ArithmeticOverflow { op, .. }`
+/// row whose `op` matches a `CheckedBinaryOp` in the body.
+///
+/// SOUNDNESS — why the exemption is not a hole, and why it is CALLER-SCOPED:
+/// * It is valid ONLY under a prior mutator-walk admission (M1/M3/FS), whose
+///   grammars guarantee every `CheckedBinaryOp` in the body sits inside a verified
+///   diverging-assert spine — `Assert(cond = _t.1, expected = false,
+///   msg = Overflow(<the same op>))` walked BETWEEN def and store (the
+///   `asserted`-flag order gate) — so the store executes only on the non-overflow
+///   edge. Overflow is therefore DIVERGENCE (the panic arm's own non-safety
+///   Assertion row, the M2 precedent), never wrap: the un-refutable
+///   `ArithmeticOverflow` row states "this function can panic", which the
+///   cell/field-post claim — partial correctness over the normally-returning
+///   path — already excludes by construction.
+/// * WRAP-vs-INT is untouched: an UNCHECKED add emits the same row but has no
+///   `CheckedBinaryOp` to match (and the walks decline it at the op match anyway);
+///   under M1's grammar no checked op is admitted at all, so the exemption set is
+///   empty and this function degenerates to the base bar.
+/// * Every OTHER safety kind (ShiftOverflow, Division/RemainderByZero, bounds,
+///   casts, negation) keeps the full refute-discharge requirement.
+///
+/// Do NOT reuse on return-value lanes: their claims are not conditioned on the
+/// spine's divergence, so the argument above does not transfer.
+fn mutator_safety_vcs_discharged_modulo_spine_asserts(func: &VerifiableFunction) -> bool {
+    use trust_types::{Rvalue, Statement, VcKind};
+    let mut spine_ops: Vec<trust_types::BinOp> = Vec::new();
+    for blk in &func.body.blocks {
+        for st in &blk.stmts {
+            if let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(op, _, _), .. } = st {
+                if !spine_ops.contains(op) {
+                    spine_ops.push(*op);
+                }
+            }
+        }
+    }
+    for vc in trust_vcgen::generate_vcs(func) {
+        if !crate::mirsem::is_safety_vc_kind_pub(&vc.kind) {
+            continue;
+        }
+        if let VcKind::ArithmeticOverflow { op, .. } = &vc.kind {
+            if spine_ops.contains(op) {
+                continue; // divergence, not wrap — see the soundness note above.
+            }
+        }
+        let augmented = augment_with_type_bounds(&vc.formula, func);
+        if !matches!(
+            crate::vc_refute::check_refute_vc(&augmented),
+            Some(crate::RefuteOutcome::RefutedModulo3)
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn function_safety_vcs_all_discharged(func: &VerifiableFunction) -> bool {
     let safety_vcs = trust_vcgen::generate_vcs(func)
         .into_iter()
@@ -13283,6 +17621,7 @@ fn prove_one_function(
             // teardown's exit criterion is this count reaching (and staying) 0
             // across every measured corpus for a full release cycle.
             f.fully_faithful_mirsem_fallback += 1;
+            f.mirsem_fallback_rows.push(func.def_path.clone());
         }
     }
     // GOAL-ITEM #4 (FAITHFULNESS) CAPSTONE TIER — count this function if the
@@ -13569,6 +17908,7 @@ mod tests {
                 blocks,
                 arg_count,
                 return_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13800,6 +18140,341 @@ mod tests {
         assert_eq!(aggregate.validate_aggregate_invariants(), Ok(()));
     }
 
+    /// Trust (#53): a whole-return `Discriminant` builds on the single-statement
+    /// lane, in BOTH the bare and the borrow-temp shapes — and declines when the
+    /// base stops being a parameter.
+    ///
+    /// `ord_to_i8` is `_0 := Discriminant(_1)`; `as_raw` is
+    /// `_2 := &_1; _0 := Discriminant((*_2))`. The second is the shape the chain
+    /// twin documents as unreachable for itself, and it is why this arm passes a
+    /// REAL use site rather than `None` — so it is asserted here explicitly, not
+    /// left to be inferred from a row count.
+    #[test]
+    fn whole_return_discriminant_builds_in_both_shapes() {
+        let load = |rel: &str, name: &str| -> Option<VerifiableFunction> {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
+                if func.name == name {
+                    return Some(func);
+                }
+            }
+            None
+        };
+
+        // Bare parameter base.
+        let ord = load("fixtures/mass-harvest2-2026-07-21/ordering-combinators/dumps", "ord_to_i8")
+            .expect("`ord_to_i8` fixture must be present");
+        assert!(
+            straight_line_ir_body(&ord).is_some(),
+            "`_0 := Discriminant(_1)` must build a trust-ir body"
+        );
+
+        // Borrow-temp base — the shape that needs the REAL use site.
+        let raw = load("fixtures/census-core-m5-2026-07-07/cmp-ordering", "as_raw")
+            .expect("`as_raw` fixture must be present");
+        assert!(
+            raw.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(
+                s,
+                trust_types::Statement::Assign { rvalue: trust_types::Rvalue::Ref { .. }, .. }
+            )),
+            "`as_raw` must actually carry the borrow temp this arm targets"
+        );
+        assert!(
+            straight_line_ir_body(&raw).is_some(),
+            "`_2 := &_1; _0 := Discriminant((*_2))` must resolve through the borrow temp"
+        );
+
+        // FORGERY: retarget the discriminant read at the RETURN place, which is not
+        // a parameter. The delegate must refuse a non-parameter base.
+        let mut forged = ord.clone();
+        for block in &mut forged.body.blocks {
+            for statement in &mut block.stmts {
+                if let trust_types::Statement::Assign { rvalue, .. } = statement
+                    && let trust_types::Rvalue::Discriminant(place) = rvalue
+                {
+                    place.local = 0;
+                }
+            }
+        }
+        assert!(
+            straight_line_ir_body(&forged).is_none(),
+            "a non-parameter discriminant base must DECLINE"
+        );
+    }
+
+    /// Trust (#53): the single-statement lane admits INTEGER bitwise and refuses
+    /// BOOL bitwise — the boundary, pinned against real fixtures on both sides.
+    ///
+    /// MIR spells `BitAnd`/`BitOr` for the Bool connective and the integer operator
+    /// alike. `map_and3`/`map_or1` (genuine `u8`/`i32`) must build a trust-ir body;
+    /// `w_and_op`/`w_or_op`/`w_xor_op` (genuine `bool`) must NOT, because
+    /// `Int.land`/`Int.lor` are opaque and a symbolic bool-or would degenerate to a
+    /// refl-provable identity that reads as a certified boolean `or`. Without the
+    /// bool half of this test, widening the gate later would look free.
+    #[test]
+    fn single_statement_bitwise_routes_int_and_bool_to_different_ops() {
+        let load_all = |rel: &str| -> Vec<VerifiableFunction> {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(&dir).expect("corpus present").flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                if let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) {
+                    out.push(func);
+                }
+            }
+            out
+        };
+
+        // INT side: the closure bodies `_0 := BitAnd/BitOr(_2, const)` on u8/i32.
+        let mut int_checked = 0;
+        for func in load_all("fixtures/mass-harvest2-2026-07-21/option-combinators2/dumps") {
+            // The CLOSURE, not its parent function: `main::map_or1_u8` returns an
+            // `Option` and is a different shape entirely, so a bare `contains` here
+            // silently pulls in a body this lane never claimed.
+            let is_target = ["map_and3_i32", "map_and3_u8", "map_or1_i32", "map_or1_u8"]
+                .iter()
+                .any(|n| func.def_path == format!("main::{n}::{{closure#0}}"));
+            if !is_target {
+                continue;
+            }
+            assert!(
+                straight_line_ir_body(&func).is_some(),
+                "{}: a genuine-Int bitwise body must build a trust-ir body",
+                func.def_path
+            );
+            int_checked += 1;
+        }
+        assert_eq!(int_checked, 4, "all four int-bitwise closure bodies must be present");
+
+        // BOOL side. Trust (#53, 2026-08-14) — THIS ASSERTION WAS DELIBERATELY
+        // INVERTED. It used to require these three to DECLINE, and that was right at
+        // the time: the only mapping available was onto `And`/`Or`/`Xor`, whose opaque
+        // `Int.land`/`Int.lor` say nothing about a symbolic operand, so admitting them
+        // would have minted a certificate that closes by `rfl` while reading as a
+        // certified boolean `or`.
+        //
+        // trust-ir 4b06918 added genuine boolean connectives (`BinOp::{BAnd,BOr,BXor}`,
+        // total and reducing on the 0/1 carrier) and the anchor now denotes them with
+        // BUILT `Bool.rec` terms rather than an opaque. So the model gained a carrier;
+        // the gate did not get weaker. Routing bool here is now earned.
+        //
+        // What has NOT changed, and is asserted just above: an INT-operand bitwise body
+        // still takes `And`/`Or`/`Xor`. The two halves are separated by operand TYPE,
+        // which is the only thing MIR itself uses to tell them apart.
+        let mut bool_checked = 0;
+        for func in load_all("fixtures/mass-harvest2-2026-07-21/bool-ops/dumps") {
+            if !matches!(func.name.as_str(), "w_and_op" | "w_or_op" | "w_xor_op") {
+                continue;
+            }
+            assert!(
+                straight_line_ir_body(&func).is_some(),
+                "{}: a BOOL-operand bitwise body must now build via the boolean \
+                 connectives",
+                func.name
+            );
+            bool_checked += 1;
+        }
+        assert_eq!(bool_checked, 3, "all three bool-op bodies must be present");
+    }
+
+    /// Trust (#53): `str::is_empty`'s fat-pointer reshape temp must ride the chain
+    /// lane, and the slice sibling must be undisturbed.
+    ///
+    /// `core::str::<impl str>::is_empty` lowers to
+    /// `_3 := Cast(_1, &[u8]); _2 := PtrMetadata(_3); _0 := Eq(_2, 0)`, whose `_3`
+    /// is REF-typed — the chain walk's scalar-carrier gate rejected the whole body
+    /// before the translation loop ever ran. Both `is_empty` bodies live in the
+    /// same fixture directory and only ONE of them carried the cast, which is why
+    /// probing "the first `is_empty` found" reported success while the corpus still
+    /// had a fallback row.
+    #[test]
+    fn both_is_empty_shapes_ride_the_trustir_chain_lane() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/slice-len-isempty-2026-07-16/dumps");
+        let mut seen_slice = false;
+        let mut seen_str = false;
+        for entry in std::fs::read_dir(&dir).expect("corpus present").flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
+            if func.name != "is_empty" {
+                continue;
+            }
+            let has_reshape = func.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(
+                    s,
+                    trust_types::Statement::Assign { rvalue: trust_types::Rvalue::Cast(_, _), .. }
+                )
+            });
+            assert!(
+                straight_line_ir_body_chain(&func).is_some(),
+                "is_empty (reshape temp: {has_reshape}) must build a trust-ir chain body"
+            );
+            if has_reshape {
+                seen_str = true;
+            } else {
+                seen_slice = true;
+            }
+        }
+        // Without BOTH, this test could pass while the shape it targets is absent.
+        assert!(seen_str, "the `str::is_empty` body carrying the fat-pointer cast must be present");
+        assert!(seen_slice, "the plain `[T]::is_empty` body must be present as the control");
+    }
+
+    /// Trust (#53): the chain walk skips a non-scalar temp ONLY for a `Cast`. A
+    /// non-`Cast` assignment on a non-scalar carrier must still decline outright —
+    /// the skip is a narrow exception, not a general relaxation of the rule that
+    /// every trust-ir SSA value in that lane lives on the Int/Bool carrier.
+    ///
+    /// Mutates the REAL `str::is_empty` fixture rather than hand-building a body,
+    /// so the control and the forgery differ in exactly one rvalue.
+    #[test]
+    fn chain_walk_skips_only_cast_reshape_temps() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/slice-len-isempty-2026-07-16/dumps");
+        let mut checked = false;
+        for entry in std::fs::read_dir(&dir).expect("corpus present").flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
+            if func.name != "is_empty" {
+                continue;
+            }
+            // Find the fat-pointer reshape `_t := Cast(..)`; only one body has it.
+            let mut forged = func.clone();
+            let mut mutated = false;
+            for block in &mut forged.body.blocks {
+                for statement in &mut block.stmts {
+                    if let trust_types::Statement::Assign { rvalue, .. } = statement
+                        && let trust_types::Rvalue::Cast(operand, _) = rvalue
+                    {
+                        // Same operand, no longer a Cast — the skip must not fire.
+                        *rvalue = trust_types::Rvalue::Use(operand.clone());
+                        mutated = true;
+                    }
+                }
+            }
+            if !mutated {
+                continue; // the plain `[T]::is_empty` control has no reshape temp.
+            }
+            assert!(
+                straight_line_ir_body_chain(&func).is_some(),
+                "the genuine reshape body must build — else the decline below is vacuous"
+            );
+            assert!(
+                straight_line_ir_body_chain(&forged).is_none(),
+                "a non-Cast assignment on a non-scalar carrier must still DECLINE"
+            );
+            checked = true;
+        }
+        assert!(checked, "no `str::is_empty` body with a reshape temp found to mutate");
+    }
+
+    /// Trust (#53): the CAST-TEMP GUARD READ mapping, and its gate.
+    ///
+    /// `sem_operand_to_ir` used to decline `SemOperand::Cast` outright as a named
+    /// residue. It now maps it onto the anchor's real truncation carrier, which is
+    /// what moves the four `ascii_utils` `char` predicates (whose guards compare a
+    /// truncating `char as u8` temp) onto the trust-ir lane. Pin both the mapping
+    /// and the bare-parameter gate, so a later widening has to be deliberate.
+    #[test]
+    fn cast_temp_guard_operand_maps_to_the_truncation_carrier() {
+        use crate::mirsem::SemOperand as S;
+        use crate::trustir_anchor::IrOperand as I;
+
+        // u32 -> u8, the `char as u8` shape these predicates carry.
+        assert_eq!(
+            sem_operand_to_ir(&S::Cast(Box::new(S::Var(0)), 8, false)),
+            Some(I::CastU(Box::new(I::Var(0)), 8)),
+            "an unsigned cast temp must denote trust-ir's width-8 truncation"
+        );
+        assert_eq!(
+            sem_operand_to_ir(&S::Cast(Box::new(S::Var(1)), 16, true)),
+            Some(I::CastS(Box::new(I::Var(1)), 16)),
+            "a signed cast temp must take the SIGNED carrier"
+        );
+        // NOT a bare parameter base — a cast of a slice element / field / nested
+        // cast is not this predicate family and must decline.
+        for base in [
+            S::Len(Box::new(S::Var(0))),
+            S::Field(Box::new(S::Var(0)), 0),
+            S::Cast(Box::new(S::Var(0)), 8, false),
+        ] {
+            assert_eq!(
+                sem_operand_to_ir(&S::Cast(Box::new(base), 8, false)),
+                None,
+                "only a BARE parameter base is admitted"
+            );
+        }
+        // A width outside the shared `IntCastDest` whitelist must decline, so this
+        // carrier cannot disagree with the chain lane about what is covered.
+        assert_eq!(
+            sem_operand_to_ir(&S::Cast(Box::new(S::Var(0)), 7, false)),
+            None,
+            "a non-whitelisted width must decline"
+        );
+    }
+
+    /// Trust (#53): the signum forgeries must fail closed on the TRUST-IR lane
+    /// too — not merely on the MirSem one.
+    ///
+    /// `mirsem::tests::signum_forgeries_are_fail_closed` pins G1–G5 against
+    /// `function_fully_faithful_witness`, which is the MirSem witness. It says
+    /// nothing about [`signum_ir_body`], so without this test the new lane's
+    /// fail-closed behaviour would rest entirely on the claim that it delegates
+    /// to the vetted gates. It does delegate — that is the design — but "by
+    /// construction" is exactly the kind of reasoning this repository has been
+    /// burned by, so it gets a test.
+    ///
+    /// G6 is the positive control: without it every assertion below could pass
+    /// because the lane declines the whole family.
+    #[test]
+    fn signum_forgeries_decline_on_the_trustir_lane() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/stdlib-leaf-num-2026-07-16/forgeries");
+        let load = |name: &str| -> VerifiableFunction {
+            let path = dir.join(name);
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("read required signum fixture {}: {e}", path.display()));
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"))
+        };
+        let control = load("forgery__G6_signum_valid_control.json");
+        assert!(
+            signum_ir_body(&control).is_some(),
+            "G6 is a genuine i32 signum: the trust-ir lane MUST build a body for it, or \
+             every DECLINE assertion here is vacuous"
+        );
+        for name in [
+            "forgery__G1_signum_cmp_rhs_nonzero.json", // `Cmp(a, 5)` — not a sign test.
+            "forgery__G2_signum_wrong_disc_mapping.json", // discriminants are not (-1, 0, 1).
+            "forgery__G3_signum_non_ordering_enum.json", // some other three-variant enum.
+            "forgery__G4_signum_flipped_operands.json", // `Cmp(0, a)` — this is -signum.
+            "forgery__G5_signum_unsigned_cast_dest.json", // unsigned dest cannot hold -1.
+        ] {
+            let func = load(name);
+            assert!(
+                signum_ir_body(&func).is_none(),
+                "{name} is a signum forgery — the trust-ir lane MUST decline it"
+            );
+        }
+    }
+
     #[test]
     fn straight_line_ir_body_requires_entry_rooted_terminating_return() {
         use trust_types::{BasicBlock, BlockId, Operand, Place, Rvalue, Statement, Terminator};
@@ -14015,10 +18690,40 @@ mod tests {
             straight_line_ir_body(&func).is_none(),
             "a checked tuple defined after `_0 := tuple.0` must fail closed"
         );
-        func.body.blocks[0].stmts = vec![define_checked, return_from_field];
+        // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — the positive now requires
+        // the same-block overflow assert (the shared license): the old form of
+        // this test pinned the ASSERT-LESS `.0` reading as positive — that WAS the
+        // via_ir half of the hole.
+        func.body.blocks[0].stmts = vec![define_checked.clone(), return_from_field.clone()];
+        assert!(
+            straight_line_ir_body(&func).is_none(),
+            "an UNASSERTED checked tuple's `.0` must decline — the wrap trap"
+        );
+        func.body.blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: vec![define_checked],
+                terminator: Terminator::Assert {
+                    cond: Operand::Move(Place {
+                        local: 3,
+                        projections: vec![Projection::Field(1)],
+                    }),
+                    expected: false,
+                    msg: trust_types::AssertMessage::Overflow(BinOp::Add),
+                    target: BlockId(1),
+                    unwind: trust_types::UnwindEdge::Unreachable,
+                    span: Default::default(),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                stmts: vec![return_from_field],
+                terminator: Terminator::Return,
+            },
+        ];
         assert!(
             straight_line_ir_body(&func).is_some(),
-            "the same sole checked definition before its field use remains modeled"
+            "the ASSERTED spine's `.0` remains modeled — the licensed reading"
         );
     }
 
@@ -14922,6 +19627,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "const_mul".into(),
@@ -14965,6 +19671,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "mul_bounded".into(),
@@ -15102,6 +19809,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![], // NO precondition — the negation may overflow.
@@ -15203,6 +19911,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: u32t(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15282,6 +19991,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: u32t(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15355,6 +20065,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15465,6 +20176,7 @@ mod tests {
                 )),
                 arg_count: 2,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![ne("b", 0), ne("a", -2147483648)],
@@ -15484,6 +20196,7 @@ mod tests {
                 blocks: one_block(Rvalue::Use(Operand::Copy(Place::local(1)))),
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15512,6 +20225,7 @@ mod tests {
                 )),
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![Formula::Lt(
@@ -15814,6 +20528,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: u(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             // #[requires(b != 0)] — forecloses the div-by-zero so the safety VC discharges.
@@ -15905,6 +20620,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: u(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![lt("a", 100), lt("b", 100)],
@@ -15993,6 +20709,7 @@ mod tests {
                     }],
                     arg_count,
                     return_ty,
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -16135,6 +20852,7 @@ mod tests {
                     }],
                     arg_count,
                     return_ty,
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -16257,6 +20975,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![ne("b", 0), ne("a", -2147483648)],
@@ -16318,6 +21037,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             // #[requires(b != 0)]
@@ -16382,6 +21102,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -16544,6 +21265,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: u32t(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -17115,6 +21837,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: raw,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -17184,6 +21907,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: usize_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -17898,6 +22622,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "call_then_pureop_caller".into(),
@@ -17926,7 +22651,7 @@ mod tests {
     #[test]
     fn call_then_pureop_minimal_shape_recognized() {
         let func = call_then_pureop_test_function(vec![], call_then_pureop_eq_ret());
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         let recognized = crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry)
             .expect("the minimal call-then-pureop shape must be recognized");
         assert!(recognized.call_is_lhs, "the call result is the Eq's LHS");
@@ -17951,6 +22676,8 @@ mod tests {
             "some_unrelated_function".to_string(),
             crate::mirsem::CalleeFact {
                 arg_count: 1,
+                param_tys: vec![trust_types::Ty::Int { width: 32, signed: true }],
+                return_ty: trust_types::Ty::Int { width: 32, signed: true },
                 requires: Some(vec![]),
                 param_names: vec![None],
             },
@@ -18018,6 +22745,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "call_then_pureop_second_call".into(),
@@ -18029,7 +22757,7 @@ mod tests {
             postconditions: vec![],
             spec: FunctionSpec::default(),
         };
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry).is_none(),
             "a SECOND Call terminator (even one writing `_0`) is never absorbed as \
@@ -18049,7 +22777,7 @@ mod tests {
             span: SourceSpan::default(),
         };
         let func = call_then_pureop_test_function(vec![extra_write], call_then_pureop_eq_ret());
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry).is_none(),
             "a multiply-written call-dest temp is not sole-writer — must decline"
@@ -18068,7 +22796,7 @@ mod tests {
             Operand::Constant(ConstValue::Uint(0, 64)),
         );
         let func = call_then_pureop_test_function(vec![], ret_rvalue);
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry).is_none(),
             "neither Eq operand is the call-dest temp `_2` — the op must CONSUME \
@@ -18154,6 +22882,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "f".into(),
@@ -18174,11 +22903,10 @@ mod tests {
     /// blanket refusal of the shape.
     #[test]
     fn call_then_pureop_reassigned_other_param_now_declines() {
-        let registry = lift_callee_registry();
-
         // Load-bearing control: WITHOUT the reassignment the shape recognizes and
         // certifies (the `other` operand is the sound entry-time `n`).
         let clean = call_then_pureop_other_is_param_function(false);
+        let registry = lift_callee_registry(&clean);
         let recognized = crate::mirsem::sem_call_then_pureop_of_mir(&clean, &registry)
             .expect("the clean `helper(5) == n` shape must still recognize");
         assert_eq!(
@@ -18221,8 +22949,6 @@ mod tests {
     #[test]
     fn call_then_pureop_reassigned_arg_param_and_requires_now_declines() {
         use trust_types::{ConstValue, Formula, Operand, Place, Rvalue, Sort};
-        let registry = lift_callee_registry();
-
         // (a) the call ARGUMENT is the reassigned parameter `_1`.
         let eq_zero = Rvalue::BinaryOp(
             trust_types::BinOp::Eq,
@@ -18230,6 +22956,7 @@ mod tests {
             Operand::Constant(ConstValue::Uint(0, 64)),
         );
         let clean = call_then_pureop_test_function(vec![], eq_zero.clone());
+        let registry = lift_callee_registry(&clean);
         assert!(
             crate::mirsem::sem_call_then_pureop_of_mir(&clean, &registry).is_some(),
             "load-bearing control: without reassignment `lift_callee(self) == 0` recognizes"
@@ -18267,6 +22994,7 @@ mod tests {
                     }],
                     arg_count: 1,
                     return_ty: u32t(),
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -18291,6 +23019,8 @@ mod tests {
         // for the reassigned actual (an unsubstitutable actual ⇒ not established).
         let fact = crate::mirsem::CalleeFact {
             arg_count: 1,
+            param_tys: vec![trust_types::Ty::Int { width: 32, signed: false }],
+            return_ty: trust_types::Ty::Int { width: 32, signed: false },
             requires: Some(vec![Formula::Lt(
                 Box::new(Formula::Var("a".into(), Sort::Int)),
                 Box::new(Formula::Int(10)),
@@ -18362,6 +23092,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "island".into(),
@@ -18381,8 +23112,8 @@ mod tests {
     /// recognizes (load-bearing control).
     #[test]
     fn call_then_pureop_unreachable_entry_now_declines() {
-        let registry = lift_callee_registry();
         let reachable = call_then_pureop_island_function(true);
+        let registry = lift_callee_registry(&reachable);
         assert!(
             crate::mirsem::sem_call_then_pureop_of_mir(&reachable, &registry).is_some(),
             "load-bearing control: the REACHABLE island recognizes"
@@ -18405,7 +23136,6 @@ mod tests {
             BasicBlock, BlockId, FunctionSpec, LocalDecl, Operand, Place, Rvalue, SourceSpan,
             Statement, Terminator, Ty, VerifiableBody,
         };
-        let registry = lift_callee_registry();
         let mk = |reachable: bool| -> VerifiableFunction {
             let u64t = || Ty::Int { width: 64, signed: false };
             let entry_goto = if reachable { BlockId(1) } else { BlockId(0) };
@@ -18455,6 +23185,7 @@ mod tests {
                     ],
                     arg_count: 1,
                     return_ty: u64t(),
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -18462,8 +23193,10 @@ mod tests {
                 spec: FunctionSpec::default(),
             }
         };
+        let reachable = mk(true);
+        let registry = lift_callee_registry(&reachable);
         assert!(
-            crate::mirsem::sem_ptr_spine_call_return_of_mir(&mk(true), &registry).is_some(),
+            crate::mirsem::sem_ptr_spine_call_return_of_mir(&reachable, &registry).is_some(),
             "load-bearing control: the REACHABLE ptr-spine island recognizes"
         );
         assert!(
@@ -18571,6 +23304,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: u32_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "danger".into(),
@@ -18647,6 +23381,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: u32_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "danger".into(),
@@ -18739,6 +23474,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "call_then_pureop_param_caller".into(),
@@ -18754,9 +23490,11 @@ mod tests {
 
     /// The registry `call_then_pureop_param_test_function`'s shapes certify
     /// against — the SAME synthetic `lift_callee` `lift_callee_registry()` uses.
-    fn call_then_pureop_param_registry()
+    fn call_then_pureop_param_registry(
+        func: &VerifiableFunction,
+    )
     -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
-        lift_callee_registry()
+        lift_callee_registry(func)
     }
 
     /// POSITIVE (hand-built, isolated) — the `has_len` shape: `_0 := (Move _3 ==
@@ -18774,7 +23512,7 @@ mod tests {
             Operand::Copy(Place { local: 2, projections: vec![] }),
         );
         let func = call_then_pureop_param_test_function(ret_rvalue);
-        let registry = call_then_pureop_param_registry();
+        let registry = call_then_pureop_param_registry(&func);
 
         let recognized = crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry)
             .expect("the has_len-shaped PARAM-operand shape must be recognized");
@@ -18824,7 +23562,7 @@ mod tests {
             Operand::Copy(Place { local: 2, projections: vec![] }),
         );
         let func = call_then_pureop_param_test_function(ret_rvalue);
-        let registry = call_then_pureop_param_registry();
+        let registry = call_then_pureop_param_registry(&func);
 
         let recognized = crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry)
             .expect("the at_least-shaped PARAM-operand shape must be recognized");
@@ -18860,7 +23598,7 @@ mod tests {
             Operand::Move(Place { local: 3, projections: vec![] }),
         );
         let func = call_then_pureop_param_test_function(ret_rvalue);
-        let registry = call_then_pureop_param_registry();
+        let registry = call_then_pureop_param_registry(&func);
 
         let recognized = crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry)
             .expect("the swapped-operand shape must be recognized");
@@ -18956,6 +23694,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "call_then_pureop_two_call_results".into(),
@@ -18967,7 +23706,7 @@ mod tests {
             postconditions: vec![],
             spec: FunctionSpec::default(),
         };
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_then_pureop_of_mir(&func, &registry).is_none(),
             "Call-OP-Call (a second call result feeding the comparison) must decline \
@@ -18985,17 +23724,11 @@ mod tests {
 
     /// A SECOND certified callee (`lift_callee_b`), alongside `lift_callee` — the
     /// `is_full` shape's TWO-DISTINCT-CALLEES topology.
-    fn lift_callee_pair_registry() -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact>
-    {
-        let mut m = lift_callee_registry();
-        m.insert(
-            "lift_callee_b".to_string(),
-            crate::mirsem::CalleeFact {
-                arg_count: 1,
-                requires: Some(Vec::new()),
-                param_names: vec![Some("x".into())],
-            },
-        );
+    fn lift_callee_pair_registry(
+        func: &VerifiableFunction,
+    ) -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+        let mut m = lift_callee_registry(func);
+        m.insert("lift_callee_b".to_string(), synthetic_callee_fact(func, "lift_callee_b"));
         m
     }
 
@@ -19067,6 +23800,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "call_op_call_caller".into(),
@@ -19098,7 +23832,7 @@ mod tests {
     #[test]
     fn call_op_call_direct_two_distinct_callees_recognized_and_certifies_both_lanes() {
         let func = call_op_call_direct_test_function("lift_callee_b", call_op_call_direct_eq_ret());
-        let registry = lift_callee_pair_registry();
+        let registry = lift_callee_pair_registry(&func);
 
         let recognized = crate::mirsem::sem_call_op_call_of_mir(&func, &registry)
             .expect("the direct is_full-shaped CALL-OP-CALL must be recognized");
@@ -19209,6 +23943,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: u64t(),
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "call_op_call_same_callee_twice".into(),
@@ -19220,7 +23955,7 @@ mod tests {
             postconditions: vec![],
             spec: FunctionSpec::default(),
         };
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
 
         let recognized = crate::mirsem::sem_call_op_call_of_mir(&func, &registry)
             .expect("the SAME callee called twice must be recognized");
@@ -19343,6 +24078,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "call_op_call_three_calls".into(),
@@ -19354,7 +24090,7 @@ mod tests {
             postconditions: vec![],
             spec: FunctionSpec::default(),
         };
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_op_call_of_mir(&func, &registry).is_none(),
             "a THIRD Call terminator (even with an otherwise-recognizable pair) must \
@@ -19371,7 +24107,7 @@ mod tests {
     fn call_op_call_one_callee_uncertified_declines() {
         let func =
             call_op_call_direct_test_function("uncertified_callee", call_op_call_direct_eq_ret());
-        let registry = lift_callee_registry(); // only "lift_callee" certified.
+        let registry = lift_callee_registry(&func); // only "lift_callee" certified.
         assert!(
             crate::mirsem::sem_call_op_call_of_mir(&func, &registry).is_none(),
             "call_b's callee is NOT in the certified registry — must decline"
@@ -19469,6 +24205,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "call_or_call_caller".into(),
@@ -19495,7 +24232,7 @@ mod tests {
     #[test]
     fn call_or_call_direct_two_distinct_callees_recognized_and_certifies_via_trustir() {
         let func = call_or_call_test_function("lift_callee", "lift_callee_b");
-        let registry = lift_callee_pair_registry();
+        let registry = lift_callee_pair_registry(&func);
 
         let recognized = crate::mirsem::sem_call_or_call_of_mir(&func, &registry)
             .expect("the direct short-circuit `||` shape must be recognized");
@@ -19522,7 +24259,7 @@ mod tests {
     #[test]
     fn call_or_call_same_callee_twice_recognized_and_certifies() {
         let func = call_or_call_test_function("lift_callee", "lift_callee");
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         let recognized = crate::mirsem::sem_call_or_call_of_mir(&func, &registry)
             .expect("the SAME callee on both sides of `||` must be recognized");
         assert_eq!(recognized.call_a.callee, "lift_callee");
@@ -19536,7 +24273,7 @@ mod tests {
     #[test]
     fn call_or_call_second_callee_uncertified_declines() {
         let func = call_or_call_test_function("lift_callee", "uncertified_callee");
-        let registry = lift_callee_registry(); // only "lift_callee" certified.
+        let registry = lift_callee_registry(&func); // only "lift_callee" certified.
         assert!(
             crate::mirsem::sem_call_or_call_of_mir(&func, &registry).is_none(),
             "callee_b is NOT in the certified registry — must decline"
@@ -19654,6 +24391,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "should_descend_like".into(),
@@ -19665,7 +24403,7 @@ mod tests {
             postconditions: vec![],
             spec: FunctionSpec::default(),
         };
-        let registry = lift_callee_pair_registry();
+        let registry = lift_callee_pair_registry(&func);
         assert!(
             crate::mirsem::sem_call_or_call_of_mir(&func, &registry).is_none(),
             "the compare-embedded false arm (field read + call + Lt) is NOT a bare \
@@ -19824,6 +24562,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "should_descend_real".into(),
@@ -19851,7 +24590,7 @@ mod tests {
             trust_types::BinOp::Lt,
             true,
         );
-        let registry = lift_callee_pair_registry();
+        let registry = lift_callee_pair_registry(&func);
         let recognized = crate::mirsem::sem_call_or_guarded_compare_of_mir(&func, &registry)
             .expect("the REAL should_descend guarded-compare shape must be recognized");
         assert_eq!(recognized.call_a.callee, "lift_callee");
@@ -19911,7 +24650,7 @@ mod tests {
             trust_types::BinOp::Lt,
             true,
         );
-        let registry = lift_callee_registry(); // only "lift_callee" certified.
+        let registry = lift_callee_registry(&func); // only "lift_callee" certified.
         assert!(
             crate::mirsem::sem_call_or_guarded_compare_of_mir(&func, &registry).is_none(),
             "callee_b is NOT in the certified registry — must decline"
@@ -19935,7 +24674,7 @@ mod tests {
         // The true-arm `_0 := true` write no longer type-checks against the new
         // Int `_0`, but the RECOGNIZER's own gate (checked FIRST, before any
         // arm-specific parsing) must decline before ever reaching it.
-        let registry = lift_callee_pair_registry();
+        let registry = lift_callee_pair_registry(&func);
         assert!(
             crate::mirsem::sem_call_or_guarded_compare_of_mir(&func, &registry).is_none(),
             "a non-Bool `_0` must decline — `||` composes two Bool values"
@@ -20068,6 +24807,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "unconditional_second_call".into(),
@@ -20079,7 +24819,7 @@ mod tests {
             postconditions: vec![],
             spec: FunctionSpec::default(),
         };
-        let registry = lift_callee_pair_registry();
+        let registry = lift_callee_pair_registry(&func);
         assert!(
             crate::mirsem::sem_call_or_guarded_compare_of_mir(&func, &registry).is_none(),
             "callee_b invoked UNCONDITIONALLY (before the switch) must NEVER be \
@@ -20155,6 +24895,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: u32t,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "range".into(),
@@ -20272,6 +25013,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: dst,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "cast".into(),
@@ -20426,6 +25168,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "bit_test_chain".into(),
@@ -20623,6 +25366,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "bit_test_chain_assert_gated".into(),
@@ -20676,6 +25420,4000 @@ mod tests {
             "the PRODUCTION via-trustir gate (shape AND the trustir_safety pillar) must certify \
              the real Assert-gated bit-test chain"
         );
+    }
+
+    /// The `Option::is_some` / `Result::is_ok` / `ControlFlow::is_break` SHAPE, the
+    /// most common enum predicate in `core`:
+    ///
+    /// ```text
+    /// fn is_some(&self) -> bool { _2 := Discriminant((*_1)); _0 := Eq(_2, 1); Return }
+    /// ```
+    ///
+    /// `mutable` flips the `&self` receiver to `&mut self` (the adversarial
+    /// control); `deref` false takes the enum BY VALUE (`Discriminant(_1)`);
+    /// `project` puts a field projection under the discriminant read.
+    fn enum_tag_predicate_function(mutable: bool, deref: bool, project: bool) -> VerifiableFunction {
+        use trust_types::{
+            BinOp, BasicBlock, BlockId, ConstValue, Operand, Place, Projection, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VariantDef, VerifiableBody,
+        };
+        let payload = Ty::Int { width: 32, signed: true };
+        let enum_ty = Ty::adt_enum(
+            "std::option::Option",
+            vec![
+                VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), payload.clone())],
+                },
+            ],
+        );
+        let self_ty = if deref {
+            Ty::Ref { mutable, inner: Box::new(enum_ty) }
+        } else {
+            enum_ty
+        };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let mut projections = Vec::new();
+        if deref {
+            projections.push(Projection::Deref);
+        }
+        if project {
+            projections.push(Projection::Field(0));
+        }
+        let body = VerifiableBody {
+            locals: vec![
+                trust_types::LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                trust_types::LocalDecl { index: 1, ty: self_ty, name: Some("self".into()) },
+                trust_types::LocalDecl {
+                    index: 2,
+                    ty: Ty::Int { width: 64, signed: true },
+                    name: None,
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    assign(2, Rvalue::Discriminant(Place { local: 1, projections })),
+                    assign(
+                        0,
+                        Rvalue::BinaryOp(
+                            BinOp::Eq,
+                            Operand::Copy(Place { local: 2, projections: vec![] }),
+                            Operand::Constant(ConstValue::Int(1)),
+                        ),
+                    ),
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
+        VerifiableFunction {
+            name: "is_some".into(),
+            def_path: "std::option::Option::<i32>::is_some".into(),
+            span: SourceSpan::default(),
+            body,
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// `fn f(a: &u32, b: &u32) -> bool { *a < *b }` — the `core::cmp::impls::<impl
+    /// PartialOrd for u32>::lt` shape, TWO reference parameters, each read through a
+    /// bare `Deref`. `deref_second` picks whether the SECOND statement reads `*_2`
+    /// (the real shape) or `*_1` again; `mutable`/`bool_referent`/`non_param` select
+    /// the adversarial variants.
+    fn two_ref_param_compare(
+        mutable: bool,
+        bool_referent: bool,
+        non_param: bool,
+    ) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Projection, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VerifiableBody,
+        };
+        let referent = if bool_referent { Ty::Bool } else { Ty::Int { width: 32, signed: false } };
+        let ref_ty = || Ty::Ref { mutable, inner: Box::new(referent.clone()) };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let deref = |local: usize| {
+            Operand::Copy(Place { local, projections: vec![Projection::Deref] })
+        };
+        // `non_param` re-points the SECOND read at a local that is NOT a parameter.
+        let second_base = if non_param { 5 } else { 2 };
+        let mut locals = vec![
+            LocalDecl { index: 0, ty: Ty::Bool, name: None },
+            LocalDecl { index: 1, ty: ref_ty(), name: Some("a".into()) },
+            LocalDecl { index: 2, ty: ref_ty(), name: Some("b".into()) },
+            LocalDecl { index: 3, ty: referent.clone(), name: None },
+            LocalDecl { index: 4, ty: referent.clone(), name: None },
+        ];
+        if non_param {
+            locals.push(LocalDecl { index: 5, ty: ref_ty(), name: None });
+        }
+        let body = VerifiableBody {
+            locals,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    assign(3, Rvalue::Use(deref(1))),
+                    assign(4, Rvalue::Use(deref(second_base))),
+                    assign(
+                        0,
+                        Rvalue::BinaryOp(
+                            BinOp::Lt,
+                            Operand::Copy(Place { local: 3, projections: vec![] }),
+                            Operand::Copy(Place { local: 4, projections: vec![] }),
+                        ),
+                    ),
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
+        VerifiableFunction {
+            name: "lt".into(),
+            def_path: "core::cmp::impls::<impl core::cmp::PartialOrd for u32>::lt".into(),
+            span: SourceSpan::default(),
+            body,
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// THE ARM-SELECTION / SHAPE ORACLE for the cell-post model — the KERNEL-DECIDABLE
+    /// half of the mutator defense. The model checker is self-relating, so it proves a
+    /// polarity-swapped or head-swapped model as readily as the right one; what the
+    /// kernel CAN decide is which arm a CLOSED fork selects, and whether the selected
+    /// arm's expression matches an INDEPENDENTLY hand-built claim — because the arms
+    /// carry DISTINCT opaque heads (`Int.lor` vs `Int.land`/`bnot`), and the kernel
+    /// never delta-unfolds an opaque, a wrong-arm or wrong-head claim cannot unify.
+    ///
+    /// The claims are written FROM THE SPEC (set_bit's documented behavior), never
+    /// from the walk's output — the independence that makes this an oracle. With every
+    /// slot closed (`recv=165, bit=3, value∈{0,1}`) the claims are fully closed
+    /// expressions with no env references.
+    ///
+    /// WHAT THIS DOES NOT DECIDE, stated plainly: numeric post-values. The opaque
+    /// heads never reduce to numerals, so `165 | 8 = 173` is outside every kernel
+    /// tier. The numeric legs — LEG B (the imported trust-ir interpreter over a
+    /// per-width emitted module) and LEG C (a trustc-compiled probe against the real
+    /// crate) — are M2, deliberately split so this landing's review surface stays
+    /// kernel-side.
+    #[test]
+    fn trust_ir_set_bit_arm_selection_oracle() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, IrTerm, RefinementVerdict, TRUSTIR_BNOT,
+            branch_model_refinement_proof, branch_model_refinement_statement,
+            check_cell_post_branch_model, check_refinement_decl, cst, int_lit,
+        };
+        use clean_kernel::Expr;
+        let path = format!(
+            "{}/fixtures/census-rung2-2026-07-07/bit_field/<u8 as lib__BitField>__set_bit.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).expect("committed set_bit dump");
+        let func: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse");
+        let open_cfg = divergence_guarded_rmw_mutator_ir_cfg(&func).expect("mints");
+
+        // Close every slot: recv=165, bit=3, value=v.
+        let close = |cfg: &crate::trustir_anchor::IrCfg,
+                     v: i128|
+         -> crate::trustir_anchor::IrCfg {
+            let mut c = cfg.clone();
+            let sub = |op: &mut IrOperand| {
+                if let IrOperand::Var(i) = op {
+                    match *i {
+                        0 => *op = IrOperand::Const(165),
+                        1 => *op = IrOperand::Const(3),
+                        2 => *op = IrOperand::Const(v),
+                        _ => {}
+                    }
+                }
+            };
+            for blk in &mut c.blocks {
+                for st in &mut blk.stmts {
+                    match &mut st.rvalue {
+                        IrRvalue::Use(a) | IrRvalue::Un(_, a) => sub(a),
+                        IrRvalue::Bin(_, a, b) | IrRvalue::Cmp(_, a, b) => {
+                            sub(a);
+                            sub(b);
+                        }
+                    }
+                }
+                if let IrTerm::Switch(cond, _, _) = &mut blk.term {
+                    sub(&mut cond.a);
+                    sub(&mut cond.b);
+                }
+            }
+            c
+        };
+        // The INDEPENDENT claims, from the spec: set_bit(165, 3, true) leaves the
+        // cell at `165 | (1 << 3)`; false at `165 & !(1 << 3)`.
+        let mask = || Expr::apps(cst("Int.shiftLeft"), [int_lit(1), int_lit(3)]);
+        let set_expr = Expr::apps(cst("Int.lor"), [int_lit(165), mask()]);
+        let clear_expr =
+            Expr::apps(cst("Int.land"), [int_lit(165), Expr::app(cst(TRUSTIR_BNOT), mask())]);
+        let claim = |cfg: &crate::trustir_anchor::IrCfg, e: &Expr| {
+            check_refinement_decl(
+                "Trust.TrustIr.Refinement.cell_post_arm_oracle",
+                branch_model_refinement_statement(cfg, Some(e)),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        for (v, right, wrong, what) in [
+            (1_i128, &set_expr, &clear_expr, "value=1 selects the OR arm"),
+            (0, &clear_expr, &set_expr, "value=0 selects the AND/NOT arm"),
+        ] {
+            let closed = close(&open_cfg, v);
+            // POSITIVE FIRST (a None statement maps to KernelRejected, so a
+            // negative-only row passes vacuously when the shape merely declined).
+            assert_eq!(
+                claim(&closed, right),
+                RefinementVerdict::ProvenModulo3,
+                "{what}: the spec-built claim must prove"
+            );
+            assert!(
+                matches!(claim(&closed, wrong), RefinementVerdict::KernelRejected(_)),
+                "{what}: the OTHER arm's claim must be rejected — distinct opaque heads \
+                 cannot unify"
+            );
+        }
+
+        // F1 — POLARITY: swap the fork targets. Three facts: the self-relating check
+        // still proves it; the true claim rejects; the wrong claim proves.
+        let mut forged = open_cfg.clone();
+        if let IrTerm::Switch(_, t, e) = &mut forged.blocks[0].term {
+            std::mem::swap(t, e);
+        }
+        let fclosed = close(&forged, 1);
+        assert_eq!(
+            check_cell_post_branch_model(&fclosed),
+            RefinementVerdict::ProvenModulo3,
+            "the polarity forgery PROVES against itself — the blindness this oracle covers"
+        );
+        assert!(matches!(claim(&fclosed, &set_expr), RefinementVerdict::KernelRejected(_)));
+        assert_eq!(claim(&fclosed, &clear_expr), RefinementVerdict::ProvenModulo3);
+
+        // F2 — DROPPED NOT: the else arm's write consumes the raw mask. The true
+        // (bnot-carrying) claim must reject.
+        let mut forged = open_cfg.clone();
+        {
+            let blk = &mut forged.blocks[2];
+            // remove the Un(Not) stmt; repoint the write's rhs at the Shl temp.
+            let not_idx = blk
+                .stmts
+                .iter()
+                .position(|s| matches!(s.rvalue, IrRvalue::Un(_, _)))
+                .expect("else arm carries the Not");
+            let shl_idx_slot = blk.stmts[not_idx.checked_sub(1).expect("Shl precedes")].idx;
+            let removed = blk.stmts.remove(not_idx);
+            let write = blk.stmts.last_mut().expect("write stmt");
+            if let IrRvalue::Bin(_, _, rhs) = &mut write.rvalue {
+                *rhs = IrOperand::Var(shl_idx_slot);
+            }
+            drop(removed);
+        }
+        let fclosed = close(&forged, 0);
+        assert_eq!(
+            check_cell_post_branch_model(&fclosed),
+            RefinementVerdict::ProvenModulo3,
+            "the dropped-Not forgery proves against itself"
+        );
+        assert!(
+            matches!(claim(&fclosed, &clear_expr), RefinementVerdict::KernelRejected(_)),
+            "the true (bnot-carrying) claim must reject against the dropped-Not model"
+        );
+
+        // F3 — HEAD SWAP: the then arm writes And instead of Or.
+        let mut forged = open_cfg.clone();
+        {
+            let write = forged.blocks[1].stmts.last_mut().expect("write");
+            if let IrRvalue::Bin(op, _, _) = &mut write.rvalue {
+                *op = crate::trustir_anchor::TrustIrBinOp::And;
+            }
+        }
+        let fclosed = close(&forged, 1);
+        assert!(
+            matches!(claim(&fclosed, &set_expr), RefinementVerdict::KernelRejected(_)),
+            "the Or->And head swap must reject the true claim"
+        );
+    }
+
+    /// Trust: W19 FIELD-POST — the field-setter fixtures, HAND-BUILT with the
+    /// `adt_kind: Some(Struct)` STAMP set explicitly: `Ty::adt` deliberately leaves it
+    /// `None` (synthetic constructions fail closed), so stamping here is the test's
+    /// statement that these simulate EXTRACTOR output — the walk's input contract.
+    /// The committed w19-setter fixtures predate the stamp and correctly decline
+    /// until regenerated (the stage2 rebuild in flight); these pins are the
+    /// capability record meanwhile, the M3 pattern.
+    fn field_setter_fixture(shape: &str, variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            AdtKind, AssertMessage, BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place,
+            Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge,
+            VerifiableBody,
+        };
+        let i64t = || Ty::Int { width: 64, signed: true };
+        let kind = match variant {
+            "unstamped" => None,
+            "union_stamp" => Some(AdtKind::Union),
+            _ => Some(AdtKind::Struct),
+        };
+        let s_adt = Ty::Adt {
+            name: "SYNTH::S".into(),
+            fields: vec![("x".into(), i64t()), ("y".into(), i64t())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: kind,
+        };
+        let refmut = Ty::Ref { mutable: true, inner: Box::new(s_adt) };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let bare = |l: usize| Place { local: l, projections: vec![] };
+        let fld = |l: usize, k: usize| Place {
+            local: l,
+            projections: vec![Projection::Deref, Projection::Field(k)],
+        };
+        let mut locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl { index: 1, ty: refmut, name: Some("self".into()) },
+            LocalDecl { index: 2, ty: i64t(), name: Some("v".into()) },
+        ];
+        let blocks = match shape {
+            "set_x" => {
+                let src = if variant == "sibling_read" {
+                    Operand::Copy(fld(1, 1)) // reads field 1 while writing field 0 — FS4.
+                } else {
+                    Operand::Copy(bare(2))
+                };
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign(fld(1, 0), Rvalue::Use(src))],
+                    terminator: Terminator::Return,
+                }]
+            }
+            "set_both" => {
+                locals.push(LocalDecl { index: 3, ty: i64t(), name: Some("b".into()) });
+                let mut stmts = vec![
+                    assign(fld(1, 0), Rvalue::Use(Operand::Copy(bare(2)))),
+                    assign(fld(1, 1), Rvalue::Use(Operand::Copy(bare(3)))),
+                ];
+                if variant == "double_write" {
+                    stmts.push(assign(fld(1, 0), Rvalue::Use(Operand::Copy(bare(3)))));
+                }
+                vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }]
+            }
+            "bump" => {
+                locals.push(LocalDecl {
+                    index: 3,
+                    ty: Ty::Tuple(vec![i64t(), Ty::Bool]),
+                    name: None,
+                });
+                let op =
+                    if variant == "unchecked_add" { None } else { Some(BinOp::Add) };
+                match op {
+                    None => vec![BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            fld(1, 0),
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(fld(1, 0)),
+                                Operand::Constant(trust_types::ConstValue::Int(1)),
+                            ),
+                        )],
+                        terminator: Terminator::Return,
+                    }],
+                    Some(op) => {
+                        // `spine_no_assert` — THE ORDER-GATE PROBE (the M3 twin): the
+                        // identical spine with the overflow assert replaced by a bare
+                        // Goto must decline at the store (`asserted` never set) — an
+                        // assert-less add modeled as `Int.add` is the WRAP-vs-INT
+                        // false claim.
+                        let b0_term = if variant == "spine_no_assert" {
+                            Terminator::Goto(BlockId(1))
+                        } else {
+                            Terminator::Assert {
+                                cond: Operand::Move(Place {
+                                    local: 3,
+                                    projections: vec![Projection::Field(1)],
+                                }),
+                                expected: false,
+                                msg: AssertMessage::Overflow(BinOp::Add),
+                                target: BlockId(1),
+                                unwind: UnwindEdge::Unreachable,
+                                span: SourceSpan::default(),
+                            }
+                        };
+                        vec![
+                            BasicBlock {
+                                id: BlockId(0),
+                                stmts: vec![assign(
+                                    bare(3),
+                                    Rvalue::CheckedBinaryOp(
+                                        op,
+                                        Operand::Copy(fld(1, 0)),
+                                        Operand::Constant(trust_types::ConstValue::Int(1)),
+                                    ),
+                                )],
+                                terminator: b0_term,
+                            },
+                            BasicBlock {
+                                id: BlockId(1),
+                                stmts: vec![assign(
+                                    fld(1, 0),
+                                    Rvalue::Use(Operand::Move(Place {
+                                        local: 3,
+                                        projections: vec![Projection::Field(0)],
+                                    })),
+                                )],
+                                terminator: Terminator::Return,
+                            },
+                        ]
+                    }
+                }
+            }
+            other => panic!("unknown shape {other}"),
+        };
+        // NOT `locals.len() - 1`: bump's tuple temp `_3` is a LOCAL — counting it as
+        // a parameter would trip the walk's `param_index(temp)` gate and decline the
+        // positive shape.
+        let arg_count = match shape {
+            "set_both" => 3,
+            _ => 2,
+        };
+        VerifiableFunction {
+            name: shape.into(),
+            def_path: format!("SYNTH::S::{shape}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the three W19 field-setter shapes mint per-field certificates and
+    /// each certifies modulo 3; `set_both` gets TWO, in field order, with DISTINCT
+    /// fresh post slots (the W6 cross-inlining hazard applies across the per-field
+    /// models exactly as across arms). The numeric rows ride the reducible heads:
+    /// `set_x` closed at v=9 proves 9 and rejects 7; `bump` closed at pre=7 proves 8
+    /// and rejects 7 — the checked field-RMW is value-decided at the kernel tier,
+    /// the strongest certificate in the family, exactly as in M3.
+    #[test]
+    fn trust_ir_field_setters_mint_and_certify() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, RefinementVerdict, branch_model_refinement_proof,
+            branch_model_refinement_statement, check_cell_post_branch_model,
+            check_refinement_decl, int_lit,
+        };
+        // set_x: one certificate, field 0, Use(Var(v-slot)).
+        let f = field_setter_fixture("set_x", "ok");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("set_x must mint");
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].0, 0);
+        assert!(matches!(
+            certs[0].1.blocks[0].stmts[0].rvalue,
+            IrRvalue::Use(IrOperand::Var(1))
+        ));
+        assert_eq!(
+            check_cell_post_branch_model(&certs[0].1),
+            RefinementVerdict::ProvenModulo3
+        );
+        // set_both: two certificates, fields 0 and 1, DISTINCT post slots.
+        let f = field_setter_fixture("set_both", "ok");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("set_both must mint");
+        assert_eq!(certs.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![0, 1]);
+        let slots: Vec<u64> = certs
+            .iter()
+            .map(|(_, c)| match c.blocks[0].term {
+                crate::trustir_anchor::IrTerm::Return(IrOperand::Var(s)) => s,
+                _ => panic!("per-field model must return its post slot"),
+            })
+            .collect();
+        assert_ne!(slots[0], slots[1], "per-field post slots must be DISTINCT");
+        for (_, c) in &certs {
+            assert_eq!(check_cell_post_branch_model(c), RefinementVerdict::ProvenModulo3);
+        }
+        // bump: one certificate, Bin(Add, Var(recv-slot), Const 1) — and the numeric rows.
+        let f = field_setter_fixture("bump", "ok");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("bump must mint");
+        assert_eq!(certs.len(), 1);
+        let mut closed = certs[0].1.clone();
+        for st in &mut closed.blocks[0].stmts {
+            if let IrRvalue::Bin(_, a, _) = &mut st.rvalue {
+                if *a == IrOperand::Var(0) {
+                    *a = IrOperand::Const(7);
+                }
+            }
+        }
+        let claim = |cfg: &crate::trustir_anchor::IrCfg, val: i128| {
+            check_refinement_decl(
+                "Trust.TrustIr.Refinement.field_post_value_row",
+                branch_model_refinement_statement(cfg, Some(&int_lit(val))),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        assert_eq!(claim(&closed, 8), RefinementVerdict::ProvenModulo3, "7+1 proves 8");
+        assert!(matches!(claim(&closed, 7), RefinementVerdict::KernelRejected(_)));
+        // And the full verdict path takes all three.
+        for shape in ["set_x", "set_both", "bump"] {
+            assert!(
+                mutator_cell_post_fully_faithful_via_trustir(
+                    &field_setter_fixture(shape, "ok"),
+                    &Default::default()
+                ),
+                "{shape} must certify on the mutator disjunct"
+            );
+        }
+    }
+
+    /// FAIL-CLOSED — the FS gates, one mutation each. `unstamped` is the load-bearing
+    /// one: `Ty::adt`'s deliberate `None` must decline (the legacy encoding cannot
+    /// exclude a union, and a union field write aliases every sibling — the
+    /// G-STRUCT-KIND inheritance); `union_stamp` declines for the stated reason
+    /// directly; `sibling_read` breaks FS4 (the recv slot denotes the certificate's
+    /// OWN field's pre-value, so a sibling read has no denotation); `double_write`
+    /// breaks the at-most-once rule; `unchecked_add` is WRAP-vs-INT;
+    /// `spine_no_assert` is the ORDER-GATE probe (the checked spine with its
+    /// overflow assert replaced by a Goto — an assert-less add modeled as `Int.add`
+    /// would be the same false claim by another door).
+    #[test]
+    fn trust_ir_field_setter_gates_fail_closed() {
+        for (shape, variant) in [
+            ("set_x", "unstamped"),
+            ("set_x", "union_stamp"),
+            ("set_x", "sibling_read"),
+            ("set_both", "double_write"),
+            ("bump", "unchecked_add"),
+            ("bump", "spine_no_assert"),
+        ] {
+            let f = field_setter_fixture(shape, variant);
+            assert!(
+                field_post_mutator_ir_cfgs(&f).is_none(),
+                "{shape}/{variant} must decline"
+            );
+            assert!(!mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()));
+        }
+    }
+
+    /// THE REAL FIXTURES — the REGENERATED (2026-08-13, stamped) w19-setter dumps
+    /// mint and certify end to end: `set_x` one certificate, `set_both` two, `bump`
+    /// one, and the full mutator disjunct takes all three. This is inc-1/inc-1.5's
+    /// original target population, FULLY-FAITHFUL at last — the arc W19 opened on
+    /// 2026-07-24 as an inert surface, closed live on the trust-ir route.
+    #[test]
+    fn trust_ir_w19_setter_fixtures_certify() {
+        let dir = format!(
+            "{}/fixtures/w19-setter-2026-07-24/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut seen = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).expect("fixture dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("dump");
+            let f: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse");
+            let name = f.def_path.rsplit("::").next().unwrap_or("?").to_string();
+            let certs = field_post_mutator_ir_cfgs(&f)
+                .unwrap_or_else(|| panic!("{name}: the REGENERATED dump must mint"));
+            assert!(
+                mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()),
+                "{name}: the full mutator disjunct must certify"
+            );
+            seen.insert(name, certs.len());
+        }
+        assert_eq!(
+            seen,
+            [("bump".to_string(), 1), ("set_both".to_string(), 2), ("set_x".to_string(), 1)]
+                .into_iter()
+                .collect(),
+            "all three shapes, with set_both carrying TWO per-field certificates"
+        );
+    }
+
+    /// Trust: PAIR RETURN (2026-08-16) — the hand-built mirror of the two real
+    /// bodies, with mutation variants.
+    fn overflowing_fixture(width: u32, signed: bool, variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody,
+        };
+        let int = || Ty::Int { width, signed };
+        let ret_ty = if variant == "scalar_return" {
+            int()
+        } else {
+            Ty::Tuple(vec![int(), Ty::Bool])
+        };
+        let op = if variant == "op_sub" { BinOp::Sub } else { BinOp::Add };
+        let (a_l, b_l) = if variant == "transposed" { (2, 1) } else { (1, 2) };
+        let mut stmts = vec![Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::CheckedBinaryOp(
+                op,
+                Operand::Copy(Place::local(a_l)),
+                Operand::Copy(Place::local(b_l)),
+            ),
+            span: SourceSpan::default(),
+        }];
+        if variant == "extra_stmt" {
+            stmts.push(Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                span: SourceSpan::default(),
+            });
+        }
+        VerifiableFunction {
+            name: "overflowing_add".into(),
+            def_path: "SYNTH::overflowing_add".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: ret_ty.clone(), name: None },
+                    LocalDecl { index: 1, ty: int(), name: Some("self".into()) },
+                    LocalDecl { index: 2, ty: int(), name: Some("rhs".into()) },
+                    LocalDecl { index: 3, ty: int(), name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts,
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 2,
+                return_ty: ret_ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the two REAL retracted dumps mint per-component models, both
+    /// certify, and the numeric rows decide at the EXACT counterexample the
+    /// retracted certificate got wrong: u8 `200+100` proves `(44, 1)` and rejects
+    /// `(45, 0)`; i32 `MAX+1` proves `(MIN, 1)`; a non-overflowing row proves
+    /// `(12, 0)`.
+    #[test]
+    fn trust_ir_overflowing_pair_mints_and_certifies() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, RefinementVerdict, branch_model_refinement_proof,
+            branch_model_refinement_statement, check_pair_component0_wrap_model,
+            check_pair_component0_wrap_row, check_pair_component1_overflow_model,
+            check_refinement_decl, int_lit,
+        };
+        // ROW CLOSURE, per-head (the M2/M3 substitution style): the kernel's
+        // native reducers demand LITERAL args (they do not normalize `Int.add`
+        // UNDER an irreducible cast/decide application — the dispatch pin's own
+        // inputs are pre-reduced), so the rows substitute the PRE-COMPUTED sum
+        // literal directly into the cast/cmp positions. The Int.add head has its
+        // own reduction pins elsewhere (the M3 checked rows); the WIRING of sum
+        // into cast/cmp is the symbolic model check's burden, discharged above.
+        let close_body = |body: &crate::trustir_anchor::IrBody, sum: i128| {
+            let mut c = body.clone();
+            c.stmts = c
+                .stmts
+                .iter()
+                .filter(|st| st.idx != 2)
+                .cloned()
+                .map(|mut st| {
+                    if let IrRvalue::Use(op) = &mut st.rvalue {
+                        if let IrOperand::CastU(inner, _) | IrOperand::CastS(inner, _) = op {
+                            // Conditional on Var(2) DELIBERATELY (audit (d)): a
+                            // mis-wired cast argument must stay an open binder
+                            // and KernelReject the row, never be papered over.
+                            if **inner == IrOperand::Var(2) {
+                                **inner = IrOperand::Const(sum);
+                            }
+                        }
+                    }
+                    st
+                })
+                .collect();
+            c
+        };
+        let close = |cfg: &crate::trustir_anchor::IrCfg, sum: i128| {
+            let mut c = cfg.clone();
+            for blk in &mut c.blocks {
+                blk.stmts.retain(|st| st.idx != 2);
+                for st in &mut blk.stmts {
+                    if let IrRvalue::Cmp(_, x, _) = &mut st.rvalue {
+                        if *x == IrOperand::Var(2) {
+                            *x = IrOperand::Const(sum);
+                        }
+                    }
+                }
+                if let crate::trustir_anchor::IrTerm::Switch(cond, _, _) = &mut blk.term {
+                    if cond.a == IrOperand::Var(2) {
+                        cond.a = IrOperand::Const(sum);
+                    }
+                }
+            }
+            c
+        };
+        let row = |name: &str, cfg: &crate::trustir_anchor::IrCfg, val: i128| {
+            check_refinement_decl(
+                name,
+                branch_model_refinement_statement(cfg, Some(&int_lit(val))),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        let dir = format!(
+            "{}/fixtures/mass-harvest-2026-07-17/arith-guarded/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut hit = 0;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("e").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let f: VerifiableFunction =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            if !f.def_path.ends_with("::overflowing_add") {
+                continue;
+            }
+            hit += 1;
+            let (c0, c1) = overflowing_pair_ir_cfgs(&f)
+                .unwrap_or_else(|| panic!("{}: must mint", f.def_path));
+            // STRUCTURAL pins (audit (d)/(b)): the minted models against
+            // hand-written expectations — the independent oracle the
+            // self-relating kernel checks cannot be. The cast argument MUST be
+            // Var(2) (the sum), the Bin MUST read Var(0)/Var(1).
+            assert_eq!(c0.ret, 3);
+            assert!(matches!(
+                &c0.stmts[..],
+                [
+                    crate::trustir_anchor::IrStmt {
+                        idx: 2,
+                        rvalue: IrRvalue::Bin(
+                            crate::trustir_anchor::TrustIrBinOp::Add,
+                            IrOperand::Var(0),
+                            IrOperand::Var(1)
+                        )
+                    },
+                    crate::trustir_anchor::IrStmt { idx: 3, rvalue: IrRvalue::Use(cast_op) }
+                ] if matches!(cast_op,
+                    IrOperand::CastU(inner, _) | IrOperand::CastS(inner, _)
+                        if **inner == IrOperand::Var(2))
+            ));
+            assert_eq!(
+                check_pair_component0_wrap_model(&c0),
+                RefinementVerdict::ProvenModulo3
+            );
+            assert_eq!(
+                check_pair_component1_overflow_model(&c1),
+                RefinementVerdict::ProvenModulo3
+            );
+            assert!(
+                mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default())
+                    || overflowing_pair_fully_faithful_via_trustir(&f),
+                "{}: the pair disjunct must certify",
+                f.def_path
+            );
+            let signed = f.def_path.contains("i32");
+            if signed {
+                // i32 MAX + 1 = 2^31 wraps to MIN, flag 1.
+                assert_eq!(
+                    check_pair_component0_wrap_row(&close_body(&c0, 2147483648), &int_lit(-2147483648)),
+                    RefinementVerdict::ProvenModulo3
+                );
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_i32_flag", &close(&c1, 2147483648), 1),
+                    RefinementVerdict::ProvenModulo3
+                );
+                assert!(matches!(
+                    row("Trust.TrustIr.Refinement.pair_row_i32_flag0", &close(&c1, 2147483648), 0),
+                    RefinementVerdict::KernelRejected(_)
+                ));
+                // The THEN-ARM (audit (b)): MIN+MIN's sum enters `Lt(t, MIN)` —
+                // kills then-arm and switch-polarity mutations.
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_i32_underflow", &close(&c1, -4294967296), 1),
+                    RefinementVerdict::ProvenModulo3
+                );
+                assert_eq!(
+                    check_pair_component0_wrap_row(&close_body(&c0, -4294967296), &int_lit(0)),
+                    RefinementVerdict::ProvenModulo3,
+                    "i32 MIN+MIN wraps to 0"
+                );
+                // In-range: flag 0 through the signed else-arm.
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_i32_inrange", &close(&c1, 5), 0),
+                    RefinementVerdict::ProvenModulo3
+                );
+            } else {
+                // THE counterexample: u8 200+100 = (44, 1) — the retracted
+                // certificate said 300.
+                assert_eq!(
+                    check_pair_component0_wrap_row(&close_body(&c0, 300), &int_lit(44)),
+                    RefinementVerdict::ProvenModulo3,
+                    "u8 200+100 wraps to 44 — the value the retracted certificate got wrong"
+                );
+                assert!(matches!(
+                    check_pair_component0_wrap_row(&close_body(&c0, 300), &int_lit(45)),
+                    RefinementVerdict::KernelRejected(_)
+                ));
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_u8_flag", &close(&c1, 300), 1),
+                    RefinementVerdict::ProvenModulo3
+                );
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_u8_noflow", &close(&c1, 12), 0),
+                    RefinementVerdict::ProvenModulo3
+                );
+                // The MAX boundary, both sides (audit (b)): sum=256 flags, sum=255
+                // does not — kills the MAX→2^W mutation AND Gt→Ge.
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_u8_boundary1", &close(&c1, 256), 1),
+                    RefinementVerdict::ProvenModulo3
+                );
+                assert_eq!(
+                    row("Trust.TrustIr.Refinement.pair_row_u8_boundary0", &close(&c1, 255), 0),
+                    RefinementVerdict::ProvenModulo3
+                );
+                assert_eq!(
+                    check_pair_component0_wrap_row(&close_body(&c0, 12), &int_lit(12)),
+                    RefinementVerdict::ProvenModulo3
+                );
+            }
+        }
+        assert_eq!(hit, 2, "both retracted dumps must be present");
+        // The retraction pins remain true on the OLD lanes — this family is a NEW
+        // lane, not a loosening (see mirsem/tests.rs's whole-pair decline pin).
+    }
+
+    /// FAIL-CLOSED — one mutation per gate.
+    #[test]
+    fn trust_ir_overflowing_pair_gates_fail_closed() {
+        for (w, s, variant) in [
+            (8u32, false, "op_sub"),        // Add only — Sub joins with its own pins.
+            (8, false, "transposed"),       // operand order pinned to declaration order.
+            (8, false, "scalar_return"),    // the pair TYPE is the shape.
+            (8, false, "extra_stmt"),       // sole-statement body only.
+            (128, false, "ok"),             // width outside the cast lane's admission.
+        ] {
+            let f = overflowing_fixture(w, s, variant);
+            assert!(
+                overflowing_pair_ir_cfgs(&f).is_none(),
+                "{w}/{s}/{variant} must decline"
+            );
+            assert!(!overflowing_pair_fully_faithful_via_trustir(&f));
+        }
+        // And the positive control for the synthetic builder itself.
+        assert!(overflowing_pair_ir_cfgs(&overflowing_fixture(8, false, "ok")).is_some());
+        assert!(overflowing_pair_ir_cfgs(&overflowing_fixture(32, true, "ok")).is_some());
+    }
+
+    /// Trust: ESTABLISHMENT PIN (2026-08-18) — clause (d)'s NON-VACUOUS paths,
+    /// previously exercised only through requires-free callees (`Some([])`, the
+    /// vacuous early-return). Three directions on the REAL u8 wrapper + callee:
+    ///   * `requires: None` (precondition not fully known) — fail-closed decline;
+    ///   * an UN-ESTABLISHABLE conjunct (`self ≥ 5` over a full-range u8 actual —
+    ///     the violation `self < 5` is satisfiable, hence not refutable) — decline;
+    ///   * an ESTABLISHABLE conjunct (`self ≥ 0`, whose violation refutes under
+    ///     the u8 type bounds) — the disjunct must still CERTIFY: the positive
+    ///     proves the establishment machinery actually RUNS on this lane rather
+    ///     than every green resting on the empty-conjuncts early return.
+    #[test]
+    fn trust_ir_call_then_project_requires_establishment() {
+        use trust_types::{Formula, Sort};
+        let dir = format!(
+            "{}/fixtures/mass-harvest-2026-07-17/arith-guarded/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut callee = None;
+        let mut wrapper = None;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("e").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let f: VerifiableFunction =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            if f.def_path == "core::num::<impl u8>::overflowing_add" {
+                callee = Some(f);
+            } else if f.def_path == "w_u8_overflowing_add_0" {
+                wrapper = Some(f);
+            }
+        }
+        let (callee, wrapper) = (callee.expect("callee dump"), wrapper.expect("wrapper dump"));
+        let base_fact = crate::mirsem::CalleeFact::of_certified(&callee);
+        assert_eq!(
+            base_fact.requires.as_deref(),
+            Some(&[][..]),
+            "load-bearing premise: the real callee is requires-free (the vacuous path)"
+        );
+        let with_requires = |req: Option<Vec<Formula>>| {
+            let mut fact = base_fact.clone();
+            fact.requires = req;
+            let mut reg = std::collections::BTreeMap::new();
+            reg.insert(callee.def_path.clone(), fact);
+            reg
+        };
+        // Control: the unmodified fact certifies (the twin's own positive).
+        assert!(call_then_project_fully_faithful_via_trustir(
+            &wrapper,
+            &with_requires(Some(vec![])),
+        ));
+        // (1) requires unknown — fail closed.
+        assert!(
+            !call_then_project_fully_faithful_via_trustir(&wrapper, &with_requires(None)),
+            "requires: None must decline (precondition not fully known)"
+        );
+        // (2) un-establishable: `self >= 5` over a full-range u8 actual.
+        let self_ge = |k: i128| {
+            Formula::Ge(
+                Box::new(Formula::Var("self".into(), Sort::Int)),
+                Box::new(Formula::Int(k)),
+            )
+        };
+        assert!(
+            !call_then_project_fully_faithful_via_trustir(
+                &wrapper,
+                &with_requires(Some(vec![self_ge(5)])),
+            ),
+            "an unestablishable requires conjunct must decline"
+        );
+        // (3) establishable: `self >= 0` refutes its violation under u8 bounds —
+        // the NON-VACUOUS positive.
+        assert!(
+            call_then_project_fully_faithful_via_trustir(
+                &wrapper,
+                &with_requires(Some(vec![self_ge(0)])),
+            ),
+            "an established requires conjunct must still CERTIFY — the machinery runs"
+        );
+    }
+
+    /// Trust: FAMILY-WIDE G8 (2026-08-17) — the chokepoint pins. A LIVE cleanup
+    /// path (Cleanup target reaching Return) must decline BOTH counted
+    /// compositions; a TERMINAL landing pad (Resume) must decline NEITHER — the
+    /// refined gate's whole point is that the panic path may diverge freely.
+    #[test]
+    fn family_wide_g8_chokepoints() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, UnwindEdge, VerifiableBody,
+        };
+        let int = || Ty::Int { width: 32, signed: false };
+        // A minimal call body: bb0 Call -> bb1 (_0 := _3; Return); cleanup edge
+        // varies. bb2 is the landing pad.
+        let build = |pad_term: Terminator, unwind_to: usize| VerifiableFunction {
+            name: "g8".into(),
+            def_path: "SYNTH::g8".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: int(), name: None },
+                    LocalDecl { index: 1, ty: int(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: int(), name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: "SYNTH::callee".into(),
+                            args: vec![Operand::Copy(Place::local(1))],
+                            dest: Place::local(2),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            unwind: UnwindEdge::Cleanup(BlockId(unwind_to)),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Return,
+                    },
+                    BasicBlock { id: BlockId(2), stmts: vec![], terminator: pad_term },
+                ],
+                arg_count: 1,
+                return_ty: int(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        };
+        // HOT: the cleanup edge points at the RETURN block itself.
+        let hot = build(Terminator::Resume, 1);
+        assert!(body_has_live_cleanup_path(&hot.body), "cleanup->return is LIVE");
+        assert!(
+            crate::mirsem::function_fully_faithful_witness_with_callees(
+                &hot,
+                &Default::default()
+            )
+            .is_none(),
+            "the MirSem chokepoint must decline a live cleanup path"
+        );
+        // (The via-ir chokepoint declines too — exercised via the public chain
+        // entry; the empty registry already declines the call shape, so pin the
+        // gate DIRECTLY where it runs: the predicate + the witness above, and
+        // the terminal ADMIT direction below is the load-bearing pair.)
+        // TERMINAL: the cleanup edge points at a Resume pad — NOT live.
+        let terminal = build(Terminator::Resume, 2);
+        assert!(
+            !body_has_live_cleanup_path(&terminal.body),
+            "a Resume landing pad is terminal — the gate must stay FREE"
+        );
+        // CHAINED: pad Goto's into the return block — live through the chain.
+        let chained = build(Terminator::Goto(BlockId(1)), 2);
+        assert!(
+            body_has_live_cleanup_path(&chained.body),
+            "cleanup->pad->Goto->return is LIVE through the chain"
+        );
+    }
+
+    /// Trust: CALL-THEN-PROJECT twin (2026-08-17) — POSITIVE on both REAL wrapper
+    /// dumps (`w_u8/w_i32_overflowing_add_0`) against a registry built from the
+    /// REAL pair-certified callee dumps, plus the fail-closed hook: a WRONG field
+    /// key builds a different `idxElem` application and must NOT prove.
+    #[test]
+    fn trust_ir_call_then_project_wrappers_certify() {
+        use crate::trustir_anchor::RefinementVerdict;
+        let dir = format!(
+            "{}/fixtures/mass-harvest-2026-07-17/arith-guarded/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        // The registry: the two overflowing_add callees, as production would
+        // carry them after the pair family certifies (callees-first order).
+        let mut reg = std::collections::BTreeMap::new();
+        let mut wrappers = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("e").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let f: VerifiableFunction =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            if f.def_path.ends_with("::overflowing_add") {
+                assert!(
+                    overflowing_pair_fully_faithful_via_trustir(&f),
+                    "{}: the callee must certify (the pair family)",
+                    f.def_path
+                );
+                reg.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(&f));
+            } else if f.def_path.starts_with("w_") && f.def_path.contains("overflowing_add") {
+                wrappers.push(f);
+            }
+        }
+        assert_eq!(reg.len(), 2, "both pair callees registered");
+        assert_eq!(wrappers.len(), 2, "both wrapper dumps present");
+        for w in &wrappers {
+            let proj = crate::mirsem::sem_call_then_project_of_mir(w, &reg)
+                .unwrap_or_else(|| panic!("{}: the wrapper must recognize", w.def_path));
+            assert_eq!(proj.field, 0, "{}: field 0 is the projected component", w.def_path);
+            assert!(
+                call_then_project_fully_faithful_via_trustir(w, &reg),
+                "{}: the trust-ir twin must certify — the teardown-reopening closure",
+                w.def_path
+            );
+            // The fail-closed hook (the MirSem dishonest-conclusion pin,
+            // twinned): a DISHONEST claimed conclusion — an arbitrary false
+            // predicate unrelated to the real field projection — must be
+            // KernelRejected: the transport certifies the EXACT
+            // `idxElem(call_result, field)` value, never a mismatched one.
+            let ir_arg = sem_call_arg_to_ir_pinned(&proj.call.args[0], &w.body)
+                .expect("modeled arg");
+            let bd =
+                || clean_kernel::BinderData::from(clean_kernel::BinderInfo::Default);
+            let wrong_pred = clean_kernel::Expr::lam(
+                bd(),
+                crate::trustir_anchor::int_ty(),
+                clean_kernel::Expr::app(
+                    clean_kernel::Expr::const_(
+                        clean_kernel::Name::from_string("False"),
+                        vec![],
+                    ),
+                    clean_kernel::Expr::bvar(0),
+                ),
+            );
+            let verdict = crate::trustir_call::check_call_then_project_instance_inner(
+                proj.call.callee_id,
+                &ir_arg,
+                proj.field,
+                Some(&wrong_pred),
+            );
+            assert!(
+                matches!(verdict, RefinementVerdict::KernelRejected(_)),
+                "{}: a dishonest claimed conclusion MUST be kernel-rejected, got {verdict:?}",
+                w.def_path
+            );
+        }
+    }
+
+    /// Trust: W19 ADT-CELL audit — test registries for the call-admitting mutator
+    /// branches' UB-free clause. `synth_registry` builds requires-free facts for
+    /// named synthetic callees (a fact exists ⟺ production certified the callee
+    /// fully faithful; the tests SIMULATE that state to exercise the certify
+    /// direction). `dump_registry` builds facts from real committed dumps — the
+    /// state production WOULD have if those callees certified.
+    fn synth_registry(
+        names: &[&str],
+    ) -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+        names
+            .iter()
+            .map(|n| {
+                let f = VerifiableFunction {
+                    name: (*n).into(),
+                    def_path: (*n).into(),
+                    span: trust_types::SourceSpan::default(),
+                    body: trust_types::VerifiableBody {
+                        locals: vec![trust_types::LocalDecl {
+                            index: 0,
+                            ty: trust_types::Ty::Unit,
+                            name: None,
+                        }],
+                        blocks: vec![],
+                        arg_count: 0,
+                        return_ty: trust_types::Ty::Unit,
+                        datatype_defs: Default::default(),
+                    },
+                    contracts: vec![],
+                    preconditions: vec![],
+                    postconditions: vec![],
+                    spec: trust_types::FunctionSpec::default(),
+                };
+                ((*n).to_string(), crate::mirsem::CalleeFact::of_certified(&f))
+            })
+            .collect()
+    }
+
+    fn dump_registry(
+        dir: &str,
+        names: &[&str],
+    ) -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+        names
+            .iter()
+            .map(|n| {
+                let raw = std::fs::read(format!("{dir}/{n}")).expect("committed callee dump");
+                let f: VerifiableFunction = serde_json::from_slice(&raw).expect("parse");
+                (f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(&f))
+            })
+            .collect()
+    }
+
+    /// Trust: W19 CALL-RMW — the hand-built mirror of the ONE committed body
+    /// (`u8 &= NonMaxU8`): hoisted pre-read, shared borrow of the by-value Adt
+    /// param, the call, the bitwise write of pre & call-result. The rhs Adt is
+    /// deliberately UNSTAMPED (`adt_kind: None`): only CELL gates require the
+    /// stamp, and this family's cell is the primitive int itself.
+    fn call_rmw_fixture(variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Projection, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
+        };
+        let u8t = || Ty::Int { width: 8, signed: false };
+        let rhs_adt = || Ty::Adt {
+            name: "SYNTH::Rhs".into(),
+            fields: vec![("0".into(), u8t())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let bare = |l: usize| Place { local: l, projections: vec![] };
+        let deref = |l: usize| Place { local: l, projections: vec![Projection::Deref] };
+        let rhs_ty = match variant {
+            // C1's pointer-free rule: a raw pointer BY VALUE, and a pointer
+            // smuggled inside an Adt field, must both decline.
+            "raw_ptr_param" => Ty::RawPtr { mutable: false, pointee: Box::new(u8t()) },
+            "ptr_in_adt_param" => Ty::Adt {
+                name: "SYNTH::PtrRhs".into(),
+                fields: vec![(
+                    "p".into(),
+                    Ty::RawPtr { mutable: true, pointee: Box::new(u8t()) },
+                )],
+                variants: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                layout: None,
+                enum_layout: None,
+                adt_kind: None,
+            },
+            _ => rhs_adt(),
+        };
+        let locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Ref { mutable: true, inner: Box::new(u8t()) },
+                name: Some("self".into()),
+            },
+            LocalDecl { index: 2, ty: rhs_ty.clone(), name: Some("rhs".into()) },
+            LocalDecl { index: 3, ty: u8t(), name: None },
+            LocalDecl { index: 4, ty: u8t(), name: None },
+            LocalDecl {
+                index: 5,
+                ty: Ty::Ref { mutable: false, inner: Box::new(rhs_ty) },
+                name: None,
+            },
+            LocalDecl { index: 6, ty: u8t(), name: None },
+        ];
+        let mut b0 = Vec::new();
+        if variant == "ok_markers" {
+            b0.push(Statement::StorageLive(3)); // legal bracketing: Live before def.
+        }
+        b0.push(assign(bare(3), Rvalue::Use(Operand::Copy(deref(1)))));
+        if variant == "dead_t_marker" {
+            b0.push(Statement::StorageDead(3)); // kills the carrier before its use.
+        }
+        if variant == "ok_markers" {
+            b0.push(Statement::StorageLive(5));
+        }
+        b0.push(assign(
+            bare(5),
+            Rvalue::Ref {
+                mutable: false,
+                place: bare(match variant {
+                    "borrow_of_recv" => 1,
+                    "borrow_of_pre_temp" => 3,
+                    _ => 2,
+                }),
+            },
+        ));
+        if variant == "double_pre_read" {
+            b0.push(assign(bare(4), Rvalue::Use(Operand::Copy(deref(1)))));
+        }
+        let mut args = vec![Operand::Move(bare(5))];
+        match variant {
+            "arg_passes_recv" => args.push(Operand::Copy(bare(1))),
+            "pre_temp_to_call" => args.push(Operand::Copy(bare(3))),
+            _ => {}
+        }
+        let dest = match variant {
+            "dest_is_param" => bare(2),
+            "dest_projected" => Place { local: 4, projections: vec![Projection::Deref] },
+            _ => bare(4),
+        };
+        let wop = match variant {
+            "write_op_add" => BinOp::Add,
+            "ok_or" => BinOp::BitOr,
+            "ok_xor" => BinOp::BitXor,
+            _ => BinOp::BitAnd,
+        };
+        let mut w = Vec::new();
+        match variant {
+            "dead_r_in_write" => w.push(Statement::StorageDead(4)),
+            "resurrect_t" => w.push(Statement::StorageLive(3)),
+            _ => {}
+        }
+        let (wa, wb) = if variant == "ok_swapped" { (4, 3) } else { (3, 4) };
+        w.push(assign(
+            deref(1),
+            Rvalue::BinaryOp(
+                wop,
+                Operand::Move(bare(wa)),
+                Operand::Move(bare(if variant == "dest_is_param" { 2 } else { wb })),
+            ),
+        ));
+        if variant == "ok_markers" {
+            w.push(Statement::StorageDead(3)); // legal: Dead AFTER the write.
+            w.push(Statement::StorageDead(4));
+            w.push(Statement::StorageDead(5));
+        }
+        let mut blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: b0,
+                terminator: Terminator::Call {
+                    func: "SYNTH::get".into(),
+                    args,
+                    dest,
+                    target: if variant == "target_none" { None } else { Some(BlockId(1)) },
+                    span: SourceSpan::default(),
+                    atomic: None,
+                    is_foreign: variant == "foreign",
+                    is_unsafe_sig: variant == "unsafe_sig",
+                    unwind: if variant == "cleanup_unwind" {
+                        UnwindEdge::Cleanup(BlockId(1))
+                    } else {
+                        UnwindEdge::Continue
+                    },
+                },
+            },
+            BasicBlock { id: BlockId(1), stmts: w, terminator: Terminator::Return },
+        ];
+        match variant {
+            "dup_block_id" => blocks.push(BasicBlock {
+                id: BlockId(1),
+                stmts: vec![],
+                terminator: Terminator::Goto(BlockId(1)),
+            }),
+            "stray_r_write" => blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(
+                    bare(4),
+                    Rvalue::Use(Operand::Constant(trust_types::ConstValue::Int(7))),
+                )],
+                terminator: Terminator::Unreachable,
+            }),
+            "double_t_read_dead" => blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(bare(6), Rvalue::Use(Operand::Copy(bare(3))))],
+                terminator: Terminator::Unreachable,
+            }),
+            "rejoining_side_path" => blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![],
+                terminator: Terminator::Goto(BlockId(1)),
+            }),
+            "addr_of_recv_dead" => blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(bare(6), Rvalue::AddressOf(false, bare(1)))],
+                terminator: Terminator::Unreachable,
+            }),
+            _ => {}
+        }
+        VerifiableFunction {
+            name: "bitand_assign".into(),
+            def_path: "SYNTH::bitand_assign".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the hand-built shape and THE REAL COMMITTED DUMP both mint and
+    /// certify through the full disjunct. The model is pinned structurally:
+    /// `Bin(And, Var(recv), Var(call))` with the call slot at `locals.len()` —
+    /// NEVER SSA-assigned, so `param_indices()` collects it and the kernel
+    /// statement Pi-binds it: ∀ pre ∀ r, post = And(pre, r). The two whole-Adt-cell
+    /// `bitand_assign` siblings must DECLINE — the scalar-cell gate is the honest
+    /// boundary, not a gap (an opaque-Adt-valued cell claim is a different design).
+    #[test]
+    fn trust_ir_call_rmw_mints_and_certifies() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, IrTerm, RefinementVerdict, TrustIrBinOp,
+            check_cell_post_branch_model,
+        };
+        let f = call_rmw_fixture("ok");
+        let cfg = call_rmw_mutator_ir_cfg(&f).expect("the hand-built shape must mint");
+        assert_eq!(cfg.blocks.len(), 1);
+        assert!(matches!(
+            cfg.blocks[0].stmts[0].rvalue,
+            IrRvalue::Bin(TrustIrBinOp::And, IrOperand::Var(0), IrOperand::Var(7))
+        ));
+        assert!(matches!(cfg.blocks[0].term, IrTerm::Return(IrOperand::Var(8))));
+        assert_eq!(check_cell_post_branch_model(&cfg), RefinementVerdict::ProvenModulo3);
+        // Trust: W19 ADT-CELL audit — the UB-free clause: WITHOUT a registered
+        // callee the disjunct DECLINES (the retraction pin); WITH the callee
+        // registered requires-free it certifies.
+        assert!(
+            !mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()),
+            "an unregistered returning-path callee must decline the disjunct"
+        );
+        assert!(
+            mutator_cell_post_fully_faithful_via_trustir(&f, &synth_registry(&["SYNTH::get"])),
+            "the hand-built shape must certify with its callee registered"
+        );
+        // The Or/Xor op-mapping lines, the swapped-operand branch, and the legal
+        // storage-marker bracketing — each pinned STRUCTURALLY against a
+        // hand-written expected model (an op-map or operand-order transposition
+        // fails HERE, independently of the self-relating kernel path).
+        let cfg = call_rmw_mutator_ir_cfg(&call_rmw_fixture("ok_or")).expect("ok_or mints");
+        assert!(matches!(
+            cfg.blocks[0].stmts[0].rvalue,
+            IrRvalue::Bin(TrustIrBinOp::Or, IrOperand::Var(0), IrOperand::Var(7))
+        ));
+        assert_eq!(check_cell_post_branch_model(&cfg), RefinementVerdict::ProvenModulo3);
+        let cfg = call_rmw_mutator_ir_cfg(&call_rmw_fixture("ok_xor")).expect("ok_xor mints");
+        assert!(matches!(
+            cfg.blocks[0].stmts[0].rvalue,
+            IrRvalue::Bin(TrustIrBinOp::Xor, IrOperand::Var(0), IrOperand::Var(7))
+        ));
+        assert_eq!(check_cell_post_branch_model(&cfg), RefinementVerdict::ProvenModulo3);
+        let cfg =
+            call_rmw_mutator_ir_cfg(&call_rmw_fixture("ok_swapped")).expect("ok_swapped mints");
+        assert!(
+            matches!(
+                cfg.blocks[0].stmts[0].rvalue,
+                IrRvalue::Bin(TrustIrBinOp::And, IrOperand::Var(7), IrOperand::Var(0))
+            ),
+            "the swapped body must model the swapped operand order, not normalize it"
+        );
+        assert_eq!(check_cell_post_branch_model(&cfg), RefinementVerdict::ProvenModulo3);
+        assert!(
+            call_rmw_mutator_ir_cfg(&call_rmw_fixture("ok_markers")).is_some(),
+            "legal storage bracketing (Live before def, Dead after the write) must ADMIT"
+        );
+        // THE REAL DUMP — the +1 the M3 report deferred.
+        let dir = format!(
+            "{}/fixtures/census-rung2-2026-07-07/nonmax",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let load = |name: &str| -> VerifiableFunction {
+            let raw = std::fs::read(format!("{dir}/{name}")).expect("committed dump");
+            serde_json::from_slice(&raw).expect("parse")
+        };
+        let real = load(
+            "lib__<impl core__ops__bit__BitAndAssign<lib__NonMaxU8> for u8>__bitand_assign.json",
+        );
+        let cfg = call_rmw_mutator_ir_cfg(&real).expect("the committed u8-cell dump must mint");
+        assert_eq!(check_cell_post_branch_model(&cfg), RefinementVerdict::ProvenModulo3);
+        // Trust: W19 ADT-CELL audit — THE RETRACTION, pinned: `NonMaxU8::get` is
+        // NOT certified at HEAD (it calls `NonZero::get`, outside the corpus
+        // registry), so the production registry carries no fact for it and the
+        // disjunct now DECLINES this body — the 2026-08-13 +1 retracts until the
+        // callee certifies. The walk + model remain green above (capability);
+        // the second assertion shows the certificate returns the moment the
+        // callee's fact exists.
+        assert!(
+            !mutator_cell_post_fully_faithful_via_trustir(&real, &Default::default()),
+            "nonmax bitand_assign (u8 cell): RETRACTED without a certified callee"
+        );
+        assert!(
+            mutator_cell_post_fully_faithful_via_trustir(
+                &real,
+                &dump_registry(&dir, &["lib__NonMaxU8__get.json"])
+            ),
+            "…and certifies again the moment `get`'s fact is registered"
+        );
+        // The whole-Adt-cell siblings: the honest scalar boundary.
+        for name in [
+            "<lib__NonMaxU8 as core__ops__bit__BitAndAssign<u8>>__bitand_assign.json",
+            "<lib__NonMaxU8 as core__ops__bit__BitAndAssign>__bitand_assign.json",
+        ] {
+            let sib = load(name);
+            assert!(
+                call_rmw_mutator_ir_cfg(&sib).is_none(),
+                "{name}: an Adt-valued cell must decline ON THIS WALK (scalar cells only)"
+            );
+            // The siblings' own family (`adt_cell_post_store_ir_cfg`) is likewise
+            // registry-gated — declined without their `bitand` facts.
+            assert!(!mutator_cell_post_fully_faithful_via_trustir(&sib, &Default::default()));
+        }
+    }
+
+    /// FAIL-CLOSED — one mutation per gate. `arg_passes_recv` and `borrow_of_recv`
+    /// are the load-bearing pair: the universal quantification of the call slot is
+    /// honest ONLY while the callee has no path to the cell. `pre_temp_to_call`
+    /// keeps the claim's carriers out of the callee; `write_op_add` is WRAP-vs-INT
+    /// (arithmetic with a call RHS has no checked spine here); `double_pre_read`
+    /// breaks the single hoisted pre-read; `dest_is_param` collapses `_r` into an
+    /// argument.
+    #[test]
+    fn trust_ir_call_rmw_gates_fail_closed() {
+        for variant in [
+            "arg_passes_recv",
+            "borrow_of_recv",
+            "pre_temp_to_call",
+            "write_op_add",
+            "double_pre_read",
+            "dest_is_param",
+            // The adversarial round's additions (2026-08-13):
+            "cleanup_unwind",     // THE confirmed hole — unwind into the write block.
+            "target_none",        // a diverging call has no returning edge to claim.
+            "foreign",            // FFI voids the safe-Rust isolation argument.
+            "unsafe_sig",
+            "dead_t_marker",      // carrier storage killed inside the def→use window.
+            "dead_r_in_write",
+            "resurrect_t",
+            "raw_ptr_param",      // pointer-carrying params void the isolation leg.
+            "ptr_in_adt_param",
+            "borrow_of_pre_temp", // the claim's carriers never reach the callee.
+            "dup_block_id",       // id-keyed gates need unique ids.
+            "stray_r_write",      // C3: `_r`'s only def is the call.
+            "double_t_read_dead", // C3: the read counters, driven to 2.
+            "rejoining_side_path",// C3: a side path into the write block.
+            "dest_projected",
+            "addr_of_recv_dead",  // C2's AddressOf arm, isolated.
+        ] {
+            let f = call_rmw_fixture(variant);
+            assert!(
+                call_rmw_mutator_ir_cfg(&f).is_none(),
+                "{variant} must decline"
+            );
+            assert!(!mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()));
+        }
+    }
+
+    /// Trust: W19 ADT-CELL — the hand-built mirror of the two committed siblings:
+    /// whole-Adt pre-read, the call taking `Move(_t)` + a param, the whole-Adt
+    /// store of the result. The recv Adt is stamped `Struct` (as both real dumps
+    /// are); the `unstamped` variant pins the fail-closed default.
+    fn adt_cell_fixture(variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            AdtKind, BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
+        };
+        let cell_adt = |kind: Option<AdtKind>| Ty::Adt {
+            name: "SYNTH::Cell".into(),
+            fields: vec![("0".into(), Ty::Int { width: 8, signed: false })],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: kind,
+        };
+        let kind = match variant {
+            "unstamped" => None,
+            "union_stamp" => Some(AdtKind::Union),
+            _ => Some(AdtKind::Struct),
+        };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let bare = |l: usize| Place { local: l, projections: vec![] };
+        let deref = |l: usize| Place { local: l, projections: vec![Projection::Deref] };
+        let locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Ref { mutable: true, inner: Box::new(cell_adt(kind)) },
+                name: Some("self".into()),
+            },
+            LocalDecl { index: 2, ty: cell_adt(Some(AdtKind::Struct)), name: Some("rhs".into()) },
+            LocalDecl { index: 3, ty: cell_adt(Some(AdtKind::Struct)), name: None }, // _r
+            LocalDecl { index: 4, ty: cell_adt(Some(AdtKind::Struct)), name: None }, // _t
+        ];
+        let mut b0 = vec![assign(bare(4), Rvalue::Use(Operand::Copy(deref(1))))];
+        if variant == "dead_t_in_entry" {
+            b0.push(Statement::StorageDead(4));
+        }
+        let mut args = vec![Operand::Move(bare(4)), Operand::Copy(bare(2))];
+        match variant {
+            "recv_in_args" => args.push(Operand::Copy(bare(1))),
+            "dest_in_args" => args.push(Operand::Copy(bare(3))),
+            _ => {}
+        }
+        let store_src = if variant == "store_not_dest" { 4 } else { 3 };
+        let mut w = Vec::new();
+        if variant == "dead_r_before_store" {
+            w.push(Statement::StorageDead(3));
+        }
+        w.push(assign(deref(1), Rvalue::Use(Operand::Move(bare(store_src)))));
+        if variant == "second_store" {
+            w.push(assign(deref(1), Rvalue::Use(Operand::Copy(bare(2)))));
+        }
+        let mut blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: b0,
+                terminator: Terminator::Call {
+                    func: "SYNTH::bitand".into(),
+                    args,
+                    dest: bare(3),
+                    target: if variant == "target_none" { None } else { Some(BlockId(1)) },
+                    span: SourceSpan::default(),
+                    atomic: None,
+                    is_foreign: variant == "foreign",
+                    is_unsafe_sig: false,
+                    unwind: if variant == "cleanup_unwind" {
+                        UnwindEdge::Cleanup(BlockId(1))
+                    } else {
+                        UnwindEdge::Continue
+                    },
+                },
+            },
+            BasicBlock { id: BlockId(1), stmts: w, terminator: Terminator::Return },
+        ];
+        if variant == "rejoining_side_path" {
+            blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![],
+                terminator: Terminator::Goto(BlockId(1)),
+            });
+        }
+        // The counter-isolating side blocks (audit F2/F3): each writes to the
+        // PARAM `_2` so no earlier sole-assign gate fires — the A3 read counter
+        // is the sole decliner.
+        if variant == "r_read_elsewhere" {
+            blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(bare(2), Rvalue::Use(Operand::Copy(bare(3))))],
+                terminator: Terminator::Unreachable,
+            });
+        }
+        if variant == "t_read_in_stmt" {
+            blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(bare(2), Rvalue::Use(Operand::Copy(bare(4))))],
+                terminator: Terminator::Unreachable,
+            });
+        }
+        if variant == "second_recv_deref_read" {
+            blocks.push(BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(bare(2), Rvalue::Use(Operand::Copy(deref(1))))],
+                terminator: Terminator::Unreachable,
+            });
+        }
+        VerifiableFunction {
+            name: "bitand_assign".into(),
+            def_path: "SYNTH::Cell::bitand_assign".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the hand-built shape and BOTH committed siblings mint the
+    /// identity model and certify through the full disjunct (the +2 the call-RMW
+    /// landing recorded as a design decision). The model is pinned structurally
+    /// (`Use(Var(r))`, fresh slots) AND numerically: unlike the opaque bitwise
+    /// heads, `Use` REDUCES, so closing `r` at 7 must prove 7 and reject 8 — the
+    /// identity claim is value-decided at the kernel tier.
+    #[test]
+    fn trust_ir_adt_cell_store_mints_and_certifies() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, IrTerm, RefinementVerdict, branch_model_refinement_proof,
+            branch_model_refinement_statement, check_adt_cell_post_store_model,
+            check_refinement_decl, int_lit,
+        };
+        let f = adt_cell_fixture("ok");
+        let cfg = adt_cell_post_store_ir_cfg(&f).expect("the hand-built shape must mint");
+        assert_eq!(cfg.blocks.len(), 1);
+        assert!(matches!(
+            cfg.blocks[0].stmts[0].rvalue,
+            IrRvalue::Use(IrOperand::Var(5))
+        ));
+        assert!(matches!(cfg.blocks[0].term, IrTerm::Return(IrOperand::Var(6))));
+        assert_eq!(
+            check_adt_cell_post_store_model(&cfg),
+            RefinementVerdict::ProvenModulo3
+        );
+        // Trust: W19 ADT-CELL audit — the UB-free clause, both directions.
+        assert!(!mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()));
+        assert!(mutator_cell_post_fully_faithful_via_trustir(
+            &f,
+            &synth_registry(&["SYNTH::bitand"])
+        ));
+        // The numeric rows: the identity trace closed at r=7.
+        let mut closed = cfg.clone();
+        for st in &mut closed.blocks[0].stmts {
+            if let IrRvalue::Use(a) = &mut st.rvalue {
+                if *a == IrOperand::Var(5) {
+                    *a = IrOperand::Const(7);
+                }
+            }
+        }
+        let claim = |cfg: &crate::trustir_anchor::IrCfg, val: i128| {
+            check_refinement_decl(
+                "Trust.TrustIr.Refinement.adt_cell_value_row",
+                branch_model_refinement_statement(cfg, Some(&int_lit(val))),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        assert_eq!(claim(&closed, 7), RefinementVerdict::ProvenModulo3, "id(7) proves 7");
+        assert!(matches!(claim(&closed, 8), RefinementVerdict::KernelRejected(_)));
+        // THE REAL DUMPS — both siblings, end to end.
+        let dir = format!(
+            "{}/fixtures/census-rung2-2026-07-07/nonmax",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        for (name, callee_dump) in [
+            (
+                "<lib__NonMaxU8 as core__ops__bit__BitAndAssign>__bitand_assign.json",
+                "<lib__NonMaxU8 as core__ops__bit__BitAnd>__bitand.json",
+            ),
+            (
+                "<lib__NonMaxU8 as core__ops__bit__BitAndAssign<u8>>__bitand_assign.json",
+                "<lib__NonMaxU8 as core__ops__bit__BitAnd<u8>>__bitand.json",
+            ),
+        ] {
+            let raw = std::fs::read(format!("{dir}/{name}")).expect("committed dump");
+            let real: VerifiableFunction = serde_json::from_slice(&raw).expect("parse");
+            let cfg = adt_cell_post_store_ir_cfg(&real)
+                .unwrap_or_else(|| panic!("{name}: the committed sibling must mint"));
+            assert_eq!(
+                check_adt_cell_post_store_model(&cfg),
+                RefinementVerdict::ProvenModulo3
+            );
+            // Trust: W19 ADT-CELL audit — THE RETRACTION, pinned: the `bitand`
+            // callees are not certified at HEAD, so the +2 this landing measured
+            // pre-clause does NOT ship; it returns when the callee facts exist
+            // (the second assertion, against the real callee dump).
+            assert!(
+                !mutator_cell_post_fully_faithful_via_trustir(&real, &Default::default()),
+                "{name}: RETRACTED without a certified callee"
+            );
+            assert!(
+                mutator_cell_post_fully_faithful_via_trustir(
+                    &real,
+                    &dump_registry(&dir, &[callee_dump])
+                ),
+                "{name}: certifies the moment its callee's fact is registered"
+            );
+        }
+        // The scalar-cell u8 body still routes to call-RMW, never here (disjoint
+        // recv types).
+        let raw = std::fs::read(format!(
+            "{dir}/lib__<impl core__ops__bit__BitAndAssign<lib__NonMaxU8> for u8>__bitand_assign.json"
+        ))
+        .expect("committed dump");
+        let u8body: VerifiableFunction = serde_json::from_slice(&raw).expect("parse");
+        assert!(adt_cell_post_store_ir_cfg(&u8body).is_none());
+        assert!(!mutator_cell_post_fully_faithful_via_trustir(&u8body, &Default::default()));
+    }
+
+    /// FAIL-CLOSED — one mutation per gate. `store_not_dest` is the load-bearing
+    /// one: a store of anything but `_r` breaks the dataflow identity the claim
+    /// IS; `unstamped`/`union_stamp` pin the family's fail-closed default (the
+    /// claim itself is layout-agnostic — the walk doc records why the gate is
+    /// posture, not soundness).
+    #[test]
+    fn trust_ir_adt_cell_store_gates_fail_closed() {
+        for variant in [
+            "store_not_dest",
+            "second_store",
+            "unstamped",
+            "union_stamp",
+            "recv_in_args",
+            "dest_in_args",
+            "cleanup_unwind",
+            "target_none",
+            "foreign",
+            "dead_t_in_entry",
+            "dead_r_before_store",
+            "rejoining_side_path",
+            "r_read_elsewhere",       // audit F2: isolates call_dest_reads == 2.
+            "t_read_in_stmt",         // audit F3: isolates pre_temp_reads == 1.
+            "second_recv_deref_read", // audit F3: isolates recv_deref_reads == 2.
+        ] {
+            let f = adt_cell_fixture(variant);
+            assert!(
+                adt_cell_post_store_ir_cfg(&f).is_none(),
+                "{variant} must decline"
+            );
+            assert!(!mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()));
+        }
+    }
+
+    /// Trust: W19 M3 — the straight-line mutator shapes, HAND-BUILT: the committed
+    /// corpus has zero walkable representatives (measured — the "73" was a
+    /// write-statement count), so these pins are the capability record. `shape`
+    /// selects store/bitwise/checked; `ret_self` picks the `&mut Self` passthrough
+    /// vs unit return; `variant` the adversarial mutations.
+    pub(crate) fn straight_mutator(shape: &str, ret_self: bool, variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            AssertMessage, BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Projection,
+            Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
+        };
+        let u32t = || Ty::Int { width: 32, signed: false };
+        let refmut = || Ty::Ref { mutable: true, inner: Box::new(u32t()) };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let bare = |l: usize| Place { local: l, projections: vec![] };
+        let deref = |l: usize| Place { local: l, projections: vec![Projection::Deref] };
+        let pre_read = || Operand::Copy(deref(1));
+        let v = || Operand::Copy(bare(2));
+        let ret_ty = if ret_self { refmut() } else { Ty::Unit };
+        let mut locals = vec![
+            LocalDecl { index: 0, ty: ret_ty.clone(), name: None },
+            LocalDecl { index: 1, ty: refmut(), name: Some("self".into()) },
+            LocalDecl { index: 2, ty: u32t(), name: Some("v".into()) },
+        ];
+        let mut blocks;
+        match shape {
+            "store" => {
+                let src = if variant == "store_reads_cell" { pre_read() } else { v() };
+                let mut stmts = vec![assign(deref(1), Rvalue::Use(src))];
+                if variant == "second_write" {
+                    stmts.push(assign(deref(1), Rvalue::Use(v())));
+                }
+                if ret_self {
+                    stmts.push(assign(bare(0), Rvalue::Use(Operand::Copy(bare(1)))));
+                }
+                blocks =
+                    vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }];
+            }
+            "bitwise" => {
+                let op =
+                    if variant == "unchecked_add" { BinOp::Add } else { BinOp::BitOr };
+                let mut stmts =
+                    vec![assign(deref(1), Rvalue::BinaryOp(op, pre_read(), v()))];
+                if ret_self {
+                    stmts.push(assign(bare(0), Rvalue::Use(Operand::Copy(bare(1)))));
+                }
+                blocks =
+                    vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }];
+            }
+            "checked" => {
+                locals.push(LocalDecl {
+                    index: 3,
+                    ty: Ty::Tuple(vec![u32t(), Ty::Bool]),
+                    name: None,
+                });
+                if variant == "tuple_escape" {
+                    locals.push(LocalDecl {
+                        index: 4,
+                        ty: Ty::Tuple(vec![u32t(), Ty::Bool]),
+                        name: None,
+                    });
+                }
+                let msg = if variant == "wrong_msg" {
+                    AssertMessage::Overflow(BinOp::Sub)
+                } else {
+                    AssertMessage::Overflow(BinOp::Add)
+                };
+                let mut b0 = vec![assign(
+                    bare(3),
+                    Rvalue::CheckedBinaryOp(BinOp::Add, pre_read(), v()),
+                )];
+                if variant == "tuple_escape" {
+                    b0.push(assign(bare(4), Rvalue::Use(Operand::Copy(bare(3)))));
+                }
+                let mut b1 = vec![assign(
+                    deref(1),
+                    Rvalue::Use(Operand::Move(Place {
+                        local: 3,
+                        projections: vec![Projection::Field(0)],
+                    })),
+                )];
+                if ret_self {
+                    b1.push(assign(bare(0), Rvalue::Use(Operand::Copy(bare(1)))));
+                }
+                // `no_assert` — THE ORDER-GATE PROBE: the identical spine with the
+                // overflow assert replaced by a bare Goto. Modeling it as `Int.add`
+                // would be the WRAP-vs-INT false claim; the walk must decline at the
+                // store (`checked_asserted` never set).
+                let b0_term = if variant == "no_assert" {
+                    Terminator::Goto(BlockId(1))
+                } else {
+                    Terminator::Assert {
+                        cond: Operand::Move(Place {
+                            local: 3,
+                            projections: vec![Projection::Field(1)],
+                        }),
+                        expected: variant == "expected_true",
+                        msg,
+                        target: BlockId(1),
+                        unwind: UnwindEdge::Unreachable,
+                        span: SourceSpan::default(),
+                    }
+                };
+                blocks = vec![
+                    BasicBlock { id: BlockId(0), stmts: b0, terminator: b0_term },
+                    BasicBlock { id: BlockId(1), stmts: b1, terminator: Terminator::Return },
+                ];
+            }
+            other => panic!("unknown shape {other}"),
+        }
+        if variant == "mutable_alias" {
+            locals.push(LocalDecl { index: 9, ty: refmut(), name: None });
+            blocks[0].stmts.insert(
+                0,
+                assign(bare(9), Rvalue::Ref { mutable: true, place: bare(1) }),
+            );
+        }
+        VerifiableFunction {
+            name: "m".into(),
+            def_path: format!("SYNTH::{shape}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 2,
+                return_ty: ret_ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE + the KERNEL VALUE ROWS the checked class uniquely affords. All three
+    /// shapes mint 1-block cell-post models and certify through
+    /// `check_cell_post_branch_model` (confirming the 1-block Switch-free cfg goes
+    /// through the existing builders), in BOTH return shapes. And because the checked
+    /// class's model carries `Int.add` — a REDUCIBLE prelude head, not an opaque —
+    /// its closed claim decides NUMERICALLY at the kernel tier: `7 + 9` must prove
+    /// `16` and reject `15`. The store class likewise (`Use` reduces). Only the
+    /// bitwise class stays opaque-shaped, exactly as in M1/M2.
+    #[test]
+    fn trust_ir_straight_mutator_shapes_certify() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, IrTerm, RefinementVerdict, branch_model_refinement_proof,
+            branch_model_refinement_statement, check_cell_post_branch_model,
+            check_refinement_decl, int_lit,
+        };
+        for ret_self in [true, false] {
+            for shape in ["store", "bitwise", "checked"] {
+                let func = straight_mutator(shape, ret_self, "ok");
+                let cfg = straight_line_mutator_ir_cfg(&func).unwrap_or_else(|| {
+                    panic!("{shape} (ret_self={ret_self}) must mint")
+                });
+                assert_eq!(cfg.blocks.len(), 1);
+                assert_eq!(
+                    check_cell_post_branch_model(&cfg),
+                    RefinementVerdict::ProvenModulo3,
+                    "{shape}: the 1-block cell-post model must certify"
+                );
+            }
+        }
+        // The numeric kernel rows for the REDUCIBLE classes, slots closed at
+        // recv=7, v=9.
+        let close = |cfg: &crate::trustir_anchor::IrCfg| {
+            let mut c = cfg.clone();
+            for blk in &mut c.blocks {
+                for st in &mut blk.stmts {
+                    let sub = |op: &mut IrOperand| {
+                        if let IrOperand::Var(i) = op {
+                            match *i {
+                                0 => *op = IrOperand::Const(7),
+                                1 => *op = IrOperand::Const(9),
+                                _ => {}
+                            }
+                        }
+                    };
+                    match &mut st.rvalue {
+                        IrRvalue::Use(a) | IrRvalue::Un(_, a) => sub(a),
+                        IrRvalue::Bin(_, a, b) | IrRvalue::Cmp(_, a, b) => {
+                            sub(a);
+                            sub(b);
+                        }
+                    }
+                }
+                if let IrTerm::Switch(c2, _, _) = &mut blk.term {
+                    let _ = c2;
+                }
+            }
+            c
+        };
+        let claim = |cfg: &crate::trustir_anchor::IrCfg, val: i128| {
+            check_refinement_decl(
+                "Trust.TrustIr.Refinement.m3_value_row",
+                branch_model_refinement_statement(cfg, Some(&int_lit(val))),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        let checked = close(
+            &straight_line_mutator_ir_cfg(&straight_mutator("checked", false, "ok")).unwrap(),
+        );
+        assert_eq!(claim(&checked, 16), RefinementVerdict::ProvenModulo3, "7+9 proves 16");
+        assert!(
+            matches!(claim(&checked, 15), RefinementVerdict::KernelRejected(_)),
+            "7+9 must reject 15 — a NUMERIC kernel row, the checked class's reducible head"
+        );
+        let store = close(
+            &straight_line_mutator_ir_cfg(&straight_mutator("store", false, "ok")).unwrap(),
+        );
+        assert_eq!(claim(&store, 9), RefinementVerdict::ProvenModulo3, "store proves v");
+        assert!(matches!(claim(&store, 7), RefinementVerdict::KernelRejected(_)));
+    }
+
+    /// FAIL-CLOSED — one mutation per gate, per the M1 pattern, on the hand-built
+    /// shapes. `unchecked_add` is THE WRAP-vs-INT probe: the same body with the
+    /// checked spine stripped (a bare `BinaryOp(Add)` write) must decline — the
+    /// mathematical reading without the discharged side condition is the live false
+    /// claim this table exists to prevent.
+    #[test]
+    fn trust_ir_straight_mutator_gates_fail_closed() {
+        for (shape, variant) in [
+            ("bitwise", "unchecked_add"),
+            ("checked", "wrong_msg"),
+            ("checked", "expected_true"),
+            ("checked", "tuple_escape"),
+            ("checked", "no_assert"),
+            ("store", "store_reads_cell"),
+            ("store", "second_write"),
+            ("store", "mutable_alias"),
+        ] {
+            let func = straight_mutator(shape, false, variant);
+            assert!(
+                straight_line_mutator_ir_cfg(&func).is_none(),
+                "{shape}/{variant} must decline"
+            );
+        }
+    }
+
+    /// Trust: SET_BIT M1 — the REAL committed dumps mint the cell-post model and it
+    /// certifies modulo 3. Both extremes of the width family (u8 and i128 — the
+    /// latter exercises the 128-bit temps the cast lane's whitelist excludes, fine
+    /// here because nothing casts), and the model shape is pinned structurally: the
+    /// value fork on `Ne(value, 0)`, per-arm FRESH post slots (W6 — a shared slot
+    /// would cross-inline the arms through the global SSA def map), the then-arm
+    /// `Or(Var(recv), _)`, the else-arm `And(Var(recv), _)` over a `bnot` temp.
+    ///
+    /// INERT BY CONSTRUCTION (the W19 discipline): this walk has no production
+    /// caller — `set_bit` still counts ff=0 in the census. The flip is M2, a separate
+    /// landing, so this certificate's review surface is not stacked with the metric
+    /// change.
+    #[test]
+    fn trust_ir_set_bit_cell_post_mints_and_certifies() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, IrTerm, RefinementVerdict, TrustIrBinOp,
+            check_cell_post_branch_model,
+        };
+        for name in ["<u8 as lib__BitField>__set_bit.json", "<i128 as lib__BitField>__set_bit.json"]
+        {
+            let path = format!(
+                "{}/fixtures/census-rung2-2026-07-07/bit_field/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let bytes = std::fs::read(&path).expect("committed set_bit dump");
+            let func: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse");
+            let cfg = divergence_guarded_rmw_mutator_ir_cfg(&func)
+                .unwrap_or_else(|| panic!("{name}: the mutator walk must admit set_bit"));
+            // The fork.
+            assert!(
+                matches!(&cfg.blocks[0].term, IrTerm::Switch(c, 1, 2)
+                    if c.op == crate::trustir_anchor::TrustIrCmpOp::Ne
+                        && c.b == IrOperand::Const(0)),
+                "{name}: the fork must model as Ne(value, 0)"
+            );
+            // Per-arm fresh post slots, distinct.
+            let (IrTerm::Return(IrOperand::Var(s1)), IrTerm::Return(IrOperand::Var(s2))) =
+                (&cfg.blocks[1].term, &cfg.blocks[2].term)
+            else {
+                panic!("{name}: both arms must return their post slot");
+            };
+            assert_ne!(s1, s2, "{name}: W6 — post slots must be per-arm FRESH");
+            // The write ops: then |= (Or over the recv pre-value), else &= (And).
+            let last = |b: usize| &cfg.blocks[b].stmts.last().unwrap().rvalue;
+            assert!(
+                matches!(last(1), IrRvalue::Bin(TrustIrBinOp::Or, IrOperand::Var(0), _)),
+                "{name}: then-arm writes Or(recv-pre, mask)"
+            );
+            assert!(
+                matches!(last(2), IrRvalue::Bin(TrustIrBinOp::And, IrOperand::Var(0), _)),
+                "{name}: else-arm writes And(recv-pre, !mask)"
+            );
+            assert_eq!(
+                check_cell_post_branch_model(&cfg),
+                RefinementVerdict::ProvenModulo3,
+                "{name}: the cell-post model must certify modulo 3"
+            );
+        }
+    }
+
+    /// FAIL-CLOSED — one mutation per W-gate, each on the real u8 dump. The frame and
+    /// alias gates are the ones a wrong certificate would ride through, so they get
+    /// the sharpest mutations: an extra write to a second cell (W2), a mutable alias
+    /// of the recv (W3), a second deref-read before the write (W4 — modeled as the
+    /// write's RHS reading a temp that itself deref-read AFTER a first write… kept
+    /// simple: swap the write's first operand off the pre-read), a tampered join
+    /// (W5), an unchecked `+=` arm (WRAP-vs-INT), and a fork on a non-parameter (W7).
+    #[test]
+    fn trust_ir_set_bit_gates_fail_closed() {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        let path = format!(
+            "{}/fixtures/census-rung2-2026-07-07/bit_field/<u8 as lib__BitField>__set_bit.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).expect("committed set_bit dump");
+        let base: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse");
+        assert!(divergence_guarded_rmw_mutator_ir_cfg(&base).is_some(), "control must mint");
+
+        // W2 — a SECOND projected write (to `(*_0)`) smuggled into the join.
+        let mut m = base.clone();
+        let join = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(7)).unwrap();
+        join.stmts.push(Statement::Assign {
+            place: Place { local: 0, projections: vec![Projection::Deref] },
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 8))),
+            span: trust_types::SourceSpan::default(),
+        });
+        assert!(divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(), "W2: extra write");
+
+        // W3 — a mutable alias of the recv taken in the entry block.
+        let mut m = base.clone();
+        m.body.locals.push(trust_types::LocalDecl {
+            index: 11,
+            ty: trust_types::Ty::Ref {
+                mutable: true,
+                inner: Box::new(trust_types::Ty::Int { width: 8, signed: false }),
+            },
+            name: None,
+        });
+        m.body.blocks[0].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place { local: 11, projections: vec![] },
+                rvalue: Rvalue::Ref {
+                    mutable: true,
+                    place: Place { local: 1, projections: vec![] },
+                },
+                span: trust_types::SourceSpan::default(),
+            },
+        );
+        assert!(divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(), "W3: mutable alias");
+
+        // W4 — the write's pre-read swapped off the recv (reads the mask twice).
+        let mut m = base.clone();
+        let b5 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(5)).unwrap();
+        let Statement::Assign { rvalue, .. } = &mut b5.stmts[1] else { unreachable!() };
+        let Rvalue::BinaryOp(_, a, _) = rvalue else { unreachable!() };
+        *a = Operand::Copy(Place { local: 6, projections: vec![] });
+        assert!(divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(), "W4: pre-read swapped");
+
+        // W5 — the join returns a fresh constant instead of the recv handle.
+        let mut m = base.clone();
+        let join = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(7)).unwrap();
+        let Statement::Assign { rvalue, .. } = &mut join.stmts[0] else { unreachable!() };
+        *rvalue = Rvalue::Use(Operand::Copy(Place { local: 0, projections: vec![] }));
+        assert!(divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(), "W5: join tampered");
+
+        // WRAP-vs-INT — the then-arm write becomes an UNCHECKED `+=`.
+        let mut m = base.clone();
+        let b5 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(5)).unwrap();
+        let Statement::Assign { rvalue, .. } = &mut b5.stmts[1] else { unreachable!() };
+        let Rvalue::BinaryOp(op, _, _) = rvalue else { unreachable!() };
+        *op = BinOp::Add;
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "WRAP-vs-INT: an unchecked Add write must never get the Int.add reading"
+        );
+
+        // W7 — the fork discr replaced by the guard temp (a non-parameter).
+        let mut m = base.clone();
+        let fork = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(1)).unwrap();
+        let trust_types::Terminator::SwitchInt { discr, .. } = &mut fork.terminator else {
+            unreachable!()
+        };
+        *discr = Operand::Copy(Place { local: 4, projections: vec![] });
+        assert!(divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(), "W7: non-param fork");
+
+        // Trust: W19 M1 marker discipline (2026-08-13) — the dead_at class, per-arm
+        // form. bb5 is the then-arm (`_6 := Shl; (*_1) := BitOr(.., Move(_6))`);
+        // bb3 is its assert-guard block (`_7 := ..; Assert(_7)`).
+        let splice = |bb: u32, pos: usize, st: Statement| -> VerifiableFunction {
+            let mut m = base.clone();
+            let blk = m
+                .body
+                .blocks
+                .iter_mut()
+                .find(|b| b.id == trust_types::BlockId(bb as usize))
+                .unwrap();
+            blk.stmts.insert(pos.min(blk.stmts.len()), st);
+            m
+        };
+        // A carrier killed between def and the write's read of it.
+        let m = splice(5, 1, Statement::StorageDead(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: StorageDead(_6) between def and read must decline"
+        );
+        // Resurrection after the def — contents fresh and indeterminate.
+        let m = splice(5, 1, Statement::StorageLive(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: StorageLive(_6) after its def must decline"
+        );
+        // The assert-guard def killed before the Assert consumes it.
+        let m = splice(3, 1, Statement::StorageDead(7));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: StorageDead(_7) before its Assert must decline"
+        );
+        // A marker naming a PARAM — outside real MIR, fail closed.
+        let m = splice(5, 0, Statement::StorageDead(2));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: a param marker must decline"
+        );
+        // A def into storage already killed.
+        let m = splice(5, 0, Statement::StorageDead(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: a def into dead storage must decline"
+        );
+        // THE ASSERT-GUARD HOLE (adversarial round, 2026-08-13) — the guard def is
+        // excluded from `defined`, which blinded both marker rules exactly there.
+        // (a) bare resurrection of the guard between def and Assert;
+        let m = splice(3, 1, Statement::StorageLive(7));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: StorageLive(guard) after its def must decline"
+        );
+        // (b) the Dead-then-Live LAUNDER — un-kills the dead set, so the Assert's
+        // own dead-check alone would admit an assert on reallocated storage.
+        let mut m = splice(3, 1, Statement::StorageDead(7));
+        let b3 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(3)).unwrap();
+        b3.stmts.insert(2, Statement::StorageLive(7));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: the StorageDead;StorageLive guard launder must decline"
+        );
+
+        // The coverage splices (P2–P7 of the round's adequacy finding).
+        // P2 — the Live variant of the param-marker decline.
+        let m = splice(5, 0, Statement::StorageLive(2));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: StorageLive(param) must decline"
+        );
+        // P3 — cross-block dead persistence: killed in the assert block (bb3),
+        // the def in the NEXT block of the same arm is a def into dead storage.
+        let m = splice(3, 1, Statement::StorageDead(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: a kill in bb3 must persist into bb5's def-into-dead"
+        );
+        // P4 — the else-arm mirrors the discipline (bb6: `_9 := Shl; _8 := Not(_9)`).
+        let m = splice(6, 1, Statement::StorageDead(9));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: else-arm StorageDead(_9) between def and its read must decline"
+        );
+        // P5 — a CLOSED Live;Dead bracket before the def still leaves the storage
+        // dead at the def.
+        let mut m = splice(5, 0, Statement::StorageLive(6));
+        let b5 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(5)).unwrap();
+        b5.stmts.insert(1, Statement::StorageDead(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_none(),
+            "marker: Live;Dead;def — the def is still into dead storage"
+        );
+        // P6 — the un-kill path is an ADMIT path: Dead;Live BEFORE the def is
+        // fresh storage plus a def — the model's value IS the defined one.
+        let mut m = splice(5, 0, Statement::StorageDead(6));
+        let b5 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(5)).unwrap();
+        b5.stmts.insert(1, Statement::StorageLive(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_some(),
+            "marker: Dead;Live;def (re-lived BEFORE the def) must ADMIT"
+        );
+        // P7 — cross-block positive bracketing: Live at the assert block, Dead
+        // after the last use in the arm block (the asan-style placement).
+        let mut m = splice(3, 0, Statement::StorageLive(6));
+        let b5 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(5)).unwrap();
+        b5.stmts.push(Statement::StorageDead(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_some(),
+            "marker: cross-block Live(bb3)/Dead(bb5-end) bracketing must ADMIT"
+        );
+
+        // POSITIVE — real MIR's legal bracketing (`Live` before the def, `Dead`
+        // after the last use) must still ADMIT and the disjunct still certify:
+        // the discipline is position-aware, not marker-phobic. (NOTE the honesty
+        // limit, measured against real rustc: the marker-carrying lowerings this
+        // family gets at opt-level >= 1 place `StorageLive(guard)` in the ENTRY
+        // block and its `Dead` at the FORK head, and those decline STRUCTURALLY
+        // at the entry/fork exact-shape pins before this discipline is ever
+        // consulted. The arm rules below are defense-in-depth for the arm
+        // windows; admitting real marker-carrying lowerings would be an
+        // entry/fork-pin decision, made deliberately or not at all.)
+        let mut m = splice(5, 0, Statement::StorageLive(6));
+        let b5 = m.body.blocks.iter_mut().find(|b| b.id == trust_types::BlockId(5)).unwrap();
+        b5.stmts.push(Statement::StorageDead(6));
+        assert!(
+            divergence_guarded_rmw_mutator_ir_cfg(&m).is_some(),
+            "marker: legal Live-before-def / Dead-after-use bracketing must ADMIT"
+        );
+        assert!(
+            mutator_cell_post_fully_faithful_via_trustir(&m, &Default::default()),
+            "marker: the bracketed body must still certify end to end"
+        );
+    }
+
+    /// The `bit_field::get_bit` SHAPE — the divergence-guarded chain:
+    ///
+    /// ```text
+    /// bb0: _3 := Lt(bit, 8); SwitchInt(_3) [0 → bb2(panic)] else bb1
+    /// bb1: _6 := *self; _8 := Lt(bit, 8); Assert(_8, Overflow(Shl)) → bb3
+    /// bb2: Call core::panicking::panic (diverges — no target)
+    /// bb3: _7 := Shl(1, bit); _5 := BitAnd(_6, _7); _0 := Ne(_5, 0); Return
+    /// ```
+    ///
+    /// `variant` selects the adversarial mutations for the fail-closed probes.
+    fn get_bit_shape(variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Projection,
+            Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
+        };
+        let u8t = || Ty::Int { width: 8, signed: false };
+        let u64t = || Ty::Int { width: 64, signed: false };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let lt_guard = |dst: usize, konst: u128| {
+            assign(
+                dst,
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place { local: 2, projections: vec![] }),
+                    Operand::Constant(ConstValue::Uint(konst, 64)),
+                ),
+            )
+        };
+        // The assert guard: same comparison as the switch guard, unless the variant
+        // perturbs it.
+        let assert_konst = if variant == "assert_diff_const" { 9 } else { 8 };
+        let assert_expected = variant != "assert_wrong_polarity";
+        // The panic arm: a genuine diverging call (no target).
+        let panic_block = BasicBlock {
+            id: BlockId(2),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                func: "core::panicking::panic".into(),
+                args: vec![],
+                dest: Place { local: 4, projections: vec![] },
+                target: if variant == "panic_reaches_return" { Some(BlockId(3)) } else { None },
+                unwind: UnwindEdge::Unreachable,
+                span: SourceSpan::default(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+            },
+        };
+        let func = VerifiableFunction {
+            name: "get_bit".into(),
+            def_path: "<u8 as lib::BitField>::get_bit".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Ref { mutable: false, inner: Box::new(u8t()) },
+                        name: Some("self".into()),
+                    },
+                    LocalDecl { index: 2, ty: u64t(), name: Some("bit".into()) },
+                    LocalDecl { index: 3, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 4, ty: Ty::Never, name: None },
+                    LocalDecl { index: 5, ty: u8t(), name: None },
+                    LocalDecl { index: 6, ty: u8t(), name: None },
+                    LocalDecl { index: 7, ty: u8t(), name: None },
+                    LocalDecl { index: 8, ty: Ty::Bool, name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![lt_guard(3, 8)],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Move(Place { local: 3, projections: vec![] }),
+                            targets: vec![(0, BlockId(2))],
+                            otherwise: BlockId(1),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![
+                            assign(
+                                6,
+                                Rvalue::Use(Operand::Copy(Place {
+                                    local: 1,
+                                    projections: vec![Projection::Deref],
+                                })),
+                            ),
+                            lt_guard(8, assert_konst),
+                        ],
+                        terminator: Terminator::Assert {
+                            cond: Operand::Move(Place { local: 8, projections: vec![] }),
+                            expected: assert_expected,
+                            msg: trust_types::AssertMessage::Overflow(BinOp::Shl),
+                            target: BlockId(3),
+                            unwind: UnwindEdge::Unreachable,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    panic_block,
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![
+                            assign(
+                                7,
+                                Rvalue::BinaryOp(
+                                    BinOp::Shl,
+                                    Operand::Constant(ConstValue::Uint(1, 8)),
+                                    Operand::Copy(Place { local: 2, projections: vec![] }),
+                                ),
+                            ),
+                            assign(
+                                5,
+                                Rvalue::BinaryOp(
+                                    BinOp::BitAnd,
+                                    Operand::Move(Place { local: 6, projections: vec![] }),
+                                    Operand::Move(Place { local: 7, projections: vec![] }),
+                                ),
+                            ),
+                            assign(
+                                0,
+                                Rvalue::BinaryOp(
+                                    BinOp::Ne,
+                                    Operand::Move(Place { local: 5, projections: vec![] }),
+                                    Operand::Constant(ConstValue::Uint(0, 8)),
+                                ),
+                            ),
+                        ],
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: 2,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        };
+        func
+    }
+
+    /// POSITIVE — the divergence-guarded `get_bit` chain builds, is GROUNDER-CONNECTED
+    /// (every operand Var/Const — `Shl` grounds via the live `Pred("Int.shiftLeft")`
+    /// arm), and certifies on the full chain lane. The value model is
+    /// partial-correctness-shaped, exactly as MirSem's certificate for the same body:
+    /// the trace describes the RETURNING path; the panic arm's divergence is carried
+    /// by its own non-safety Assertion row, outside the FF bar, unchanged.
+    #[test]
+    fn trust_ir_divergence_guarded_get_bit_certifies() {
+        use crate::trustir_anchor::{IrRvalue, RefinementVerdict, TrustIrBinOp};
+        let func = get_bit_shape("ok");
+        let ir = straight_line_ir_body_chain(&func)
+            .expect("the divergence-guarded get_bit chain must be admitted");
+        assert!(
+            ir.stmts
+                .iter()
+                .any(|s| matches!(&s.rvalue, IrRvalue::Bin(TrustIrBinOp::Shl, _, _))),
+            "the mask computation must carry the Shl op"
+        );
+        assert_eq!(
+            crate::trustir_anchor::check_body_refinement(&ir),
+            RefinementVerdict::ProvenModulo3,
+            "get_bit's chain is GROUNDER-CONNECTED — the primary checker must carry it"
+        );
+        assert!(straight_line_chain_fully_faithful_via_trustir(&func));
+    }
+
+    /// FAIL-CLOSED — every gate of the divergence-guard admission, one variant at a
+    /// time. `panic_reaches_return`: the "diverging" arm secretly rejoins the value
+    /// path — BOTH successors reach Return, a genuine branch, the branch lane's job;
+    /// admitting it here would model only one arm of a real two-arm function.
+    /// `assert_diff_const`: the assert repeats the guard with a DIFFERENT bound
+    /// (`bit < 9` vs the established `bit < 8`) — not the established fact, and this
+    /// lane must not do arithmetic entailment (`<8 ⇒ <9` is true but is vc_refute's
+    /// job, not a syntactic fact match). `assert_wrong_polarity`: the established
+    /// polarity contradicts `expected` — following the target would model the
+    /// impossible path.
+    #[test]
+    fn trust_ir_divergence_guard_gates_fail_closed() {
+        for variant in ["panic_reaches_return", "assert_diff_const", "assert_wrong_polarity"] {
+            let func = get_bit_shape(variant);
+            assert!(
+                straight_line_ir_body_chain(&func).is_none(),
+                "the `{variant}` mutation must decline"
+            );
+            assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+        }
+    }
+
+    /// `fn f(x: i64) -> i64 { if x < 3 { 10 } else { 20 } }` — the guarded-return MIR
+    /// shape, through the REAL recognizer. `op` selects the guard comparison.
+    fn guarded_return_fixture(op: trust_types::BinOp) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody,
+        };
+        let i64_ty = || Ty::Int { width: 64, signed: true };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "f".into(),
+            def_path: "SYNTH::guarded".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: i64_ty(), name: None },
+                    LocalDecl { index: 1, ty: i64_ty(), name: Some("x".into()) },
+                    LocalDecl { index: 2, ty: Ty::Bool, name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            2,
+                            Rvalue::BinaryOp(
+                                op,
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                                Operand::Constant(ConstValue::Int(3)),
+                            ),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Move(Place { local: 2, projections: vec![] }),
+                            targets: vec![(0, BlockId(2))],
+                            otherwise: BlockId(1),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![assign(
+                            0,
+                            Rvalue::Use(Operand::Constant(ConstValue::Int(10))),
+                        )],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![assign(
+                            0,
+                            Rvalue::Use(Operand::Constant(ConstValue::Int(20))),
+                        )],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 1,
+                return_ty: i64_ty(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// Build the branch `IrCfg` through the REAL recognizer + translation, then close
+    /// parameter 0 at `x` by substituting the guard's `Var(0)` operand.
+    fn closed_branch_cfg(
+        op: trust_types::BinOp,
+        x: i128,
+    ) -> crate::trustir_anchor::IrCfg {
+        use crate::trustir_anchor::{IrOperand, IrTerm};
+        let func = guarded_return_fixture(op);
+        let tree = crate::mirsem::sem_cf_return_shape_of(&func)
+            .and_then(|r| sem_cf_return_to_branch_tree(&r))
+            .expect("the guarded return must be recognized");
+        let mut cfg = sem_branch_tree_to_ir_cfg(&tree, func.body.arg_count)
+            .expect("the tree must translate");
+        for blk in &mut cfg.blocks {
+            if let IrTerm::Switch(cond, _, _) = &mut blk.term {
+                if cond.a == IrOperand::Var(0) {
+                    cond.a = IrOperand::Const(x);
+                }
+                if cond.b == IrOperand::Var(0) {
+                    cond.b = IrOperand::Const(x);
+                }
+            }
+        }
+        cfg
+    }
+
+    /// THE BRANCH MODEL VALUE ORACLE — the independent defense for
+    /// `check_branch_refinement_model`, which is SELF-RELATING (statement and proof
+    /// from the same `IrCfg`, closed by `Eq.refl`) and therefore proves a wrong
+    /// translation as readily as a right one. Named in that checker's doc; the
+    /// blindness it covers: the `Bool.rec` minor order in the new
+    /// `inlined_return_denotation` (a transposition type-checks and self-relates),
+    /// then/else polarity, and the comparison-op mapping's THIRD copy
+    /// (`sem_cmpop_to_ir`).
+    ///
+    /// Each row asserts the POSITIVE half FIRST: `check_refinement_decl` maps a
+    /// `None` statement to KernelRejected, so a negative half alone passes vacuously
+    /// when the shape merely declined — a lesson pinned by the earlier oracles.
+    #[test]
+    fn trust_ir_branch_model_value_oracle() {
+        use crate::trustir_anchor::{
+            RefinementVerdict, branch_model_refinement_proof, branch_model_refinement_statement,
+            check_branch_refinement_model, check_refinement_decl, int_lit,
+        };
+        let claim = |cfg: &crate::trustir_anchor::IrCfg, v: i128| {
+            check_refinement_decl(
+                "Trust.TrustIr.Refinement.branch_model_oracle",
+                branch_model_refinement_statement(cfg, Some(&int_lit(v))),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        // The TRUE table for `if x <op> 3 { 10 } else { 20 }`, probed at values chosen
+        // so every op is separated from every other (3 is the Lt/Le boundary).
+        for (op, x, want) in [
+            (trust_types::BinOp::Lt, 2, 10_i128),
+            (trust_types::BinOp::Lt, 3, 20), // the boundary: Lt(3,3) is FALSE
+            (trust_types::BinOp::Lt, 4, 20),
+            (trust_types::BinOp::Le, 3, 10), // Le(3,3) is TRUE — separates Le from Lt
+            (trust_types::BinOp::Le, 4, 20),
+            (trust_types::BinOp::Eq, 3, 10),
+            (trust_types::BinOp::Eq, 4, 20),
+            (trust_types::BinOp::Ne, 3, 20),
+            (trust_types::BinOp::Ne, 4, 10),
+            (trust_types::BinOp::Gt, 3, 20), // Gt encodes by OPERAND SWAP — boundary row
+            (trust_types::BinOp::Gt, 4, 10),
+            (trust_types::BinOp::Ge, 3, 10),
+            (trust_types::BinOp::Ge, 2, 20),
+        ] {
+            let cfg = closed_branch_cfg(op, x);
+            // POSITIVE FIRST: the true value must PROVE.
+            assert_eq!(
+                claim(&cfg, want),
+                RefinementVerdict::ProvenModulo3,
+                "{op:?} at x={x} must prove {want}"
+            );
+            // Then the wrong arm's value must be REJECTED.
+            let other = if want == 10 { 20 } else { 10 };
+            assert!(
+                matches!(claim(&cfg, other), RefinementVerdict::KernelRejected(_)),
+                "{op:?} at x={x}: the WRONG arm's value {other} must be rejected"
+            );
+        }
+
+        // THE POLARITY FORGERY — then/else swapped in the Switch. (a) the
+        // self-relating check STILL PROVES it (this is the blindness the oracle
+        // exists to cover — if this assert ever fails, the comment is stale, not the
+        // code); (b) the value rows reject the TRUE claims.
+        let mut forged = closed_branch_cfg(trust_types::BinOp::Lt, 2);
+        for blk in &mut forged.blocks {
+            if let crate::trustir_anchor::IrTerm::Switch(_, t, e) = &mut blk.term {
+                std::mem::swap(t, e);
+            }
+        }
+        assert_eq!(
+            check_branch_refinement_model(&forged),
+            RefinementVerdict::ProvenModulo3,
+            "the polarity-swapped CFG PROVES against itself — the self-relating blindness"
+        );
+        assert!(
+            matches!(claim(&forged, 10), RefinementVerdict::KernelRejected(_)),
+            "the polarity-swapped CFG must FAIL the true value (Lt at x=2 is 10)"
+        );
+        assert_eq!(
+            claim(&forged, 20),
+            RefinementVerdict::ProvenModulo3,
+            "…and prove the WRONG one — which is exactly why the recognizer's polarity \
+             derivations must never be re-derived downstream"
+        );
+    }
+
+    /// HONESTY PIN — the `w_result_is_ok`-class DISCRIMINANT-guarded switch: the
+    /// GROUNDED branch checker must DECLINE it (the guard's `Discr` reflects to a
+    /// formula the live grounder has no arm for), the MODEL checker must CARRY it,
+    /// and the full via-lane must certify. The certificate asserts STRUCTURAL
+    /// correspondence only — the tag is opaque, so no arm choice is ever decided at
+    /// values; the oracle above defends the translation on the value-decidable
+    /// fragment, and `sem_discriminant_base_of_mir`'s gates (never re-transcribed)
+    /// defend the base.
+    #[test]
+    fn trust_ir_discr_guarded_branch_is_model_only_and_certifies() {
+        use crate::trustir_anchor::{
+            RefinementVerdict, check_branch_refinement, check_branch_refinement_model,
+        };
+        // Reuse the enum tag-read fixture family: a 2-variant enum, tag-guarded
+        // exhaustive switch, constant arms — the `is_ok` shape.
+        let func = enum_tag_switch_fixture();
+        let tree = crate::mirsem::sem_cf_return_shape_of(&func)
+            .and_then(|r| sem_cf_return_to_branch_tree(&r))
+            .or_else(|| crate::mirsem::sem_nested_branch_shape_of(&func))
+            .expect("the discriminant-guarded switch must be recognized");
+        let cfg = sem_branch_tree_to_ir_cfg(&tree, func.body.arg_count)
+            .expect("the tree must translate — Discr is an admitted operand");
+        assert!(
+            !matches!(check_branch_refinement(&cfg), RefinementVerdict::ProvenModulo3),
+            "the GROUNDED checker must DECLINE the Discr-guarded CFG"
+        );
+        assert_eq!(
+            check_branch_refinement_model(&cfg),
+            RefinementVerdict::ProvenModulo3,
+            "the MODEL checker must carry it"
+        );
+        assert!(
+            branch_fully_faithful_via_trustir(&func),
+            "the full branch via-lane must certify the Discr-guarded switch"
+        );
+    }
+
+    /// The `Result::<i32, u8>::is_ok` SHAPE for the honesty pin: tag read, exhaustive
+    /// 2-variant switch, constant Bool arms.
+    fn enum_tag_switch_fixture() -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VariantDef, VerifiableBody,
+        };
+        let enum_ty = Ty::adt_enum(
+            "core::result::Result",
+            vec![
+                VariantDef {
+                    name: "Ok".into(),
+                    discriminant: 0,
+                    fields: vec![("0".into(), Ty::Int { width: 32, signed: true })],
+                },
+                VariantDef {
+                    name: "Err".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), Ty::Int { width: 8, signed: false })],
+                },
+            ],
+        );
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "is_ok".into(),
+            def_path: "core::result::Result::<i32, u8>::is_ok".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Ref { mutable: false, inner: Box::new(enum_ty) },
+                        name: Some("self".into()),
+                    },
+                    LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            2,
+                            Rvalue::Discriminant(Place {
+                                local: 1,
+                                projections: vec![Projection::Deref],
+                            }),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Move(Place { local: 2, projections: vec![] }),
+                            targets: vec![(0, BlockId(1))],
+                            otherwise: BlockId(2),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![assign(
+                            0,
+                            Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+                        )],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![assign(
+                            0,
+                            Rvalue::Use(Operand::Constant(ConstValue::Bool(false))),
+                        )],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 1,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// The `min_max_i32` TWO-CALL CHAIN — `a.min(b).max(c)` — mirroring the mirsem
+    /// test fixture byte-for-byte, plus the `max_min` transposition where the
+    /// intermediate lands in the SECOND outer slot instead of the first.
+    fn two_call_chain_fixture(
+        intermediate_second: bool,
+    ) -> (VerifiableFunction, std::collections::BTreeMap<String, crate::mirsem::CalleeFact>) {
+        use trust_types::{
+            BasicBlock, BlockId, Formula as F, LocalDecl, Operand, Place, Sort, SourceSpan,
+            Terminator, Ty, UnwindEdge, VerifiableBody,
+        };
+        let i32_ty = || Ty::Int { width: 32, signed: true };
+        let range = |name: &str| {
+            F::And(vec![
+                F::Ge(
+                    Box::new(F::Var(name.into(), Sort::Int)),
+                    Box::new(F::Int(-2_147_483_648)),
+                ),
+                F::Le(Box::new(F::Var(name.into(), Sort::Int)), Box::new(F::Int(2_147_483_647))),
+            ])
+        };
+        let fact = || crate::mirsem::CalleeFact {
+            arg_count: 2,
+            param_tys: vec![i32_ty(), i32_ty()],
+            return_ty: i32_ty(),
+            requires: Some(vec![range("self"), range("other")]),
+            param_names: vec![Some("self".into()), Some("other".into())],
+        };
+        let mut registry = std::collections::BTreeMap::new();
+        registry.insert("<i32 as std::cmp::Ord>::min".to_string(), fact());
+        registry.insert("<i32 as std::cmp::Ord>::max".to_string(), fact());
+        let call = |func: &str, args: Vec<Operand>, dest: usize, target: usize| {
+            Terminator::Call {
+                func: func.to_string(),
+                args,
+                dest: Place { local: dest, projections: vec![] },
+                target: Some(BlockId(target)),
+                unwind: UnwindEdge::Unreachable,
+                span: SourceSpan::default(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+            }
+        };
+        let outer_args = if intermediate_second {
+            vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))]
+        } else {
+            vec![Operand::Copy(Place::local(4)), Operand::Copy(Place::local(3))]
+        };
+        let func = VerifiableFunction {
+            name: "min_max_i32".into(),
+            def_path: "min_max_i32".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: i32_ty(), name: None },
+                    LocalDecl { index: 1, ty: i32_ty(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: i32_ty(), name: Some("b".into()) },
+                    LocalDecl { index: 3, ty: i32_ty(), name: Some("c".into()) },
+                    LocalDecl { index: 4, ty: i32_ty(), name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: call(
+                            "<i32 as std::cmp::Ord>::min",
+                            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+                            4,
+                            1,
+                        ),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![],
+                        terminator: call("<i32 as std::cmp::Ord>::max", outer_args, 0, 2),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![],
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: 3,
+                return_ty: i32_ty(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![range("a"), range("b"), range("c")],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        };
+        (func, registry)
+    }
+
+    /// POSITIVE + POSITIONAL — the two-call chain certifies on the trust-ir lane, and
+    /// the recognizer keeps the outer call's argument ORDER: `max(_t, c)` and
+    /// `max(c, _t)` transcribe to DIFFERENT `outer_args` layouts. The order matters
+    /// even though today's two-transport certificate cannot see it (the transport is
+    /// universal over the Call): `min_max` and `max_min` differ exactly there, and if
+    /// the model is ever strengthened to an n-ary functional claim a wrong order
+    /// would mint false certificates retroactively.
+    #[test]
+    fn trust_ir_two_call_chain_certifies_and_keeps_intermediate_slot() {
+        use crate::mirsem::{ChainArg, SemOperand};
+        let (func, registry) = two_call_chain_fixture(false);
+        let chain = crate::mirsem::sem_two_call_chain_of_mir(&func, &registry)
+            .expect("min_max must be recognized");
+        assert_eq!(
+            chain.outer_args,
+            vec![ChainArg::Intermediate, ChainArg::Modeled(SemOperand::Var(2))],
+            "max(_t, c): the intermediate is the FIRST outer slot"
+        );
+        assert!(
+            two_call_chain_fully_faithful_via_trustir(&func, &registry),
+            "min_max must certify on the trust-ir two-call-chain lane"
+        );
+        let (swapped, registry2) = two_call_chain_fixture(true);
+        let chain2 = crate::mirsem::sem_two_call_chain_of_mir(&swapped, &registry2)
+            .expect("max(c, _t) must be recognized");
+        assert_eq!(
+            chain2.outer_args,
+            vec![ChainArg::Modeled(SemOperand::Var(2)), ChainArg::Intermediate],
+            "max(c, _t): the intermediate is the SECOND outer slot — the transcription \
+             reads the MIR, it does not normalize"
+        );
+        assert!(two_call_chain_fully_faithful_via_trustir(&swapped, &registry2));
+    }
+
+    /// FAIL-CLOSED — an EMPTY registry (no certified callee) and a missing outer
+    /// requires-establishment both decline. The registry variant exercises the
+    /// recognizer's own gate; the requires variant exercises clause (d): with the
+    /// caller's preconditions REMOVED, the callee's range `#[requires]` cannot be
+    /// established from nothing, and the lane must fail closed rather than mint the
+    /// transports anyway.
+    #[test]
+    fn trust_ir_two_call_chain_gates_fail_closed() {
+        let (func, _) = two_call_chain_fixture(false);
+        assert!(
+            !two_call_chain_fully_faithful_via_trustir(&func, &std::collections::BTreeMap::new()),
+            "an empty registry must decline"
+        );
+        let (mut bare, registry) = two_call_chain_fixture(false);
+        bare.preconditions.clear();
+        assert!(
+            !two_call_chain_fully_faithful_via_trustir(&bare, &registry),
+            "with the caller's preconditions removed, the callees' range requires \
+             cannot be established — clause (d) must fail closed"
+        );
+    }
+
+    /// The `i32::saturating_add`/`saturating_sub` SHAPE — a body-less arity-2 pinned
+    /// intrinsic call writing `_0` directly. `arg_order_swapped` builds the SAME call
+    /// with the two actuals transposed, for the positional pin.
+    fn saturating_call(sub: bool, arg_order_swapped: bool) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
+            VerifiableBody,
+        };
+        let i32_ty = || Ty::Int { width: 32, signed: true };
+        let name = if sub { "saturating_sub" } else { "saturating_add" };
+        let (a, b) = if arg_order_swapped { (2, 1) } else { (1, 2) };
+        VerifiableFunction {
+            name: name.into(),
+            def_path: format!("core::num::<impl i32>::{name}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: i32_ty(), name: None },
+                    LocalDecl { index: 1, ty: i32_ty(), name: Some("self".into()) },
+                    LocalDecl { index: 2, ty: i32_ty(), name: Some("rhs".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: format!(
+                                "@trust-rustc-intrinsic::std::intrinsics::{name}::<i32>"
+                            ),
+                            args: vec![
+                                Operand::Move(Place { local: a, projections: vec![] }),
+                                Operand::Move(Place { local: b, projections: vec![] }),
+                            ],
+                            dest: Place { local: 0, projections: vec![] },
+                            target: Some(BlockId(1)),
+                            unwind: Default::default(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 2,
+                return_ty: i32_ty(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE + POSITIONAL — the arity-2 pinned entry admits the saturating pair,
+    /// and the recognizer's transcription KEEPS the actual-argument order.
+    ///
+    /// The order matters even though today's certificate cannot see it: the transport
+    /// lemma is universal over the Call (the `args.first()` tag is semantically
+    /// vacuous — the disclosed one-arg `Call.mk` residue #3), so a swapped
+    /// transcription is refinement-invisible NOW. The pin is insurance for the day the
+    /// model is strengthened to an n-ary functional claim: `saturating_sub(a, b)` is
+    /// not symmetric, and if the transcription order were wrong, strengthening the
+    /// theory would mint false certificates retroactively. Asserted per-slot with the
+    /// two args DISTINGUISHABLE (Var(0) vs Var(1)).
+    #[test]
+    fn trust_ir_saturating_arity2_certifies_and_keeps_arg_order() {
+        use crate::mirsem::SemOperand;
+        for sub in [false, true] {
+            let func = saturating_call(sub, false);
+            let call = crate::mirsem::sem_intrinsic_call_return_of_mir(&func)
+                .expect("the saturating call-return shape must be recognized");
+            assert_eq!(
+                call.args,
+                vec![
+                    SemOperand::Move(Box::new(SemOperand::Var(0))),
+                    SemOperand::Move(Box::new(SemOperand::Var(1)))
+                ],
+                "the transcription must keep (self, rhs) order"
+            );
+            let swapped = saturating_call(sub, true);
+            let call2 = crate::mirsem::sem_intrinsic_call_return_of_mir(&swapped)
+                .expect("recognized either way");
+            assert_eq!(
+                call2.args,
+                vec![
+                    SemOperand::Move(Box::new(SemOperand::Var(1))),
+                    SemOperand::Move(Box::new(SemOperand::Var(0)))
+                ],
+                "a swapped call must transcribe SWAPPED — the recognizer reads the MIR, \
+                 it does not normalize"
+            );
+            assert!(
+                call_return_fully_faithful_via_trustir(&func, &std::collections::BTreeMap::new()),
+                "the arity-2 pinned entry must certify {}",
+                if sub { "saturating_sub" } else { "saturating_add" }
+            );
+        }
+    }
+
+    /// FAIL-CLOSED — the partial siblings stay OUT. `unchecked_add` (UB on overflow)
+    /// and `cttz_nonzero` (UB on zero) carry real preconditions; admitting either
+    /// would certify a claim silent about its UB. The classifier excludes them by
+    /// name on both spelling lanes; this pins that the arity-2 widening did not
+    /// accidentally widen the SET.
+    #[test]
+    fn trust_ir_arity2_partial_siblings_decline() {
+        for name in ["unchecked_add", "unchecked_sub", "cttz_nonzero"] {
+            let mut func = saturating_call(false, false);
+            let n = func.body.blocks[0].terminator.clone();
+            if let trust_types::Terminator::Call { func: f, .. } =
+                &mut func.body.blocks[0].terminator
+            {
+                *f = format!("@trust-rustc-intrinsic::std::intrinsics::{name}::<i32>");
+            } else {
+                unreachable!("{n:?}");
+            }
+            assert!(
+                !call_return_fully_faithful_via_trustir(&func, &std::collections::BTreeMap::new()),
+                "`{name}` must NOT be admitted by the pinned entry"
+            );
+        }
+    }
+
+    /// The `cap_and::{closure#0}` SHAPE — `|x: u8| x & <captured>` — a closure body
+    /// reading upvar 0 off its env parameter then combining it with the ordinary
+    /// argument. `kind` selects the closure call kind; `upvar_idx` the field read
+    /// (1 = out of range for a single capture); `bool_upvar` makes the capture a Bool
+    /// read into a u8 temp (the adversarial non-matching-type control).
+    fn closure_upvar_bitand(
+        kind: Option<trust_types::ClosureCallKind>,
+        upvar_idx: usize,
+        non_scalar_upvar: bool,
+    ) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ClosureCallSig, LocalDecl, Operand, Place, Projection,
+            Rvalue, SourceSpan, Statement, Terminator, Ty, VerifiableBody,
+        };
+        let u8_ty = || Ty::Int { width: 8, signed: false };
+        let upvar = if non_scalar_upvar {
+            Ty::adt("SomeStruct", vec![("0".into(), u8_ty())])
+        } else {
+            u8_ty()
+        };
+        let env_ty = Ty::Closure {
+            name: "cap_and::{closure#0}".into(),
+            upvars: vec![upvar],
+            call: kind.map(|k| {
+                Box::new(ClosureCallSig { kind: k, params: vec![u8_ty()], ret: Some(u8_ty()) })
+            }),
+        };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "{closure#0}".into(),
+            def_path: "cap_and::{closure#0}".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: u8_ty(), name: None },
+                    LocalDecl { index: 1, ty: env_ty, name: Some("env".into()) },
+                    LocalDecl { index: 2, ty: u8_ty(), name: Some("x".into()) },
+                    LocalDecl { index: 3, ty: u8_ty(), name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        assign(
+                            3,
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 1,
+                                projections: vec![Projection::Field(upvar_idx)],
+                            })),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::BinaryOp(
+                                BinOp::BitAnd,
+                                Operand::Copy(Place { local: 2, projections: vec![] }),
+                                Operand::Move(Place { local: 3, projections: vec![] }),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 2,
+                return_ty: u8_ty(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the closure-upvar read certifies, and the upvar binds `Field` at the
+    /// ENV's parameter slot (0 — the env is the closure's first parameter), never the
+    /// raw local. The delegation to `mirsem::sem_field_read_operand` is what carries
+    /// the capture gates; this pins the mapping it hands back.
+    #[test]
+    fn trust_ir_closure_upvar_chain_certifies() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue};
+        use trust_types::ClosureCallKind;
+        for kind in [ClosureCallKind::Fn, ClosureCallKind::FnOnce] {
+            let func = closure_upvar_bitand(Some(kind), 0, false);
+            let ir = straight_line_ir_body_chain(&func)
+                .unwrap_or_else(|| panic!("{kind:?} upvar chain must be admitted"));
+            assert_eq!(
+                ir.stmts[0].rvalue,
+                IrRvalue::Use(IrOperand::Field(0, 0)),
+                "upvar 0 must denote Field(env_slot=0, 0)"
+            );
+            assert!(
+                straight_line_chain_fully_faithful_via_trustir(&func),
+                "the {kind:?} upvar chain must certify on the trust-ir lane"
+            );
+        }
+    }
+
+    /// FAIL-CLOSED — the capture gates, one at a time: a recorded `FnMut` kind, a
+    /// MISSING call signature, and an OUT-OF-RANGE upvar index all decline via the
+    /// delegate; a NON-SCALAR capture declines via this lane's own added type gate
+    /// (the one gate the delegate does not carry — MirSem's opaque selector tolerates
+    /// it, an Int-sorted trust-ir denotation must not).
+    ///
+    /// HONESTY NOTE on the `FnMut` row: it exercises the kind gate on a fixture whose
+    /// recorded kind IS `FnMut`. In REAL dumps that gate is weaker than it looks — the
+    /// extractor records `cap_fnmut::{closure#0}`'s kind as `FnOnce` (measured,
+    /// trust-mir-ac28fceb2d447b02), so the kind gate does NOT stop the mutating-capture
+    /// forgery there; the delegate's PROJECTED-WRITE gate (the body assigns `_1.0`) and
+    /// its `Call` terminator do. Never cite the kind gate as that forgery's defense,
+    /// and never weaken the projected-write gate on its strength.
+    #[test]
+    fn trust_ir_closure_upvar_gates_fail_closed() {
+        use trust_types::ClosureCallKind;
+        for (what, func) in [
+            ("FnMut env", closure_upvar_bitand(Some(ClosureCallKind::FnMut), 0, false)),
+            ("missing call signature", closure_upvar_bitand(None, 0, false)),
+            ("out-of-range upvar", closure_upvar_bitand(Some(ClosureCallKind::Fn), 1, false)),
+            ("non-scalar capture", closure_upvar_bitand(Some(ClosureCallKind::Fn), 0, true)),
+        ] {
+            assert!(
+                straight_line_ir_body_chain(&func).is_none(),
+                "the `{what}` upvar shape must decline"
+            );
+            assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+        }
+    }
+
+    /// The `u8::ascii_change_case_unchecked` SHAPE — `*self ^ 32` — and its `|` sibling:
+    /// a bare-Deref read then a bitwise op against a literal. `bop` selects the op;
+    /// `mutable` flips the reference for the fail-closed control.
+    fn deref_then_bitop(bop: trust_types::BinOp, mutable: bool) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VerifiableBody,
+        };
+        let u8_ty = || Ty::Int { width: 8, signed: false };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "f".into(),
+            def_path: "core::num::<impl u8>::ascii_change_case_unchecked".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: u8_ty(), name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Ref { mutable, inner: Box::new(u8_ty()) },
+                        name: Some("self".into()),
+                    },
+                    LocalDecl { index: 2, ty: u8_ty(), name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        assign(
+                            2,
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: 1,
+                                projections: vec![Projection::Deref],
+                            })),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::BinaryOp(
+                                bop,
+                                Operand::Move(Place { local: 2, projections: vec![] }),
+                                Operand::Constant(ConstValue::Uint(32, 8)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: u8_ty(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — `BitXor`/`BitOr` in the chain, on the real `*self ^ 32` shape. The
+    /// value claim is OPAQUE (`Int.xor`/`Int.lor` carriers — grounder-connected via the
+    /// BITWISE SHAPE LANE, but no numeric fact is asserted); what this pins is that the
+    /// mapping exists, certifies, and maps each MIR op to ITS OWN trust-ir op. The
+    /// cross-op rejection (`Or` claiming `Xor`'s grounding must fail, the swapped-minor
+    /// detector) is pinned separately in trustir_anchor's
+    /// `trustir_or_xor_refinement_fail_closed_and_swap_detected`.
+    #[test]
+    fn trust_ir_bitxor_bitor_chain_certifies() {
+        use crate::trustir_anchor::{IrRvalue, TrustIrBinOp};
+        for (bop, want) in [
+            (trust_types::BinOp::BitXor, TrustIrBinOp::Xor),
+            (trust_types::BinOp::BitOr, TrustIrBinOp::Or),
+        ] {
+            let func = deref_then_bitop(bop, false);
+            let ir = straight_line_ir_body_chain(&func)
+                .unwrap_or_else(|| panic!("{bop:?} chain must be admitted"));
+            assert!(
+                matches!(&ir.stmts[1].rvalue, IrRvalue::Bin(op, _, _) if *op == want),
+                "{bop:?} must map to {want:?} — its OWN op, never a neighbour's"
+            );
+            assert!(
+                straight_line_chain_fully_faithful_via_trustir(&func),
+                "{bop:?} chain must certify on the trust-ir lane"
+            );
+        }
+    }
+
+    /// FAIL-CLOSED — the same shape through a `&mut` reference declines (inherited from
+    /// the delegated bare-Deref arm: a mutable alias could rebind the referent between
+    /// the read and its use).
+    #[test]
+    fn trust_ir_bitxor_chain_declines_mutable_ref() {
+        let func = deref_then_bitop(trust_types::BinOp::BitXor, true);
+        assert!(straight_line_ir_body_chain(&func).is_none());
+        assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+    }
+
+    /// The `slice::is_empty` SHAPE — `_2 := PtrMetadata(_1); _0 := Eq(_2, 0)` — and its
+    /// fail-closed controls. `mutable` flips the slice reference; `non_slice` points the
+    /// metadata read at a non-slice reference.
+    fn ptr_metadata_is_empty(mutable: bool, non_slice: bool) -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, UnOp, VerifiableBody,
+        };
+        let elem = Ty::Int { width: 32, signed: true };
+        let inner = if non_slice {
+            elem.clone()
+        } else {
+            Ty::Slice { elem: Box::new(elem) }
+        };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "is_empty".into(),
+            def_path: "core::slice::<impl [i32]>::is_empty".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Ref { mutable, inner: Box::new(inner) },
+                        name: Some("self".into()),
+                    },
+                    LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: false }, name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        assign(
+                            2,
+                            Rvalue::UnaryOp(
+                                UnOp::PtrMetadata,
+                                Operand::Copy(Place { local: 1, projections: vec![] }),
+                            ),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Move(Place { local: 2, projections: vec![] }),
+                                Operand::Constant(ConstValue::Uint(0, 64)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the SINGLE-STATEMENT lane's own `PtrMetadata` arm
+    /// (`w_slice_len`'s `_0 := PtrMetadata(_1)`), which the chain lane never sees
+    /// (its fragment starts at 2 statements). Distinct from the chain pin below
+    /// because the two arms delegate with DIFFERENT use sites — this one passes the
+    /// REAL (return_block, statement), which is what activates the resolver's
+    /// same-fat-pointer cast passthrough for `str::len`.
+    #[test]
+    fn trust_ir_ptr_metadata_single_statement_certifies() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue};
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, UnOp, VerifiableBody,
+        };
+        let slice_ref = Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Slice { elem: Box::new(Ty::Int { width: 32, signed: true }) }),
+        };
+        let func = VerifiableFunction {
+            name: "w_slice_len".into(),
+            def_path: "w_slice_len".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
+                    LocalDecl { index: 1, ty: slice_ref, name: Some("s".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place { local: 0, projections: vec![] },
+                        rvalue: Rvalue::UnaryOp(
+                            UnOp::PtrMetadata,
+                            Operand::Copy(Place { local: 1, projections: vec![] }),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Int { width: 64, signed: false },
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        };
+        let ir = straight_line_ir_body(&func)
+            .expect("the single-statement PtrMetadata shape must be admitted");
+        assert_eq!(
+            ir.stmts[0].rvalue,
+            IrRvalue::Use(IrOperand::Len(Box::new(IrOperand::Var(0)))),
+            "the length must bind parameter slot 0"
+        );
+        assert!(straight_line_fully_faithful_via_trustir(&func));
+    }
+
+    /// POSITIVE + HONESTY — `slice::is_empty` certifies on the chain lane, the length
+    /// carrier binds the right parameter slot, and the certificate is MODEL-ONLY: `Len`
+    /// is not grounder-connected (the live grounder's `slice_len` head is
+    /// `Trust.MirSem.*`'s, not this anchor's opaque), so the value is asserted only as
+    /// an uninterpreted quantity determined by the entry-time slice.
+    #[test]
+    fn trust_ir_ptr_metadata_is_empty_certifies_model_only() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, RefinementVerdict, check_body_refinement,
+        };
+        let func = ptr_metadata_is_empty(false, false);
+        let ir = straight_line_ir_body_chain(&func)
+            .expect("the slice::is_empty shape must be admitted");
+        assert_eq!(
+            ir.stmts[0].rvalue,
+            IrRvalue::Use(IrOperand::Len(Box::new(IrOperand::Var(0)))),
+            "the metadata read must denote the LENGTH of parameter slot 0"
+        );
+        assert!(
+            straight_line_chain_fully_faithful_via_trustir(&func),
+            "slice::is_empty must certify on the trust-ir chain lane"
+        );
+        assert!(
+            !IrOperand::Len(Box::new(IrOperand::Var(0))).is_grounder_connected(),
+            "Len must stay MODEL-ONLY"
+        );
+        assert!(
+            !matches!(check_body_refinement(&ir), RefinementVerdict::ProvenModulo3),
+            "the GROUNDER-CONNECTED checker must decline — the model lane carries this"
+        );
+    }
+
+    /// FAIL-CLOSED — a `&mut [T]` slice and a metadata read of a NON-slice reference
+    /// both decline (inherited from the delegated W-LEN-ISEMPTY resolver).
+    #[test]
+    fn trust_ir_ptr_metadata_gates_fail_closed() {
+        for (what, func) in [
+            ("&mut slice", ptr_metadata_is_empty(true, false)),
+            ("non-slice referent", ptr_metadata_is_empty(false, true)),
+        ] {
+            assert!(
+                straight_line_ir_body_chain(&func).is_none(),
+                "the `{what}` metadata read must decline"
+            );
+            assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+        }
+    }
+
+    /// HONESTY PIN for the Bool-`Not` arm, on a REAL body rather than on the carrier.
+    ///
+    /// The arm's own comment says logical negation is "expressed with the already-
+    /// grounder-connected `Cmp` rather than a new opaque". That is true of the CARRIER
+    /// and false of every body the arm actually moved: all 37 begin with
+    /// `Rvalue::Discriminant`, so `check_body_refinement` declines the body and only
+    /// `check_body_refinement_model_chain` carries it. A reader takes the comment as a
+    /// claim about the certificate. Found by adversarial review; this pins the real
+    /// tier, the way `trust_ir_enum_tag_predicate_chain_is_model_only` already does for
+    /// the tag read.
+    #[test]
+    fn trust_ir_bool_not_predicate_body_is_model_only_in_practice() {
+        use crate::trustir_anchor::{RefinementVerdict, check_body_refinement};
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Projection,
+            Rvalue, SourceSpan, Statement, Terminator, Ty, UnOp, VariantDef, VerifiableBody,
+        };
+        // `Option::<i32>::is_none` as trustc emits it: tag read, compare, negate.
+        let enum_ty = Ty::adt_enum(
+            "core::option::Option",
+            vec![
+                VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), Ty::Int { width: 32, signed: true })],
+                },
+            ],
+        );
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let func = VerifiableFunction {
+            name: "is_none".into(),
+            def_path: "core::option::Option::<i32>::is_none".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Ref { mutable: false, inner: Box::new(enum_ty) },
+                        name: Some("self".into()),
+                    },
+                    LocalDecl { index: 2, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 3, ty: Ty::Int { width: 64, signed: true }, name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        assign(
+                            3,
+                            Rvalue::Discriminant(Place {
+                                local: 1,
+                                projections: vec![Projection::Deref],
+                            }),
+                        ),
+                        assign(
+                            2,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place { local: 3, projections: vec![] }),
+                                Operand::Constant(ConstValue::Int(1)),
+                            ),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::UnaryOp(
+                                UnOp::Not,
+                                Operand::Move(Place { local: 2, projections: vec![] }),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        };
+        let ir = straight_line_ir_body_chain(&func).expect("the is_none shape must be admitted");
+        assert!(
+            straight_line_chain_fully_faithful_via_trustir(&func),
+            "is_none must certify on the chain lane"
+        );
+        assert!(
+            !matches!(check_body_refinement(&ir), RefinementVerdict::ProvenModulo3),
+            "the GROUNDER-CONNECTED checker must DECLINE this body — the `Cmp` carrier is \
+             grounder-connected but the tag read in statement 1 is not, so the certificate \
+             this arm actually produces is MODEL-ONLY"
+        );
+    }
+
+    /// SLOT PIN for the shipped `Rvalue::Discriminant` arm. Its own fixture is
+    /// `arg_count: 1` with the receiver at local 1, so `param_index(1) == 0` and a
+    /// `p.local`-vs-`param_index(p.local)` confusion is INVISIBLE there — `Discr(0)`
+    /// and `Discr(1)` cannot be told apart by a one-argument body. What prevents it is
+    /// the delegation to `sem_discriminant_base_of_mir`, which returns the slot itself;
+    /// that was sound but unpinned. No value oracle is possible for `Discr` (the tag is
+    /// an opaque `idxElem` at a reserved key, so the certificate asserts nothing about
+    /// the tag's value), which makes a POSITIONAL pin the only available substitute.
+    #[test]
+    fn trust_ir_discriminant_binds_the_second_parameter_slot() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue};
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VariantDef, VerifiableBody,
+        };
+        let enum_ty = Ty::adt_enum(
+            "std::cmp::Ordering",
+            vec![
+                VariantDef { name: "Less".into(), discriminant: -1, fields: vec![] },
+                VariantDef { name: "Equal".into(), discriminant: 0, fields: vec![] },
+            ],
+        );
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        // `fn f(_ignored: i64, o: Ordering) -> bool { discriminant(o) < 0 }` — the tag
+        // is read off the SECOND parameter, so the right slot is 1, not the local 2.
+        let func = VerifiableFunction {
+            name: "f".into(),
+            def_path: "SYNTH::f".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Int { width: 64, signed: true },
+                        name: Some("ignored".into()),
+                    },
+                    LocalDecl { index: 2, ty: enum_ty, name: Some("o".into()) },
+                    LocalDecl { index: 3, ty: Ty::Int { width: 8, signed: true }, name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        assign(
+                            3,
+                            Rvalue::Discriminant(Place { local: 2, projections: vec![] }),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::BinaryOp(
+                                BinOp::Lt,
+                                Operand::Copy(Place { local: 3, projections: vec![] }),
+                                Operand::Constant(ConstValue::Int(0)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 2,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        };
+        let ir = straight_line_ir_body_chain(&func).expect("builds");
+        assert_eq!(
+            ir.stmts[0].rvalue,
+            IrRvalue::Use(IrOperand::Discr(1)),
+            "the tag of the SECOND parameter must be `Discr(1)` — the parameter SLOT, \
+             not the raw local 2"
+        );
+    }
+
+    /// THE SLOT PIN, and the reason this arm delegates instead of transcribing.
+    ///
+    /// A parameter's trust-ir slot is `local - 1`; a TEMP's slot is its local index.
+    /// The bare-place arm three lines above the new one spells `Var(p.local)` for a
+    /// temp, and copying that spelling would give `(*_1)` the slot `Var(1)` — which in
+    /// a two-argument function is the SECOND parameter. The body would then compute
+    /// `b < b`, and `check_body_refinement` would prove it, because the refinement
+    /// relates the IrBody to itself and has no idea which Rust parameter `Var(1)` was
+    /// meant to name. Nothing else in the suite would notice either: the body still
+    /// builds, still certifies, still counts.
+    ///
+    /// So this asserts the slots POSITIONALLY: `*a` is `Var(0)` and `*b` is `Var(1)`,
+    /// and they are DISTINCT.
+    #[test]
+    fn trust_ir_bare_deref_reads_bind_the_right_parameter_slots() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue, TrustIrCmpOp};
+        let func = two_ref_param_compare(false, false, false);
+        let ir = straight_line_ir_body_chain(&func)
+            .expect("two bare-Deref reads of `&u32` parameters must be admitted");
+        assert_eq!(
+            ir.stmts[0].rvalue,
+            IrRvalue::Use(IrOperand::Var(0)),
+            "`*a` must bind parameter slot 0 — NOT the raw local 1"
+        );
+        assert_eq!(
+            ir.stmts[1].rvalue,
+            IrRvalue::Use(IrOperand::Var(1)),
+            "`*b` must bind parameter slot 1 — NOT the raw local 2"
+        );
+        assert_eq!(
+            ir.stmts[2].rvalue,
+            IrRvalue::Cmp(
+                TrustIrCmpOp::Lt,
+                IrOperand::Var(u64::try_from(3usize).unwrap()),
+                IrOperand::Var(u64::try_from(4usize).unwrap()),
+            ),
+            "the comparison must read the two distinct temps"
+        );
+        assert!(straight_line_chain_fully_faithful_via_trustir(&func));
+    }
+
+    /// A bare-`Deref` read is GROUNDER-CONNECTED, unlike the `Discr` and cast carriers
+    /// that also landed on this lane: it produces a plain `IrOperand::Var`, so these
+    /// bodies certify through the PRIMARY `check_body_refinement` rather than the
+    /// model-only chain fallback. Pinned because it is the distinguishing property —
+    /// if a future change routes this read through an opaque carrier instead, the
+    /// count would not move but the evidence behind it would silently weaken.
+    #[test]
+    fn trust_ir_bare_deref_bodies_are_grounder_connected() {
+        use crate::trustir_anchor::{RefinementVerdict, check_body_refinement};
+        let func = two_ref_param_compare(false, false, false);
+        let ir = straight_line_ir_body_chain(&func).expect("builds");
+        assert_eq!(
+            check_body_refinement(&ir),
+            RefinementVerdict::ProvenModulo3,
+            "the GROUNDER-CONNECTED checker must carry this body, not just the model lane"
+        );
+    }
+
+    /// FAIL-CLOSED — every gate the delegation inherits, exercised one at a time.
+    ///
+    /// `&mut`: the referent could be reassigned between the read and its use, so
+    /// `Var(idx)` (the ENTRY value) is not what the program reads. `&bool`: MirSem's
+    /// arm is `Ty::Int`-only, and widening it "for symmetry" with the bare-place arm
+    /// would assert something that recognizer never vetted. Non-parameter base: the
+    /// delegate requires `param_index(p.local)`, without which the slot would be an
+    /// index no statement assigns — promoted to a free universally-quantified Int with
+    /// no relation to the program at all.
+    #[test]
+    fn trust_ir_bare_deref_gates_fail_closed() {
+        for (what, func) in [
+            ("&mut referent", two_ref_param_compare(true, false, false)),
+            ("&bool referent", two_ref_param_compare(false, true, false)),
+            ("non-parameter base", two_ref_param_compare(false, false, true)),
+        ] {
+            assert!(
+                straight_line_ir_body_chain(&func).is_none(),
+                "the `{what}` bare-Deref shape must decline"
+            );
+            assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+        }
+    }
+
+    /// The `Ordering::is_lt` / `is_gt` / `is_eq` / … SHAPE — the `is_*` predicate as
+    /// `trustc` ACTUALLY emits it, with the discriminant temp bracketed by storage
+    /// markers:
+    ///
+    /// ```text
+    /// StorageLive(_2); _2 := Discriminant(_1); _0 := Lt(_2, 0); StorageDead(_2); Return
+    /// ```
+    ///
+    /// `variant` selects the shape under test — the honest one, or one of the three
+    /// ways storage markers can mean something the value model would get WRONG.
+    fn ordering_predicate_with_storage(variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            BinOp, BasicBlock, BlockId, ConstValue, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VariantDef, VerifiableBody,
+        };
+        let enum_ty = Ty::adt_enum(
+            "std::cmp::Ordering",
+            vec![
+                VariantDef { name: "Less".into(), discriminant: -1, fields: vec![] },
+                VariantDef { name: "Equal".into(), discriminant: 0, fields: vec![] },
+                VariantDef { name: "Greater".into(), discriminant: 1, fields: vec![] },
+            ],
+        );
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place { local, projections: vec![] },
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let tag = || assign(2, Rvalue::Discriminant(Place { local: 1, projections: vec![] }));
+        let cmp = || {
+            assign(
+                0,
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place { local: 2, projections: vec![] }),
+                    Operand::Constant(ConstValue::Int(0)),
+                ),
+            )
+        };
+        let stmts = match variant {
+            // The honest shape: the marker trails the LAST use of `_2`.
+            "ok" => vec![Statement::StorageLive(2), tag(), cmp(), Statement::StorageDead(2)],
+            // ADVERSARIAL — `_2` is read AFTER its storage is declared dead. UB in MIR;
+            // the value model would hand back the last assigned tag regardless.
+            "use_after_dead" => {
+                vec![Statement::StorageLive(2), tag(), Statement::StorageDead(2), cmp()]
+            }
+            // ADVERSARIAL — the RETURN PLACE's storage is killed.
+            "dead_return" => {
+                vec![Statement::StorageLive(2), tag(), cmp(), Statement::StorageDead(0)]
+            }
+            // ADVERSARIAL — `_2`'s storage is killed and then RESURRECTED; its contents
+            // are indeterminate from that point, not the previously assigned tag.
+            "resurrect" => vec![
+                Statement::StorageLive(2),
+                tag(),
+                Statement::StorageDead(2),
+                Statement::StorageLive(2),
+                cmp(),
+            ],
+            other => panic!("unknown variant {other}"),
+        };
+        let body = VerifiableBody {
+            locals: vec![
+                trust_types::LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                trust_types::LocalDecl { index: 1, ty: enum_ty, name: Some("self".into()) },
+                trust_types::LocalDecl {
+                    index: 2,
+                    ty: Ty::Int { width: 8, signed: true },
+                    name: None,
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts,
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
+        VerifiableFunction {
+            name: "is_lt".into(),
+            def_path: "std::cmp::Ordering::is_lt".into(),
+            span: SourceSpan::default(),
+            body,
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — storage markers are SKIPPED, not translated. `Ordering::is_lt` and
+    /// its five siblings declined outright before this, because the discriminant temp
+    /// `trustc` emits is bracketed by exactly these markers. The value trace must come
+    /// out as the SAME two statements the marker-free shape produces: a marker writes
+    /// no value and therefore is not a statement of the trust-ir trace.
+    #[test]
+    fn trust_ir_storage_markers_are_skipped_not_translated() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue};
+        let func = ordering_predicate_with_storage("ok");
+        let ir_body = straight_line_ir_body_chain(&func)
+            .expect("the storage-bracketed tag predicate must build a multi-statement IrBody");
+        assert_eq!(
+            ir_body.stmts.len(),
+            2,
+            "a storage marker writes no value — it must not appear in the value trace"
+        );
+        assert_eq!(ir_body.stmts[0].rvalue, IrRvalue::Use(IrOperand::Discr(0)));
+        assert!(matches!(ir_body.stmts[1].rvalue, IrRvalue::Cmp(..)));
+        assert!(
+            straight_line_chain_fully_faithful_via_trustir(&func),
+            "the Ordering::is_* shape must certify on the trust-ir chain lane"
+        );
+    }
+
+    /// FAIL-CLOSED — USE AFTER `StorageDead`, the one way skipping the markers could
+    /// launder a real defect. Reading a local whose storage has ended is UB and its
+    /// contents are indeterminate; this lane's value model would silently denote it as
+    /// the last assigned value, certifying a claim about a program the machine does not
+    /// run. The position-keyed `dead_at` is what makes this precise — it must reject
+    /// THIS while still admitting the ordinary trailing marker above.
+    #[test]
+    fn trust_ir_storage_use_after_dead_declines() {
+        let func = ordering_predicate_with_storage("use_after_dead");
+        assert!(
+            straight_line_ir_body_chain(&func).is_none(),
+            "a read of storage already declared dead must decline"
+        );
+        assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+    }
+
+    /// FAIL-CLOSED — the RETURN PLACE's storage killed, and a RESURRECTED local (dead
+    /// then live again, whose contents are indeterminate rather than the value assigned
+    /// before the death). Neither is a shape `trustc` emits for this family; both are
+    /// declined rather than reasoned about.
+    #[test]
+    fn trust_ir_storage_dead_return_place_and_resurrection_decline() {
+        for variant in ["dead_return", "resurrect"] {
+            let func = ordering_predicate_with_storage(variant);
+            assert!(
+                straight_line_ir_body_chain(&func).is_none(),
+                "the `{variant}` storage shape must decline"
+            );
+            assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+        }
+    }
+
+    /// POSITIVE — the enum TAG READ in the multi-statement chain. Before this arm
+    /// existed `Rvalue::Discriminant` fell into the builder's catch-all, so the whole
+    /// `is_*` predicate family sat at ZERO on the trust-ir lane despite `IrRvalue::Cmp`
+    /// already handling its second statement. Both the `&self` and by-value receivers
+    /// resolve to the SAME `Discr(0)` — `*(&x)` is the identity.
+    #[test]
+    fn trust_ir_enum_tag_predicate_chain_builds_and_certifies() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue};
+        for deref in [true, false] {
+            let func = enum_tag_predicate_function(false, deref, false);
+            let ir_body = straight_line_ir_body_chain(&func)
+                .expect("the enum tag-read predicate must build a multi-statement IrBody");
+            assert_eq!(
+                ir_body.stmts[0].rvalue,
+                IrRvalue::Use(IrOperand::Discr(0)),
+                "the tag read must denote the DISCRIMINANT of parameter 0 (deref={deref})"
+            );
+            assert!(
+                matches!(ir_body.stmts[1].rvalue, IrRvalue::Cmp(..)),
+                "the predicate's second statement is the COMPARE-AS-VALUE arm"
+            );
+            assert!(
+                straight_line_chain_fully_faithful_via_trustir(&func),
+                "the enum tag predicate must certify on the trust-ir chain lane (deref={deref})"
+            );
+        }
+    }
+
+    /// HONESTY PIN — `Discr` is MODEL-ONLY, exactly as `Field`/`Index`/`Len` are: the
+    /// live grounder's arms hardcode the `Trust.MirSem.*` opaques, not
+    /// `Trust.TrustIr.*`'s, so a body carrying a tag read certifies through
+    /// `check_body_refinement_model_chain` and NOT through the grounder-connected
+    /// `check_body_refinement`. Recorded so nobody later reads this lane move as
+    /// having established a live-grounder tie for the tag read — it has not.
+    #[test]
+    fn trust_ir_enum_tag_predicate_chain_is_model_only() {
+        use crate::trustir_anchor::{IrOperand, RefinementVerdict, check_body_refinement};
+        assert!(
+            !IrOperand::Discr(0).is_grounder_connected(),
+            "Discr must stay MODEL-ONLY"
+        );
+        let func = enum_tag_predicate_function(false, true, false);
+        let ir_body = straight_line_ir_body_chain(&func).expect("builds");
+        assert!(
+            !matches!(check_body_refinement(&ir_body), RefinementVerdict::ProvenModulo3),
+            "the GROUNDER-connected checker must decline it — the model lane is what carries it"
+        );
+    }
+
+    /// FAIL-CLOSED — `&mut self`. A mutable receiver could be written through between
+    /// the borrow and the read, so the tag `Discr(0)` denotes need not be the tag the
+    /// program reads. Inherited from `sem_discriminant_base_of_mir` rather than
+    /// re-transcribed here, which is the whole reason this arm delegates to it.
+    #[test]
+    fn trust_ir_enum_tag_predicate_chain_declines_mutable_receiver() {
+        let func = enum_tag_predicate_function(true, true, false);
+        assert!(
+            straight_line_ir_body_chain(&func).is_none(),
+            "a `&mut self` discriminant read must decline — the tag is not pinned to entry"
+        );
+        assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
+    }
+
+    /// FAIL-CLOSED — a PROJECTED base (`Discriminant((*_1).0)`): the tag of a FIELD is
+    /// not the tag of the parameter, and `Discr(idx)` can only denote the latter.
+    /// Without this the arm would silently mis-denote a nested enum's tag as its
+    /// container's.
+    #[test]
+    fn trust_ir_enum_tag_predicate_chain_declines_projected_base() {
+        let func = enum_tag_predicate_function(false, true, true);
+        assert!(
+            straight_line_ir_body_chain(&func).is_none(),
+            "a field-projected discriminant read must decline — `Discr(idx)` names the \
+             PARAMETER's tag, not a field's"
+        );
+        assert!(!straight_line_chain_fully_faithful_via_trustir(&func));
     }
 
     /// FAIL-CLOSED — NON-LITERAL ASSERT CONDITION: the SAME 2-block shape, but the
@@ -20801,7 +29539,7 @@ mod tests {
         use trust_types::{Operand, Place, Rvalue};
         let ret_rvalue = Rvalue::Use(Operand::Move(Place { local: 2, projections: vec![] }));
         let func = call_op_call_direct_test_function("lift_callee", ret_rvalue);
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_op_call_of_mir(&func, &registry).is_none(),
             "`_0 := Use(Move _2)` does not combine BOTH call results — must decline, \
@@ -21077,6 +29815,11 @@ mod tests {
             "num::<impl u8>::to_ascii_lowercase".to_string(),
             crate::mirsem::CalleeFact {
                 arg_count: 1,
+                param_tys: vec![trust_types::Ty::Ref {
+                    mutable: false,
+                    inner: Box::new(trust_types::Ty::Int { width: 8, signed: false }),
+                }],
+                return_ty: trust_types::Ty::Int { width: 8, signed: false },
                 requires: Some(vec![]),
                 param_names: vec![Some("self".into())],
             },
@@ -21518,16 +30261,23 @@ mod tests {
             sc.fully_faithful, sc.fully_faithful_via_trustir, sc.fully_faithful_mirsem_fallback,
         );
         assert_eq!(sc.fully_faithful, 2, "BOTH count_raw and its closure caller certify");
+        // Trust (#54, 2026-08-15): 1 -> 2. `count_raw` used to sit on the MirSem
+        // fallback because its CondIncrGeConst loop had no trust-ir witness; the
+        // cond-update lane now accepts the accumulate body. `fully_faithful`
+        // above is UNCHANGED at 2 — a port moves the witness, not the verdict.
+        // The caller's certification never depended on the callee's lane (that is
+        // modular verification), so only the split moved.
         assert_eq!(
-            sc.fully_faithful_via_trustir, 1,
-            "the closure certifies trust-ir-PRIMARY (the CALL witness, both arg shapes \
-             closing); count_raw itself stays on the MirSem fallback below — its OWN \
-             lane is irrelevant to the caller's certification (modular verification)"
+            sc.fully_faithful_via_trustir, 2,
+            "the closure AND count_raw are both trust-ir-primary"
         );
         assert_eq!(
-            sc.fully_faithful_mirsem_fallback, 1,
-            "count_raw is the one MirSem-fallback member (its synthesized conditional- \
-             increment loop invariant has no trust-ir translation) — named, not hidden"
+            sc.fully_faithful_mirsem_fallback, 0,
+            "no MirSem-only member left: count_raw's synthesized conditional-INCREMENT \
+             loop invariant now HAS a trust-ir translation (Trust #54 -- the \
+             cond-update lane accepts the accumulate body and
+             `cond_update_preservation_proof_ir` discharges its true arm by \
+             c <= m <= m+1). `fully_faithful` above is unchanged: a port."
         );
     }
 
@@ -21574,6 +30324,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "lift_caller".into(),
@@ -21587,18 +30338,49 @@ mod tests {
         }
     }
 
-    /// The one-arg `lift_callee` registry entry (requires-free — vacuously
-    /// established at every call site) THE-LIFT's negative controls call against.
-    fn lift_callee_registry() -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+    /// Build a requires-free fact from the exact synthetic MIR call edge. These
+    /// tests intentionally reuse the `lift_callee` spelling across several
+    /// distinct signatures (`u64 -> u64`, `u64 -> bool`, and reference-valued
+    /// calls), so a single hard-coded fact would make otherwise-valid fixtures
+    /// stale or accidentally conceal a signature mismatch.
+    fn synthetic_callee_fact(
+        func: &VerifiableFunction,
+        callee: &str,
+    ) -> crate::mirsem::CalleeFact {
+        let (param_tys, return_ty) = func
+            .body
+            .blocks
+            .iter()
+            .find_map(|block| match &block.terminator {
+                trust_types::Terminator::Call { func: name, args, dest, .. }
+                    if name == callee =>
+                {
+                    let params = args
+                        .iter()
+                        .map(|arg| trust_vcgen::operand_ty(func, arg))
+                        .collect::<Option<Vec<_>>>()?;
+                    let ret = crate::assignment_types::place_type(&func.body, dest)?;
+                    Some((params, ret))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("synthetic fixture has no `{callee}` call"));
+        crate::mirsem::CalleeFact {
+            arg_count: param_tys.len(),
+            param_names: vec![None; param_tys.len()],
+            param_tys,
+            return_ty,
+            requires: Some(Vec::new()),
+        }
+    }
+
+    /// The `lift_callee` registry entry, with the exact signature of `func`'s
+    /// own call edge (requires-free — vacuously established at every call site).
+    fn lift_callee_registry(
+        func: &VerifiableFunction,
+    ) -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
         let mut m = std::collections::BTreeMap::new();
-        m.insert(
-            "lift_callee".to_string(),
-            crate::mirsem::CalleeFact {
-                arg_count: 1,
-                requires: Some(Vec::new()),
-                param_names: vec![Some("x".into())],
-            },
-        );
+        m.insert("lift_callee".to_string(), synthetic_callee_fact(func, "lift_callee"));
         m
     }
 
@@ -21635,7 +30417,7 @@ mod tests {
         };
         let func = lift_arg_test_function(base_ty, shared_u64, vec![lift_field_read_stmt()]);
         assert!(crate::assignment_types::all_assignments_match(&func.body));
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         let call = crate::mirsem::sem_call_return_of_mir(&func, &registry)
             .expect("the closure-upvar field-read call arg must be recognized");
         assert_eq!(
@@ -21665,7 +30447,7 @@ mod tests {
             vec![lift_field_read_stmt()],
         );
         assert!(crate::assignment_types::all_assignments_match(&func.body));
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_return_of_mir(&func, &registry).is_none(),
             "a plain `&mut` struct field read must NEVER be absorbed as a call arg \
@@ -21700,7 +30482,7 @@ mod tests {
         let func =
             lift_arg_test_function(base_ty, shared_u64, vec![lift_field_read_stmt(), second_write]);
         assert!(crate::assignment_types::all_assignments_match(&func.body));
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_return_of_mir(&func, &registry).is_none(),
             "a multiply-assigned temp is a genuine mutable variable, not a field-read \
@@ -21738,7 +30520,7 @@ mod tests {
         let func =
             lift_arg_test_function(base_ty, Ty::Int { width: 64, signed: false }, vec![arbitrary]);
         assert!(crate::assignment_types::all_assignments_match(&func.body));
-        let registry = lift_callee_registry();
+        let registry = lift_callee_registry(&func);
         assert!(
             crate::mirsem::sem_call_return_of_mir(&func, &registry).is_none(),
             "an arbitrary arithmetic temp must NEVER be absorbed as a field-read call \
@@ -21906,14 +30688,24 @@ mod tests {
             sc.fully_faithful, 2,
             "BOTH count_raw (the loop leaf) and count (the ptr-spine composition) certify"
         );
+        // Trust (#54, 2026-08-15): the split moved 1+1 -> 2+0. The assertion below
+        // used to read `mirsem_fallback == 1`, with the reason recorded as
+        // "`count_raw` alone stays MirSem-fallback — its CondIncrGeConst loop has
+        // no trust-ir loop witness". It has one now: the cond-update lane accepts
+        // the ACCUMULATE body (`t := m+1; m := Sel(_) t m; i := i+1`) alongside the
+        // max-scan one, and `cond_update_preservation_proof_ir` discharges its true
+        // arm by `c <= m <= m+1` instead of `And.right hI`.
+        //
+        // UNCHANGED above, deliberately: `kernel_rejected == 0` and
+        // `fully_faithful == 2`. This is a PORT — which witness certifies moved,
+        // not whether the rows certify.
         assert_eq!(
-            sc.fully_faithful_via_trustir, 1,
-            "`One::count` is now TRUST-IR-PRIMARY (the Index/Len call-arg residue is closed)"
+            sc.fully_faithful_via_trustir, 2,
+            "`One::count` AND `count_raw` are both trust-ir-primary"
         );
         assert_eq!(
-            sc.fully_faithful_mirsem_fallback, 1,
-            "`count_raw` alone stays MirSem-fallback — its CondIncrGeConst loop has no \
-             trust-ir loop witness (unrelated to this closure)"
+            sc.fully_faithful_mirsem_fallback, 0,
+            "the ptr-spine corpus has no MirSem-only row left"
         );
     }
 
@@ -22007,6 +30799,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: usize_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "opaque_intermediate".into(),
@@ -22112,6 +30905,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: usize_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "unresolvable_arg".into(),
@@ -22210,6 +31004,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: usize_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "read_prefix".into(),
@@ -22307,6 +31102,11 @@ mod tests {
         // established — the pre-increment behavior for requires-free callees.
         let fact = crate::mirsem::CalleeFact {
             arg_count: 2,
+            param_tys: vec![
+                trust_types::Ty::Int { width: 32, signed: false },
+                trust_types::Ty::Int { width: 32, signed: false },
+            ],
+            return_ty: trust_types::Ty::Int { width: 32, signed: false },
             requires: Some(Vec::new()),
             param_names: vec![Some("a".into()), Some("b".into())],
         };
@@ -22324,6 +31124,11 @@ mod tests {
         // that would establish a complete precondition.
         let fact = crate::mirsem::CalleeFact {
             arg_count: 2,
+            param_tys: vec![
+                trust_types::Ty::Int { width: 32, signed: false },
+                trust_types::Ty::Int { width: 32, signed: false },
+            ],
+            return_ty: trust_types::Ty::Int { width: 32, signed: false },
             requires: None,
             param_names: vec![Some("a".into()), Some("b".into())],
         };
@@ -22340,6 +31145,11 @@ mod tests {
         let bx = Box::new;
         let mk = |conjuncts: Vec<F>| crate::mirsem::CalleeFact {
             arg_count: 2,
+            param_tys: vec![
+                trust_types::Ty::Int { width: 32, signed: false },
+                trust_types::Ty::Int { width: 32, signed: false },
+            ],
+            return_ty: trust_types::Ty::Int { width: 32, signed: false },
             requires: Some(conjuncts),
             param_names: vec![Some("a".into()), Some("b".into())],
         };
@@ -22959,6 +31769,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: i64_ty(),
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "hidden_double_write".into(),
@@ -23222,6 +32033,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: i64_ty(),
+            datatype_defs: Default::default(),
         };
 
         // `extract_loop_shape`'s OWN gate does NOT fire here: the GUARD counter `i` is
@@ -23362,6 +32174,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: i64_ty(),
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "shared_temp_branch".into(),
@@ -23528,6 +32341,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: i64_ty(),
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "reassigned_bound".into(),
@@ -23689,6 +32503,7 @@ mod tests {
             ],
             arg_count: 3,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "non_const_delta".into(),
@@ -25252,6 +34067,7 @@ mod tests {
                             );
                             if is_fallback {
                                 sc.fully_faithful_mirsem_fallback += 1;
+                                sc.mirsem_fallback_rows.push(func.def_path.clone());
                                 fallback_fns.push(func);
                             }
                         }
@@ -25835,6 +34651,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "danger".into(),
@@ -25918,6 +34735,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: u8t,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -26281,24 +35099,39 @@ mod tests {
              composed through the now-certified as_raw registry entry) must ALL open \
              fully faithful — the M5 slice-B core-cmp count"
         );
-        // `as_raw` itself is the ONLY function whose OWN body needed the new
-        // discriminant-as-value recognizer, landed in `mirsem.rs` only (no
-        // trust-ir theory this increment) — it certifies via the MirSem
-        // strangler-fallback lane, honestly named, not silently claimed
-        // `via_trustir`. Once `as_raw` enters the (shared) certified-callee
-        // registry, the 6 `is_*` callers' PRE-EXISTING Call-then-compare
-        // composition ALREADY has a trust-ir-primary lane
-        // (`call_then_pureop_fully_faithful_via_trustir`) that consumes the
-        // SAME registry — so they open `via_trustir`, zero further recognizer
-        // work needed on either side, exactly the census's "sole blocker is
-        // as_raw" claim.
+        // Trust (#53, 2026-08-13) — THE SPLIT MOVED, 1+6 -> 0+7, BY DESIGN.
+        //
+        // This assertion used to read `mirsem_fallback == 1, via_trustir == 6`,
+        // and its reason was recorded here as: `as_raw` is the only function
+        // whose OWN body needed the discriminant-as-value recognizer, which
+        // "landed in `mirsem.rs` only (no trust-ir theory this increment) — it
+        // certifies via the MirSem strangler-fallback lane, honestly named, not
+        // silently claimed `via_trustir`."
+        //
+        // The R4 teardown has since supplied that missing trust-ir theory: the
+        // single-statement lane now has a whole-return `Rvalue::Discriminant`
+        // arm over `IrOperand::Discr`, delegating to the SAME vetted
+        // `sem_discriminant_base_of_mir` gates, and passing a real use site so
+        // `as_raw`'s borrow-temp base (`_2 := &_1; _0 := Discriminant((*_2))`)
+        // resolves. So `via_trustir` here is now earned rather than claimed, and
+        // the honest number is 7.
+        //
+        // WHAT DID NOT MOVE, deliberately: `fully_faithful == 7` and
+        // `kernel_rejected == 0` above are untouched. This lane changed WHICH
+        // witness certifies these rows, never WHETHER they certify — that is the
+        // whole shape of an R4 port, and a change to either of those two numbers
+        // would mean something quite different had happened.
+        //
+        // The 6 `is_*` callers are unaffected: they already composed trust-ir-
+        // primary through `call_then_pureop_fully_faithful_via_trustir` off the
+        // shared certified-callee registry once `as_raw` was registered.
         assert_eq!(
-            sc.fully_faithful_mirsem_fallback, 1,
-            "as_raw alone is the MirSem-only strangler-fallback certification"
+            sc.fully_faithful_mirsem_fallback, 0,
+            "as_raw now has a trust-ir lane of its own — nothing is MirSem-only here"
         );
         assert_eq!(
-            sc.fully_faithful_via_trustir, 6,
-            "the 6 is_* callers compose trust-ir-primary once as_raw is registered"
+            sc.fully_faithful_via_trustir, 7,
+            "as_raw (whole-return Discriminant) + the 6 is_* callers that compose off it"
         );
     }
 
@@ -26716,6 +35549,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: ret,
+            datatype_defs: Default::default(),
         };
         let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
         // A minimal operand lowering: the sole parameter (local 1) is `Var 0`.
@@ -27599,10 +36433,30 @@ mod tests {
             return;
         };
         let next_key = "<std::slice::Iter<'_, i32> as std::iter::Iterator>::next".to_string();
+        let (param_tys, return_ty) = func
+            .body
+            .blocks
+            .iter()
+            .find_map(|block| match &block.terminator {
+                trust_types::Terminator::Call { func: callee, args, dest, .. }
+                    if callee == &next_key =>
+                {
+                    let params = args
+                        .iter()
+                        .map(|arg| trust_vcgen::operand_ty(&func, arg))
+                        .collect::<Option<Vec<_>>>()?;
+                    let ret = crate::assignment_types::place_type(&func.body, dest)?;
+                    Some((params, ret))
+                }
+                _ => None,
+            })
+            .expect("sum_loop's certified next call has a complete typed signature");
         let mk = |requires| {
             let mut m = std::collections::BTreeMap::new();
             m.insert(next_key.clone(), crate::mirsem::CalleeFact {
                 arg_count: 1,
+                param_tys: param_tys.clone(),
+                return_ty: return_ty.clone(),
                 requires,
                 param_names: vec![Some("self".into())],
             });
@@ -28380,17 +37234,46 @@ mod w6_map_compose_lane_tests {
     const AND_THEN: &str = "trust-mir-b0282c69c16082e4-e11fb07682484adc.json";
     const FILTER: &str = "trust-mir-4fc5e5e1c0f8ba5c-a45a703cdd36ac11.json";
 
-    fn closure_fact() -> crate::mirsem::CalleeFact {
+    fn closure_fact(func: &VerifiableFunction) -> crate::mirsem::CalleeFact {
+        let (param_tys, return_ty) = func
+            .body
+            .blocks
+            .iter()
+            .find_map(|block| match &block.terminator {
+                trust_types::Terminator::Call { args, dest, .. } => {
+                    let params = args
+                        .iter()
+                        .map(|arg| trust_vcgen::operand_ty(func, arg))
+                        .collect::<Option<Vec<_>>>()?;
+                    let ret = crate::assignment_types::place_type(&func.body, dest)?;
+                    Some((params, ret))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                (
+                    Vec::new(),
+                    trust_types::Ty::Unsupported {
+                        kind: "missing synthetic call signature".into(),
+                        detail: "test fact must fail closed".into(),
+                    },
+                )
+            });
         crate::mirsem::CalleeFact {
             arg_count: 2,
+            param_tys,
+            return_ty,
             requires: Some(vec![]),
             param_names: vec![None, Some("x".into())],
         }
     }
 
-    fn registry(key: &str) -> BTreeMap<String, crate::mirsem::CalleeFact> {
+    fn registry(
+        func: &VerifiableFunction,
+        key: &str,
+    ) -> BTreeMap<String, crate::mirsem::CalleeFact> {
         let mut m = BTreeMap::new();
-        m.insert(key.to_string(), closure_fact());
+        m.insert(key.to_string(), closure_fact(func));
         m
     }
 
@@ -28400,7 +37283,7 @@ mod w6_map_compose_lane_tests {
     #[test]
     fn map_compose_lane_flips_with_certified_closure() {
         let func = load_dump(MAP_NONCAP);
-        let callees = registry("map_add1::{closure#0}");
+        let callees = registry(&func, "map_add1::{closure#0}");
         assert!(
             map_compose_fully_faithful_via_trustir(&func, &callees),
             "the mono map over a certified non-capturing closure must certify on the W6 lane"
@@ -28421,7 +37304,7 @@ mod w6_map_compose_lane_tests {
     #[test]
     fn and_then_compose_lane_flips_with_certified_closure() {
         let func = load_dump(AND_THEN);
-        let callees = registry("and_then_pos::{closure#0}");
+        let callees = registry(&func, "and_then_pos::{closure#0}");
         assert!(
             map_compose_fully_faithful_via_trustir(&func, &callees),
             "the mono and_then over a certified flat-return closure must certify on the W6 lane"
@@ -28439,7 +37322,7 @@ mod w6_map_compose_lane_tests {
     #[test]
     fn and_then_compose_lane_declines_suffix_decoy() {
         let func = load_dump(AND_THEN);
-        let callees = registry("inner::and_then_pos::{closure#0}");
+        let callees = registry(&func, "inner::and_then_pos::{closure#0}");
         assert!(
             !map_compose_fully_faithful_via_trustir(&func, &callees),
             "a suffix-only decoy must not certify the and_then instance"
@@ -28452,7 +37335,7 @@ mod w6_map_compose_lane_tests {
     #[test]
     fn filter_compose_lane_flips_with_certified_closure() {
         let func = load_dump(FILTER);
-        let callees = registry("filter_pos::{closure#0}");
+        let callees = registry(&func, "filter_pos::{closure#0}");
         assert!(
             filter_compose_fully_faithful_via_trustir(&func, &callees),
             "the mono filter over a certified predicate closure must certify on the W6 lane"
@@ -28467,7 +37350,7 @@ mod w6_map_compose_lane_tests {
     #[test]
     fn filter_compose_lane_declines_suffix_decoy() {
         let func = load_dump(FILTER);
-        let callees = registry("inner::filter_pos::{closure#0}");
+        let callees = registry(&func, "inner::filter_pos::{closure#0}");
         assert!(!filter_compose_fully_faithful_via_trustir(&func, &callees));
     }
 
@@ -28477,7 +37360,7 @@ mod w6_map_compose_lane_tests {
     #[test]
     fn map_compose_lane_declines_suffix_decoy() {
         let func = load_dump(MAP_NONCAP);
-        let callees = registry("inner::map_add1::{closure#0}");
+        let callees = registry(&func, "inner::map_add1::{closure#0}");
         assert!(
             !map_compose_fully_faithful_via_trustir(&func, &callees),
             "a suffix-only decoy must not certify the map instance"
@@ -28493,5 +37376,75 @@ mod w6_map_compose_lane_tests {
         let func = load_dump(MAP_NONCAP);
         let callees: BTreeMap<String, crate::mirsem::CalleeFact> = BTreeMap::new();
         assert!(!map_compose_fully_faithful_via_trustir(&func, &callees));
+    }
+}
+
+/// Trust (#56, 2026-08-16) — the LAST two MirSem-fallback rows in the R4 census
+/// certify TRUST-IR-PRIMARY through [`call_chain_pureop_fully_faithful_via_trustir`].
+///
+/// This drives the REAL dumps through the production gate with a registry built the
+/// way the census builds it (callees-first, inserted only on `fully_faithful`), so a
+/// pass here means the composition actually resolves -- not that a hand-built
+/// fixture happens to line up.
+#[cfg(test)]
+mod call_chain_pureop_trustir_lane_tests {
+    use super::*;
+
+    #[test]
+    fn u8_to_ascii_pair_certifies_trust_ir_primary() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/census-core-m5-2026-07-07/u8-ascii");
+        let mut funcs = Vec::new();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(t) = std::fs::read_to_string(&p) else { continue };
+            if let Ok(f) = serde_json::from_str::<VerifiableFunction>(&t) {
+                funcs.push(f);
+            }
+        }
+        assert!(!funcs.is_empty(), "the u8-ascii corpus must load, or this test proves nothing");
+        let order = trust_vcgen::compute_verification_order(&trust_vcgen::build_call_graph(&funcs));
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        let mut certified: std::collections::BTreeMap<String, crate::mirsem::CalleeFact> =
+            Default::default();
+        let mut seq: Vec<&VerifiableFunction> = Vec::new();
+        for n in &order {
+            if let Some(f) = funcs.iter().find(|f| &f.def_path == n) {
+                seq.push(f);
+            }
+        }
+        for f in funcs.iter() {
+            if !seq.iter().any(|s| s.def_path == f.def_path) {
+                seq.push(f);
+            }
+        }
+        let mut seen = 0usize;
+        let mut fallback = Vec::new();
+        for f in seq {
+            if f.def_path.contains("to_ascii_lowercase") || f.def_path.contains("to_ascii_uppercase")
+            {
+                seen += 1;
+                assert!(
+                    call_chain_pureop_fully_faithful_via_trustir(f, &certified),
+                    "{}: must certify on the trust-ir call-chain lane",
+                    f.def_path
+                );
+            }
+            let dg = diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies);
+            if dg.fully_faithful {
+                if !dg.via_ir {
+                    fallback.push(f.def_path.clone());
+                }
+                certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f));
+            }
+        }
+        assert_eq!(seen, 2, "both to_ascii bodies must be present in the corpus");
+        assert!(
+            fallback.is_empty(),
+            "no row in this corpus may remain on the MirSem fallback, got {fallback:?}"
+        );
     }
 }

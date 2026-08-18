@@ -183,6 +183,21 @@ precedence = "override"
 SPDX-FileCopyrightText = "2026 Andrew Yates"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 
+# First-party memchr. The implementation is Trust's own — pure scalar safe Rust
+# written so the verifier can discharge it — but the public API, its
+# documentation and its semantics are reproduced from BurntSushi/memchr so that
+# `[patch.crates-io]` can redirect the whole dependency graph. That derivation
+# means the crate keeps memchr's terms and carries both copyrights; it narrows
+# the `crates/**` block above and therefore has to sit below it.
+[[annotations]]
+path = "crates/trust-memchr/**"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2026 Andrew Yates",
+    "2015 Andrew Gallant",
+]
+SPDX-License-Identifier = "Unlicense OR MIT"
+
 # Patches Trust carries against third-party sources. The diffs are derived from
 # the software they patch, so they keep that software's terms rather than
 # Trust's; patches/README.md above is Trust's own prose. Today the only patch is

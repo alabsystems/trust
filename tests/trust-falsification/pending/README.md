@@ -259,3 +259,54 @@ false-accept; only the drop-in (Pillar-5) characterization is uncertain until a
 rebuild. (A CORRECTION: an earlier note here claimed rc 0 was "verified on the
 live binary" — that was a pipe-`$?` misread of grep's exit, not trustc's.) See
 memory `project-trust-iterator-sum-product-falseaccept`.
+
+---
+
+# Coroutine resume-state contract lane (piece #13 step-3) — added with the contract lane
+
+Three fixtures accompany the `contract:coroutine-resume-state` lane (the
+promotion of the `assumption:coroutine` executor-protocol premise into a
+solver-proved, exported precondition; gated pair:
+`proved/async_zero_await_widen.rs` + `mutant/async_zero_await_widen.rs`).
+They are quarantined here because each depends on a capability beyond the
+zero-await contract itself; none is a soundness hole, and each carries an
+explicit soundness pin that must hold ALREADY.
+
+NOTE (D1 repair): the recognizer now mints the contract ONLY when every
+reserved-discriminant arm (RETURNED=1/POISONED=2) present in the dispatch is
+verifiably rustc's always-false `ResumedAfter*` Assert sentinel — the async-fn
+shape. `gen` / `async gen` / async-drop coroutines lower RETURNED=1 to LEGAL
+reachable code (`next()` after exhaustion returns `None`; polling returns
+`Poll::Ready`), so those shapes DECLINE the whole contract and keep the
+pre-lane fail-closed path (no entry Assume, `assumption:coroutine`, strict
+abort). Future gen-family fixtures must pin that decline: a
+`contract:coroutine-resume-state` row on a `gen` block is a P0 false proof.
+
+## `mutant/async_manual_executor_repoll.rs` — in-crate executor polls after Ready
+
+The adversarial callsite fixture: a hand-rolled executor re-polls the
+completed future, violating the coroutine body's exported resume-state
+precondition. The bridge mints an unprovable
+`[trust-coroutine-resume-precondition]` caller-side obligation at every
+in-bundle poll/resume callsite — wired through the audited absent-callee
+may-panic encoding (in-body `Assert(false)` marker + marked `PanicFreedom`
+obligation + the whole-function counted carrier), the only bridge encoding
+that verifiably reaches a published row — so the crate is expected rc 1 via
+honest INCOMPLETE (plus absent-callee rows from the `Waker`/`Pin` plumbing). It
+cannot sit in the gated `mutant/` lane, which requires an explicit REFUTATION
+verdict; honestly refuting the re-poll (and proving the first poll) is the
+follow-on caller-side discharge lane. RESTORE/PROMOTE when that lane lands.
+**Soundness pin that must hold today: this crate must NEVER verify clean —
+rc 0 here is a P0 swallowed-callsite-obligation fail-open.**
+
+## `proved/async_one_await_widen.rs` + `mutant/async_one_await_overflow.rs` — live set {0, 3}
+
+The one-await pair: the dispatch case set gains suspend state 3, so the
+exported contract must be the disjunction `state ∈ {0, 3}` (the trust-ir-bridge
+unit test `coroutine_contract_one_await_live_set_is_a_disjunction` pins the
+lowering). The proved side needs the in-crate `YieldOnce` executor's
+`Poll`/`Context` std surface modeled before it can reach rc 0; the mutant's
+overflow refutation (dropped widen, havoc'd u8 operands) is expected to hold
+already. **Soundness pin that must hold today: the mutant must keep refuting —
+if it ever proves, the entry contract leaked a data fact past the resume-state
+selector (the "never constrain captured data" violation).**

@@ -56,6 +56,7 @@ fn make_add() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -86,6 +87,7 @@ fn make_identity() -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -147,6 +149,7 @@ fn make_checked_div() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -206,6 +209,7 @@ fn make_sum_loop() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -232,6 +236,7 @@ fn test_emit_metadata_e2e_smoke() {
     let crate_info = CrateInfo {
         crate_name: "trust_cg_smoke".to_string(),
         functions: vec![make_add(), make_identity(), make_checked_div(), make_sum_loop()],
+        linkage: Vec::new(),
     };
 
     // Step 1: codegen_crate (MIR -> LIR lowering for all functions)
@@ -313,7 +318,7 @@ fn test_emit_metadata_e2e_smoke() {
 #[test]
 fn test_emit_metadata_empty_crate() {
     let backend = TrustCgCodegenBackend::host();
-    let crate_info = CrateInfo { crate_name: "empty_crate".to_string(), functions: vec![] };
+    let crate_info = CrateInfo { crate_name: "empty_crate".to_string(), functions: vec![], linkage: Vec::new() };
 
     let ongoing =
         backend.codegen_crate(&crate_info).expect("empty crate should codegen successfully");
@@ -358,6 +363,7 @@ fn test_emit_metadata_float_function() {
             }],
             arg_count: 2,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -366,7 +372,11 @@ fn test_emit_metadata_float_function() {
     };
 
     let crate_info =
-        CrateInfo { crate_name: "float_crate".to_string(), functions: vec![float_add] };
+        CrateInfo {
+            crate_name: "float_crate".to_string(),
+            functions: vec![float_add],
+            linkage: Vec::new(),
+        };
 
     let ongoing = backend.codegen_crate(&crate_info).expect("float function should codegen");
 

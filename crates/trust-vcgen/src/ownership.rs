@@ -427,7 +427,7 @@ mod tests {
             name: "test_fn".to_string(),
             def_path: "test::test_fn".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { arg_count: 0, return_ty: Ty::Unit, locals, blocks },
+            body: VerifiableBody { arg_count: 0, return_ty: Ty::Unit, locals, blocks, datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],

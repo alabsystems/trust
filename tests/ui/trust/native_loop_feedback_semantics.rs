@@ -16,7 +16,9 @@
 //! The `one_leg` revision proves initiation but falsifies consecution by
 //! retaining `phase` after assigning zero. Its still-useful pre-state predicate
 //! must not be admitted from only one E4 proof, so the termination row remains
-//! unproved and strict verification fails closed.
+//! unproved and strict verification fails closed. (Post ay-0.9.0, the solver's
+//! refutation of the encoded VC carries no producer fidelity attestation and is
+//! demoted, so the unproved rows read UNKNOWN rather than FAILED.)
 
 #[cfg(both_legs)]
 pub fn feedback_closes(mut phase: u32) //[both_legs]~ NOTE Trust verification: 4 proved, 0 failed, 0 unknown
@@ -31,8 +33,8 @@ pub fn feedback_closes(mut phase: u32) //[both_legs]~ NOTE Trust verification: 4
 }
 
 #[cfg(one_leg)]
-pub fn one_leg_is_not_authority(phase: u32) //[one_leg]~ NOTE Trust verification: 2 proved, 2 failed, 0 unknown
-//[one_leg]~| NOTE [termination] FAILED
+pub fn one_leg_is_not_authority(phase: u32) //[one_leg]~ NOTE Trust verification: 2 proved, 0 failed, 2 unknown
+//[one_leg]~| NOTE [termination] UNKNOWN
 //[one_leg]~| ERROR Trust strict verification failed for
     requires phase <= 1
 {

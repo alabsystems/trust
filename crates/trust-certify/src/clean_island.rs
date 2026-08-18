@@ -58,7 +58,7 @@ impl CleanIslandOutcome {
 
 /// The registered declaration's primary name (mirrors trust-clean's
 /// `elab_result_name`; kept local so the island lane has no trust-clean dep).
-fn elab_result_name(result: &ElabResult) -> String {
+pub(crate) fn elab_result_name(result: &ElabResult) -> String {
     match result {
         ElabResult::Definition { name, .. }
         | ElabResult::Theorem { name, .. }
@@ -79,7 +79,7 @@ fn elab_result_name(result: &ElabResult) -> String {
 
 /// Turn an authoritative parser byte position into a non-empty, UTF-8-safe
 /// source range whenever the input itself is non-empty.
-fn point_diagnostic_span(source: &str, at: usize) -> (usize, usize) {
+pub(crate) fn point_diagnostic_span(source: &str, at: usize) -> (usize, usize) {
     let mut at = at.min(source.len());
     while at > 0 && !source.is_char_boundary(at) {
         at -= 1;
@@ -719,6 +719,34 @@ impl CleanIslandSession {
         outcome
     }
 
+    /// Check EVERY island of a crate together, header-first (Trust I1).
+    ///
+    /// Unlike repeated [`Self::check`], this does not make source order
+    /// load-bearing for name resolution: every declaration's header is
+    /// elaborated before any body is, so an earlier island may name a
+    /// declaration a later island introduces — exactly as Rust items resolve
+    /// from a whole-crate symbol table.
+    ///
+    /// Returns one outcome per input island, in input order, with
+    /// island-relative byte offsets, plus any dependency cycles. A cycle means
+    /// NOTHING from the batch was registered.
+    ///
+    /// The session is tainted if any island was rejected or any cycle found,
+    /// so positive citation evidence is withheld exactly as it is for
+    /// [`Self::check`].
+    pub fn check_all(
+        &mut self,
+        sources: &[&str],
+    ) -> crate::clean_island_batch::CleanIslandBatch {
+        let batch = crate::clean_island_batch::check_islands_batched(
+            &mut self.env,
+            &mut self.file_ctx,
+            sources,
+        );
+        self.tainted |= batch.is_rejected();
+        batch
+    }
+
     /// E6 kernel-import: for every ADMISSIBLE program function among
     /// `functions`, import its defining equation into this session's kernel
     /// environment and return `(def_path, Admission)` for each one minted. The
@@ -908,7 +936,7 @@ fn param_domains_of(
 /// Enforce the strict island authority policy after kernel registration. The
 /// environment may retain the rejected declaration for diagnostics, but the
 /// caller taints the whole session and the Rust build fails.
-fn strict_leaf_policy_error(env: &Environment, leaf: &ElabResult) -> Option<String> {
+pub(crate) fn strict_leaf_policy_error(env: &Environment, leaf: &ElabResult) -> Option<String> {
     match leaf {
         ElabResult::Axiom { name, .. } => {
             return Some(format!(
@@ -976,6 +1004,101 @@ fn strict_leaf_policy_error(env: &Environment, leaf: &ElabResult) -> Option<Stri
     };
     if let Some((name, ty, proof)) = proof_judgment {
         match cert_meter::grade(env, ty, proof) {
+            cert_meter::Grade::Certified => {}
+            cert_meter::Grade::Trusted { closure } => {
+                return Some(format!(
+                    "Clean island proof `{name}` failed the strict certification audit because it depends on trust provenance: {}",
+                    closure.join(", ")
+                ));
+            }
+            cert_meter::Grade::Rejected { error } => {
+                return Some(format!(
+                    "Clean island proof `{name}` failed the strict certification audit: {error}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The same strict island authority policy as [`strict_leaf_policy_error`],
+/// addressed BY NAME instead of by elaboration result.
+///
+/// The batch lane never holds an `ElabResult`: `clean_elab::module_batch` owns
+/// elaboration and registration and reports names. So the policy reads the
+/// constant the kernel actually stored — which is the object the leaf-addressed
+/// form ultimately grades too — and applies the identical rules in the identical
+/// order:
+///
+///   1. an `axiom` or a valueless `opaque` is an ASSUMPTION, and a strict island
+///      hosts none;
+///   2. no declaration into the compiler's `trust_import_*` namespace;
+///   3. no `unsafe`, no `partial`, no trust debt (`sorry`, `trustedArith`, …);
+///   4. every proof judgment must pass the certification audit with an EMPTY
+///      trust closure — `Trusted` and `Rejected` are both build errors, and the
+///      `Trusted` message discloses the assumptions BY NAME.
+///
+/// Registration by the Clean kernel is necessary, never sufficient: Clean will
+/// register an axiom, and Trust will not accept one.
+pub(crate) fn strict_registered_policy_error(
+    env: &Environment,
+    name: &clean_kernel::Name,
+) -> Option<String> {
+    // A name the environment does not hold cannot be graded. The caller only
+    // asks about declarations the batch reported as REGISTERED, so an absent
+    // constant means the batch did not commit; the uncommitted case is refused
+    // by the caller's own tripwire rather than silently graded here.
+    let info = env.get_const(name)?;
+
+    match info.kind {
+        ConstantKind::Axiom => {
+            return Some(format!(
+                "Clean island declaration `{name}` is an axiom; strict islands require checked proof terms"
+            ));
+        }
+        ConstantKind::Opaque if info.value.is_none() => {
+            return Some(format!(
+                "Clean island declaration `{name}` is a valueless opaque (an assumption); strict islands require checked bodies"
+            ));
+        }
+        _ => {}
+    }
+
+    // See `strict_leaf_policy_error` for why the `trust_import_` namespace is
+    // refused at the point of declaration rather than downstream.
+    if name.to_string().starts_with("trust_import_") {
+        return Some(format!(
+            "Clean island declaration `{name}` declares into the compiler's kernel-import \
+             namespace (`trust_import_*`); that namespace is reserved for E6 program-function \
+             imports and an island may not define or shadow a name in it"
+        ));
+    }
+    if env.is_unsafe(name) {
+        return Some(format!(
+            "Clean island declaration `{name}` is marked `unsafe`; strict islands reject unsafe declarations"
+        ));
+    }
+    if env.is_partial(name) {
+        return Some(format!(
+            "Clean island declaration `{name}` is marked `partial`; strict islands require total declarations"
+        ));
+    }
+    if let Some(warning) = clean_elab::register::registration_warning_for_name(env, name) {
+        return Some(format!(
+            "Clean island declaration `{}` uses {}; strict islands reject all trust debt",
+            warning.decl_name,
+            registration_debt_label(warning.kind)
+        ));
+    }
+
+    if info.kind == ConstantKind::Theorem {
+        let Some(proof) = &info.value else {
+            return Some(format!(
+                "Clean island proof `{name}` was registered without a proof term; strict islands \
+                 require a checked term, not a statement"
+            ));
+        };
+        match cert_meter::grade(env, &info.type_, proof) {
             cert_meter::Grade::Certified => {}
             cert_meter::Grade::Trusted { closure } => {
                 return Some(format!(
@@ -1233,6 +1356,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -1282,6 +1406,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -1361,6 +1486,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: u(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -1508,6 +1634,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: u(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -1743,6 +1870,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -2170,6 +2298,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),

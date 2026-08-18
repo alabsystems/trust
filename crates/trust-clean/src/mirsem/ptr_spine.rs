@@ -458,8 +458,9 @@ pub(crate) fn sem_ptr_spine_call_return_of_mir(
     if resolved == func.def_path || *callee_str == func.def_path {
         return None;
     }
-    // Arity must match the certified callee's declared parameter count.
-    if fact.arg_count != args.len() {
+    // Exact actual/formal type matching closes forged or stale synthetic call
+    // edges; MIR coercions have already been made explicit.
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) {
         return None;
     }
 

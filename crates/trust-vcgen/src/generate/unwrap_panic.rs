@@ -95,6 +95,35 @@ pub(super) fn is_bounds_panicking_slice_mutator(
         || callee.contains("collections::")
 }
 
+/// Trust (falsification gate, `absent_callee_call_only_mono`): a call to a std
+/// container method that PANICS on an out-of-range index and whose body is not
+/// modeled — `Vec::{remove, insert, swap_remove}` (panic: `index >= len`, resp.
+/// `index > len` for `insert`) and `String::{remove, insert, insert_str}`
+/// (panic: out of bounds or not a char boundary). Surfaced as the same
+/// `panic-freedom-unverified` UnsupportedMir row as the slice-mutator lane, which
+/// STRICT policy counts as `failed` — the honest verdict for an unguarded call
+/// whose panic set is known and input-reachable.
+///
+/// EXACT-PATH gated, deliberately STRICTER than
+/// `is_bounds_panicking_slice_mutator`'s path fallback (which accepts
+/// `collections::`): `HashMap`/`BTreeMap`/`HashSet::remove`/`insert` and
+/// `VecDeque::remove` are TOTAL (they return `Option`/`bool`) and render under
+/// `collections::` — matching them here would reject valid programs under
+/// strict policy (this lane's rows count as FAILED, not Unknown, so an
+/// over-match is not merely conservative). Only the real `alloc::vec::Vec` /
+/// `alloc::string::String` paths qualify, and `collections::` is excluded
+/// outright.
+pub(super) fn is_index_panicking_container_mutator(callee: &str) -> bool {
+    if !matches!(method_tail(callee), "remove" | "insert" | "swap_remove" | "insert_str") {
+        return false;
+    }
+    // Total map/set/deque methods live under `collections::` — never match.
+    if callee.contains("collections::") {
+        return false;
+    }
+    callee.contains("vec::Vec") || callee.contains("string::String")
+}
+
 /// Trust (hunt-15 Class D): a call to a std method that PANICS on its failure
 /// variant — `Option`/`Result` `unwrap`/`expect`/`unwrap_err`/`expect_err`. These
 /// have a normal-return target (the success value) but an unmodeled internal panic

@@ -14,6 +14,11 @@ pub const TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY: &str =
 // never re-declared: a local spelling could drift from the admitted list and
 // silently split the hardened lane in two.
 pub(crate) use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
+// Allocation-capacity namespace, aliased for the same no-drift reason. Routable
+// ONLY to the trust-vc certificate-import lane (see `obligation_route_for_kind`),
+// never to the whole-function CHC — the mapping that false-proved unbounded
+// allocations (the recorded P0 at trust-verifier-api's namespace constant).
+pub(crate) use trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE as TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE;
 pub(crate) const TRUST_VC_HARDENED_WILDCARD: &str = "*";
 
 /// Full-verification execution policy.

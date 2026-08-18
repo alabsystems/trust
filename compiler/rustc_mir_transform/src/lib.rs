@@ -532,12 +532,23 @@ fn mir_for_ctfe(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &Body<'_> {
 }
 
 /// Preserve elaborated MIR for query-cycle-safe Trust verification after `optimized_mir`
-/// consumes the source [`Steal`]. For mutual-recursion members, the snapshot query is always
-/// evaluated before that steal (see [`inner_optimized_mir`]); guarded callers therefore never
-/// need to inspect `Steal::is_stolen`.
-fn mir_for_trust_verification(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &Body<'_> {
+/// consumes the source [`Steal`].
+///
+/// `None` when the source was already stolen. The pre-steal snapshot in
+/// [`inner_optimized_mir`] guarantees `Some` for mutual-recursion SCC members —
+/// but the CONSUMERS route through `optimized_mir_query_would_cycle`, which is
+/// deliberately WIDER (it also covers live query ancestors outside any static
+/// SCC), and that dynamic remainder cannot be snapshotted ahead of the steal.
+/// Callers in that gap used to reach a post-steal `borrow()` and abort the
+/// build with a `Steal` panic; they all sit inside fail-soft loops whose
+/// designed degradation is the absent-callee may-panic marker, so `None` is the
+/// contract they already honor.
+fn mir_for_trust_verification(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<&Body<'_>> {
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-    tcx.arena.alloc(body.borrow().clone())
+    if body.is_stolen() {
+        return None;
+    }
+    Some(tcx.arena.alloc(body.borrow().clone()))
 }
 
 fn inner_mir_for_ctfe(tcx: TyCtxt<'_>, def: LocalDefId) -> Body<'_> {
@@ -794,6 +805,14 @@ fn run_runtime_cleanup_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
                     LocalInfo::User(BindingForm::Var(binding)) => {
                         Some(binding.binding_hir_local_id.as_u32())
                     }
+                    // A TrustIR-flipped body is reconstructed at `Built` with
+                    // this compact carrier already authenticated from the
+                    // module's sealed source-place provenance. Advancing that
+                    // body through the ordinary cleanup pipeline must retain
+                    // the carrier just as it retains one derived from native
+                    // MIR; clearing it here silently disables E4/E5 monitors
+                    // only on the default flipped codegen path.
+                    LocalInfo::TrustSourceBinding { hir_local_id } => Some(*hir_local_id),
                     _ => None,
                 },
                 ClearCrossCrate::Clear => None,

@@ -460,6 +460,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             ssa: None,
             annotations: vec![],

@@ -12,11 +12,11 @@
 //     -Ztrust-policy=advisory count_to.rs
 //
 // NOTE ON RECONSTRUCTION: the original count_to.rs was a scratch file that was
-// never checked in. The function text below (lines 23-31) and the two contract
-// attribute lines are exactly pinned by the spans + MIR embedded in the
-// checked-in count_to.json; this header preamble (lines 1-22) is NOT pinned by
-// the dump (no span reaches it) and is authored for this reconstruction. The
-// re-dump byte-comparison against count_to.json is what validates the fn text.
+// never checked in. The function text below (lines 26-32) and the two contract
+// attribute lines (24-25) are exactly pinned by the spans + MIR embedded in the
+// checked-in count_to.json; this header's CONTENT is unpinned but its LINE COUNT
+// is not — spans are absolute, so editing the header moves the fixture. The
+// re-dump byte-comparison in regenerate.sh is what validates the fn text.
 //
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
 #![feature(contracts)]

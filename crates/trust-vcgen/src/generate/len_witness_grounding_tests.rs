@@ -59,7 +59,7 @@ fn func_with(
         name: "len_pair".to_string(),
         def_path: "test::len_pair".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty: ret_ty },
+        body: VerifiableBody { locals, blocks, arg_count, return_ty: ret_ty, datatype_defs: Default::default() },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
             span: SourceSpan::default(),
@@ -108,7 +108,7 @@ fn err_aggregate() -> Rvalue {
 }
 
 /// `<name> == <int>` pins on the AND-spine (NOT under `Not` — the negated
-/// obligation contains its own `_0_discr == 0` atoms).
+/// obligation contains its own `_0__discr == 0` atoms).
 fn and_spine_int_pins(formula: &Formula, name: &str, out: &mut Vec<i128>) {
     match formula {
         Formula::And(cs) => {
@@ -263,16 +263,16 @@ fn paired_push_fn(extra_v1_push: bool, ensures: &str) -> VerifiableFunction {
 
 #[test]
 fn len_model_var_parser_is_strict() {
-    let v = parse_len_model_var("_0_value.0.1_len").expect("crown shape parses");
+    let v = parse_len_model_var("_0__value.0.1__len").expect("crown shape parses");
     assert_eq!(v.path, vec![0, 1]);
-    assert_eq!(v.name, "_0_value.0.1_len");
+    assert_eq!(v.name, "_0__value.0.1__len");
     // Versioned copies parse to the BASE name.
-    assert_eq!(parse_len_model_var("_0_value.2_len#s1_0").map(|v| v.name).as_deref(), Some("_0_value.2_len"));
+    assert_eq!(parse_len_model_var("_0__value.2__len#s1_0").map(|v| v.name).as_deref(), Some("_0__value.2__len"));
     // Bare-payload length, non-numeric segments, other bases: fail closed.
-    assert!(parse_len_model_var("_0_value_len").is_none());
-    assert!(parse_len_model_var("_0_value.a_len").is_none());
-    assert!(parse_len_model_var("_0_value._len").is_none());
-    assert!(parse_len_model_var("_0_discr").is_none());
+    assert!(parse_len_model_var("_0__value__len").is_none());
+    assert!(parse_len_model_var("_0__value.a__len").is_none());
+    assert!(parse_len_model_var("_0__value.__len").is_none());
+    assert!(parse_len_model_var("_0__discr").is_none());
     assert!(parse_len_model_var("xs_len").is_none());
 }
 
@@ -280,19 +280,19 @@ fn len_model_var_parser_is_strict() {
 fn paired_pushes_ground_both_lens_and_their_equality() {
     // Same-chain construction: both tuple fields pushed once, back-to-back
     // — lengths equal by construction. The pair is credited (no ungrounded
-    // row), the ONE return path's VC pins `_0_discr == 1` and the equality
-    // `_0_value.0_len == _0_value.1_len`.
+    // row), the ONE return path's VC pins `_0__discr == 1` and the equality
+    // `_0__value.0__len == _0__value.1__len`.
     let func = paired_push_fn(false, TUPLE_PAIR_ENSURES);
     assert!(ungrounded_details(&func).is_empty(), "pair must be credited");
     let vcs = postcondition_vcs(&func);
     assert_eq!(vcs.len(), 1, "one return path -> one body-aware VC: {vcs:#?}");
     let mut discr = Vec::new();
-    and_spine_int_pins(&vcs[0].formula, "_0_discr", &mut discr);
+    and_spine_int_pins(&vcs[0].formula, "_0__discr", &mut discr);
     assert_eq!(discr, vec![1], "{:#?}", vcs[0].formula);
     let mut eqs = Vec::new();
-    and_spine_var_pins(&vcs[0].formula, "_0_value.0_len", &mut eqs);
+    and_spine_var_pins(&vcs[0].formula, "_0__value.0__len", &mut eqs);
     assert!(
-        eqs.contains(&"_0_value.1_len".to_string()),
+        eqs.contains(&"_0__value.1__len".to_string()),
         "equality pin between the two len terms must be conjoined: {:#?}",
         vcs[0].formula
     );
@@ -304,7 +304,7 @@ fn unpaired_pushes_stay_fail_closed_no_equality_fact() {
     // GENUINELY UNEQUAL (2 vs 1), so an equality fact would false-PROVE the
     // ensures. The pair must stay uncredited: no refutable Postcondition VC,
     // one SpecModelUngrounded row naming both len terms (and not the
-    // groundable `_0_discr`).
+    // groundable `_0__discr`).
     let func = paired_push_fn(true, TUPLE_PAIR_ENSURES);
     assert!(
         postcondition_vcs(&func).is_empty(),
@@ -313,9 +313,9 @@ fn unpaired_pushes_stay_fail_closed_no_equality_fact() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_value.0_len")
-            && details[0].contains("_0_value.1_len")
-            && !details[0].contains("_0_discr"),
+        details[0].contains("_0__value.0__len")
+            && details[0].contains("_0__value.1__len")
+            && !details[0].contains("_0__discr"),
         "both len terms fail closed: {}",
         details[0]
     );
@@ -417,7 +417,7 @@ fn second_return_path_without_construction_blocks_grounding() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_value.0_len") && details[0].contains("_0_value.1_len"),
+        details[0].contains("_0__value.0__len") && details[0].contains("_0__value.1__len"),
         "{}",
         details[0]
     );
@@ -528,14 +528,14 @@ fn dominating_length_guard_grounds_equality_and_witness_pins() {
         .iter()
         .find(|vc| {
             let mut discr = Vec::new();
-            and_spine_int_pins(&vc.formula, "_0_discr", &mut discr);
+            and_spine_int_pins(&vc.formula, "_0__discr", &mut discr);
             discr == vec![1]
         })
-        .expect("the Ok path VC pins _0_discr == 1");
+        .expect("the Ok path VC pins _0__discr == 1");
     let mut a_pins = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.0.0_len", &mut a_pins);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.0.0__len", &mut a_pins);
     assert!(
-        a_pins.contains(&"_0_value.0.1_len".to_string()),
+        a_pins.contains(&"_0__value.0.1__len".to_string()),
         "equality pin missing: {:#?}",
         ok_vc.formula
     );
@@ -545,7 +545,7 @@ fn dominating_length_guard_grounds_equality_and_witness_pins() {
         ok_vc.formula
     );
     let mut b_pins = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.0.1_len", &mut b_pins);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.0.1__len", &mut b_pins);
     assert!(
         b_pins.contains(&"_5".to_string()),
         "multipliers-len witness pin missing: {:#?}",
@@ -568,7 +568,7 @@ fn payload_mutation_after_guard_stays_fail_closed() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_value.0.0_len") && details[0].contains("_0_value.0.1_len"),
+        details[0].contains("_0__value.0.0__len") && details[0].contains("_0__value.0.1__len"),
         "{}",
         details[0]
     );
@@ -746,7 +746,7 @@ fn use_hop_wrapper_grounds_equality_and_witness_pins() {
     // credited, all THREE return paths yield VCs (including the guard-Err
     // path whose pred reaches Return via a Drop terminator), the Ok VC pins
     // the equality plus both `Vec::len`-dest witnesses, and the Err VCs pin
-    // `_0_discr == 0`.
+    // `_0__discr == 0`.
     let func = extract_then_guard_wrapper_fn(false);
     assert!(ungrounded_details(&func).is_empty(), "pair must be credited");
     let vcs = postcondition_vcs(&func);
@@ -754,7 +754,7 @@ fn use_hop_wrapper_grounds_equality_and_witness_pins() {
     let mut discr_pins = Vec::new();
     for vc in &vcs {
         let mut discr = Vec::new();
-        and_spine_int_pins(&vc.formula, "_0_discr", &mut discr);
+        and_spine_int_pins(&vc.formula, "_0__discr", &mut discr);
         assert_eq!(discr.len(), 1, "one discr pin per path: {:#?}", vc.formula);
         discr_pins.push(discr[0]);
     }
@@ -764,14 +764,14 @@ fn use_hop_wrapper_grounds_equality_and_witness_pins() {
         .iter()
         .find(|vc| {
             let mut discr = Vec::new();
-            and_spine_int_pins(&vc.formula, "_0_discr", &mut discr);
+            and_spine_int_pins(&vc.formula, "_0__discr", &mut discr);
             discr == vec![1]
         })
-        .expect("the Ok path VC pins _0_discr == 1");
+        .expect("the Ok path VC pins _0__discr == 1");
     let mut a_pins = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.0.0_len", &mut a_pins);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.0.0__len", &mut a_pins);
     assert!(
-        a_pins.contains(&"_0_value.0.1_len".to_string()),
+        a_pins.contains(&"_0__value.0.1__len".to_string()),
         "equality pin missing: {:#?}",
         ok_vc.formula
     );
@@ -781,7 +781,7 @@ fn use_hop_wrapper_grounds_equality_and_witness_pins() {
         ok_vc.formula
     );
     let mut b_pins = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.0.1_len", &mut b_pins);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.0.1__len", &mut b_pins);
     assert!(
         b_pins.contains(&"_14".to_string()),
         "multipliers-len witness pin missing: {:#?}",
@@ -806,7 +806,7 @@ fn use_hop_source_mutation_stays_fail_closed() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_value.0.0_len") && details[0].contains("_0_value.0.1_len"),
+        details[0].contains("_0__value.0.0__len") && details[0].contains("_0__value.0.1__len"),
         "{}",
         details[0]
     );
@@ -987,15 +987,15 @@ fn two_pairs_both_guards_ground_both_equalities() {
         .iter()
         .find(|vc| {
             let mut discr = Vec::new();
-            and_spine_int_pins(&vc.formula, "_0_discr", &mut discr);
+            and_spine_int_pins(&vc.formula, "_0__discr", &mut discr);
             discr == vec![1]
         })
-        .expect("the Ok path VC pins _0_discr == 1");
+        .expect("the Ok path VC pins _0__discr == 1");
     // Pair 1: mu_plus (.2) / mu_minus (.3).
     let mut p1 = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.2_len", &mut p1);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.2__len", &mut p1);
     assert!(
-        p1.contains(&"_0_value.3_len".to_string()),
+        p1.contains(&"_0__value.3__len".to_string()),
         "pair-1 equality pin missing: {:#?}",
         ok_vc.formula
     );
@@ -1006,9 +1006,9 @@ fn two_pairs_both_guards_ground_both_equalities() {
     );
     // Pair 2: entailment.premises (.4.0) / entailment.multipliers (.4.1).
     let mut p2 = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.4.0_len", &mut p2);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.4.0__len", &mut p2);
     assert!(
-        p2.contains(&"_0_value.4.1_len".to_string()),
+        p2.contains(&"_0__value.4.1__len".to_string()),
         "pair-2 equality pin missing: {:#?}",
         ok_vc.formula
     );
@@ -1034,10 +1034,10 @@ fn two_pairs_one_guard_leaves_the_other_ungrounded() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_value.4.0_len")
-            && details[0].contains("_0_value.4.1_len")
-            && !details[0].contains("_0_value.2_len")
-            && !details[0].contains("_0_value.3_len"),
+        details[0].contains("_0__value.4.0__len")
+            && details[0].contains("_0__value.4.1__len")
+            && !details[0].contains("_0__value.2__len")
+            && !details[0].contains("_0__value.3__len"),
         "only the unguarded pair-2 terms fail closed: {}",
         details[0]
     );
@@ -1308,15 +1308,15 @@ fn destructure_rebuild_flat_and_nested_pairs_both_ground_real_mir() {
         .iter()
         .find(|vc| {
             let mut discr = Vec::new();
-            and_spine_int_pins(&vc.formula, "_0_discr", &mut discr);
+            and_spine_int_pins(&vc.formula, "_0__discr", &mut discr);
             discr == vec![1]
         })
-        .expect("the Ok path VC pins _0_discr == 1");
+        .expect("the Ok path VC pins _0__discr == 1");
     // FLAT pair 1 (.2/.3) — the case the terminal-move-alias fix unlocks.
     let mut p1 = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.2_len", &mut p1);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.2__len", &mut p1);
     assert!(
-        p1.contains(&"_0_value.3_len".to_string()),
+        p1.contains(&"_0__value.3__len".to_string()),
         "flat pair-1 equality pin missing: {:#?}",
         ok_vc.formula
     );
@@ -1327,9 +1327,9 @@ fn destructure_rebuild_flat_and_nested_pairs_both_ground_real_mir() {
     );
     // NESTED pair 2 (.4.0/.4.1) — already grounded pre-fix; must still hold.
     let mut p2 = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.4.0_len", &mut p2);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.4.0__len", &mut p2);
     assert!(
-        p2.contains(&"_0_value.4.1_len".to_string()),
+        p2.contains(&"_0__value.4.1__len".to_string()),
         "nested pair-2 equality pin missing: {:#?}",
         ok_vc.formula
     );
@@ -1471,10 +1471,10 @@ fn forwarded_err_return_grounds_discr_via_dominating_switch() {
     // b62 ROOT CAUSE FIX: the extract-Err arm FORWARDS the inner Result
     // whole (`_0 = move _2`), reached ONLY on the
     // `switchInt(discriminant(_2))` Err-edge (tag 1). That forward-return
-    // path now grounds `_0_discr` (Err = model 0) via the dominating switch;
+    // path now grounds `_0__discr` (Err = model 0) via the dominating switch;
     // with all THREE paths grounded the len pair is credited and the post
     // reaches the refutable body-aware lane. Pre-fix the forward path failed
-    // the gate (`_0_discr` UNGROUNDED for the whole fn) and the whole post
+    // the gate (`_0__discr` UNGROUNDED for the whole fn) and the whole post
     // stayed SpecModelUngrounded (the `sbar:174` Unknown).
     let func = forward_err_delegator_fn();
     assert!(
@@ -1487,7 +1487,7 @@ fn forwarded_err_return_grounds_discr_via_dominating_switch() {
     let mut discr_pins = Vec::new();
     for vc in &vcs {
         let mut d = Vec::new();
-        and_spine_int_pins(&vc.formula, "_0_discr", &mut d);
+        and_spine_int_pins(&vc.formula, "_0__discr", &mut d);
         assert_eq!(d.len(), 1, "one discr pin per path: {:#?}", vc.formula);
         discr_pins.push(d[0]);
     }
@@ -1499,14 +1499,14 @@ fn forwarded_err_return_grounds_discr_via_dominating_switch() {
         .iter()
         .find(|vc| {
             let mut d = Vec::new();
-            and_spine_int_pins(&vc.formula, "_0_discr", &mut d);
+            and_spine_int_pins(&vc.formula, "_0__discr", &mut d);
             d == vec![1]
         })
-        .expect("the Ok path VC pins _0_discr == 1");
+        .expect("the Ok path VC pins _0__discr == 1");
     let mut a_pins = Vec::new();
-    and_spine_var_pins(&ok_vc.formula, "_0_value.0.0_len", &mut a_pins);
+    and_spine_var_pins(&ok_vc.formula, "_0__value.0.0__len", &mut a_pins);
     assert!(
-        a_pins.contains(&"_0_value.0.1_len".to_string()) && a_pins.contains(&"_7".to_string()),
+        a_pins.contains(&"_0__value.0.1__len".to_string()) && a_pins.contains(&"_7".to_string()),
         "Ok path must pin the len equality + the premises-len witness (_7): {:#?}",
         ok_vc.formula
     );
@@ -1514,7 +1514,7 @@ fn forwarded_err_return_grounds_discr_via_dominating_switch() {
 
 /// SOUNDNESS PIN (no forcing switch): the inner Result is forwarded
 /// UNCONDITIONALLY (`_0 = move _2`, no `match`). No dominating discriminant
-/// switch forces a variant, so `_0_discr` must stay UNGROUNDED — grounding
+/// switch forces a variant, so `_0__discr` must stay UNGROUNDED — grounding
 /// it would guess the returned variant (and, if guessed Ok, leave the
 /// payload len terms free-yet-refutable: a false-PROVE).
 fn unconditional_forward_fn() -> VerifiableFunction {
@@ -1543,7 +1543,7 @@ fn unconditional_forward_fn() -> VerifiableFunction {
 fn unconditional_forward_stays_ungrounded() {
     // No switch to force the variant -> the forward stays fail-closed: no
     // refutable Postcondition VC, and the ungrounded row still names
-    // `_0_discr` (proving the discr was NOT falsely grounded).
+    // `_0__discr` (proving the discr was NOT falsely grounded).
     let func = unconditional_forward_fn();
     assert!(
         postcondition_vcs(&func).is_empty(),
@@ -1552,7 +1552,7 @@ fn unconditional_forward_stays_ungrounded() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_discr"),
+        details[0].contains("_0__discr"),
         "the discr must stay ungrounded on an unforced forward: {}",
         details[0]
     );
@@ -1609,7 +1609,7 @@ fn ok_edge_forward_fn() -> VerifiableFunction {
 fn ok_edge_forward_never_grounds() {
     // The forward sits on the Ok (payload) edge — the resolver refuses to
     // ground it (never assume Ok for a forwarded value), so the whole post
-    // stays fail-closed with `_0_discr` ungrounded.
+    // stays fail-closed with `_0__discr` ungrounded.
     let func = ok_edge_forward_fn();
     assert!(
         postcondition_vcs(&func).is_empty(),
@@ -1618,7 +1618,7 @@ fn ok_edge_forward_never_grounds() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains("_0_discr"),
+        details[0].contains("_0__discr"),
         "the discr must stay ungrounded on an Ok-edge forward: {}",
         details[0]
     );

@@ -1,6 +1,6 @@
 {
   "name": "stack_safe",
-  "def_path": "expr::stack_safe",
+  "def_path": "extract_foldmemo::expr::stack_safe",
   "span": {
     "file": "src/expr/mod.rs",
     "line_start": 55,
@@ -37,7 +37,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "stacker::maybe_grow",
+            "func": "stacker::maybe_grow::<R, impl FnOnce() -> R>::<__trust_args@be746c8a0e7ceac68f9944f3ff2f085f>",
             "args": [
               {
                 "Constant": {
@@ -76,7 +76,8 @@
             },
             "atomic": null,
             "is_foreign": false,
-            "is_unsafe_sig": false
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
           }
         }
       },

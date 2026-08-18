@@ -97,3 +97,10 @@ debug = 0
 [profile.dev.package]
 # Only use debuginfo=1 to further reduce compile times.
 bootstrap.debug = 1
+
+# memchr is first-party. This workspace is EXCLUDED from the root workspace and
+# carries its own lockfile, so the root [patch.crates-io] does not reach it —
+# and this is the graph that `bootstrap_disables_default_trust_verification`
+# leaves verification ON for, i.e. the one where upstream memchr fails.
+[patch.crates-io]
+memchr = { path = "../../crates/trust-memchr" }

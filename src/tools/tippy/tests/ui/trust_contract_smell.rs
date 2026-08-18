@@ -5,17 +5,26 @@
 #![warn(clippy::trust_contract_smell)]
 #![allow(dead_code)]
 
-// A postcondition over entry values only: it restates the precondition and
-// says nothing about the value the caller receives.
-fn restated_precondition(x: u32, y: u32) -> u32
+// NO `ensures` IS DIAGNOSED — the three below are NEGATIVE cases. While the
+// contract carrier is one-state (the compiler rejects every primed place, so a
+// postcondition is evaluated purely in the EXIT state), an unprimed name in an
+// `ensures` already denotes the post-state and there is nothing to report.
+// If a future change restores that arm, these start failing — which is the
+// point: restoring it is only correct once the deep E2 lane lands D2's
+// two-state carrier (primes lowering to bound MIR places for `&mut` borrows),
+// and that restoration must travel with the downstream migration it forces —
+// every `self.field` postcondition changes meaning (exit → entry) on that day.
+
+// Reads as a restated precondition, but under exit-state semantics it
+// constrains the value of `x` on return, so it is not vacuous.
+fn ensures_over_unprimed_names(x: u32, y: u32) -> u32
     requires x <= 1000
     ensures x <= 1000
-    //~^ trust_contract_smell
 {
     x + y
 }
 
-// `result` names the output record, so the postcondition constrains the call.
+// `result` names the output record.
 fn names_result(x: u32, y: u32) -> u32
     requires x <= 1000
     ensures result >= x
@@ -23,12 +32,29 @@ fn names_result(x: u32, y: u32) -> u32
     x + y
 }
 
-// A primed output is the post-state of a `&mut` borrow.
+// A primed output. NOTE: the lint is silent here, but the COMPILER refuses
+// this predicate — "primed post-state identifier `balance'` has no verified
+// MIR state binding" — so it is reserved grammar, not usable specification.
 fn withdraw(balance: &mut u64, amount: u64)
     requires *balance >= amount
     ensures balance' == balance - amount
 {
     *balance -= amount;
+}
+
+// The shape this lint used to reject and the verifier proves: a `self`-rooted
+// place in a postcondition, which is how every state-machine property on a
+// `&mut self` method is written.
+struct Window {
+    detached: bool,
+}
+
+impl Window {
+    fn abort(&mut self)
+        ensures !self.detached
+    {
+        self.detached = false;
+    }
 }
 
 // A precondition built only from literals admits every call.

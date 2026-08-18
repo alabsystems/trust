@@ -84,3 +84,50 @@ fn check_dup_symbol_and_keyword() {
     };
     test_symbols_macro(input, &["Symbol `splat` is duplicated", "location of previous definition"]);
 }
+
+/// trust: the `AppendOnly` section is optional, so every pre-existing
+/// invocation shape stays legal.
+#[test]
+fn check_append_only_is_optional() {
+    let input = quote! {
+        Keywords {}
+        Symbols {
+            splat,
+        }
+    };
+    test_symbols_macro(input, &[]);
+}
+
+/// trust: `AppendOnly` shares one index space with `Keywords`/`Symbols`, so
+/// duplicates across the boundary are still caught.
+#[test]
+fn check_dup_symbol_and_append_only() {
+    let input = quote! {
+        Keywords {}
+        Symbols {
+            splat,
+        }
+        AppendOnly {
+            splat,
+        }
+    };
+    test_symbols_macro(input, &["Symbol `splat` is duplicated", "location of previous definition"]);
+}
+
+/// trust: env-derived values are interned BEFORE the `AppendOnly` tail, so
+/// allowing them there would silently reintroduce renumbering.
+#[test]
+fn check_append_only_rejects_env() {
+    let input = quote! {
+        Keywords {}
+        Symbols {}
+        AppendOnly {
+            env_SOMETHING: env!("SOMETHING"),
+        }
+    };
+    test_symbols_macro(
+        input,
+        &["env!() values are not supported in the AppendOnly section; they are interned \
+           before it and would defeat its index stability"],
+    );
+}

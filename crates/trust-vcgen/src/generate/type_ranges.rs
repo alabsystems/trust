@@ -514,7 +514,9 @@ pub(super) fn nonzst_slice_len_vars(func: &VerifiableFunction) -> FxHashSet<Stri
 pub(super) fn ty_is_definitely_non_zst(ty: &Ty) -> bool {
     match ty {
         Ty::Bool
+        | Ty::Char
         | Ty::Int { .. }
+        | Ty::PtrSizedInt { .. }
         | Ty::Float { .. }
         | Ty::Ref { .. }
         | Ty::RawPtr { .. }

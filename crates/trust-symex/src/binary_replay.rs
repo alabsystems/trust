@@ -627,6 +627,13 @@ pub enum BinaryMachineReplayEffectKind {
     Aarch64SyncBoundary,
     /// AArch64 atomic/acquire/release effect.
     Aarch64AtomicAccess,
+    /// A machine effect whose VARIANT machine-code replay does not recognize at
+    /// all — one added to `Effect` since the classification below was written.
+    ///
+    /// This is not a witness class anyone can satisfy, and that is the point:
+    /// it makes an unrecognized effect a requirement that replay cannot
+    /// discharge, instead of the silence it produced before.
+    UnrecognizedMachineEffect,
 }
 
 impl fmt::Display for BinaryMachineReplayEffectKind {
@@ -643,6 +650,7 @@ impl fmt::Display for BinaryMachineReplayEffectKind {
             Self::FloatingPointRegisterWrite => f.write_str("floating_point_register_write"),
             Self::Aarch64SyncBoundary => f.write_str("aarch64_sync_boundary"),
             Self::Aarch64AtomicAccess => f.write_str("aarch64_atomic_access"),
+            Self::UnrecognizedMachineEffect => f.write_str("unrecognized_machine_effect"),
         }
     }
 }
@@ -7388,10 +7396,30 @@ fn required_effect_evidence_from_effect(
         | Effect::Return { .. } => {
             (BinaryMachineReplayEffectKind::ControlFlow, Some("PC".to_owned()), None)
         }
+        // Recognized, but carrying no witness requirement HERE: each of these
+        // is covered by `unsupported_effect_witness_diagnostic`, which the
+        // callers run FIRST and which emits a typed unsupported-class
+        // diagnostic for exactly this set.
         Effect::FpRegWrite { .. }
         | Effect::Aarch64SyncBoundary { .. }
         | Effect::Aarch64AtomicAccess { .. } => return None,
-        _ => return None,
+        // SOUNDNESS: this used to be a second `_ => return None`, coupled to the
+        // identical wildcard in `unsupported_effect_witness_diagnostic`. A
+        // variant added to `Effect` hit BOTH: no diagnostic from the first, no
+        // requirement from the second, and the caller's `continue` carried on
+        // with the effect completely unwitnessed. Neither function could be
+        // made to notice, because `Effect` is `#[non_exhaustive]` and defined in
+        // another crate, so both wildcards are mandatory and neither would ever
+        // produce a compiler warning.
+        //
+        // It is now REACHABLE ONLY IF the two lists drift, and it fails closed:
+        // it demands an evidence item of a kind no witness can ever match, so
+        // replay must fail rather than fall silent.
+        other => (
+            BinaryMachineReplayEffectKind::UnrecognizedMachineEffect,
+            Some(format!("unrecognized machine effect {other:?}")),
+            None,
+        ),
     };
     Some(RequiredEffectEvidence {
         kind,
@@ -7426,7 +7454,30 @@ fn unsupported_effect_witness_diagnostic(
             BinaryMachineReplayEffectKind::Aarch64AtomicAccess,
             "atomic ordering event, synchronization edge, monitor/thread identity, happens-before witness",
         ),
-        _ => return None,
+        // The effects `required_effect_evidence_from_effect` DOES witness. This
+        // list is the complement of the arms above plus the refusal below, and
+        // writing it out positively is what makes the pair total: whatever is
+        // not named here gets a diagnostic, so no variant can be silently
+        // absent from both functions the way the old paired `_ => return None`
+        // wildcards allowed.
+        Effect::RegWrite { .. }
+        | Effect::SpWrite { .. }
+        | Effect::MemRead { .. }
+        | Effect::MemWrite { .. }
+        | Effect::FlagUpdate { .. }
+        | Effect::PcUpdate { .. }
+        | Effect::Branch { .. }
+        | Effect::ConditionalBranch { .. }
+        | Effect::Call { .. }
+        | Effect::Return { .. } => return None,
+        // SOUNDNESS: was `_ => return None`. See the matching note in
+        // `required_effect_evidence_from_effect` — a variant added to `Effect`
+        // used to get neither a diagnostic here nor a requirement there.
+        _ => (
+            BinaryMachineReplayEffectKind::UnrecognizedMachineEffect,
+            "the effect VARIANT itself is unknown to machine-code replay; no witness class is \
+             defined for it, so nothing can be required and nothing can be checked",
+        ),
     };
     let step_text = step.map(|step| format!(" at machine trace step {step}")).unwrap_or_default();
     Some(
@@ -8680,6 +8731,7 @@ mod tests {
                 blocks,
                 arg_count: 1,
                 return_ty: Ty::unit_ty(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -11772,5 +11824,165 @@ mod tests {
         let minimized_trace = result.counterexample.trace.expect("trace should remain");
         assert_eq!(minimized_trace.steps.len(), 2);
         assert_eq!(result.counterexample.assignments.len(), 1);
+    }
+}
+
+/// The COUPLED PAIR: `required_effect_evidence_from_effect` and
+/// `unsupported_effect_witness_diagnostic` both used to end in `_ => return
+/// None`, and the callers run them in sequence. A variant added to `Effect`
+/// therefore got NEITHER a diagnostic nor a witness requirement, and the
+/// caller's `continue` carried on with the effect completely unwitnessed.
+///
+/// The two are now complementary by construction. These tests pin that: every
+/// `Effect` variant must be claimed by exactly one of them, and neither may
+/// answer "nothing to do" for something the other has not covered.
+#[cfg(test)]
+mod effect_witness_totality_tests {
+    use trust_machine_sem::{Effect, MachineState};
+    use trust_types::Formula;
+
+    use super::*;
+
+    fn sample_effects() -> Vec<(&'static str, Effect)> {
+        use trust_machine_sem::{
+            Aarch64AtomicAccessKind, Aarch64AtomicOrdering, Aarch64SyncBoundaryKind,
+            Aarch64SyncOrdering, Aarch64SyncScope,
+        };
+        let state = MachineState::symbolic();
+        let bv = |v: i128| Formula::BitVec { value: v, width: 64 };
+        vec![
+            ("RegWrite", Effect::RegWrite { index: 0, width: 64, value: bv(1) }),
+            ("SpWrite", Effect::SpWrite { value: bv(1) }),
+            ("MemRead", Effect::MemRead { address: bv(0x1000), width_bytes: 4 }),
+            ("MemWrite", Effect::MemWrite { address: bv(0x1000), value: bv(7), width_bytes: 4 }),
+            (
+                "FlagUpdate",
+                Effect::FlagUpdate {
+                    n: Formula::Bool(false),
+                    z: Formula::Bool(false),
+                    c: Formula::Bool(false),
+                    v: Formula::Bool(false),
+                },
+            ),
+            ("PcUpdate", Effect::PcUpdate { value: bv(0x1004) }),
+            ("Branch", Effect::Branch { target: bv(0x2000) }),
+            (
+                "ConditionalBranch",
+                Effect::ConditionalBranch {
+                    condition: trust_disasm::operand::Condition::Eq,
+                    target: bv(0x2000),
+                    fallthrough: bv(0x1004),
+                },
+            ),
+            ("Call", Effect::Call { target: bv(0x3000), return_addr: bv(0x1004) }),
+            ("Return", Effect::Return { target: state.gpr[30].clone() }),
+            ("FpRegWrite", Effect::FpRegWrite { index: 0, width: 64, value: bv(1) }),
+            (
+                "Aarch64SyncBoundary",
+                Effect::Aarch64SyncBoundary {
+                    kind: Aarch64SyncBoundaryKind::DataMemoryBarrier,
+                    scope: Aarch64SyncScope::InnerShareable,
+                    ordering: Aarch64SyncOrdering::LoadsAndStores,
+                    clears_exclusive_monitor: false,
+                    raw_option: Some(0b1011),
+                },
+            ),
+            (
+                "Aarch64AtomicAccess",
+                Effect::Aarch64AtomicAccess {
+                    kind: Aarch64AtomicAccessKind::Load,
+                    ordering: Aarch64AtomicOrdering::Acquire,
+                    address: bv(0x1000),
+                    width_bytes: 4,
+                    exclusive: false,
+                },
+            ),
+        ]
+    }
+
+    /// No effect may be invisible to BOTH functions. This is the exact
+    /// condition the old paired wildcards violated.
+    #[test]
+    fn every_effect_is_either_witnessed_or_diagnosed() {
+        let insn = trust_disasm::decode_aarch64(&0xD503_201Fu32.to_le_bytes(), 0x1000)
+            .expect("nop must decode");
+
+        for (name, effect) in sample_effects() {
+            let diagnostic =
+                unsupported_effect_witness_diagnostic("AArch64", &insn, Some(0), &effect);
+            let required = required_effect_evidence_from_effect(
+                "AArch64",
+                insn.address,
+                Some(0),
+                &effect,
+                Some(0),
+            );
+
+            assert!(
+                diagnostic.is_some() || required.is_some(),
+                "{name} is invisible to BOTH the witness requirement and the diagnostic — it \
+                 would pass through machine-code replay completely unwitnessed"
+            );
+            // ... and never both: the callers check the diagnostic FIRST and
+            // `continue`, so an effect claimed by both would silently lose its
+            // witness requirement.
+            assert!(
+                !(diagnostic.is_some() && required.is_some()),
+                "{name} is claimed by both functions; the caller would use the diagnostic and \
+                 drop the witness requirement"
+            );
+        }
+    }
+
+    /// The three recognized-but-unsupported classes must be DIAGNOSED, with
+    /// their own kind — not silently skipped and not lumped together.
+    #[test]
+    fn unsupported_effect_classes_keep_their_typed_diagnostic() {
+        let insn = trust_disasm::decode_aarch64(&0xD503_201Fu32.to_le_bytes(), 0x1000)
+            .expect("nop must decode");
+        let expected = [
+            ("FpRegWrite", BinaryMachineReplayEffectKind::FloatingPointRegisterWrite),
+            ("Aarch64SyncBoundary", BinaryMachineReplayEffectKind::Aarch64SyncBoundary),
+            ("Aarch64AtomicAccess", BinaryMachineReplayEffectKind::Aarch64AtomicAccess),
+        ];
+        for (name, want_kind) in expected {
+            let effect = sample_effects()
+                .into_iter()
+                .find_map(|(n, e)| (n == name).then_some(e))
+                .expect("sample present");
+            let diagnostic =
+                unsupported_effect_witness_diagnostic("AArch64", &insn, Some(0), &effect)
+                    .unwrap_or_else(|| panic!("{name} must be diagnosed"));
+            assert_eq!(diagnostic.effect_kind, Some(want_kind), "{name} diagnostic kind");
+            assert_ne!(
+                diagnostic.effect_kind,
+                Some(BinaryMachineReplayEffectKind::UnrecognizedMachineEffect),
+                "{name} is recognized; it must not be reported as an unknown variant"
+            );
+        }
+    }
+
+    /// The scalar/control effects must carry a real witness requirement rather
+    /// than the unrecognized-variant placeholder.
+    #[test]
+    fn witnessed_effects_do_not_use_the_unrecognized_placeholder() {
+        let insn = trust_disasm::decode_aarch64(&0xD503_201Fu32.to_le_bytes(), 0x1000)
+            .expect("nop must decode");
+        for (name, effect) in sample_effects() {
+            if let Some(required) = required_effect_evidence_from_effect(
+                "AArch64",
+                insn.address,
+                Some(0),
+                &effect,
+                Some(0),
+            ) {
+                assert_ne!(
+                    required.kind,
+                    BinaryMachineReplayEffectKind::UnrecognizedMachineEffect,
+                    "{name} is a recognized effect but produced the unrecognized-variant \
+                     requirement; the two arm lists have drifted apart"
+                );
+            }
+        }
     }
 }

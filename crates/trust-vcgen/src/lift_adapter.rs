@@ -3113,6 +3113,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         };
 
         LiftedFunction {
@@ -3342,6 +3343,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         };
 
         LiftedFunction {
@@ -3618,6 +3620,7 @@ mod tests {
             ],
             arg_count: 0,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         };
 
         LiftedFunction {
@@ -4928,6 +4931,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         };
 
         let lifted = LiftedFunction {

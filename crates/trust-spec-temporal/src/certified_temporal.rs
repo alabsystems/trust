@@ -20,6 +20,7 @@ pub enum CertifiedTemporalPropertyClass {
 
 /// Exact-input-bound evidence after independent kernel replay.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertifiedTemporalEvidence {
     /// Versioned Trust wrapper schema.
     pub schema: String,

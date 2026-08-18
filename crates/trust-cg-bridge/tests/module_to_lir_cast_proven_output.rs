@@ -127,7 +127,7 @@ fn make_bridge_cast_module(kind: CastKind) -> Module {
         name: name.to_string(),
         def_path: "cast::op".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: to_ty },
+        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: to_ty, datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -307,7 +307,10 @@ impl<'a> Executor<'a> {
             }
 
             if let Some((condition, target, _fallthrough)) = cond_branch {
-                let path_cond = condition_to_formula(&state, condition);
+                // A condition the machine model does not evaluate must REFUSE
+                // this replay, not become an `always taken` path condition.
+                let path_cond = condition_to_formula(&state, condition)
+                    .map_err(|er| ExecError::Unsupported(format!("condition at {pc:#x}: {er}")))?;
                 let target_pc = const_addr(&target)
                     .ok_or_else(|| ExecError::Unsupported(format!("indirect bcond at {pc:#x}")))?;
                 let fall_pc = pc + 4;

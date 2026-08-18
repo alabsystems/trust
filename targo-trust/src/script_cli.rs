@@ -16,12 +16,38 @@ use std::time::Instant;
 use crate::bounded_process;
 use crate::stage2_tools::{discover_unique_repo_stage2_tool, validate_repo_stage2_tool};
 
+mod certified_monitor_authority;
+use certified_monitor_authority::{
+    certified_monitor_authority_receipt_path, certified_monitor_evidence_layout,
+    preflight_certified_monitor_evidence_layout,
+    publish_certified_monitor_native_authority_receipt,
+    render_certified_monitor_native_authority_receipt, validate_certified_monitor_payload,
+};
+
 const SCRIPT_MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 const CERTIFIED_MONITOR_RELEASE_SCRIPT: &str = "scripts/stage2_certified_monitor_e2e.sh";
 const CERTIFIED_MONITOR_RELEASE_PATH: &str = "/usr/bin:/bin";
 const CERTIFIED_MONITOR_CACHE_HOME_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_CACHE_HOME";
 const CERTIFIED_MONITOR_EXPECTED_HEAD_ENV: &str = "TRUST_CERTIFIED_MONITOR_EXPECTED_HEAD";
+const CERTIFIED_MONITOR_LOG_DIR_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_LOG_DIR";
+const CERTIFIED_MONITOR_RUN_ID_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_RUN_ID";
+const CERTIFIED_MONITOR_PAYLOAD_IDENTITY_SCHEMA: &str =
+    "trust.certified-monitor-e2e-payload-identity.v4";
+const CERTIFIED_MONITOR_NATIVE_AUTHORITY_SCHEMA: &str =
+    "trust.certified-monitor-native-authority.v1";
+const CERTIFIED_MONITOR_EVIDENCE_MANIFEST: &str = "evidence.sha256";
+const CERTIFIED_MONITOR_PAYLOAD_FILES: &[&str] = &[
+    "gate-identity.txt",
+    "compiled-test-inventory.log",
+    "real_targo_test_instruments_library_used_by_integration_test.log",
+    "real_targo_test_executes_loop_invariant_violation.log",
+    "real_targo_test_executes_authorized_satisfying_integration_test.log",
+    "real_targo_test_rejects_unharnessed_test_target_before_execution.log",
+];
+const CERTIFIED_MONITOR_MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const CERTIFIED_MONITOR_MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
+const CERTIFIED_MONITOR_MAX_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const TEMPORAL_FABRIC_MANIFEST: &str = "targo-trust/tests/fixtures/fabric/Cargo.toml";
 const TEMPORAL_FABRIC_LOCK: &str = "targo-trust/tests/fixtures/fabric/Cargo.lock";
 
@@ -2234,7 +2260,6 @@ fn run_maintenance_script(
         }
     };
     if script == CERTIFIED_MONITOR_RELEASE_SCRIPT {
-        configure_certified_monitor_release_environment(&mut command);
         let initial_head = match certified_monitor_source_authority(&repo_root, "before") {
             Ok(head) => head,
             Err(error) => {
@@ -2242,11 +2267,80 @@ fn run_maintenance_script(
                 return ExitCode::from(2);
             }
         };
+        let evidence_layout = match certified_monitor_evidence_layout(
+            &repo_root,
+            args,
+            &initial_head,
+            env::var_os(CERTIFIED_MONITOR_LOG_DIR_ENV),
+            env::var_os(CERTIFIED_MONITOR_RUN_ID_ENV),
+        ) {
+            Ok(layout) => layout,
+            Err(error) => {
+                eprintln!("targo trust: {label} evidence layout is invalid: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        if let Err(error) = preflight_certified_monitor_evidence_layout(&evidence_layout) {
+            eprintln!("targo trust: {label} evidence preflight failed: {error}");
+            return ExitCode::from(2);
+        }
+        configure_certified_monitor_release_environment(&mut command);
         command
             .env(CERTIFIED_MONITOR_EXPECTED_HEAD_ENV, &initial_head)
+            .env(CERTIFIED_MONITOR_LOG_DIR_ENV, &evidence_layout.payload_directory)
             .current_dir(&repo_root)
-            .args(args);
+            .args(args)
+            // The native parent owns the receipt location. Appending this exact
+            // spelling after caller arguments makes it authoritative over both
+            // inherited environment and any earlier shell option.
+            .arg("--log-dir")
+            .arg(&evidence_layout.payload_directory);
         let result = run_child(label, command);
+        if result != ExitCode::SUCCESS {
+            if let Err(error) = certified_monitor_source_authority(&repo_root, "after failure") {
+                eprintln!(
+                    "targo trust: {label} source authority also failed after payload failure: {error}"
+                );
+            }
+            return result;
+        }
+
+        let payload = match validate_certified_monitor_payload(
+            &evidence_layout.payload_directory,
+            &initial_head,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("targo trust: {label} payload receipt validation failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let authority_receipt_path =
+            certified_monitor_authority_receipt_path(&payload.evidence_directory);
+        if authority_receipt_path != evidence_layout.authority_receipt {
+            eprintln!(
+                "targo trust: {label} canonical payload path changed its authority-receipt identity: expected {}, observed {}",
+                evidence_layout.authority_receipt.display(),
+                authority_receipt_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        let receipt_bytes = match render_certified_monitor_native_authority_receipt(
+            &repo_root,
+            &authority_receipt_path,
+            &initial_head,
+            &payload,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("targo trust: {label} could not serialize native authority: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // Payload parsing and hashing can be lengthy. Make the controlled-Git
+        // source check the final authority operation immediately before the
+        // create-new publication boundary, not an early check followed by work.
         let terminal_head = match certified_monitor_source_authority(&repo_root, "after") {
             Ok(head) => head,
             Err(error) => {
@@ -2261,18 +2355,32 @@ fn run_maintenance_script(
             );
             return ExitCode::FAILURE;
         }
-        if result == ExitCode::SUCCESS {
-            println!(
-                "certified-monitor release gate: PASS (native controlled-Git source authority \
-                 verified before and after at {initial_head})"
-            );
-        }
-        return result;
+        let authority_receipt_sha256 = match publish_certified_monitor_native_authority_receipt(
+            &authority_receipt_path,
+            &receipt_bytes,
+        ) {
+            Ok(digest) => digest,
+            Err(error) => {
+                eprintln!(
+                    "targo trust: {label} could not publish native authority receipt: {error}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "certified-monitor release gate: PASS (native controlled-Git source authority \
+             verified before and after at {initial_head})"
+        );
+        println!(
+            "certified-monitor native authority receipt: {}",
+            authority_receipt_path.display()
+        );
+        println!("certified-monitor native authority receipt sha256: {authority_receipt_sha256}");
+        return ExitCode::SUCCESS;
     }
     command.current_dir(repo_root).args(args);
     run_child(label, command)
 }
-
 /// Bind the certified-monitor shell payload to the real worktree, HEAD object,
 /// tracked bytes, index authority, untracked inventory, and recursive submodule
 /// graph through the same fixed-system-Git implementation used by native
@@ -2635,6 +2743,7 @@ mod tests {
         .expect("read certified-monitor release gate");
         for test in [
             "tests::real_targo_test_instruments_library_used_by_integration_test",
+            "tests::real_targo_test_executes_loop_invariant_violation",
             "tests::real_targo_test_executes_authorized_satisfying_integration_test",
             "tests::real_targo_test_rejects_unharnessed_test_target_before_execution",
         ] {
@@ -2675,6 +2784,11 @@ mod tests {
         assert!(script.contains("FINAL_TARGO_SHA256"));
         assert!(script.contains("FINAL_TARGO_TRUST_SHA256"));
         assert!(script.contains("hash_stable_stage2_tree"));
+        assert!(
+            !script.contains("case \"$entry\" in"),
+            "macOS /bin/bash 3.2 misparses case patterns nested inside the stage2-tree command substitution"
+        );
+        assert!(script.contains("[[ \"$entry\" != ./lib/rustlib/rustc-src/rust"));
         assert!(script.contains("STAGE2_TREE_SHA256"));
         assert!(script.contains("FINAL_STAGE2_TREE_SHA256"));
         assert!(script.contains("TERMINAL_STAGE2_TREE_SHA256"));

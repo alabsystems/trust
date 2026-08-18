@@ -181,3 +181,144 @@ pub enum Effect {
         value: Formula,
     },
 }
+
+/// Emits the whole `Effect` variant census — [`Effect::VARIANT_NAMES`] and
+/// [`Effect::variant_name`] — from ONE list of variant identifiers.
+///
+/// SINGLE-SOURCED, NOT ASSERTED. The name table and the match that produces
+/// those names are expanded from the same tokens, so "the table says one thing
+/// and the code says another" is not a mistake that can be written down. This
+/// replaces a `const` assertion against `core::mem::variant_count::<Effect>()`,
+/// which only DETECTED that drift after the fact and cost the crate an unstable
+/// `#![feature(variant_count)]` — an unstable feature this crate cannot afford,
+/// because it is reachable from `rustc_codegen_trust_cg` and therefore sits in
+/// the compiler's own build graph.
+///
+/// The generated `match` is an ordinary exhaustive match with NO wildcard arm,
+/// written in the crate that DEFINES `Effect` (where `#[non_exhaustive]` is
+/// inert), so it keeps exactly the property the hand-written match had: a
+/// fourteenth variant that is not censused is `cargo build` error E0004 in the
+/// library itself, not merely in a test, and never a silent default. The
+/// converse mistake — a name in this list that the enum does not have — is
+/// E0599 pointing at the offending line of the list. Both directions are
+/// MEASURED, not asserted; see [`Effect::VARIANT_NAMES`].
+macro_rules! declare_effect_census {
+    ($($variant:ident),+ $(,)?) => {
+        impl Effect {
+            /// EVERY `Effect` variant name, in declaration order.
+            ///
+            /// This is the CENSUS every consumer of the effect surface is
+            /// measured against. A consumer that handles some variants ITSELF
+            /// (rather than forwarding them to a fail-closed threader) is
+            /// protected only by enumerating them correctly, so each such
+            /// consumer carries a test that walks this list and requires a
+            /// declared, MEASURED disposition for every entry — see
+            /// `effect_variant_census` in this crate's tests and
+            /// `f_every_effect_variant_has_a_measured_gate_disposition` in
+            /// `trust-cg-bridge`.
+            ///
+            /// The list cannot drift from the enum, and the enforcement is a
+            /// chain in which every link is a hard failure:
+            ///
+            /// 1. This list and [`Effect::variant_name`]'s match are expanded
+            ///    from ONE token list by `declare_effect_census!`, so a name
+            ///    here that no arm produces — or an arm producing a name that
+            ///    is not here — is UNREPRESENTABLE rather than merely
+            ///    detected. Nothing checkable-only-by-sampling guards the
+            ///    count, and nothing unstable is required to hold it.
+            /// 2. That match is EXHAUSTIVE with no wildcard arm, in the crate
+            ///    that DEFINES `Effect`, so a fourteenth variant is `cargo
+            ///    build` error E0004 in the library itself. There is exactly
+            ///    one OTHER way to silence that E0004 — pasting rustc's own
+            ///    `help:` arm into the macro body rather than extending the
+            ///    list — and `deny(unreachable_patterns)` on the generated
+            ///    match makes that a hard error too, because such an arm is
+            ///    expanded once per census entry. So the only way through is to
+            ///    add the variant to the census list, which extends this table
+            ///    in the same edit, by construction.
+            /// 3. `effect_variant_census` (tests) then requires the sample set
+            ///    to cover this list exactly, so extending the list without
+            ///    MEASURING the new variant's disposition in each consumer
+            ///    fails the test.
+            ///
+            /// Step 1 is not decoration. It is what makes the "hurried author"
+            /// path safe: the edit that resolves E0004 is the same edit that
+            /// censuses the variant, so the earlier failure mode — E0004
+            /// resolved, name table left short, census silently passing with an
+            /// uncensused variant present — no longer has a spelling.
+            ///
+            /// MEASURED, 2026-08-10, by injecting a fourteenth variant:
+            /// `cargo build -p trust-machine-sem --lib` reported THREE E0004s —
+            /// this match, `ConcreteState::apply_effect`, and
+            /// `ConcreteState::apply_effect_with_eval_state`. Adding the
+            /// identifier to the census list (the laziest resolution this
+            /// construction admits) cleared this one and extended
+            /// `VARIANT_NAMES` in the same edit; giving the concrete oracle
+            /// fail-closed arms then built the library clean, and
+            /// `effect_variant_census` failed on coverage naming the injected
+            /// variant — link 3 doing its job. Removing the census entry while
+            /// leaving the enum variant out is E0599 on the census line.
+            ///
+            /// The bypass in step 2 is MEASURED too, and it is why the `deny` is
+            /// there. Injecting the fourteenth variant AND pasting rustc's
+            /// suggested arm inside the macro repetition — which silenced the
+            /// census with only a warning before the `deny` — now reports
+            /// `error: unreachable pattern` alongside the remaining E0004s.
+            /// Duplicating an entry in the census list is likewise
+            /// `error: unreachable pattern` rather than the runtime test
+            /// failure it used to be.
+            pub const VARIANT_NAMES: &'static [&'static str] =
+                &[$(stringify!($variant)),+];
+
+            /// The name of this effect's variant, for diagnostics.
+            ///
+            /// EXHAUSTIVE BY CONSTRUCTION — there is deliberately no wildcard
+            /// arm and no fallback string. A fourteenth `Effect` variant does
+            /// not silently report itself under a generic label; it fails to
+            /// compile. The returned name is an element of
+            /// [`Effect::VARIANT_NAMES`] by construction, not by test: both
+            /// come from the same list.
+            //
+            // `deny(unreachable_patterns)` is LOAD-BEARING, not hygiene. It
+            // closes the one bypass the single-source list would otherwise
+            // leave: rustc's own `help:` for the E0004 below prints an arm to
+            // paste in, and pasting it INSIDE this repetition silences the
+            // error while leaving the census list — and therefore
+            // `VARIANT_NAMES` — short. Expanded 13 times, such an arm is
+            // unreachable after the first, so denying the lint turns that
+            // paste into a hard error instead of a warning. It also makes a
+            // DUPLICATED entry in the census list a compile error rather than
+            // a runtime test failure.
+            #[deny(unreachable_patterns)]
+            #[must_use]
+            pub fn variant_name(&self) -> &'static str {
+                match self {
+                    $( Effect::$variant { .. } => stringify!($variant), )+
+                }
+            }
+        }
+    };
+}
+
+// THE CENSUS. One list, in declaration order. Adding an `Effect` variant
+// without adding it here is E0004 in the generated `variant_name`; adding it
+// here without adding it to the enum is E0599 on that line. Once it compiles,
+// add a row to
+// `effect_variant_census` (trust-machine-sem tests) and to the gate-disposition
+// table (`f_every_effect_variant_has_a_measured_gate_disposition`,
+// trust-cg-bridge) declaring what each consumer does with it.
+declare_effect_census! {
+    RegWrite,
+    SpWrite,
+    MemWrite,
+    MemRead,
+    FlagUpdate,
+    Branch,
+    ConditionalBranch,
+    Call,
+    Return,
+    FpRegWrite,
+    Aarch64SyncBoundary,
+    Aarch64AtomicAccess,
+    PcUpdate,
+}

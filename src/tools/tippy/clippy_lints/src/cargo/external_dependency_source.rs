@@ -104,7 +104,9 @@ fn source_outside_tree<'a>(
 /// package name — a renamed `[[bin]]`, or a build script — therefore matches
 /// nothing and reports nothing. That is the safe direction: it drops reports
 /// rather than attaching one package's manifest to another package's build.
-fn local_package<'a>(cx: &LateContext<'_>, metadata: &'a Metadata) -> Option<&'a Package> {
+// Trust: shared with `hand_encoded_solver_query`, which needs the same package
+// to locate the directory cargo reads this crate's manifest from.
+pub(super) fn local_package<'a>(cx: &LateContext<'_>, metadata: &'a Metadata) -> Option<&'a Package> {
     let local_name = cx.tcx.crate_name(LOCAL_CRATE);
     metadata.workspace_packages().into_iter().find(|package| {
         // A manifest name keeps its dashes; a crate name is a namespace, so cargo

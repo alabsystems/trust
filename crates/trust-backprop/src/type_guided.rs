@@ -429,7 +429,7 @@ mod tests {
         let arg_count = params.len();
         let mut locals = vec![LocalDecl { index: 0, ty: return_ty, name: Some("_return".into()) }];
         locals.extend(params);
-        VerifiableBody { locals, blocks: vec![], arg_count, return_ty: Ty::Unit }
+        VerifiableBody { locals, blocks: vec![], arg_count, return_ty: Ty::Unit, datatype_defs: Default::default() }
     }
 
     fn make_param(index: usize, name: &str, ty: Ty) -> LocalDecl {
@@ -746,6 +746,7 @@ mod tests {
             blocks: vec![],
             arg_count: 0,
             return_ty: Ty::Int { width: 32, signed: false },
+            datatype_defs: Default::default(),
         };
         let suggestions = generate_ensures_from_types(&body);
         assert!(!suggestions.is_empty());

@@ -1271,6 +1271,7 @@ pub mod fixtures {
             ],
             arg_count: 2,
             return_ty: o_dt(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: name.to_string(),
@@ -1412,6 +1413,7 @@ pub mod fixtures {
             ],
             arg_count: 2,
             return_ty: o_dt(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: name.to_string(),

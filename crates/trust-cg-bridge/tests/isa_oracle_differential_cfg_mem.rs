@@ -405,6 +405,7 @@ fn author_max() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -423,6 +424,7 @@ fn author_min() -> VerifiableFunction {
             blocks: vec![cmp_branch_block(BinOp::Le, 1, 2, 3, 1, 2), ret_use_block(1, 1), ret_use_block(2, 2)],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -473,6 +475,7 @@ fn author_abs() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -530,6 +533,7 @@ fn author_clamp() -> VerifiableFunction {
             ],
             arg_count: 3,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -571,6 +575,7 @@ fn author_dispatch() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -624,6 +629,7 @@ fn author_sum_loop() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -664,6 +670,7 @@ fn author_ptr_rw() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }

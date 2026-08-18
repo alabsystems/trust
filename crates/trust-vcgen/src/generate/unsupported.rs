@@ -520,6 +520,23 @@ pub(super) fn collect_statement_unsupported(
                 vcs,
             );
         }
+        // MODELED statement: its bounds/overlap obligations come from the sep
+        // engine (`SepEngine::interpret_statement` -> `interpret_ptr_copy`), so
+        // no `UnsupportedMir` marker is owed for the statement itself. Its
+        // OPERANDS still fail closed here exactly like `Intrinsic`/`Unsupported`
+        // operands do — an `Operand::Unsupported` or rejected symbolic formula
+        // inside the copy must surface, not slide through the wildcard.
+        Statement::CopyNonOverlapping { src, dst, count, span, .. } => {
+            for (slot, operand) in [("src", src), ("dst", dst), ("count", count)] {
+                collect_operand_unsupported(
+                    func,
+                    format!("bb{} stmt{} copy_nonoverlapping {slot}", block.0, stmt_index),
+                    span,
+                    operand,
+                    vcs,
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -761,6 +778,28 @@ pub(super) fn collect_terminator_unsupported(
                         "bb{}: `{m}` panics on an out-of-range argument (`> len`) and its \
                          panic-freedom is not modeled — guard the argument; use `-Z trust-policy=advisory` \
                          only for non-proof triage",
+                        block.0
+                    ),
+                    span.clone(),
+                ));
+            }
+            // Index-panicking `Vec`/`String` mutators (`remove`/`insert`/
+            // `swap_remove`/`insert_str`) — exact-path gated (see the
+            // recognizer): their panic set is known (`index >= len` /
+            // `index > len` / char-boundary) and reachable for a caller-supplied
+            // container, so an unguarded, unmodeled call must surface the same
+            // `panic-freedom-unverified` row, which strict policy counts as
+            // FAILED rather than silently accepting a callee the verifier
+            // never saw (`absent_callee_call_only_mono`).
+            if target.is_some() && is_index_panicking_container_mutator(callee) {
+                let m = method_tail(callee);
+                vcs.push(unsupported_mir_vc(
+                    func,
+                    format!("Call::{m}::panic-freedom-unverified"),
+                    format!(
+                        "bb{}: `{m}` panics on an out-of-range index (or non-char-boundary) and \
+                         its panic-freedom is not modeled — guard the index; use \
+                         `-Z trust-policy=advisory` only for non-proof triage",
                         block.0
                     ),
                     span.clone(),

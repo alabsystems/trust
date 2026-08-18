@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +41,17 @@ stage0_prepare = load_module(
     "trust_stage0_dist_prepare",
     REPO_ROOT / "src" / "tools" / "trust-stage0-dist" / "prepare.py",
 )
+
+
+def extract_test_archive(archive: tarfile.TarFile, destination: Path) -> None:
+    """Safely extract a test-owned archive on Python versions before 3.12."""
+
+    members = archive.getmembers()
+    for member in members:
+        path = PurePosixPath(member.name)
+        assert not path.is_absolute() and ".." not in path.parts
+        assert member.isfile() or member.isdir()
+    archive.extractall(destination)
 
 
 def _fake_genesis_rustc(path: Path, *, commit: str, date: str, host: str) -> None:
@@ -713,7 +725,7 @@ done
 
             extracted = root / "extracted"
             with tarfile.open(output, "r:xz") as archive:
-                archive.extractall(extracted, filter="data")
+                extract_test_archive(archive, extracted)
             package = extracted / new_prefix
             assert (package / "components").read_text(encoding="utf-8") == f"{canonical}\n"
             assert (package / canonical / "manifest.in").is_file()
@@ -1116,8 +1128,8 @@ def test_producer_preflight_rejects_builder_prefix_and_wrong_kind_decoys() -> No
         (
             "chained describe result",
             lambda source: source.replace(
-                "                dist::Gcc\n            ),",
-                "                dist::Gcc\n"
+                "                dist::ReproducibleArtifacts\n            ),",
+                "                dist::ReproducibleArtifacts\n"
                 "            ).into_iter().filter(producer_builder_decoy),",
                 1,
             ),

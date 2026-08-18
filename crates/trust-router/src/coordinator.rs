@@ -3180,11 +3180,32 @@ mod tests {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-            // File-ledger authority deliberately rejects shared/sticky
-            // ancestors such as /tmp. Place this fixture below the checkout,
-            // whose euid/root-owned chain matches the accepted production shape.
-            let directory = std::env::current_dir().expect("test working directory").join(format!(
-                ".trust-file-lane-test-{label}-{}-{nonce:x}-{sequence}",
+            // Root under $HOME, NOT the checkout — the same correction Part A
+            // made to `memory_jobserver::TestDirectory`, for the same reason.
+            //
+            // The comment this replaced said to "place this fixture below the
+            // checkout, whose euid/root-owned chain matches the accepted
+            // production shape". That is false under the common `umask 0002`:
+            // every directory in a checked-out repo is 0775, and the ledger
+            // rejects a token whose ANCESTOR chain is group/other writable. The
+            // leaf is 0700 (set below) and everything above it is not, which is
+            // why the failure reads as puzzling — "token ancestor is
+            // group/other writable: .../crates/trust-router". `/tmp` is no
+            // better: it is 1777, and this check has no root-owned-sticky
+            // exemption. `$HOME` is 0750 owner-only on a normal account.
+            //
+            // Falls back to the temp dir when HOME is unset (CI containers),
+            // which reproduces the old failure loudly rather than skipping.
+            let base = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cache")
+                .join("trust-file-lane-tests");
+            std::fs::create_dir_all(&base).expect("create file-lane test root");
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+                .expect("make file-lane test root private");
+            let directory = base.join(format!(
+                "{label}-{}-{nonce:x}-{sequence}",
                 std::process::id()
             ));
             std::fs::create_dir(&directory).expect("create private file-lane fixture");
@@ -3570,6 +3591,13 @@ mod tests {
 
     #[test]
     fn explicit_cross_version_identity_still_binds_exact_executable_bytes() {
+        let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("explicit-cross-version-identity");
         let executable = fixture.path.parent().expect("fixture parent").join("trustd");
         std::fs::write(&executable, b"cross-version packaged trustd").expect("write executable");
@@ -3642,6 +3670,12 @@ mod tests {
     #[test]
     fn configured_hung_daemon_fails_without_minting_file_capacity() {
         let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("hung-reserve");
         let listener = UnixListener::bind(&fixture.path).expect("bind hung responder");
         make_socket_private(&fixture.path);
@@ -3686,6 +3720,12 @@ mod tests {
     #[test]
     fn configured_malformed_daemon_fails_without_minting_file_capacity() {
         let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("malformed-reserve");
         let listener = UnixListener::bind(&fixture.path).expect("bind malformed responder");
         make_socket_private(&fixture.path);
@@ -3718,6 +3758,12 @@ mod tests {
     #[test]
     fn configured_daemon_decline_fails_without_minting_file_capacity() {
         let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("declined-reserve");
         let listener = UnixListener::bind(&fixture.path).expect("bind declining responder");
         make_socket_private(&fixture.path);
@@ -3742,6 +3788,12 @@ mod tests {
     #[test]
     fn configured_over_connection_limit_fails_without_minting_file_capacity() {
         let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("busy-reserve");
         let listener = UnixListener::bind(&fixture.path).expect("bind busy responder");
         make_socket_private(&fixture.path);
@@ -4202,6 +4254,12 @@ mod tests {
     #[test]
     fn active_file_reservation_refuses_external_child_spawn() {
         let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let _socket = ScopedEnvOverride::remove(SOCK_ENV);
         let _enabled = ScopedEnvOverride::remove(DISABLE_ENV);
         let _file_lane = TestFileLane::new("child-lifetime");
@@ -4410,6 +4468,13 @@ mod tests {
 
     #[test]
     fn explicit_endpoint_reserve_helper_is_active_and_releases() {
+        let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("explicit-reserve");
         let listener = UnixListener::bind(&fixture.path).expect("bind explicit reserve server");
         make_socket_private(&fixture.path);
@@ -4648,6 +4713,13 @@ mod tests {
 
     #[test]
     fn concurrent_binders_leave_exactly_one_stable_owner() {
+        let _guard = memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies a socket and a
+        // token path. Without it `machine_budget_bytes()` is 0 wherever the visible
+        // cgroup root has no `memory.max` (every bare-metal cgroup-v2 Linux box), and
+        // the admission this test exists to exercise is refused before it begins.
+        // NOT the fail-closed cgroup exemption — that rule governs production.
+        let _budget = memory_jobserver::TestTotalMemory::set(1 << 30);
         let fixture = TestSocket::new("concurrent");
         let start = Arc::new(std::sync::Barrier::new(3));
         let (result_tx, result_rx) = std::sync::mpsc::channel();

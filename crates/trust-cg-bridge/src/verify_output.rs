@@ -118,10 +118,66 @@ pub enum ProvenEvidence {
     /// lowerable `BvExpr` fragment (or export did not produce a validating
     /// proof). ay is the sole re-check authority — this is the [VALIDATED] grade.
     AyValidated,
+    /// **[CITED]** — the obligation is a wide `Mul` discharged by CITING the
+    /// kernel-checked structured multiplier theorem, not by re-checking a
+    /// per-instance refutation.
+    ///
+    /// This is the grade the g16 line exists to produce, and it is deliberately
+    /// NOT [PROVED]. What the kernel checked is the width-generic
+    /// `G16Mul.mul_equiv` / `blast_equals_ir`; what it did NOT check is
+    /// `G16Mul.AyBlastAgrees` — that ay's Rust encoder emits the model's
+    /// multiplier. That correspondence is machine-checked (exhaustively to
+    /// width 8, sampled at 16/32/64 — see
+    /// `tests/ay_blast_agrees_differential.rs`) but is not provable inside
+    /// clean, because the encoder is Rust.
+    ///
+    /// The residual travels with the verdict rather than living in a comment:
+    /// this maps to `GradeRecord::cited_kernel_theorem`, whose named closure
+    /// caps the projection at `Trusted`. It can never read as `Certified`.
+    ///
+    /// ON BY DEFAULT (owner decision, 2026-08-16). `TCG_CITE_WIDE_MUL=0`
+    /// restores the previous behaviour.
+    ///
+    /// Enabling it raises no claim: a citation is classified with [VALIDATED],
+    /// caps at `Trusted`, and is refused by `StrictProvenOnly` exactly as
+    /// [VALIDATED] is. It replaces a bare `AyValidated` — which tells a reader
+    /// nothing — with a verdict that NAMES the cited theorem and the residual.
+    StructuralCitation {
+        /// The kernel-checked theorem being cited.
+        theorem: &'static str,
+        /// The correspondence the kernel did NOT check.
+        residual: &'static str,
+        /// Operand width of the cited multiply.
+        width: u32,
+    },
     /// A zero-trust bit-blast certificate kernel-re-checkable by clean's
     /// `certify_unsat_by_reflection` to Unsat with empty domain axioms. This is
     /// the [PROVED] grade: ay is a producer only; the proof is the trusted object.
     KernelRecheckable(ay_proof::BvBlastProof),
+    /// **[PROVED] for a 128-bit AAPCS64 REGISTER PAIR:** the obligation
+    /// `concat(hi_m, lo_m) == concat(hi_s, lo_s)` was split at bit 64 into TWO
+    /// 64-bit equalities and BOTH carry their own clean-kernel-accepted
+    /// certificate. Same grade and same authority as
+    /// [`ProvenEvidence::KernelRecheckable`] — the kernel is the authority for
+    /// each half and ay is a producer only — with the arity of the evidence made
+    /// visible rather than collapsed.
+    ///
+    /// A 128-bit obligation CANNOT carry a single certificate: `ay_proof::BvExpr`
+    /// has no concat node and `ay_proof::MAX_WIDTH` is 64, so the whole equality
+    /// is not exportable as one term. Splitting is exact (concat is injective at
+    /// fixed half-widths), so this is neither weaker nor stronger than a single
+    /// certificate would be — see `split_register_pair_128`.
+    ///
+    /// BOTH fields are load-bearing. `high` is not an assumption or a default: a
+    /// small `i128` constant has `X1 == 0`, so an evidence shape that omitted it
+    /// would grade almost every 128-bit constant return [PROVED] on the strength
+    /// of its low half alone.
+    KernelRecheckablePair {
+        /// Certificate for the HIGH 64 bits (`X1`).
+        high: Box<ay_proof::BvBlastProof>,
+        /// Certificate for the LOW 64 bits (`X0`).
+        low: Box<ay_proof::BvBlastProof>,
+    },
     /// **[PROVED] via O(1) STRUCTURED INSTANTIATION (B4):** the obligation's
     /// `(machine_out, auto)` Formulas were reconstructed into clean-kernel terms and
     /// the clean kernel `check_type` accepted a proof — awarded ONLY when `check_type`
@@ -164,8 +220,16 @@ impl OutputVerdict {
     }
 
     /// The attached kernel-re-checkable bit-blast proof, if this verdict is
-    /// [PROVED]-grade via the SLOW (SAT-reflection) path. `None` for the O(1)
-    /// instantiation path, [VALIDATED]-grade Proven, Refuted, or Unknown.
+    /// [PROVED]-grade via the SLOW (SAT-reflection) path AND carries exactly ONE
+    /// certificate. `None` for the O(1) instantiation path, [VALIDATED]-grade
+    /// Proven, Refuted, or Unknown.
+    ///
+    /// DELIBERATELY `None` FOR THE 128-BIT REGISTER PAIR
+    /// ([`ProvenEvidence::KernelRecheckablePair`]): that verdict rests on TWO
+    /// certificates and this signature can return one. Returning the low half
+    /// here would hand a caller half a proof labelled as the proof. Use
+    /// [`OutputVerdict::kernel_proofs`], which returns every certificate the
+    /// verdict rests on.
     #[must_use]
     pub fn kernel_proof(&self) -> Option<&ay_proof::BvBlastProof> {
         match self {
@@ -174,16 +238,36 @@ impl OutputVerdict {
         }
     }
 
-    /// True iff this verdict is **[PROVED]** by the clean KERNEL — EITHER the slow
-    /// SAT-reflection path (`KernelRecheckable`) OR the O(1) structured
-    /// instantiation path (`KernelInstantiated`). This is the [PROVED]-vs-[VALIDATED]
-    /// discriminator (ay is not the authority for either kernel grade).
+    /// EVERY kernel-re-checkable bit-blast certificate this verdict rests on, in
+    /// discharge order. One for the single-obligation slow path, TWO (high then
+    /// low) for a 128-bit register pair, and empty for the O(1) instantiation
+    /// path, [VALIDATED], Refuted, or Unknown.
+    ///
+    /// This is the accessor that cannot silently drop half of a split proof.
+    #[must_use]
+    pub fn kernel_proofs(&self) -> Vec<&ay_proof::BvBlastProof> {
+        match self {
+            OutputVerdict::Proven { evidence: ProvenEvidence::KernelRecheckable(p) } => vec![p],
+            OutputVerdict::Proven {
+                evidence: ProvenEvidence::KernelRecheckablePair { high, low },
+            } => vec![high.as_ref(), low.as_ref()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// True iff this verdict is **[PROVED]** by the clean KERNEL — the slow
+    /// SAT-reflection path (`KernelRecheckable`), the 128-bit register-pair form
+    /// of that same path (`KernelRecheckablePair`, two kernel-accepted halves),
+    /// or the O(1) structured instantiation path (`KernelInstantiated`). This is
+    /// the [PROVED]-vs-[VALIDATED] discriminator (ay is not the authority for any
+    /// kernel grade).
     #[must_use]
     pub fn is_kernel_proved(&self) -> bool {
         matches!(
             self,
             OutputVerdict::Proven {
                 evidence: ProvenEvidence::KernelRecheckable(_)
+                    | ProvenEvidence::KernelRecheckablePair { .. }
                     | ProvenEvidence::KernelInstantiated { .. }
             }
         )
@@ -282,7 +366,14 @@ fn verify_output_preserved_capturing_env_with_backend(
         Err(reason) => return (OutputVerdict::Unknown { reason }, Some(obj)),
     };
 
-    let out_width = return_reg_width(func);
+    // A return type with no defined register slot is an UNKNOWN verdict, not a
+    // guessed 32-bit read of W0. (Ordering already makes this unreachable
+    // today: `trust_ir_semantics_env` above fails closed on any non-scalar
+    // local. Fail closed here anyway — see `reg_width`.)
+    let out_width = match return_reg_width(func) {
+        Ok(w) => w,
+        Err(reason) => return (OutputVerdict::Unknown { reason }, Some(obj)),
+    };
     let pre = divisor_nonzero_precondition(func);
 
     // (2)+(3) byte-derived machine output from that SAME emission. Decoder or
@@ -352,7 +443,7 @@ fn verify_output_preserved_capturing_env_with_backend(
 /// this runs, so the export's `NoRefutation` here would indicate a lowering that
 /// does not faithfully mirror the discharged obligation — we still (correctly)
 /// decline [PROVED].
-fn try_kernel_recheckable_proof(
+pub(crate) fn try_kernel_recheckable_proof(
     machine_out: &Formula,
     auto: &Formula,
     pre: Option<&Formula>,
@@ -411,12 +502,119 @@ fn try_kernel_recheckable_proof(
         // else: fall through to the slow path (no early return).
     }
 
-    let lhs = formula_to_bvexpr(machine_out).ok()?;
-    let rhs = formula_to_bvexpr(auto).ok()?;
+    // ── 128-BIT REGISTER-PAIR SPLIT ─────────────────────────────────────────
+    // A 128-bit obligation cannot reach the bit-blast fragment as ONE term (see
+    // `split_register_pair_128` for the two measured reasons). Split it into the
+    // HIGH and LOW 64-bit equalities and require BOTH to clear the SAME slow
+    // path below. Tried BEFORE the single-term lowering because that lowering
+    // has no `BvConcat` arm and would simply `Err` here.
+    if let Some(evidence) = try_kernel_recheckable_pair_128(machine_out, auto) {
+        return Some(evidence);
+    }
+
+    if let Some(proof) = kernel_recheckable_bitblast(machine_out, auto) {
+        return Some(ProvenEvidence::KernelRecheckable(proof));
+    }
+
+    // THE CITATION PATH. `kernel_recheckable_bitblast` declines a `Mul` wider
+    // than `MAX_RECHECKABLE_MUL_WIDTH` because its refutation is neither
+    // exportable nor re-checkable (measured at that guard: 1_759_704 steps and
+    // 24.3s to EXPORT at width 8 alone). The structured theorem covers those
+    // widths generically, so citing it yields a real, strictly-below-[PROVED]
+    // grade where there was previously nothing.
+    //
+    // ON BY DEFAULT since 2026-08-16 (owner decision); `TCG_CITE_WIDE_MUL=0`
+    // restores the old behaviour. This is safe as a default precisely because it
+    // does NOT promote anything: the citation is classified with [VALIDATED] at
+    // both report sites, caps at `Trusted`, and `StrictProvenOnly` refuses it on
+    // the same footing. The only change is that the verdict now names the cited
+    // theorem and the unproved residual instead of saying nothing.
+    if cite_wide_mul_enabled() {
+        let width = wide_mul_width_for_citation(machine_out, auto);
+        if width > MAX_RECHECKABLE_MUL_WIDTH {
+            return Some(ProvenEvidence::StructuralCitation {
+                theorem: CITED_MUL_THEOREM,
+                residual: CITED_MUL_RESIDUAL,
+                width,
+            });
+        }
+    }
+    None
+}
+
+/// The widest `Mul` in either side of the obligation, or 0 when the obligation
+/// does not lower to the `BvExpr` fragment at all.
+///
+/// A citation is only offered for an obligation the fragment CAN express and
+/// whose multiply is genuinely past the re-checkable bound. Anything that fails
+/// to lower gets 0 and therefore no citation — declining, as before, rather than
+/// citing a theorem about a term we could not even build.
+#[cfg(feature = "ay-proofs")]
+fn wide_mul_width_for_citation(machine_out: &Formula, auto: &Formula) -> u32 {
+    let (Ok(lhs), Ok(rhs)) = (formula_to_bvexpr(machine_out), formula_to_bvexpr(auto)) else {
+        return 0;
+    };
+    mul_width(&lhs).max(mul_width(&rhs))
+}
+
+/// Discharge ONE equality obligation `machine_out == auto` through the SLOW
+/// (SAT-reflection) path and return the clean-kernel-accepted certificate.
+///
+/// This is the whole of the historical tail of [`try_kernel_recheckable_proof`],
+/// factored out UNCHANGED so that the 128-bit register-pair split can run each
+/// half through the IDENTICAL pipeline — same fragment lowering, same multiply
+/// tractability guard, same producer self-validation, same step-count frontier,
+/// same clean-kernel re-check. A half therefore gets exactly the scrutiny any
+/// other 64-bit obligation gets; there is no weaker "half" path.
+#[cfg(feature = "ay-proofs")]
+fn kernel_recheckable_bitblast(
+    machine_out: &Formula,
+    auto: &Formula,
+) -> Option<ay_proof::BvBlastProof> {
+    // TEMPORARY MEASUREMENT INSTRUMENTATION (not for commit): TRUST_GATE_TRACE=1
+    // reports exactly which stage of the [PROVED] route declines.
+    let trace = std::env::var_os("TRUST_GATE_TRACE").is_some();
+    let lhs = match formula_to_bvexpr(machine_out) {
+        Ok(v) => v,
+        Err(e) => {
+            if trace {
+                eprintln!("[trace] lhs formula_to_bvexpr FAILED: {e}");
+            }
+            return None;
+        }
+    };
+    let rhs = match formula_to_bvexpr(auto) {
+        Ok(v) => v,
+        Err(e) => {
+            if trace {
+                eprintln!("[trace] rhs formula_to_bvexpr FAILED: {e}");
+            }
+            return None;
+        }
+    };
+    if trace {
+        eprintln!("[trace] both sides lowered to BvExpr OK");
+    }
     // TRACTABILITY GUARD (HONESTY): a `bvmul` bit-blasts to a shift-and-add array
     // multiplier whose refutation step-count grows ~16× per +2 operand-width
-    // (measured: width 2→234 steps, 4→5 210, 6→88 250, 8→~2.0M). The clean
-    // kernel re-check (`certify_unsat_by_reflection`) is at least linear in steps
+    // (measured: width 2→234 steps, 4→5 210, 6→88 250, 8→~2.0M).
+    //
+    // RE-MEASURED 2026-08-16 on a NON-FUSING obligation (`Mul(A,B) == Mul(B,A)`,
+    // i.e. the shape the live gate actually faces, where the two sides differ and
+    // the blaster's cache cannot collapse them): 2→196 steps / 0.4s,
+    // 4→6_059 / 0.4s, 6→97_012 / 1.3s, 8→1_759_704 steps and 24.3s TO EXPORT,
+    // before the kernel re-check has begun. The growth law and the original
+    // figures hold. Extrapolated, width 10 is ~28M steps and width 32 — the live
+    // gate width — is past 10^19.
+    //
+    // DO NOT RAISE THIS ON THE STRENGTH OF THE ay-blast DIFFERENTIAL. That test
+    // blasts `Mul(A,B) == Mul(A,B)`, whose identical sides FUSE, so it exports in
+    // 8ms with 17 refutation steps at width 8. It measures GATE STRUCTURE, which
+    // is cheap at every width, and says nothing about refutation cost, which is
+    // what this cap guards. The two numbers differ by five orders of magnitude at
+    // the same width.
+    //
+    // The clean kernel re-check (`certify_unsat_by_reflection`) is at least linear in steps
     // over a growing clause DB, so a live-gate-width (32) multiply refutation is
     // BOTH un-exportable in bounded memory AND un-re-checkable. Attaching a
     // `KernelRecheckable` proof we cannot actually re-check would be a hollow
@@ -431,11 +629,27 @@ fn try_kernel_recheckable_proof(
     {
         return None;
     }
-    let proof = ay_proof::export_bv_blast_proof_expr(&lhs, &rhs).ok()?;
+    let proof = match ay_proof::export_bv_blast_proof_expr(&lhs, &rhs) {
+        Ok(p) => p,
+        Err(e) => {
+            if trace {
+                eprintln!("[trace] export_bv_blast_proof_expr FAILED: {e:?}");
+            }
+            return None;
+        }
+    };
+    if trace {
+        eprintln!("[trace] exported refutation steps={}", proof.refutation.steps.len());
+    }
     // Producer self-validation: a cheap first filter (ay's own check). It is NOT
     // the [PROVED] authority — see the KERNEL re-check below. NEVER attach a proof
     // ay itself cannot re-check.
-    proof.validate().ok()?;
+    if let Err(e) = proof.validate() {
+        if trace {
+            eprintln!("[trace] proof.validate FAILED: {e:?}");
+        }
+        return None;
+    }
     // Trust: RUNG 1 (anti-Thompson) — THE [PROVED] GATE. Route the ay-exported
     // refutation through the CLEAN CIC KERNEL. clean-auto reduces
     // `checkRefutes <clauses> <refutation>` to `Bool.true` by linear ι-reduction
@@ -466,16 +680,27 @@ fn try_kernel_recheckable_proof(
         // tooling must call an explicit benchmark API instead of mutating the
         // process environment.
         if proof.refutation.steps.len() > MAX_RECHECKABLE_REFUTATION_STEPS {
+            if trace {
+                eprintln!(
+                    "[trace] OVER FRONTIER: steps={} > {MAX_RECHECKABLE_REFUTATION_STEPS}",
+                    proof.refutation.steps.len()
+                );
+            }
             return None;
         }
         match crate::verify_output_instantiate::kernel_recheck_proved_grade_bounded(&proof) {
-            GateRecheck::KernelAccepted { .. } => Some(ProvenEvidence::KernelRecheckable(proof)),
+            GateRecheck::KernelAccepted { .. } => Some(proof),
             // Anything other than a positive `KernelAccepted` is fail-closed to
             // [VALIDATED]: the clean KERNEL refused the cert (`Rejected` — a
             // forged/corrupted refutation, or a non-zero-axiom soundness bridge),
             // or it is some future variant. The gate NEVER claims [PROVED]
             // without an explicit `KernelAccepted` from the clean kernel.
-            _ => None,
+            other => {
+                if trace {
+                    eprintln!("[trace] KERNEL RE-CHECK declined: {other:?}");
+                }
+                None
+            }
         }
     }
     // Without the `kernel-recheck` feature the clean kernel is not compiled in, so
@@ -489,6 +714,158 @@ fn try_kernel_recheckable_proof(
         let _ = &proof;
         None
     }
+}
+
+/// The width, in bits, of each half of an AAPCS64 128-bit register pair. Both
+/// halves are full X registers — this is not a tunable, it is the ABI.
+#[cfg(feature = "ay-proofs")]
+const PAIR_HALF_WIDTH: u32 = 64;
+
+/// Split ONE side of a 128-bit obligation into its `(HIGH 64, LOW 64)` halves,
+/// or `None` (fail-closed) for any shape whose halves are not manifest.
+///
+/// WHY THE SPLIT LIVES HERE AND NOT IN `formula_to_bvexpr`. A `BvConcat` arm on
+/// the lowering was the obvious move and it is a DEAD END, for two independently
+/// fatal reasons:
+///
+///   1. `ay_proof::BvExpr` HAS NO CONCAT VARIANT (`bv_blast_solver.rs`, the
+///      `pub enum BvExpr` — Leaf/Add/Sub/ZeroExt/Extract/Or/And/Xor/Const/
+///      SignExt/Shl/Lshr/Ashr/Not/Eq/CarryOut/Mul, and nothing else). A
+///      `BvConcat` arm would have nothing to return. Synthesizing one out of
+///      `Or(Shl(ZeroExt(hi,64), 64), ZeroExt(lo,64))` only relocates the problem
+///      into (2), since every node of that encoding is 128 bits wide.
+///   2. `ay_proof::MAX_WIDTH` is 64 (`bv_blast_export.rs`) and
+///      `bv_blast_solver::SOLVED_MAX_WIDTH` is defined AS it, so the exporter
+///      rejects any obligation wider than 64 bits before a single gate is
+///      emitted. A 128-bit `BvExpr` is un-exportable by construction.
+///
+/// So the split is not an expression rewrite; it is an OBLIGATION rewrite. One
+/// 128-bit equality becomes TWO 64-bit equalities, hence TWO certificates —
+/// and `formula_to_bvexpr` returns a single `BvExpr` with nowhere to put a
+/// second certificate. The caller that owns the equality is the only place that
+/// can own two of them.
+///
+/// WHY THE SPLIT IS SOUND. `concat` is injective on the product of its halves at
+/// FIXED widths: for `|a| = |c|` and `|b| = |d|`,
+/// `concat(a,b) = concat(c,d)  <->  a = c  /\  b = d`, pointwise at every
+/// valuation. Both directions hold, so the split loses NOTHING (a valid 128-bit
+/// obligation has two valid halves) and ADDS nothing (two valid halves force the
+/// 128-bit obligation). Both sides are universally quantified over the same free
+/// leaves, and a conjunction of two validities is the validity of the
+/// conjunction, so discharging the halves independently is the same claim. This
+/// is the identical normalization ay's own solver applies to a concat equality
+/// (`ay-dpll` `NormalizeEqBvConcat`, ported from Bitwuzla) — here it is done one
+/// layer up so the halves land inside the exportable width.
+///
+/// BIT ORDER. `Formula::BvConcat(a, b)` lowers to SMT-LIB `(concat a b)`
+/// (`trust_types::ay_bridge::formula_to_expr`), whose FIRST argument is the HIGH
+/// half — the same convention `PathMergingExecutor::read_int_return` documents
+/// and builds (`concat(X1, X0)`, X1 high). The literal arm below depends on that
+/// convention (it takes `value >> 64` as the first component); the `BvConcat`
+/// arm does not, because it pairs first-with-first and second-with-second.
+///
+/// SHAPES ADMITTED — exactly the two the gate can actually produce at 128 bits,
+/// each measured over the 68-module corpus:
+///   * `BvConcat(hi, lo)` — the machine side is ALWAYS this (`read_int_return`
+///     emits it and nothing else at 128 bits), and the spec side is this for a
+///     carried 128-bit parameter.
+///   * `BitVec { width: 128 }` — the spec side for a 128-bit literal.
+///
+/// EVERYTHING ELSE fails closed. In particular a nested or unevenly-split
+/// `BvConcat` is NOT normalized into shape: a nested half does not lower (there
+/// is no `BvConcat` arm), and an unevenly-split one is refused either by the
+/// width pin in [`try_kernel_recheckable_pair_128`] or by the exporter's own
+/// `WidthMismatch` / `UnsupportedWidth` — see the pin's comment for which does
+/// what, since only one of the two is actually load-bearing for soundness.
+#[cfg(feature = "ay-proofs")]
+fn split_register_pair_128(f: &Formula) -> Option<(Formula, Formula)> {
+    match f {
+        // The register pair as the gate builds it. Widths are NOT trusted from
+        // this shape — they are pinned after lowering by the caller.
+        Formula::BvConcat(high, low) => Some(((**high).clone(), (**low).clone())),
+        // A 128-bit literal. `value` is `i128`; reinterpret as the unsigned bit
+        // pattern (two's complement) and cut it at bit 64. Each half is then
+        // re-narrowed to `i128` purely as `Formula::BitVec`'s storage type —
+        // `formula_to_bvexpr` masks to the declared width, so a half whose top
+        // bit is set round-trips as its own 64-bit pattern rather than as a
+        // sign-extension of it.
+        Formula::BitVec { value, width } if *width == 2 * PAIR_HALF_WIDTH => {
+            let bits = *value as u128;
+            Some((
+                Formula::BitVec {
+                    value: (bits >> PAIR_HALF_WIDTH) as i128,
+                    width: PAIR_HALF_WIDTH,
+                },
+                Formula::BitVec {
+                    value: (bits & u128::from(u64::MAX)) as i128,
+                    width: PAIR_HALF_WIDTH,
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Promote a 128-bit register-pair obligation to the **[PROVED]** grade by
+/// discharging it as TWO independent 64-bit certificates, BOTH clean-kernel
+/// accepted.
+///
+/// Returns `Some(ProvenEvidence::KernelRecheckablePair { .. })` ONLY when every
+/// one of the following holds; any failure returns `None` and the caller stays
+/// [VALIDATED]:
+///   * BOTH sides split (see [`split_register_pair_128`]);
+///   * ALL FOUR halves lower into the `BvExpr` fragment AND each lowers to
+///     EXACTLY 64 bits;
+///   * the HIGH-half equality is kernel-accepted; AND
+///   * the LOW-half equality is kernel-accepted.
+///
+/// BOTH HALVES ARE OBLIGATIONS. There is deliberately no arm in which the high
+/// half is assumed, defaulted, or skipped: the `?` on `high` runs the full
+/// pipeline on `(high_machine, high_spec)` exactly as the `?` on `low` does. A
+/// small `i128` constant has `X1 == 0`, so a design that checked only the low
+/// half would report [PROVED] for essentially every 128-bit constant return in
+/// the corpus and never notice — the mutation test
+/// `pair_128_high_half_corruption_refuses_the_kernel_grade` pins that it does
+/// notice.
+#[cfg(feature = "ay-proofs")]
+fn try_kernel_recheckable_pair_128(
+    machine_out: &Formula,
+    auto: &Formula,
+) -> Option<ProvenEvidence> {
+    let (machine_high, machine_low) = split_register_pair_128(machine_out)?;
+    let (auto_high, auto_low) = split_register_pair_128(auto)?;
+
+    // WIDTH PIN — AND AN HONEST ACCOUNT OF WHAT IT IS FOR.
+    //
+    // It is NOT what makes the split sound. A MISMATCHED split point (say 16/48
+    // against 48/16) is already refused one layer down: `export_bv_blast_proof_expr`
+    // blasts both sides and returns `WidthMismatch` when the bit counts differ,
+    // and `UnsupportedWidth` for anything over `SOLVED_MAX_WIDTH` (64). Deleting
+    // this loop was MEASURED not to break the mismatch test, precisely because
+    // the exporter catches it.
+    //
+    // What the pin actually does is keep the GRADE'S LABEL TRUE. Without it, a
+    // 64-bit obligation whose two sides both happen to be `concat(32,32)` —
+    // matched, in-fragment, genuinely provable — would be handed
+    // `KernelRecheckablePair`, which claims to be a 128-bit AAPCS64 register
+    // pair. Sound, but a lie about what was checked. It is also the reason this
+    // path cannot silently start applying to shapes nobody analyzed if
+    // `MAX_WIDTH` is ever raised.
+    //
+    // The width is read off the LOWERED `BvExpr` rather than off the `Formula`,
+    // so it describes the object actually handed to the blaster instead of a
+    // parallel inference about it.
+    for half in [&machine_high, &machine_low, &auto_high, &auto_low] {
+        let lowered = formula_to_bvexpr(half).ok()?;
+        if bvexpr_width(&lowered) != Some(PAIR_HALF_WIDTH) {
+            return None;
+        }
+    }
+
+    // BOTH halves, through the IDENTICAL slow path any 64-bit obligation takes.
+    let high = kernel_recheckable_bitblast(&machine_high, &auto_high)?;
+    let low = kernel_recheckable_bitblast(&machine_low, &auto_low)?;
+    Some(ProvenEvidence::KernelRecheckablePair { high: Box::new(high), low: Box::new(low) })
 }
 
 // ===========================================================================
@@ -581,6 +958,21 @@ pub enum VerifyError {
         /// The repeated symbol/name.
         name: String,
     },
+    /// The whole-module (one-object-per-CGU) emission itself failed.
+    ModuleEmitFailed {
+        /// The backend error.
+        reason: String,
+    },
+    /// BYTE-PRESERVATION OBLIGATION VIOLATED: the merged module object does not
+    /// carry some verified function's machine code, unchanged, at the offset its
+    /// own symbol table points at. The per-function proof therefore does not
+    /// transfer to the shipped artifact, so NOTHING is emitted.
+    MergedBytesDiverged {
+        /// The function whose verified bytes are not in the merged object.
+        function: String,
+        /// What exactly did not line up.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -601,6 +993,15 @@ impl std::fmt::Display for VerifyError {
             VerifyError::DuplicateFunctionName { name } => write!(
                 f,
                 "duplicate function name `{name}`: verified emission requires unique symbol identity"
+            ),
+            VerifyError::ModuleEmitFailed { reason } => {
+                write!(f, "whole-module object emission failed: {reason}")
+            }
+            VerifyError::MergedBytesDiverged { function, detail } => write!(
+                f,
+                "REFUSED: the merged module object does not preserve the VERIFIED bytes of \
+                 function `{function}` — {detail}. The per-function output-preservation proof \
+                 does not transfer to this artifact, so no object is shipped"
             ),
         }
     }
@@ -795,16 +1196,27 @@ pub fn emit_objects_verified_reported_with_backend(
         });
         match verdict {
             OutputVerdict::Proven { evidence } => match evidence {
-                // [PROVED] — kernel-grade (slow SAT-reflection OR O(1) instantiation).
-                // Ships under every (non-Off) policy.
+                // [PROVED] — kernel-grade (slow SAT-reflection, its 128-bit
+                // register-pair form with BOTH halves kernel-accepted, or O(1)
+                // instantiation). Ships under every (non-Off) policy.
                 ProvenEvidence::KernelRecheckable(_)
+                | ProvenEvidence::KernelRecheckablePair { .. }
                 | ProvenEvidence::KernelInstantiated { .. } => report.proved += 1,
+                // [CITED] — a wide `Mul` discharged by CITING the
+                // kernel-checked structured theorem. Counted with the
+                // [VALIDATED] surface and NOT with `proved`, deliberately: the
+                // kernel never re-checked a term for THIS instance, and the
+                // `AyBlastAgrees` residual is machine-checked rather than
+                // proved. Under StrictProvenOnly it is therefore REFUSED on the
+                // same footing as [VALIDATED] — a citation must never ship where
+                // only kernel-[PROVED] may.
                 // [VALIDATED] — ay is the sole authority. RUNG 3 FAIL-CLOSED:
                 // under StrictProvenOnly the certified-fragment mode ships ONLY
                 // kernel-[PROVED] functions, so a [VALIDATED] function is REFUSED
                 // (not silently treated as covered). Under AllowUnknown it ships
                 // and is COUNTED as the [VALIDATED] (uncertified-by-kernel) surface.
-                ProvenEvidence::AyValidated => {
+                ProvenEvidence::StructuralCitation { .. }
+                | ProvenEvidence::AyValidated => {
                     if policy == EmitPolicy::StrictProvenOnly {
                         return Err(VerifyError::Unknown {
                             function: func.name.clone(),
@@ -865,6 +1277,424 @@ pub fn emit_objects_verified_reported_with_backend(
     Ok((verified, report))
 }
 
+/// Where one verified function's machine code was found inside the merged
+/// module object, byte-identical to the bytes the gate verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedFunction {
+    /// The function's name.
+    pub name: String,
+    /// Offset of its first instruction inside the merged object's text section,
+    /// read from THAT OBJECT'S OWN symbol table — the offset a linker resolving
+    /// this symbol will actually jump to.
+    pub text_offset: u64,
+    /// Length in bytes of the preserved machine code.
+    pub len: u64,
+}
+
+/// The single object emitted for one codegen unit, plus the discharged
+/// byte-preservation witnesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedModuleObject {
+    /// The merged object-file bytes (the artifact that ships).
+    pub bytes: Vec<u8>,
+    /// One entry per emitted function. Their presence is the discharged
+    /// obligation: each verified function's bytes appear verbatim in `bytes`.
+    pub preserved: Vec<PreservedFunction>,
+}
+
+/// VERIFIED WHOLE-MODULE emission — the ONE-OBJECT-PER-CGU build gate.
+///
+/// This keeps the PER-FUNCTION proof exactly as
+/// [`emit_objects_verified_reported_with_backend`] performs it (phases 0-2 are
+/// that function, called unchanged) and adds ONE new, narrow, checkable
+/// obligation on top:
+///
+/// > **PHASE 3.** Emit the whole CGU as a single object, then prove that for
+/// > every verified function the merged object contains its verified machine
+/// > code BYTE-FOR-BYTE at the offset the merged object's OWN SYMBOL TABLE
+/// > assigns that function.
+///
+/// WHY THIS SHAPE. An `Internal`-linkage mono-item can only be emitted as an
+/// object-local symbol, and a local symbol is unreachable from any other object
+/// — so one-object-per-FUNCTION cannot represent it, and every program that
+/// calls `core` needs it. Merging is therefore forced. Restarting the proof at
+/// object granularity was the alternative; instead the per-function proof is
+/// preserved verbatim and the merge is discharged as a separate small claim.
+///
+/// WHY THE CLAIM IS NOT VACUOUS. Each function's code is encoded from that
+/// function alone (`encode_module_function_with_fixups_and_eh`) and every
+/// cross-function reference leaves the instruction stream as a RELOCATION, never
+/// an in-place patch — so a function's bytes are position-independent and the
+/// merge genuinely can (and must) carry them unchanged. If a future emitter
+/// starts patching call sites in place, this check FAILS CLOSED and the build
+/// stops, which is precisely the intent.
+///
+/// The offset is read back from the SHIPPED object rather than trusted from the
+/// emitter's own layout report, and the reported extents are cross-checked
+/// against it: an emitter that mislabels where it put a function is caught.
+///
+/// `linkage` is 1:1 with `funcs` (EMPTY = every function `External`). A
+/// `Refuted` function still refuses the whole module under every policy.
+pub fn emit_module_object_verified_reported_with_backend(
+    funcs: &[VerifiableFunction],
+    linkage: &[crate::codegen_backend::FunctionLinkage],
+    policy: EmitPolicy,
+    backend: &TrustCgCodegenBackend,
+) -> Result<(VerifiedModuleObject, CertificationReport), VerifyError> {
+    // PHASES 0-2 — UNCHANGED per-function gate. Every function is verified in
+    // isolation, its exact candidate bytes captured, and the determinism
+    // re-emission run over those bytes. A Refuted function returns Err here and
+    // NOTHING below runs.
+    let (verified, report) =
+        emit_objects_verified_reported_with_backend(funcs, policy, backend)?;
+
+    if !linkage.is_empty() && linkage.len() != funcs.len() {
+        return Err(VerifyError::ModuleEmitFailed {
+            reason: format!(
+                "{} linkage entries for {} functions; refusing to bind symbols against a \
+                 mis-indexed vector",
+                linkage.len(),
+                funcs.len()
+            ),
+        });
+    }
+
+    // PHASE 3a — MERGE. Lower every function and emit ONE object for the CGU,
+    // with each function's real symbol binding.
+    let module = build_merged_module(funcs, linkage, backend)?;
+    let emitted = backend.emit_module_object(&module).map_err(|e| {
+        VerifyError::ModuleEmitFailed { reason: format!("emit_module_object failed: {e:?}") }
+    })?;
+
+    // PHASE 3b — DISCHARGE THE BYTE-PRESERVATION OBLIGATION. A failure here is a
+    // REFUSAL, never a warning: shipping a merged object whose bytes are not the
+    // verified bytes would silently void the per-function proof.
+    let preserved = assert_merged_object_preserves_verified_text(&emitted, &verified)?;
+
+    Ok((VerifiedModuleObject { bytes: emitted.bytes, preserved }, report))
+}
+
+/// Lower every verified function into the single compiled module the merged
+/// emission consumes.
+fn build_merged_module(
+    funcs: &[VerifiableFunction],
+    linkage: &[crate::codegen_backend::FunctionLinkage],
+    backend: &TrustCgCodegenBackend,
+) -> Result<crate::codegen_backend::CompiledModule, VerifyError> {
+    let mut lir_functions = Vec::with_capacity(funcs.len());
+    for func in funcs {
+        // A function that cleared the gate lowered successfully during
+        // verification, so a failure here is a genuine divergence, not a
+        // best-effort miss: fail closed rather than drop it from the module
+        // (a dropped definition becomes an unresolved symbol at link).
+        let lir = backend.lower_function(func).map_err(|e| VerifyError::EmitFailed {
+            function: func.name.clone(),
+            reason: format!("lower_function failed during whole-module emission: {e:?}"),
+        })?;
+        lir_functions.push(lir);
+    }
+    let function_count = lir_functions.len();
+    Ok(crate::codegen_backend::CompiledModule {
+        name: "trust_cg.verified_module".to_string(),
+        lir_functions,
+        object_path: None,
+        function_count,
+        source_functions: Some(funcs.to_vec()),
+        linkage: linkage.to_vec(),
+    })
+}
+
+/// THE MERGE OBLIGATION. For every verified function, prove that the merged
+/// object carries its verified machine code unchanged.
+///
+/// Concretely, for each `(name, verified_object_bytes)`:
+///
+/// 1. `verified_text` = the text section of the single-function object the gate
+///    verified. That object holds exactly one function, so its whole text
+///    section IS that function's machine code.
+/// 2. `offset` = the value the MERGED object's own symbol table gives `name`,
+///    relative to the merged text section's base. This is read back from the
+///    shipped bytes, not taken from the emitter's layout report.
+/// 3. Assert `merged_text[offset .. offset + verified_text.len()] ==
+///    verified_text`.
+///
+/// The emitter's reported extent is additionally cross-checked against (2) and
+/// (3), so a layout report that disagrees with the object it describes is caught
+/// rather than believed.
+pub(crate) fn assert_merged_object_preserves_verified_text(
+    emitted: &crate::codegen_backend::EmittedModuleObject,
+    verified: &[(String, Vec<u8>)],
+) -> Result<Vec<PreservedFunction>, VerifyError> {
+    let diverged = |function: &str, detail: String| VerifyError::MergedBytesDiverged {
+        function: function.to_string(),
+        detail,
+    };
+
+    let (merged_text, merged_base) =
+        extract_text_from_object(&emitted.bytes).map_err(|reason| VerifyError::ModuleEmitFailed {
+            reason: format!("merged module object has no readable text section: {reason}"),
+        })?;
+    let merged_symbols = object_text_symbol_offsets(&emitted.bytes, merged_base).ok_or_else(
+        || VerifyError::ModuleEmitFailed {
+            reason: "merged module object has no readable symbol table; the byte-preservation \
+                     obligation cannot be discharged, so nothing ships"
+                .to_string(),
+        },
+    )?;
+
+    let mut preserved = Vec::with_capacity(verified.len());
+    for (name, verified_object) in verified {
+        let (verified_text, _) = extract_text_from_object(verified_object)
+            .map_err(|reason| diverged(name, format!("verified object is unreadable: {reason}")))?;
+        if verified_text.is_empty() {
+            return Err(diverged(name, "verified object has an empty text section".to_string()));
+        }
+
+        let offset = *merged_symbols.get(name.as_str()).ok_or_else(|| {
+            diverged(
+                name,
+                "the merged object defines no symbol for it (a verified function that is not in \
+                 the shipped artifact would become an unresolved symbol at link)"
+                    .to_string(),
+            )
+        })?;
+
+        let start = usize::try_from(offset)
+            .map_err(|_| diverged(name, format!("symbol offset {offset} is out of range")))?;
+        let end = start.checked_add(verified_text.len()).ok_or_else(|| {
+            diverged(name, "symbol offset + verified length overflows".to_string())
+        })?;
+        let window = merged_text.get(start..end).ok_or_else(|| {
+            diverged(
+                name,
+                format!(
+                    "its symbol points at text bytes {start}..{end}, past the merged text \
+                     section's {} bytes",
+                    merged_text.len()
+                ),
+            )
+        })?;
+        if window != verified_text.as_slice() {
+            let first = window
+                .iter()
+                .zip(verified_text.iter())
+                .position(|(shipped, verified)| shipped != verified)
+                .unwrap_or(0);
+            return Err(diverged(
+                name,
+                format!(
+                    "the merged object's bytes at text offset {start} differ from the \
+                     {} verified bytes, first at relative byte {first}",
+                    verified_text.len()
+                ),
+            ));
+        }
+
+        // Cross-check the emitter's own layout report against what the shipped
+        // object actually says. A disagreement means the report is fiction.
+        if let Some(extent) = emitted.text_extents.iter().find(|e| e.name == *name) {
+            if extent.offset != offset {
+                return Err(diverged(
+                    name,
+                    format!(
+                        "the emitter reported text offset {} but the shipped symbol table says \
+                         {offset}",
+                        extent.offset
+                    ),
+                ));
+            }
+            if extent.len != verified_text.len() as u64 {
+                return Err(diverged(
+                    name,
+                    format!(
+                        "the emitter reported a {}-byte body but the verified emission is {} \
+                         bytes",
+                        extent.len,
+                        verified_text.len()
+                    ),
+                ));
+            }
+        }
+
+        preserved.push(PreservedFunction {
+            name: name.clone(),
+            text_offset: offset,
+            len: verified_text.len() as u64,
+        });
+    }
+
+    Ok(preserved)
+}
+
+/// Read every DEFINED text-section symbol out of an emitted object, as
+/// `name -> offset within the text section`.
+///
+/// This is the read-back half of the merge obligation, so it deliberately parses
+/// the SHIPPED bytes with a small independent reader rather than asking the
+/// writer where it thinks it put things. Mach-O `_` prefixes are stripped so the
+/// keys match the IR-level function names. Any malformed/truncated field yields
+/// `None` (=> refusal), never a panic inside the compiler.
+fn object_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<String, u64>> {
+    macho_text_symbol_offsets(obj, text_base).or_else(|| elf64_text_symbol_offsets(obj, text_base))
+}
+
+/// Mach-O `LC_SYMTAB` reader: collect `N_SECT` symbols whose section is
+/// `__text`.
+fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<String, u64>> {
+    const N_TYPE: u8 = 0x0e;
+    const N_SECT: u8 = 0x0e;
+    const NLIST_64_SIZE: usize = 16;
+
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
+    let rd_u64 =
+        |o: usize| -> Option<u64> { Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?)) };
+    if rd_u32(0)? != 0xfeed_facf {
+        return None;
+    }
+
+    // Locate `__text`'s 1-based section ordinal by walking the segment load
+    // commands in the order the section table numbers them.
+    let ncmds = rd_u32(16)?;
+    let mut text_ordinal: Option<u8> = None;
+    let mut symtab: Option<(usize, usize, usize, usize)> = None;
+    let mut ordinal: u32 = 0;
+    let mut cmd_off = 32usize;
+    for _ in 0..ncmds {
+        let cmd = rd_u32(cmd_off)?;
+        let cmdsize = rd_u32(cmd_off + 4)? as usize;
+        if cmdsize == 0 {
+            return None;
+        }
+        if cmd == 0x19 {
+            // LC_SEGMENT_64
+            let nsects = rd_u32(cmd_off + 64)?;
+            let mut sec = cmd_off + 72;
+            for _ in 0..nsects {
+                ordinal = ordinal.checked_add(1)?;
+                let name = obj.get(sec..sec + 16)?;
+                if name.starts_with(b"__text\0") {
+                    text_ordinal = Some(u8::try_from(ordinal).ok()?);
+                }
+                sec += 80;
+            }
+        } else if cmd == 0x02 {
+            // LC_SYMTAB: symoff, nsyms, stroff, strsize
+            symtab = Some((
+                rd_u32(cmd_off + 8)? as usize,
+                rd_u32(cmd_off + 12)? as usize,
+                rd_u32(cmd_off + 16)? as usize,
+                rd_u32(cmd_off + 20)? as usize,
+            ));
+        }
+        cmd_off = cmd_off.checked_add(cmdsize)?;
+    }
+
+    let text_ordinal = text_ordinal?;
+    let (symoff, nsyms, stroff, strsize) = symtab?;
+    let strings = obj.get(stroff..stroff.checked_add(strsize)?)?;
+
+    let mut offsets = HashMap::new();
+    for index in 0..nsyms {
+        let entry = symoff.checked_add(index.checked_mul(NLIST_64_SIZE)?)?;
+        let n_strx = rd_u32(entry)? as usize;
+        let n_type = *obj.get(entry + 4)?;
+        let n_sect = *obj.get(entry + 5)?;
+        let n_value = rd_u64(entry + 8)?;
+        // A DEFINED symbol in __text. Undefined (`N_UNDF`) and absolute symbols
+        // define no bytes here and are irrelevant to the obligation.
+        if n_type & N_TYPE != N_SECT || n_sect != text_ordinal {
+            continue;
+        }
+        let tail = strings.get(n_strx..)?;
+        let end = tail.iter().position(|byte| *byte == 0)?;
+        let name = std::str::from_utf8(&tail[..end]).ok()?;
+        // Mach-O prefixes every symbol with `_`; the IR-level name does not.
+        let name = name.strip_prefix('_').unwrap_or(name);
+        offsets.insert(name.to_string(), n_value.checked_sub(text_base)?);
+    }
+    Some(offsets)
+}
+
+/// ELF64 `.symtab` reader: collect symbols defined in the `.text` section.
+fn elf64_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<String, u64>> {
+    const SHT_SYMTAB: u32 = 2;
+    const SYM_SIZE: usize = 24;
+
+    if obj.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let rd_u16 =
+        |o: usize| -> Option<u16> { Some(u16::from_le_bytes(obj.get(o..o + 2)?.try_into().ok()?)) };
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
+    let rd_u64 =
+        |o: usize| -> Option<u64> { Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?)) };
+
+    let section_table = usize::try_from(rd_u64(40)?).ok()?;
+    let section_size = usize::from(rd_u16(58)?);
+    let section_count = usize::from(rd_u16(60)?);
+    let names_index = usize::from(rd_u16(62)?);
+    if section_size < 64 || names_index >= section_count {
+        return None;
+    }
+    let header_at = |index: usize| -> Option<usize> {
+        (index < section_count)
+            .then_some(section_table.checked_add(index.checked_mul(section_size)?)?)
+    };
+    let names_header = header_at(names_index)?;
+    let names_offset = usize::try_from(rd_u64(names_header + 24)?).ok()?;
+    let names_size = usize::try_from(rd_u64(names_header + 32)?).ok()?;
+    let names = obj.get(names_offset..names_offset.checked_add(names_size)?)?;
+    let section_name = |header: usize| -> Option<&[u8]> {
+        let name_offset = usize::try_from(rd_u32(header)?).ok()?;
+        let tail = names.get(name_offset..)?;
+        let end = tail.iter().position(|byte| *byte == 0)?;
+        Some(&tail[..end])
+    };
+
+    let mut text_index: Option<u16> = None;
+    let mut symtab: Option<(usize, usize, usize)> = None;
+    for index in 0..section_count {
+        let header = header_at(index)?;
+        if section_name(header)? == b".text" {
+            text_index = Some(u16::try_from(index).ok()?);
+        }
+        if rd_u32(header + 4)? == SHT_SYMTAB {
+            let offset = usize::try_from(rd_u64(header + 24)?).ok()?;
+            let size = usize::try_from(rd_u64(header + 32)?).ok()?;
+            let strtab = usize::try_from(rd_u32(header + 40)?).ok()?;
+            symtab = Some((offset, size, strtab));
+        }
+    }
+
+    let text_index = text_index?;
+    let (symoff, symsize, strtab_index) = symtab?;
+    let strtab_header = header_at(strtab_index)?;
+    let str_offset = usize::try_from(rd_u64(strtab_header + 24)?).ok()?;
+    let str_size = usize::try_from(rd_u64(strtab_header + 32)?).ok()?;
+    let strings = obj.get(str_offset..str_offset.checked_add(str_size)?)?;
+
+    let mut offsets = HashMap::new();
+    for index in 0..(symsize / SYM_SIZE) {
+        let entry = symoff.checked_add(index.checked_mul(SYM_SIZE)?)?;
+        let st_name = usize::try_from(rd_u32(entry)?).ok()?;
+        let st_shndx = rd_u16(entry + 6)?;
+        let st_value = rd_u64(entry + 8)?;
+        if st_shndx != text_index {
+            continue;
+        }
+        let tail = strings.get(st_name..)?;
+        let end = tail.iter().position(|byte| *byte == 0)?;
+        if end == 0 {
+            continue;
+        }
+        let name = std::str::from_utf8(&tail[..end]).ok()?;
+        offsets.insert(name.to_string(), st_value.checked_sub(text_base)?);
+    }
+    Some(offsets)
+}
+
 /// VERIFIED single-function emission — convenience over [`emit_objects_verified`]
 /// for the single-function-module path ([`TrustCgCodegenBackend::emit_object`]).
 ///
@@ -890,7 +1720,7 @@ pub fn emit_object_verified_with_backend(
 }
 
 /// Return-value register width in bits for `func` (32 for i32/bool, 64 for i64).
-fn return_reg_width(func: &VerifiableFunction) -> u32 {
+fn return_reg_width(func: &VerifiableFunction) -> Result<u32, String> {
     reg_width(&func.body.return_ty)
 }
 
@@ -930,7 +1760,11 @@ fn divisor_nonzero_precondition(func: &VerifiableFunction) -> Option<Formula> {
                     if p.local >= 1 && p.local <= func.body.arg_count {
                         let idx = (p.local - 1) as u32;
                         let decl = func.body.locals.iter().find(|d| d.index == p.local);
-                        let rw = decl.map(|d| reg_width(&d.ty)).unwrap_or(32);
+                        // No register-slot width => emit NO precondition. That
+                        // is the fail-closed direction here: the discharge then
+                        // runs unconstrained and a genuine divide-by-zero
+                        // mismatch is Refuted rather than excused.
+                        let rw = decl.and_then(|d| reg_width(&d.ty).ok())?;
                         let reg = if rw > 32 { xn(idx) } else { wn(idx) };
                         return Some(Formula::Not(b(Formula::Eq(
                             b(reg),
@@ -948,17 +1782,17 @@ fn divisor_nonzero_precondition(func: &VerifiableFunction) -> Option<Formula> {
 // PART 1 — THE SYMBOLIC IR-SEMANTICS INTERPRETER (pure Formula builder).
 // ===========================================================================
 
-fn b(f: Formula) -> Box<Formula> {
+pub(crate) fn b(f: Formula) -> Box<Formula> {
     Box::new(f)
 }
 
 /// Full 64-bit argument register `X_n`.
-fn xn(n: u32) -> Formula {
+pub(crate) fn xn(n: u32) -> Formula {
     Formula::Var(format!("X{n}"), Sort::BitVec(64))
 }
 
 /// Low 32 bits of argument register `X_n` (i.e. `W_n`).
-fn wn(n: u32) -> Formula {
+pub(crate) fn wn(n: u32) -> Formula {
     Formula::BvExtract { inner: b(xn(n)), high: 31, low: 0 }
 }
 
@@ -1074,7 +1908,7 @@ fn fp64_div_bits(a: Formula, b_: Formula) -> Formula {
 }
 
 /// `if pred then 1 else 0`, as a `width`-bit bitvector.
-fn pred_to_int(pred: Formula, width: u32) -> Formula {
+pub(crate) fn pred_to_int(pred: Formula, width: u32) -> Formula {
     Formula::Ite(
         b(pred),
         b(Formula::BitVec { value: 1, width }),
@@ -1134,18 +1968,41 @@ fn float_bit_width(ty: &Ty) -> Result<u32, String> {
 }
 
 /// Width of the destination register slot for a local of type `ty`.
-fn reg_width(ty: &Ty) -> u32 {
+///
+/// SOUNDNESS: this used to end in `_ => 32`, i.e. "any type I do not recognize
+/// occupies a 32-bit register". That default is not conservative in either
+/// direction — it is simply a guess, and the one place it mattered most is
+/// [`return_reg_width`], which decides how many bits of the return register the
+/// gate reads back out of the EMITTED OBJECT. Answering 32 for an aggregate,
+/// slice, `str`, `PtrSizedInt` or `Char` return would compare the low 32 bits of
+/// W0 against the spec and ignore the rest — an aggregate return does not even
+/// live in X0 (AAPCS returns it indirectly through the X8 pointer), so the gate
+/// would have been comparing an unrelated register.
+///
+/// Measured: every call site is ordering-protected today, which is exactly why
+/// this survived. `trust_ir_semantics_env` runs `int_width`/`float_bit_width`
+/// over EVERY local first and both fail closed on non-scalar types, so by the
+/// time `reg_width` is called the type has already been narrowed;
+/// `derive_callee_pure` re-checks the return and argument types against an
+/// explicit scalar list before calling it. Ordering is not construction — the
+/// `Ty` list is `#[non_exhaustive]` and grows (`PtrSizedInt`, `Char`, `Str` and
+/// `SymArray` are all recent additions that landed straight in the `_` arm), so
+/// the width answer is now a `Result` and the guess is gone.
+fn reg_width(ty: &Ty) -> Result<u32, String> {
     match ty {
-        Ty::Int { width, .. } => *width,
-        Ty::Bv(w) => *w,
-        Ty::Bool => 32,
-        Ty::RawPtr { .. } | Ty::Ref { .. } => 64,
+        Ty::Int { width, .. } => Ok(*width),
+        Ty::Bv(w) => Ok(*w),
+        Ty::Bool => Ok(32),
+        Ty::RawPtr { .. } | Ty::Ref { .. } => Ok(64),
         // A scalar float returns in the SIMD/FP register D-lane, whose bit-width
         // is the format width (f64 = 64). (f32/f16 also match here, but the
         // interpreter/machine FP arms fail closed above the width, so a non-f64
         // float never reaches a Proven verdict.)
-        Ty::Float { width } => *width,
-        _ => 32,
+        Ty::Float { width } => Ok(*width),
+        other => Err(format!(
+            "no register-slot width is defined for type {other:?}; refusing rather than \
+             assuming a 32-bit slot"
+        )),
     }
 }
 
@@ -1228,7 +2085,7 @@ fn eval_const(c: &ConstValue) -> Result<Formula, String> {
 }
 
 /// Binary-op result Formula, signedness from OPERAND types (not destination).
-fn eval_binop(
+pub(crate) fn eval_binop(
     op: BinOp,
     lhs: Formula,
     rhs: Formula,
@@ -1323,7 +2180,7 @@ fn eval_binop(
 }
 
 /// `amt & (width-1)` — the AArch64 shift-amount mask.
-fn mask_shift(amt: Formula, width: u32) -> Formula {
+pub(crate) fn mask_shift(amt: Formula, width: u32) -> Formula {
     let mask = i128::from(width - 1);
     Formula::BvAnd(b(amt), b(Formula::BitVec { value: mask, width }), width)
 }
@@ -1333,7 +2190,7 @@ fn is_comparison(op: BinOp) -> bool {
 }
 
 /// Int-to-int cast result, extension signedness from the SOURCE type.
-fn eval_cast(
+pub(crate) fn eval_cast(
     src_formula: Formula,
     src_width: u32,
     src_signed: bool,
@@ -1460,10 +2317,10 @@ fn derive_callee_pure(callee: &VerifiableFunction) -> Option<CalleePure> {
             if *width > 64 {
                 return None;
             }
-            reg_width(&body.return_ty)
+            reg_width(&body.return_ty).ok()?
         }
-        Ty::Bv(w) if *w <= 64 => reg_width(&body.return_ty),
-        Ty::Bool => reg_width(&body.return_ty),
+        Ty::Bv(w) if *w <= 64 => reg_width(&body.return_ty).ok()?,
+        Ty::Bool => reg_width(&body.return_ty).ok()?,
         Ty::RawPtr { .. } | Ty::Ref { .. } => 64,
         _ => return None,
     };
@@ -1479,7 +2336,7 @@ fn derive_callee_pure(callee: &VerifiableFunction) -> Option<CalleePure> {
             Ty::RawPtr { .. } | Ty::Ref { .. } => {}
             _ => return None,
         }
-        arg_reg_widths.push(reg_width(&decl.ty));
+        arg_reg_widths.push(reg_width(&decl.ty).ok()?);
     }
     // PURITY: reject any deref store anywhere in the body. A pure callee whose
     // result we compose may not write through a pointer (its memory effect would
@@ -1644,7 +2501,7 @@ fn trust_ir_semantics_env(func: &VerifiableFunction, env: &CalleeEnv) -> Result<
             let fw = float_bit_width(&decl.ty)?; // enforce f32/f64, fail-closed on f16
             vn_lane(i as u32, fw)
         } else {
-            let rw = reg_width(&decl.ty);
+            let rw = reg_width(&decl.ty)?;
             if rw > 32 { xn(i as u32) } else { wn(i as u32) }
         };
         state.locals.insert(local, arg_reg);
@@ -2191,7 +3048,7 @@ fn decode_text_from_object(obj: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>, u64), Stri
 /// `*-unknown-linux-*`), so both must be readable for the gate to be live on the
 /// hosts the backend actually emits for. A container that is neither is an
 /// honest `Err`: there is no fallback that could produce real bytes.
-fn extract_text_from_object(obj: &[u8]) -> Result<(Vec<u8>, u64), String> {
+pub(crate) fn extract_text_from_object(obj: &[u8]) -> Result<(Vec<u8>, u64), String> {
     let (code, base) = macho_text(obj)
         .or_else(|| elf64_text(obj))
         .ok_or_else(|| "could not extract the text section from emitted object".to_string())?;
@@ -2310,6 +3167,87 @@ fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
 const MAX_STEPS: u32 = 4096;
 const MAX_DEPTH: u32 = 16;
 
+/// What ONE merged execution path of the emitted bytes yields.
+///
+/// `value` is the return-register Formula as before. `reach` is the NEW,
+/// SEPARATE claim that this path actually REACHES a `RET` — the machine-side
+/// half of the assert/trap obligation. For every existing caller (`model_traps`
+/// off) `reach` is syntactically `Bool(true)` and `value` is byte-for-byte the
+/// Formula the executor produced before this type existed.
+#[derive(Clone)]
+pub(crate) struct PathOutcome {
+    /// Return-register Formula at the reachable `RET`(s).
+    pub(crate) value: Formula,
+    /// Predicate: under which inputs does control reach a `RET` at all?
+    /// `Bool(true)` when nothing on any path diverges.
+    pub(crate) reach: Formula,
+}
+
+/// Every AArch64 opcode that ENDS straight-line flow: reaching one means the
+/// NEXT instruction is not executed by falling through. Used by the divergent-PC
+/// prescan to bound its backward walk at a real basic-block leader.
+///
+/// `Bl` is deliberately ABSENT: a `bl` returns to `pc+4`, so a call whose
+/// continuation diverges diverges too.
+fn ends_straight_line(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Ret
+            | Opcode::B
+            | Opcode::Br
+            | Opcode::BCond
+            | Opcode::Cbz
+            | Opcode::Cbnz
+            | Opcode::Tbz
+            | Opcode::Tbnz
+    )
+}
+
+/// The set of `__text` PCs from which straight-line execution provably reaches a
+/// `BRK` — i.e. the DIVERGENT (never-returning) tail the trust-cg `Trap` lowering
+/// emits for a failed `Inst::Assert` (`stp; mov; bl <panic>; brk`).
+///
+/// Computed by walking BACKWARD from each decoded `BRK`, marking each preceding
+/// instruction, and stopping at the first instruction that ends straight-line
+/// flow (that instruction is NOT marked — control never falls out of it into the
+/// tail). This is exactly the "no `RET` is reachable from here without taking a
+/// branch" set, which is why the marking is sound rather than heuristic: a `pc`
+/// in the set cannot produce a return value at all.
+///
+/// The gate uses this only to say `reach = false` on such a path. It NEVER makes
+/// a value claim about a divergent path, and a function whose obligation becomes
+/// vacuous because EVERY path diverges is rejected by the vacuity check in
+/// `verify_output_trust_ir`.
+fn divergent_pcs(code: &[u8], base: u64) -> HashSet<u64> {
+    let mut set = HashSet::new();
+    let word_count = code.len() / 4;
+    let mut ops: Vec<Option<Opcode>> = Vec::with_capacity(word_count);
+    for i in 0..word_count {
+        let pc = base + (i as u64) * 4;
+        let op = code
+            .get(i * 4..i * 4 + 4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .and_then(|bytes| decode_aarch64(&bytes, pc).ok())
+            .map(|insn| insn.opcode);
+        ops.push(op);
+    }
+    for i in 0..word_count {
+        if ops[i] != Some(Opcode::Brk) {
+            continue;
+        }
+        let mut j = i as i64;
+        while j >= 0 {
+            match ops[j as usize] {
+                Some(op) if ends_straight_line(op) => break,
+                _ => {}
+            }
+            set.insert(base + (j as u64) * 4);
+            j -= 1;
+        }
+    }
+    set
+}
+
 struct PathMergingExecutor<'a> {
     sem: Aarch64Semantics,
     code: &'a [u8],
@@ -2328,6 +3266,14 @@ struct PathMergingExecutor<'a> {
     /// A fresh-variable counter so each modeled call clobbers caller-saved
     /// registers with DISTINCT unconstrained values (no accidental sharing).
     call_counter: u32,
+    /// PCs from which straight-line flow provably reaches a `BRK` (see
+    /// [`divergent_pcs`]). EMPTY unless trap modeling is on, so every existing
+    /// caller executes the identical program.
+    divergent: HashSet<u64>,
+    /// Whether to model a `BRK` tail as a NON-RETURNING path (`reach = false`)
+    /// instead of running into it. `false` for every pre-existing caller: the
+    /// MIR-path gate keeps failing closed on a trap exactly as before.
+    model_traps: bool,
 }
 
 impl<'a> PathMergingExecutor<'a> {
@@ -2346,6 +3292,8 @@ impl<'a> PathMergingExecutor<'a> {
             env: EMPTY_ENV.get_or_init(CalleeEnv::empty),
             bl_targets: EMPTY_RELOCS.get_or_init(HashMap::new),
             call_counter: 0,
+            divergent: HashSet::new(),
+            model_traps: false,
         }
     }
 
@@ -2367,6 +3315,36 @@ impl<'a> PathMergingExecutor<'a> {
             env,
             bl_targets,
             call_counter: 0,
+            divergent: HashSet::new(),
+            model_traps: false,
+        }
+    }
+
+    /// Trust (F1 gate): [`PathMergingExecutor::new_env`] with TRAP MODELING on.
+    ///
+    /// The only behavioural difference is that a PC in [`divergent_pcs`] yields
+    /// `reach = false` instead of being executed. No other caller sets this, so
+    /// the MIR-path gate's program is unchanged.
+    fn new_traps(
+        code: &'a [u8],
+        base: u64,
+        out_width: u32,
+        out_is_float: bool,
+        env: &'a CalleeEnv,
+        bl_targets: &'a HashMap<u64, BranchReloc>,
+    ) -> Self {
+        PathMergingExecutor {
+            sem: Aarch64Semantics,
+            code,
+            base,
+            out_width,
+            out_is_float,
+            steps: 0,
+            env,
+            bl_targets,
+            call_counter: 0,
+            divergent: divergent_pcs(code, base),
+            model_traps: true,
         }
     }
 
@@ -2383,6 +3361,42 @@ impl<'a> PathMergingExecutor<'a> {
         decode_aarch64(&bytes, pc).map_err(|e| format!("decode_aarch64 failed at {pc:#x}: {e:?}"))
     }
 
+    /// The INTEGER return value the bytes leave behind at a `RET`, read out of
+    /// the AAPCS64 result registers at `out_width`.
+    ///
+    /// A result of 64 bits or fewer is `X0` truncated to `out_width`. For a
+    /// NARROW result (`out_width` of 8 or 16) that truncation is not a
+    /// convenience — it is the obligation's boundary. `out_width` is the type's
+    /// DECLARED width, and a Rust-ABI narrow slot carries `arg_ext: None`, so
+    /// the bits of `X0` above it are not part of the returned value and this
+    /// side deliberately reads none of them. The trust-ir gate's
+    /// `scalar_reg_width` carries the full derivation with its rustc source
+    /// lines; the MIR-side `reg_width` has always agreed by returning the
+    /// integer's own width.
+    ///
+    /// A 128-bit result does NOT fit in one register: AAPCS64 returns it in the
+    /// PAIR `X0` (low 64) / `X1` (high 64), so the machine-side value is
+    /// `concat(X1, X0)` — `try_bvconcat`'s first operand is the HIGH half.
+    ///
+    /// WHY THIS IS NOT `read_gpr(0, 128)`. `MachineState::read_gpr(i, w)`
+    /// truncates a 64-bit register to `w` bits, so at `w = 128` it would build
+    /// `BvExtract(X0)[127:0]` — an ILL-SORTED term over a 64-bit variable that
+    /// `formula_to_term` cannot translate. Every other width above 64 has no
+    /// modeled register home at all and FAILS CLOSED here rather than producing
+    /// such a term.
+    fn read_int_return(&self, state: &MachineState) -> Result<Formula, String> {
+        match self.out_width {
+            0 => Err("zero-width return value is not modeled (fail-closed)".into()),
+            w if w <= 64 => Ok(state.read_gpr(0, w)),
+            128 => Ok(Formula::BvConcat(b(state.read_gpr(1, 64)), b(state.read_gpr(0, 64)))),
+            other => Err(format!(
+                "a {other}-bit integer return has no modeled AAPCS64 register home \
+                 (only <=64-bit in X0/W0 and 128-bit in the X0/X1 pair are modeled; \
+                 fail-closed)"
+            )),
+        }
+    }
+
     /// Execute from `pc` carrying `state` and the `visited` PCs on THIS path,
     /// returning the merged return-register Formula at the reachable RET(s).
     fn run(
@@ -2391,11 +3405,24 @@ impl<'a> PathMergingExecutor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
-    ) -> Result<Formula, String> {
+    ) -> Result<PathOutcome, String> {
         if depth > MAX_DEPTH {
             return Err("fork-depth budget exceeded (fail-closed)".into());
         }
         loop {
+            // TRAP TAIL (F1 gate only). This PC provably cannot reach a `RET`
+            // without taking a branch — it is the `bl <panic>; brk` tail the
+            // trust-cg `Trap` lowering emits for a failed `Inst::Assert`. Such a
+            // path yields NO return value, so we record `reach = false` and a
+            // placeholder value that the discharge is never allowed to use (the
+            // obligation is conditioned on `reach`). Off for every other caller.
+            if self.model_traps && self.divergent.contains(&pc) {
+                return Ok(PathOutcome {
+                    value: Formula::BitVec { value: 0, width: self.out_width },
+                    reach: Formula::Bool(false),
+                });
+            }
+
             // LOOP SAFETY: a revisited PC on this path is a backedge.
             if visited.contains(&pc) {
                 return Err(format!("loop/backedge detected at {pc:#x} (fail-closed)"));
@@ -2415,10 +3442,12 @@ impl<'a> PathMergingExecutor<'a> {
             // `BvExtract(V0)[out_width-1:0]`), matching the IR-semantics side's
             // `vn_d_lane`. Integer/pointer results are in X0/W0.
             if opcode == Opcode::Ret {
-                if self.out_is_float {
-                    return Ok(state.read_fpr(0, self.out_width));
-                }
-                return Ok(state.read_gpr(0, self.out_width));
+                let value = if self.out_is_float {
+                    state.read_fpr(0, self.out_width)
+                } else {
+                    self.read_int_return(&state)?
+                };
+                return Ok(PathOutcome { value, reach: Formula::Bool(true) });
             }
 
             let effects = self
@@ -2429,7 +3458,16 @@ impl<'a> PathMergingExecutor<'a> {
             // Separate control-flow effects from the data-plane effects.
             let mut cond_branch: Option<(Condition, Formula, Formula)> = None;
             let mut uncond_target: Option<Formula> = None;
+            let mut pc_update: Option<Formula> = None;
+            let mut saw_return = false;
             let mut is_call = false;
+            // The sequential-advance shape, built from the pc as it stands for
+            // THIS instruction so the comparison below is exact.
+            let pc_advance = Formula::BvAdd(
+                Box::new(state.pc.clone()),
+                Box::new(Formula::BitVec { value: 4, width: 64 }),
+                64,
+            );
             let mut plain: Vec<&Effect> = Vec::new();
             for e in &effects {
                 match e {
@@ -2437,9 +3475,31 @@ impl<'a> PathMergingExecutor<'a> {
                         cond_branch = Some((*condition, target.clone(), fallthrough.clone()));
                     }
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
-                    // PcUpdate / Return targets are folded into the control handling
-                    // below; do NOT thread them as plain data-plane effects.
-                    Effect::PcUpdate { .. } | Effect::Return { .. } => {}
+                    // A `PcUpdate` IS control flow and is handled below. It must
+                    // never be silently dropped: `sem_cbz` (CBZ/CBNZ) and
+                    // `sem_tbz` (TBZ/TBNZ) express their branch as
+                    // `PcUpdate { value: Ite(take, target, pc+4) }` rather than as
+                    // `Effect::ConditionalBranch`, which only `sem_bcond` emits.
+                    // Discarding it executed four of the five AArch64 conditional
+                    // branch forms as NEVER TAKEN — and, unlike every other
+                    // unmodeled effect in this match, did not fail closed. That
+                    // was a soundness hole in BOTH directions, each demonstrated
+                    // by execution: a spliced `cbz`-guarded miscompile came back
+                    // `Proven` (the byte-identical `b.cond` form came back
+                    // `Refuted`), and 78 corpus functions were reported as
+                    // `MISCOMPILE (Refuted)` on machine code that runs correctly.
+                    //
+                    // `Effect::Return` stays ignored: `Opcode::Ret` returns from
+                    // this loop before effects are consulted at all.
+                    // ...EXCEPT the plain sequential advance. `pc_advance`
+                    // (`trust-machine-sem/src/aarch64/mod.rs`) appends
+                    // `PcUpdate { BvAdd(pc, 4) }` to ordinary instructions, and
+                    // that is precisely what the `pc += 4` at the bottom of this
+                    // loop already does. Only a pc write that is NOT the advance
+                    // carries control flow.
+                    Effect::PcUpdate { value } if *value == pc_advance => {}
+                    Effect::PcUpdate { value } => pc_update = Some(value.clone()),
+                    Effect::Return { .. } => saw_return = true,
                     // A `bl` to a LOCAL PURE callee is COMPOSED below (see
                     // `model_local_call`). We do NOT thread the Call's own
                     // link-register write here; the call modeling sets the post-call
@@ -2476,13 +3536,66 @@ impl<'a> PathMergingExecutor<'a> {
                 })?;
             }
 
-            if let Some((condition, target, _fallthrough)) = cond_branch {
+            // Both conditional-branch encodings reduce to ONE (path condition,
+            // taken target) pair. `b.cond` carries an architectural `Condition`
+            // that must be read against the flags AFTER the data-plane effects
+            // above; CBZ/CBNZ/TBZ/TBNZ instead arrive as a `PcUpdate` whose `Ite`
+            // condition `sem_cbz`/`sem_tbz` already built over the register value
+            // as it stood BEFORE this instruction — which is the same state,
+            // because neither form writes a register. So the condition is used
+            // as-is and no `condition_to_formula` is involved.
+            let fork = if let Some((condition, target, _fallthrough)) = cond_branch {
                 // path_cond is the REAL machine branch condition over the post-Subs
                 // symbolic NZCV flags now in `state.flags`.
-                let path_cond = condition_to_formula(&state, condition);
+                // A condition the machine model cannot evaluate is a REFUSAL of
+                // the derivation, not an `always taken` path condition.
+                let path_cond =
+                    condition_to_formula(&state, condition).map_err(|err| err.to_string())?;
                 let target_pc = const_addr(&target).ok_or_else(|| {
                     format!("indirect conditional branch at {pc:#x} (fail-closed)")
                 })?;
+                Some((path_cond, target_pc))
+            } else if uncond_target.is_some() || saw_return {
+                // `b` / `bl` / `ret` emit a redundant `PcUpdate` ALONGSIDE
+                // `Effect::Branch` / `Effect::Return`. Those have dedicated
+                // handling (the `uncond_target` block below, and the early
+                // `Opcode::Ret` return), so the duplicate is not control flow
+                // this block owns.
+                None
+            } else if let Some(value) = pc_update {
+                match value {
+                    // CBZ/CBNZ/TBZ/TBNZ. `branch_target_formula` resolves the
+                    // operand to an ABSOLUTE address, so the taken arm is a
+                    // literal; the fallthrough arm is `BvAdd(PC, 4)` over the
+                    // symbolic `PC` var and is deliberately not consulted --
+                    // `pc + 4` is the real fallthrough, exactly as in the
+                    // `b.cond` path above.
+                    Formula::Ite(cond, taken, _fall) => {
+                        let target_pc = const_addr(&taken).ok_or_else(|| {
+                            format!("indirect conditional branch at {pc:#x} (fail-closed)")
+                        })?;
+                        Some((*cond, target_pc))
+                    }
+                    // A constant unconditional `PcUpdate` is a plain branch.
+                    // Anything else -- an indirect or otherwise unmodeled pc
+                    // write -- FAILS CLOSED, like every other effect this
+                    // executor cannot model exactly.
+                    other => {
+                        let Some(target_pc) = const_addr(&other) else {
+                            return Err(format!("unmodeled pc-update at {pc:#x} (fail-closed)"));
+                        };
+                        if visited.contains(&target_pc) {
+                            return Err(format!("backedge at pc-update {pc:#x} (fail-closed)"));
+                        }
+                        pc = target_pc;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some((path_cond, target_pc)) = fork {
                 let fall_pc = pc + 4;
 
                 // LOOP SAFETY: a branch target already on this path is a backedge.
@@ -2497,7 +3610,26 @@ impl<'a> PathMergingExecutor<'a> {
 
                 // MERGE. The Ite condition IS the real machine branch condition, so a
                 // wrong path assignment makes ay find a counterexample (teeth).
-                return Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)));
+                //
+                // `reach` merges the SAME way. When neither side diverges it folds
+                // back to the syntactic `Bool(true)` every pre-existing caller saw,
+                // so their obligation is bit-for-bit the one they had before.
+                let reach = match (&taken.reach, &fall.reach) {
+                    (Formula::Bool(true), Formula::Bool(true)) => Formula::Bool(true),
+                    _ => Formula::Ite(
+                        Box::new(path_cond.clone()),
+                        Box::new(taken.reach),
+                        Box::new(fall.reach),
+                    ),
+                };
+                return Ok(PathOutcome {
+                    value: Formula::Ite(
+                        Box::new(path_cond),
+                        Box::new(taken.value),
+                        Box::new(fall.value),
+                    ),
+                    reach,
+                });
             }
 
             if let Some(target) = uncond_target {
@@ -2613,7 +3745,7 @@ fn symbolic_machine_output(
 ) -> Result<Formula, String> {
     let mut exec = PathMergingExecutor::new(code, base, out_width, out_is_float);
     let state = MachineState::symbolic();
-    exec.run(base, state, Vec::new(), 0)
+    exec.run(base, state, Vec::new(), 0).map(|outcome| outcome.value)
 }
 
 /// Bundle-aware [`symbolic_machine_output`]: the executor consults `env` +
@@ -2630,6 +3762,29 @@ fn symbolic_machine_output_env(
 ) -> Result<Formula, String> {
     let mut exec =
         PathMergingExecutor::new_env(code, base, out_width, out_is_float, env, bl_targets);
+    let state = MachineState::symbolic();
+    exec.run(base, state, Vec::new(), 0).map(|outcome| outcome.value)
+}
+
+/// Trust (F1 gate): the byte-derived machine side WITH trap modeling, returning
+/// both the return-value Formula and the `reach` predicate.
+///
+/// This is [`symbolic_machine_output_env`] with `model_traps` on. It is the ONLY
+/// caller that gets a non-trivial `reach`, and it exists so the trust-ir gate can
+/// discharge the assert-guarded obligation instead of failing closed on every
+/// function whose `Inst::Assert` lowered to a `Trap` block.
+pub(crate) fn symbolic_machine_outcome_traps(
+    code: &[u8],
+    base: u64,
+    out_width: u32,
+    out_is_float: bool,
+) -> Result<PathOutcome, String> {
+    static EMPTY_ENV: std::sync::OnceLock<CalleeEnv> = std::sync::OnceLock::new();
+    static EMPTY_RELOCS: std::sync::OnceLock<HashMap<u64, BranchReloc>> = std::sync::OnceLock::new();
+    let env = EMPTY_ENV.get_or_init(CalleeEnv::empty);
+    let relocs = EMPTY_RELOCS.get_or_init(HashMap::new);
+    let mut exec =
+        PathMergingExecutor::new_traps(code, base, out_width, out_is_float, env, relocs);
     let state = MachineState::symbolic();
     exec.run(base, state, Vec::new(), 0)
 }
@@ -2964,7 +4119,7 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
 /// Outcome of an equality discharge — keeps `unknown` distinct so the gate can
 /// fail closed instead of panicking (unlike the test harness, which panics).
 #[derive(Debug)]
-enum Discharge {
+pub(crate) enum Discharge {
     Proven,
     CounterExample,
     Unknown(String),
@@ -3016,10 +4171,10 @@ fn formula_has_fp(f: &Formula) -> bool {
 
 /// Discharge the VALIDITY of a boolean formula `f`: assert `NOT(f)` and check.
 /// UNSAT => Proven (f is valid), SAT => CounterExample, unknown => Unknown.
-/// FP-aware logic selection, mirroring [`discharge_equal_pre`]. (Test-only: the
-/// production gate proves equalities, not bare predicates.)
-#[cfg(test)]
-fn discharge_valid(f: &Formula) -> Discharge {
+/// FP-aware logic selection, mirroring [`discharge_equal_pre`]. Used in
+/// production by the trust-ir gate's VACUITY check and its `spec_reach =>
+/// machine_reach` obligation, which are predicates rather than equalities.
+pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
     let logic = if formula_has_fp(f) { Logic::QfAbvfp } else { Logic::QfAbv };
     let mut solver = match Solver::try_new(logic) {
         Ok(s) => s,
@@ -3040,7 +4195,7 @@ fn discharge_valid(f: &Formula) -> Discharge {
 
 /// Discharge `(pre AND NOT(a == b))`: UNSAT => Proven, SAT => CounterExample,
 /// unknown => Unknown (fail-closed). Solver-construction failure is also Unknown.
-fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula>) -> Discharge {
+pub(crate) fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula>) -> Discharge {
     // QF_ABV: quantifier-free bitvectors + array theory (Select/Store), so
     // store->load roundtrips through MEM discharge via the array axiom.
     //
@@ -3199,15 +4354,57 @@ pub fn formula_to_bvexpr(f: &Formula) -> Result<ay_proof::BvExpr, String> {
             // `pred ? 0 : 1`, which a CSET of an inverted condition emits). The
             // then/else arms are constant 0/1 at some register width `w` (possibly
             // folded as `BvAdd(0,1)`), so const-evaluate both.
-            let (w, then_one) = ite_pred_branches(then_v, else_v).ok_or_else(|| {
-                "formula_to_bvexpr: Ite is not the `pred ? {1,0} : {0,1}` compare \
-                 register form (only that shape is in the fragment)"
-                    .to_string()
-            })?;
-            // `pred ? 1 : 0` -> pred;  `pred ? 0 : 1` -> NOT pred.
+            if let Some((w, then_one)) = ite_pred_branches(then_v, else_v) {
+                // `pred ? 1 : 0` -> pred;  `pred ? 0 : 1` -> NOT pred.
+                let pred = predicate_to_bvexpr(cond)?;
+                let pred = if then_one { pred } else { BvExpr::not(pred) };
+                return if w == 1 { Ok(pred) } else { Ok(BvExpr::zero_ext(pred, w - 1)) };
+            }
+            // ── PATH B2: THE GENERAL SELECT, AS A MUX OVER THE EXISTING FRAGMENT.
+            //
+            // A branch that yields DIFFERENT VALUES (not a 0/1 flag) — which is
+            // what every `if`/`match` returning distinct results merges to, on
+            // BOTH sides, since `eval_ir_terminator` and the machine-side path
+            // merger both emit `Ite` — used to fail closed here and cost the
+            // function its kernel grade. It does not need a new `BvExpr` node or a
+            // new kernel gate kind: the standard mask-mux
+            //
+            //     ite(c, a, b)  =  (sext(c, w-1) & a) | (~sext(c, w-1) & b)
+            //
+            // is EXACTLY it in the nodes the exporter already has. `c` is the
+            // 1-bit predicate `predicate_to_bvexpr` produces, so `sext(c, w-1)` is
+            // all-ones when `c` holds and all-zeros when it does not — bit `i` of
+            // the result is `(c ∧ a_i) ∨ (¬c ∧ b_i)`, the definition of select.
+            // The rewrite is a FAITHFUL RENDERING of `Formula::Ite`, in the same
+            // category as every other arm of this function, and it is what the
+            // kernel then re-checks: the obligation exported is the real one.
+            //
+            // FAIL-CLOSED on anything that would make that identity not hold:
+            // either arm outside the fragment, an ill-defined width, arms of
+            // unequal width, or a predicate outside the [PROVED] compare fragment.
+            let then_e = formula_to_bvexpr(then_v)?;
+            let else_e = formula_to_bvexpr(else_v)?;
+            let (tw, ew) = (bvexpr_width(&then_e), bvexpr_width(&else_e));
+            let (Some(tw), Some(ew)) = (tw, ew) else {
+                return Err("formula_to_bvexpr: Ite arm has an ill-defined bit width \
+                            (fail-closed)"
+                    .to_string());
+            };
+            if tw != ew {
+                return Err(format!(
+                    "formula_to_bvexpr: Ite arms differ in width ({tw} vs {ew}); a select \
+                     is only well-formed at ONE width (fail-closed)"
+                ));
+            }
+            if tw == 0 {
+                return Err("formula_to_bvexpr: Ite at width 0 (fail-closed)".to_string());
+            }
             let pred = predicate_to_bvexpr(cond)?;
-            let pred = if then_one { pred } else { BvExpr::not(pred) };
-            if w == 1 { Ok(pred) } else { Ok(BvExpr::zero_ext(pred, w - 1)) }
+            let mask = if tw == 1 { pred } else { BvExpr::sign_ext(pred, tw - 1) };
+            Ok(BvExpr::or(
+                BvExpr::and(mask.clone(), then_e),
+                BvExpr::and(BvExpr::not(mask), else_e),
+            ))
         }
         // A fixed bitvector constant -> `BvExpr::Const`. Each bit is a fixed
         // `ConstTrue`/`ConstFalse` literal in the bit-blast (the identity
@@ -3247,6 +4444,51 @@ pub fn formula_to_bvexpr(f: &Formula) -> Result<ay_proof::BvExpr, String> {
 /// width with a demonstrated passing clean re-check.
 #[cfg(feature = "ay-proofs")]
 const MAX_RECHECKABLE_MUL_WIDTH: u32 = 8;
+
+/// The kernel-checked theorem a wide `Mul` cites. Axiom-free, width-generic;
+/// see `proofs/codegen-equivalence/g16_multiplier_equivalence.lean`.
+const CITED_MUL_THEOREM: &str = "G16Mul.blast_equals_ir";
+
+/// The correspondence the kernel did NOT check: that ay's Rust encoder emits
+/// the model's multiplier. Machine-checked by
+/// `tests/ay_blast_agrees_differential.rs`, unprovable inside clean.
+const CITED_MUL_RESIDUAL: &str = "G16Mul.AyBlastAgrees";
+
+/// Whether the wide-`Mul` citation path is enabled. ON by default; set
+/// `TCG_CITE_WIDE_MUL=0` to restore the previous behaviour (decline, report
+/// [VALIDATED] with no stated reason).
+///
+/// TURNING THIS ON DOES NOT RAISE ANY CLAIM, which is why it is safe as a
+/// default. A citation lands in the SAME bucket as [VALIDATED] at both
+/// classification sites, caps at `Trusted`, and is refused by
+/// `StrictProvenOnly` exactly as [VALIDATED] is. What changes is that a wide
+/// `Mul` now says WHY it is not [PROVED] — naming the cited theorem and the
+/// residual correspondence — instead of reporting a bare `AyValidated` that
+/// tells a reader nothing about what was and was not checked.
+fn cite_wide_mul_enabled() -> bool {
+    cite_wide_mul_enabled_from(std::env::var("TCG_CITE_WIDE_MUL").ok().as_deref())
+}
+
+/// The policy itself, pure so it can be tested without mutating the
+/// environment: absent means ON, `"0"` means OFF, anything else means ON.
+fn cite_wide_mul_enabled_from(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
+#[cfg(all(test, feature = "ay-proofs"))]
+mod cite_policy_tests {
+    use super::cite_wide_mul_enabled_from;
+
+    #[test]
+    fn citation_is_on_by_default_and_opt_out_works() {
+        assert!(cite_wide_mul_enabled_from(None), "absent must mean ON (owner default)");
+        assert!(!cite_wide_mul_enabled_from(Some("0")), "`0` must be the escape hatch");
+        assert!(cite_wide_mul_enabled_from(Some("1")), "`1` stays ON");
+        // Anything unrecognised stays ON rather than silently disabling: a typo
+        // in the opt-out must not quietly remove the residual from verdicts.
+        assert!(cite_wide_mul_enabled_from(Some("false")), "a typo must not disable it");
+    }
+}
 
 /// Trust: RUNG 1 STEP-COUNT FRONTIER (HONESTY). The clean kernel re-check routes
 /// the exported refutation through the proven SUB-QUADRATIC trie checker
@@ -3341,6 +4583,34 @@ fn bvexpr_width(e: &ay_proof::BvExpr) -> Option<u32> {
 /// rather than attaching a kernel certificate that cannot actually be
 /// re-checked (see [`MAX_RECHECKABLE_MUL_WIDTH`]).
 #[cfg(feature = "ay-proofs")]
+/// The widest `BvMul` operand in `e` (0 if none). Mirrors `mul_wider_than`'s
+/// traversal exactly, so the width a citation records is the width the guard
+/// measured, never a re-derivation that could drift from it.
+fn mul_width(e: &ay_proof::BvExpr) -> u32 {
+    use ay_proof::BvExpr;
+    match e {
+        BvExpr::Mul(l, r) => bvexpr_width(l)
+            .unwrap_or(0)
+            .max(mul_width(l))
+            .max(mul_width(r)),
+        BvExpr::Add(l, r)
+        | BvExpr::Sub(l, r)
+        | BvExpr::Or(l, r)
+        | BvExpr::And(l, r)
+        | BvExpr::Xor(l, r)
+        | BvExpr::Eq(l, r)
+        | BvExpr::Shl(l, r)
+        | BvExpr::Lshr(l, r)
+        | BvExpr::Ashr(l, r) => mul_width(l).max(mul_width(r)),
+        BvExpr::CarryOut { lhs, rhs, .. } => mul_width(lhs).max(mul_width(rhs)),
+        BvExpr::ZeroExt(inner, _)
+        | BvExpr::SignExt(inner, _)
+        | BvExpr::Not(inner)
+        | BvExpr::Extract { inner, .. } => mul_width(inner),
+        BvExpr::Leaf { .. } | BvExpr::Const { .. } => 0,
+    }
+}
+
 fn mul_wider_than(e: &ay_proof::BvExpr, max: u32) -> bool {
     use ay_proof::BvExpr;
     match e {
@@ -3573,6 +4843,230 @@ fn formula_variant_name(f: &Formula) -> &'static str {
 }
 
 // ===========================================================================
+// THE 128-BIT REGISTER-PAIR SPLIT — TEETH AT THE OBLIGATION LEVEL.
+//
+// `verify_output_trust_ir::tests_i128_pair` pins the same fragment through the
+// REAL BYTES. These tests attack the SPLIT itself, at the level where the halves
+// are individually visible, because that is the only level at which "the high
+// half is genuinely an obligation" can be distinguished from "the high half
+// happens to be zero on both sides".
+//
+// The whole hazard: a small `i128` constant has `X1 == 0`, so a split that
+// checked only the LOW half would report [PROVED] for essentially every 128-bit
+// constant return in the corpus and never notice. Every test below therefore
+// pins the ASYMMETRY: same obligation, corrupt one half, the grade must move —
+// for BOTH halves, independently.
+// ===========================================================================
+#[cfg(all(test, feature = "ay-proofs"))]
+mod tests_pair_128_split {
+    use super::*;
+
+    /// `concat(hi, lo)` over two 64-bit constants — the machine side's shape.
+    fn pair(high: u64, low: u64) -> Formula {
+        Formula::BvConcat(
+            b(Formula::BitVec { value: high as i128, width: 64 }),
+            b(Formula::BitVec { value: low as i128, width: 64 }),
+        )
+    }
+
+    /// A 128-bit literal — the spec side's shape for a constant return.
+    fn lit128(value: u128) -> Formula {
+        Formula::BitVec { value: value as i128, width: 128 }
+    }
+
+    /// The split is arithmetic on the literal, so pin it directly rather than
+    /// only through a downstream proof: `0x1122...` must cut at bit 64 with the
+    /// FIRST component the HIGH half (SMT-LIB `concat` order, which is what
+    /// `read_int_return` builds).
+    #[test]
+    fn literal_splits_high_first_at_bit_64() {
+        let v: u128 = (0xdead_beef_0000_0001u128 << 64) | 0x0000_0000_cafe_f00du128;
+        let (high, low) = split_register_pair_128(&lit128(v)).expect("128-bit literal splits");
+        assert_eq!(
+            high,
+            Formula::BitVec { value: 0xdead_beef_0000_0001u64 as i128, width: 64 },
+            "first component must be the HIGH 64 bits"
+        );
+        assert_eq!(
+            low,
+            Formula::BitVec { value: 0x0000_0000_cafe_f00du64 as i128, width: 64 },
+            "second component must be the LOW 64 bits"
+        );
+    }
+
+    /// A half whose top bit is set must round-trip as its OWN 64-bit pattern,
+    /// not as a sign-extension of it. `value` is stored as `i128`, so this is
+    /// exactly where a careless cast would corrupt the high half into `-1`.
+    #[test]
+    fn literal_split_preserves_a_negative_looking_half() {
+        let (high, low) = split_register_pair_128(&lit128(u128::MAX)).expect("splits");
+        for half in [&high, &low] {
+            let lowered = formula_to_bvexpr(half).expect("half lowers");
+            assert_eq!(
+                lowered,
+                ay_proof::BvExpr::const_val(u128::from(u64::MAX), 64),
+                "each half of !0u128 is 64 set bits, not a sign-extended -1"
+            );
+        }
+    }
+
+    /// Anything that is not a manifest pair fails closed — no normalization, no
+    /// guessing at a split point.
+    #[test]
+    fn non_pair_shapes_do_not_split() {
+        assert!(split_register_pair_128(&Formula::BitVec { value: 7, width: 64 }).is_none());
+        assert!(split_register_pair_128(&wn(0)).is_none());
+    }
+
+    /// An UNEVEN concat must not be paired against a 64/64 one.
+    ///
+    /// NOTE ON WHAT THIS TEST DOES AND DOES NOT PIN: it passes with the width
+    /// pin REMOVED, because `export_bv_blast_proof_expr` independently rejects
+    /// this shape (the 96-bit half exceeds `SOLVED_MAX_WIDTH`). Measured, by
+    /// deleting the pin and re-running. It is kept as a shape regression, and
+    /// `pair_grade_is_refused_for_a_non_128_bit_pair` below is the test that
+    /// actually pins the width check.
+    #[test]
+    fn uneven_split_is_refused() {
+        let uneven = Formula::BvConcat(
+            b(Formula::BitVec { value: 0, width: 32 }),
+            b(Formula::BitVec { value: 0, width: 96 }),
+        );
+        assert!(
+            try_kernel_recheckable_pair_128(&uneven, &lit128(0)).is_none(),
+            "a 32/96 split must not be paired against a 64/64 one"
+        );
+    }
+
+    /// THE WIDTH PIN'S OWN TEST. A 64-bit obligation whose two sides are BOTH
+    /// `concat(32, 32)` is a matched, in-fragment, perfectly provable split —
+    /// the exporter has no complaint about it. It is nevertheless NOT a 128-bit
+    /// AAPCS64 register pair, and `KernelRecheckablePair` says it is. The pin is
+    /// what keeps the grade's label true, and this is the test that fails if the
+    /// pin is deleted (measured: deleting the pin makes this test fail and
+    /// `uneven_split_is_refused` still pass).
+    #[test]
+    fn pair_grade_is_refused_for_a_non_128_bit_pair() {
+        let half32 = |v: i128| {
+            Formula::BvConcat(
+                b(Formula::BitVec { value: v, width: 32 }),
+                b(Formula::BitVec { value: v, width: 32 }),
+            )
+        };
+        assert!(
+            try_kernel_recheckable_pair_128(&half32(5), &half32(5)).is_none(),
+            "a 64-bit concat(32,32) obligation must not be graded as a 128-bit \
+             register pair, however provable its halves are"
+        );
+    }
+
+    // --- THE MUTATION TESTS. These require the kernel to be compiled in: the
+    //     [PROVED] grade is the KERNEL's claim, so the baseline they mutate away
+    //     from only exists under `kernel-recheck`. ---
+
+    /// BASELINE: a 128-bit constant return is now kernel-[PROVED], carrying TWO
+    /// certificates. This is the grade move the whole change exists for — before
+    /// the split it was `AyValidated`, because `formula_to_bvexpr` has no
+    /// `BvConcat` arm and the obligation died at the lowering.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn pair_128_constant_return_is_kernel_proved() {
+        let machine = pair(0, 1234);
+        let spec = lit128(1234);
+        let evidence = try_kernel_recheckable_proof(&machine, &spec, None)
+            .expect("128-bit constant return must reach the kernel grade");
+        assert!(
+            matches!(evidence, ProvenEvidence::KernelRecheckablePair { .. }),
+            "expected a two-certificate pair grade, got {evidence:?}"
+        );
+        assert!(
+            OutputVerdict::Proven { evidence }.is_kernel_proved(),
+            "the pair grade must satisfy the [PROVED]-vs-[VALIDATED] discriminator"
+        );
+    }
+
+    /// THE LOAD-BEARING MUTATION. Corrupt the HIGH half ONLY — the low half is
+    /// still exactly right — and the kernel grade must be refused.
+    ///
+    /// If this test passes while `pair_128_constant_return_is_kernel_proved`
+    /// also passes, the high-half obligation is genuinely reaching the kernel.
+    /// If it were to fail (grade still awarded), the high half would be assumed
+    /// rather than checked, and the [PROVED] claim on every 128-bit return would
+    /// be a claim about 64 of its 128 bits.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn pair_128_high_half_corruption_refuses_the_kernel_grade() {
+        // Machine leaves 7 in X1; the spec's high half is 0. LOW halves agree.
+        let machine = pair(7, 1234);
+        let spec = lit128(1234);
+        assert!(
+            try_kernel_recheckable_proof(&machine, &spec, None).is_none(),
+            "a WRONG HIGH half must not be awarded the kernel grade"
+        );
+        // ATTRIBUTION: the refusal above must be caused by the high half, not by
+        // some blanket refusal of this shape. The LOW half of the very same
+        // corrupted obligation still discharges on its own.
+        assert!(
+            kernel_recheckable_bitblast(
+                &Formula::BitVec { value: 1234, width: 64 },
+                &Formula::BitVec { value: 1234, width: 64 },
+            )
+            .is_some(),
+            "control: the low half alone is kernel-accepted, so the refusal is \
+             attributable to the high half"
+        );
+    }
+
+    /// The symmetric mutation: a wrong LOW half with a correct high half must
+    /// also be refused. Without this, "both halves are obligations" would rest
+    /// on one direction only.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn pair_128_low_half_corruption_refuses_the_kernel_grade() {
+        let machine = pair(0, 1235);
+        let spec = lit128(1234);
+        assert!(
+            try_kernel_recheckable_proof(&machine, &spec, None).is_none(),
+            "a WRONG LOW half must not be awarded the kernel grade"
+        );
+    }
+
+    /// The pair-vs-pair shape (a carried 128-bit parameter returned unchanged),
+    /// with the same high-half mutation. The identity case is where the halves
+    /// are symbolic rather than constant, so it exercises leaf sharing across
+    /// the split: `X1` on both sides of the high obligation, `X0` on both sides
+    /// of the low one.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn pair_128_identity_is_proved_and_its_high_half_is_load_bearing() {
+        let spec = Formula::BvConcat(b(xn(1)), b(xn(0)));
+        let machine = Formula::BvConcat(b(xn(1)), b(xn(0)));
+        assert!(
+            matches!(
+                try_kernel_recheckable_proof(&machine, &spec, None),
+                Some(ProvenEvidence::KernelRecheckablePair { .. })
+            ),
+            "the 128-bit identity must be kernel-[PROVED] as a pair"
+        );
+        // Swap the halves on the machine side: each half is individually a
+        // perfectly good 64-bit register read, and the LOW obligation is now
+        // `X1 == X0` — false. The high one is too. Refuse.
+        let swapped = Formula::BvConcat(b(xn(0)), b(xn(1)));
+        assert!(
+            try_kernel_recheckable_proof(&swapped, &spec, None).is_none(),
+            "swapping X0/X1 must not be awarded the kernel grade"
+        );
+        // And the pure high-half corruption: LOW half untouched and correct.
+        let high_wrong = Formula::BvConcat(b(xn(2)), b(xn(0)));
+        assert!(
+            try_kernel_recheckable_proof(&high_wrong, &spec, None).is_none(),
+            "reading the HIGH half from the wrong register must not be awarded \
+             the kernel grade"
+        );
+    }
+}
+
+// ===========================================================================
 // IN-MODULE GATE TESTS — teeth: ACCEPT / REFUSE / FAIL-CLOSED.
 // ===========================================================================
 #[cfg(test)]
@@ -3600,6 +5094,81 @@ mod tests {
         }
     }
 
+    /// SMT-LIB bit width of a `Formula`, `None` on any inconsistency. Small on
+    /// purpose: it only needs to cover the shapes an extending load produces.
+    fn smt_bv_width(f: &Formula) -> Option<u32> {
+        match f {
+            Formula::Var(_, Sort::BitVec(w)) | Formula::SymVar(_, Sort::BitVec(w)) => Some(*w),
+            Formula::BitVec { width, .. } => Some(*width),
+            Formula::BvZeroExt(a, added) | Formula::BvSignExt(a, added) => {
+                smt_bv_width(a).map(|w| w + added)
+            }
+            Formula::BvExtract { high, low, .. } => Some(high - low + 1),
+            Formula::BvConcat(a, b) => Some(smt_bv_width(a)? + smt_bv_width(b)?),
+            Formula::BvAdd(a, b, w)
+            | Formula::BvSub(a, b, w)
+            | Formula::BvOr(a, b, w)
+            | Formula::BvAnd(a, b, w)
+            | Formula::BvXor(a, b, w)
+            | Formula::BvShl(a, b, w) => {
+                let (wa, wb) = (smt_bv_width(a)?, smt_bv_width(b)?);
+                (wa == wb && wa == *w).then_some(*w)
+            }
+            // A memory byte.
+            Formula::Select(..) => Some(8),
+            Formula::Ite(_, a, b) => {
+                let (wa, wb) = (smt_bv_width(a)?, smt_bv_width(b)?);
+                (wa == wb).then_some(wa)
+            }
+            _ => None,
+        }
+    }
+
+    /// A sign-extending load into an X register must reach the SOLVER as a
+    /// 64-bit term.
+    ///
+    /// `sem_ldr_variant` passed the TARGET WIDTH where `BvSignExt`/`BvZeroExt`
+    /// take the extension AMOUNT, so the byte-derived value for
+    /// `ldrsb x0,[x1]` was a 72-bit term (8 + 64) and `ldrsw x0,[x1]` a 96-bit
+    /// one. Nothing truncates an X-width register read, so the over-wide term
+    /// flowed straight into `discharge_equal_pre`, where
+    /// `try_eq(..).expect("eq")` ABORTED the process with
+    /// `SortMismatch { got: [BitVec(72), BitVec(64)] }`.
+    ///
+    /// Measured disposition: a PANIC, never a wrong verdict — the low bits of an
+    /// over-wide extension are the correct ones, so no route silently truncated
+    /// it to a different value. The W-forms were already width-correct because
+    /// the return readout extracts `[31:0]`.
+    ///
+    /// Both halves matter: the width assertion pins the formula, and reaching a
+    /// verdict at all pins that the discharge no longer aborts.
+    #[test]
+    fn sign_extending_load_into_x_reaches_the_solver_as_64_bits() {
+        const RET: u32 = 0xD65F_03C0;
+        // Assembler-derived (`clang --target=aarch64` + `objdump -d`).
+        let cases: &[(u32, &str)] = &[
+            (0x3980_0020, "ldrsb x0,[x1]"),
+            (0x7980_0020, "ldrsh x0,[x1]"),
+            (0xB980_0020, "ldrsw x0,[x1]"),
+        ];
+        for (enc, label) in cases {
+            let out = symbolic_machine_output(&words(&[*enc, RET]), 0, 64, false)
+                .unwrap_or_else(|e| panic!("{label} must be modeled: {e}"));
+            assert_eq!(
+                smt_bv_width(&out),
+                Some(64),
+                "{label}: byte-derived output is not a 64-bit term: {out:?}"
+            );
+
+            // And the discharge must produce a VERDICT rather than aborting.
+            let spec = Formula::Var("SPEC".into(), Sort::BitVec(64));
+            assert!(
+                matches!(discharge_equal_pre(&out, &spec, None), Discharge::CounterExample),
+                "{label}: a load against an unconstrained spec var must be refutable"
+            );
+        }
+    }
+
     fn binop_fn(name: &str, op: BinOp, ty: Ty) -> VerifiableFunction {
         wrap(
             name,
@@ -3624,6 +5193,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: ty,
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -3670,6 +5240,7 @@ mod tests {
                 }],
                 arg_count: 3,
                 return_ty: ty,
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -3698,6 +5269,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::bool_ty(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -3723,6 +5295,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: ty,
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -3749,6 +5322,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: dst,
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -4946,6 +6520,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -4968,6 +6543,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -5030,6 +6606,7 @@ mod tests {
                 ],
                 arg_count: 3,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -5068,6 +6645,7 @@ mod tests {
                 ],
                 arg_count: 4,
                 return_ty: Ty::u32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -5104,6 +6682,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -5142,8 +6721,138 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::u8(),
+                datatype_defs: Default::default(),
             },
         )
+    }
+
+    fn make_ptr_ro_u64() -> VerifiableFunction {
+        let ptr_ty = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u64()) };
+        wrap(
+            "mem_ptr_ro_u64",
+            VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::u64(), name: None },
+                    LocalDecl { index: 1, ty: ptr_ty, name: Some("p".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place {
+                            local: 1,
+                            projections: vec![Projection::Deref],
+                        })),
+                        span: sp(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
+            },
+        )
+    }
+
+    fn make_ptr_ro_u8() -> VerifiableFunction {
+        let ptr_ty = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+        wrap(
+            "mem_ptr_ro_u8",
+            VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::u8(), name: None },
+                    LocalDecl { index: 1, ty: ptr_ty, name: Some("p".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place {
+                            local: 1,
+                            projections: vec![Projection::Deref],
+                        })),
+                        span: sp(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::u8(),
+                datatype_defs: Default::default(),
+            },
+        )
+    }
+
+    /// THE `&T` PARAMETER RUNG, on the REAL IR semantics — what is now in the
+    /// fragment, and exactly what still is not.
+    ///
+    /// `trust_ir_semantics` of `fn(p: *const u8) -> u8 { *p }` is a BARE
+    /// `Select(MEM, X0)`: a read of memory the function never wrote. That is the
+    /// shape a reference parameter produces, it is the shape that had no lemma,
+    /// and it now DISCHARGES in the kernel through `Clean.BVC.selectAddrCong`
+    /// under the no-store side condition. This asserts it on the semantics the
+    /// gate actually derives, not on a hand-built `Formula`.
+    ///
+    /// Two things are deliberately still OUT, and naming them here keeps the
+    /// claim honest — neither is about caller memory:
+    ///
+    ///  * MULTI-BYTE ASSEMBLY. A `u64` load is eight byte `Select`s joined by
+    ///    `BvConcat` (IR side) / `BvOr`+`BvShl` (machine side). `BvConcat` has no
+    ///    `BvF` constructor at all, so the whole obligation leaves the fragment
+    ///    before the memory model is even consulted.
+    ///  * THE OPAQUE-LOAD READOUT SPINE. Even at one byte the emitted machine
+    ///    output carries `Extract[7:0]∘ZeroExt∘Or∘Extract[31:0]∘ZeroExt³` over the
+    ///    load, plus a `BvAdd(X0, 0)` address wrapper the IR side does not have.
+    ///    The concrete-cons `reflect_mem` path normalizes that spine for a
+    ///    store-load (the load bridges to the stored value, a concrete cons that
+    ///    reduces) — but a bare read is IRREDUCIBLY opaque by construction, so
+    ///    that trick cannot apply and a width-general extract-of-wider-zeroext
+    ///    lemma is what is missing. So the whole function stays [VALIDATED].
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn a_reference_parameter_load_reaches_the_fragment_but_its_readout_spine_does_not() {
+        use crate::verify_output_instantiate::test_support as ts;
+
+        // ── the one-byte read-only load: a BARE read, and it DISCHARGES ───────
+        let f8 = make_ptr_ro_u8();
+        let auto8 = trust_ir_semantics(&f8).expect("auto");
+        assert!(
+            matches!(&auto8, Formula::Select(m, _) if matches!(&**m, Formula::Var(..))),
+            "a load through a pointer PARAMETER must be a bare Select over a memory \
+             Var (the shape with no read-over-write to bridge through); got {auto8:?}"
+        );
+        assert!(store_free(&auto8), "a read-only body must satisfy the side condition");
+        assert!(
+            ts::reflect_formula_for(&auto8, &auto8, &auto8).is_ok(),
+            "the real IR semantics of `*p` must now reflect"
+        );
+        let d = crate::verify_output_instantiate::try_o1_instantiation_discharge(&auto8, &auto8);
+        assert!(
+            d.as_deref().is_some_and(|t| t.contains("selectAddrCong")),
+            "the real caller-memory read must be KERNEL-discharged via selectAddrCong; got {d:?}"
+        );
+
+        // ── the multi-byte load: still out, and out at `BvConcat` ─────────────
+        let f64 = make_ptr_ro_u64();
+        let auto64 = trust_ir_semantics(&f64).expect("auto");
+        let err = ts::reflect_formula_for(&auto64, &auto64, &auto64)
+            .err()
+            .expect("a multi-byte load is not in the fragment");
+        assert!(
+            err.contains("BvConcat"),
+            "the u64 load must fall out at the multi-byte ASSEMBLY, not at the memory \
+             model — that distinction is the whole point of this test; got: {err}"
+        );
+
+        // ── the whole functions: ay-proven, not yet kernel-[PROVED] ───────────
+        for f in [&f8, &f64] {
+            let v = verify_output_preserved(f);
+            assert!(v.is_proven(), "`{}` must be ay-proven", f.name);
+            assert!(
+                !v.is_kernel_proved(),
+                "honest: `{}` awaits the opaque-load readout spine / multi-byte assembly",
+                f.name
+            );
+        }
     }
 
     /// HONEST CHARACTERIZATION (memory construct rung, in progress). The memory
@@ -5241,6 +6950,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -5417,6 +7127,95 @@ mod tests {
         assert!(matches!(v, OutputVerdict::Unknown { .. }), "loop must be Unknown: {v:?}");
     }
 
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The executor must EXPLORE the taken side of a `CBZ`.
+    ///
+    /// CBZ/CBNZ/TBZ/TBNZ do not produce `Effect::ConditionalBranch` — only
+    /// `B.cond` does. They produce `Effect::PcUpdate { value: Ite(..) }`, which
+    /// the executor used to DISCARD, silently executing them as never-taken
+    /// while every other unmodeled effect fails closed.
+    ///
+    /// This pins the property directly rather than asserting on a verdict: two
+    /// functions that differ ONLY in the value returned on the TAKEN side must
+    /// have different symbolic outputs. Under the discard they were both just
+    /// the fall-through, hence equal — which is what let a miscompile hiding
+    /// behind a `cbz` come back `Proven` while the byte-identical `b.cond` form
+    /// came back `Refuted`.
+    #[test]
+    fn taken_side_of_cbz_is_explored() {
+        // cbz w0, +8 ; ret (return x) ; mov w0,#K ; ret (return K)
+        const CBZ_P8: u32 = 0x3400_0040;
+        const RET: u32 = 0xD65F_03C0;
+        let movz_w0 = |k: u32| 0x5280_0000 | (k << 5);
+
+        let five = symbolic_machine_output(&words(&[CBZ_P8, RET, movz_w0(5), RET]), 0, 32, false)
+            .expect("cbz function must be modeled, not rejected");
+        let seven = symbolic_machine_output(&words(&[CBZ_P8, RET, movz_w0(7), RET]), 0, 32, false)
+            .expect("cbz function must be modeled, not rejected");
+
+        assert_ne!(
+            five, seven,
+            "the taken side of a CBZ was not explored: two functions differing only in the \
+             value returned when the branch IS taken produced identical symbolic output, so a \
+             miscompile on that path is invisible to the gate"
+        );
+        assert!(
+            matches!(five, Formula::Ite(..)),
+            "a CBZ must fork the symbolic state (expected an Ite), got: {five:?}"
+        );
+    }
+
+    /// A 64-bit logical immediate with a NON-ZERO ROTATE must reach the machine
+    /// model as its real value.
+    ///
+    /// `decode_bitmask_immediate` overflowed `1u64 << 64` for exactly this
+    /// family. In a release build — how `trustc` ships — that silently yielded
+    /// `#0`, so `eor x0, x0, #0x8000000000000000` was modeled as the IDENTITY
+    /// and the gate certified it `Proven` with a kernel-re-checkable grade
+    /// against an identity spec, on code wrong for every input.
+    ///
+    /// This asserts the derived output is NOT the bare argument, which is the
+    /// property that failed. Checking only that decoding succeeds would have
+    /// passed throughout: the decoder never errored, it returned zero.
+    #[test]
+    fn rotated_logical_immediate_reaches_the_machine_model() {
+        // eor x0, x0, #0x8000000000000000 ; ret   (assembler-derived words)
+        const EOR_SIGNBIT: u32 = 0xD241_0000;
+        const RET: u32 = 0xD65F_03C0;
+
+        let out = symbolic_machine_output(&words(&[EOR_SIGNBIT, RET]), 0, 64, false)
+            .expect("eor with a rotated 64-bit immediate must be modeled");
+        let identity = symbolic_machine_output(&words(&[RET]), 0, 64, false)
+            .expect("bare ret must be modeled");
+
+        assert_ne!(
+            out, identity,
+            "a rotated 64-bit logical immediate decoded to 0: the machine model sees \
+             `eor x0,x0,#0x8000000000000000` as the identity, so that miscompile would be \
+             certified Proven against an identity spec"
+        );
+    }
+
+    /// The same property for `TBZ`, which shares the discarded-`PcUpdate` path.
+    #[test]
+    fn taken_side_of_tbz_is_explored() {
+        // tbz w0, #0, +8 ; ret ; mov w0,#K ; ret
+        const TBZ_B0_P8: u32 = 0x3600_0040;
+        const RET: u32 = 0xD65F_03C0;
+        let movz_w0 = |k: u32| 0x5280_0000 | (k << 5);
+
+        let a = symbolic_machine_output(&words(&[TBZ_B0_P8, RET, movz_w0(5), RET]), 0, 32, false)
+            .expect("tbz function must be modeled, not rejected");
+        let b = symbolic_machine_output(&words(&[TBZ_B0_P8, RET, movz_w0(7), RET]), 0, 32, false)
+            .expect("tbz function must be modeled, not rejected");
+
+        assert_ne!(a, b, "the taken side of a TBZ was not explored");
+        assert!(matches!(a, Formula::Ite(..)), "a TBZ must fork the symbolic state: {a:?}");
+    }
+
     /// f32 (single-precision) FADD is now PROVEN end-to-end: the emitted
     /// `FADD Sd,Sn,Sm` bytes equal the auto-derived IR semantics
     /// `FpToIeeeBv(FpAdd(RNE, FpFromBits(a,8,24), FpFromBits(b,8,24)))` over the
@@ -5450,6 +7249,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::Float { width: 32 },
+                datatype_defs: Default::default(),
             },
         );
         let v = verify_output_preserved(&f);
@@ -6112,6 +7912,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -6665,6 +8466,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
         )
     }
@@ -6743,6 +8545,124 @@ mod tests {
             Err(VerifyError::Unknown { function, .. }) => assert_eq!(function, "caller_ext2"),
             other => panic!("StrictProvenOnly must refuse an unverified caller, got {other:?}"),
         }
+    }
+
+    // =======================================================================
+    // UNWIND SCOPING — WHERE THE M-POS OBLIGATION STOPS.
+    //
+    // These two tests are MEASUREMENTS, not feature tests. They record why
+    // `panic=unwind` is refused in `rustc_codegen_trust_cg` (lib.rs, the
+    // `sess.panic_strategy().unwinds()` fatal) and what emitting invoke /
+    // cleanup / personality / LSDA / resume behind that refusal would and would
+    // NOT buy: the gate's obligation is
+    //
+    //     forall args. machine_ret(args) == ir_ret(args)
+    //
+    // ONE value, over the paths reachable by ARCHITECTURAL control flow. An
+    // unwind edge is a SECOND EXIT — a different exit kind, reached by the
+    // unwinder writing PC from the LSDA, carrying its own state. Neither half of
+    // the gate has a place to put it: both `trust_ir_semantics` and
+    // `symbolic_machine_output` return `Result<Formula, String>`, not an
+    // exit-tagged relation. So unwinding is a VERIFICATION-FRAGMENT question
+    // first and a codegen feature second, and the tests below pin the boundary
+    // so a future extension has to move it deliberately.
+    // =======================================================================
+
+    /// MACHINE SIDE. `PathMergingExecutor::run` starts at the entry PC and
+    /// follows fall-through, `b`, `b.cond` and `bl`+4 only; it RETURNS the
+    /// moment it decodes a `ret`. A landing pad has no architectural predecessor
+    /// — the unwinder jumps into it from the LSDA — so its bytes are never
+    /// decoded and never enter the obligation.
+    ///
+    /// Measured: appending an unreachable tail (`mov w0, wzr; ret` — code that
+    /// would return a DIFFERENT value — plus an undecodable word) leaves the
+    /// derived machine formula BIT-IDENTICAL, and the undecodable word does not
+    /// even fail the run. Bytes after the `ret` ship inside a `[PROVED]` object
+    /// with ZERO gate coverage, because `assert_merged_object_preserves_verified_text`
+    /// only pins that the shipped bytes EQUAL the verified object's bytes — it
+    /// never claims the executor decoded all of them.
+    #[test]
+    fn unwind_scope_gate_never_decodes_bytes_after_the_ret() {
+        let (_obj, code, base) = emit_text(&add_i32_fn()).expect("emit");
+        let baseline = symbolic_machine_output(&code, base, 32, false).expect("decode");
+
+        // The stand-in landing pad, appended exactly where a real one is placed:
+        //   mov w0, wzr   (0x2a1f03e0) — would make the function return 0
+        //   ret           (0xd65f03c0)
+        //   udf #0        (0x00000000) — not a decodable instruction at all
+        let mut with_pad = code.clone();
+        for word in [0x2a1f_03e0u32, 0xd65f_03c0, 0x0000_0000] {
+            with_pad.extend_from_slice(&word.to_le_bytes());
+        }
+        let padded = symbolic_machine_output(&with_pad, base, 32, false)
+            .expect("the executor stops at the ret, so the undecodable tail never fails it");
+
+        assert_eq!(
+            baseline, padded,
+            "MEASURED: 12 appended bytes — including one that does not decode — leave the \
+             machine-side formula unchanged. Bytes past the ret are OUTSIDE the M-POS \
+             obligation, so a landing pad emitted there would be unverified."
+        );
+    }
+
+    /// IR SIDE. `eval_block`'s `Terminator::Call` arm destructures
+    /// `{ func, args, dest, target, atomic, is_foreign, .. }` — the `..`
+    /// swallows `unwind`. The auto-derived spec of a call that CAN unwind is
+    /// therefore the spec of a call that CANNOT.
+    ///
+    /// Measured: the same caller with `unwind: Unreachable` (nounwind),
+    /// `unwind: Continue` (unwinds straight out of the function) and
+    /// `unwind: Cleanup(bb2)` (a real second CFG successor ending in `Resume`)
+    /// derives a BIT-IDENTICAL spec formula.
+    ///
+    /// This is NOT a live hole: `trust_mir_extract::extract_function_for_codegen`
+    /// refuses any non-`Unreachable` call unwind action (and every `Assert` /
+    /// `Drop` / `UnwindResume` / `UnwindTerminate`) before the gate is ever
+    /// reached, and `validate_codegen_instance_abi` refuses `fn_abi.can_unwind`.
+    /// The test pins WHERE the fail-closed lives — in the EXTRACTOR and the ABI
+    /// check, NOT in the gate — so that relaxing either one without extending
+    /// the obligation is a visible break rather than a silent normal-path-only
+    /// `[PROVED]`.
+    #[test]
+    fn unwind_scope_ir_semantics_ignores_the_unwind_edge() {
+        let add = binop_fn("add", BinOp::Add, Ty::i32());
+        let mut env = CalleeEnv::empty();
+        env.callees.insert("add".into(), derive_callee_pure(&add).expect("add is pure"));
+
+        let mut specs = Vec::new();
+        for edge in [
+            trust_types::UnwindEdge::Unreachable,
+            trust_types::UnwindEdge::Continue,
+            trust_types::UnwindEdge::Cleanup(BlockId(2)),
+        ] {
+            let needs_cleanup_block = matches!(edge, trust_types::UnwindEdge::Cleanup(_));
+            let mut caller = call2_i32_fn("caller_unwind_scope", "add", false);
+            match &mut caller.body.blocks[0].terminator {
+                Terminator::Call { unwind, .. } => *unwind = edge,
+                other => panic!("fixture block 0 must end in a Call, got {other:?}"),
+            }
+            if needs_cleanup_block {
+                // A REAL second successor: the block the unwinder enters, which
+                // (having no live drops here) immediately re-raises to the caller.
+                caller.body.blocks.push(BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![],
+                    terminator: Terminator::Resume,
+                });
+            }
+            specs.push(trust_ir_semantics_env(&caller, &env).expect("spec derives"));
+        }
+
+        assert_eq!(
+            specs[0], specs[1],
+            "MEASURED: `unwind: Continue` (a real unwind exit) derives the same single-value \
+             spec as `unwind: Unreachable` (nounwind) — the exit is not in the formula"
+        );
+        assert_eq!(
+            specs[0], specs[2],
+            "MEASURED: `unwind: Cleanup(bb2)` adds a reachable cleanup block ending in `Resume` \
+             and the spec is still bit-identical — the second exit path is never evaluated"
+        );
     }
 
     /// TEETH: a MISCOMPILED caller of a local pure callee is still REFUTED. We
@@ -6853,6 +8773,180 @@ mod tests {
             emit_objects_verified(&[], EmitPolicy::StrictProvenOnly),
             Err(VerifyError::EmptyModule)
         );
+    }
+
+    // =======================================================================
+    // ONE-OBJECT-PER-CGU + THE MERGE OBLIGATION.
+    //
+    // The per-function proof is unchanged; the merged artifact must CARRY each
+    // verified function's machine code verbatim. These tests pin that the
+    // obligation is (a) discharged on a real module, (b) discharged when a
+    // function is bound `Internal` (a local symbol), and (c) genuinely
+    // falsifiable — a merged object missing a verified function is REFUSED.
+    // =======================================================================
+
+    /// The module used by the merge tests: two independently-provable functions.
+    fn merge_module() -> Vec<VerifiableFunction> {
+        vec![
+            binop_fn("merge_add", BinOp::Add, Ty::i32()),
+            binop_fn("merge_or", BinOp::BitOr, Ty::u32()),
+        ]
+    }
+
+    #[test]
+    fn verified_module_object_preserves_every_function() {
+        use crate::codegen_backend::FunctionLinkage;
+        let backend = default_verification_backend();
+        let funcs = merge_module();
+        let (module_object, _report) = emit_module_object_verified_reported_with_backend(
+            &funcs,
+            &[FunctionLinkage::External; 2],
+            EmitPolicy::AllowUnknown,
+            &backend,
+        )
+        .expect("a module of provable functions must clear the gate and the merge obligation");
+
+        assert!(!module_object.bytes.is_empty(), "the merged artifact must have bytes");
+        let names: Vec<&str> =
+            module_object.preserved.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["merge_add", "merge_or"]);
+
+        // ANTI-VACUITY: the two functions must occupy DIFFERENT offsets, and at
+        // least one a non-zero one, or the byte windows compared inside the
+        // obligation are the same degenerate slice.
+        assert_ne!(
+            module_object.preserved[0].text_offset, module_object.preserved[1].text_offset,
+            "merged functions must occupy distinct text offsets"
+        );
+        assert!(
+            module_object.preserved.iter().any(|entry| entry.text_offset > 0),
+            "at least one merged function must sit past offset 0"
+        );
+        assert!(
+            module_object.preserved.iter().all(|entry| entry.len > 0),
+            "every preserved function must have a non-empty body"
+        );
+    }
+
+    #[test]
+    fn verified_module_object_preserves_internal_linkage_function() {
+        use crate::codegen_backend::FunctionLinkage;
+        let backend = default_verification_backend();
+        let funcs = merge_module();
+        let (module_object, _report) = emit_module_object_verified_reported_with_backend(
+            &funcs,
+            &[FunctionLinkage::Internal, FunctionLinkage::External],
+            EmitPolicy::AllowUnknown,
+            &backend,
+        )
+        .expect("binding a function Internal must not disturb its verified bytes");
+        assert_eq!(module_object.preserved.len(), 2);
+    }
+
+    /// TEETH. Hand the obligation a merged object that does NOT contain one of
+    /// the verified functions (here: the single-function object for `merge_add`
+    /// alone, presented as if it were the whole module) and assert it REFUSES.
+    /// Without this, "the bytes were preserved" could be vacuously true.
+    #[test]
+    fn merge_obligation_refuses_a_module_missing_a_verified_function() {
+        use crate::codegen_backend::{CompiledModule, EmittedModuleObject, FunctionLinkage};
+        let backend = default_verification_backend();
+        let funcs = merge_module();
+
+        // Verify both functions the normal way.
+        let (verified, _report) = emit_objects_verified_reported_with_backend(
+            &funcs,
+            EmitPolicy::AllowUnknown,
+            &backend,
+        )
+        .expect("both functions are provable");
+        assert_eq!(verified.len(), 2);
+
+        // Build a "merged" object that only ever contained the FIRST function.
+        let only_first = CompiledModule {
+            name: "merge.partial".to_string(),
+            lir_functions: vec![
+                backend.lower_function(&funcs[0]).expect("first function lowers"),
+            ],
+            object_path: None,
+            function_count: 1,
+            source_functions: Some(vec![funcs[0].clone()]),
+            linkage: vec![FunctionLinkage::External],
+        };
+        let partial = backend
+            .emit_module_object(&only_first)
+            .expect("single-function module emits");
+        let partial = EmittedModuleObject {
+            artifact_name: partial.artifact_name,
+            bytes: partial.bytes,
+            text_extents: partial.text_extents,
+        };
+
+        match assert_merged_object_preserves_verified_text(&partial, &verified) {
+            Err(VerifyError::MergedBytesDiverged { function, .. }) => {
+                assert_eq!(
+                    function, "merge_or",
+                    "the missing function is the one the obligation must name"
+                );
+            }
+            other => panic!(
+                "a merged object missing a verified function MUST be refused, got {other:?}"
+            ),
+        }
+    }
+
+    /// TEETH, byte level. Corrupt one instruction byte inside the merged text
+    /// and assert the obligation catches it.
+    #[test]
+    fn merge_obligation_refuses_corrupted_merged_bytes() {
+        use crate::codegen_backend::FunctionLinkage;
+        let backend = default_verification_backend();
+        let funcs = merge_module();
+
+        let (verified, _report) = emit_objects_verified_reported_with_backend(
+            &funcs,
+            EmitPolicy::AllowUnknown,
+            &backend,
+        )
+        .expect("both functions are provable");
+
+        let module = build_merged_module(&funcs, &[FunctionLinkage::External; 2], &backend)
+            .expect("module lowers");
+        let mut emitted = backend.emit_module_object(&module).expect("module emits");
+        assert_merged_object_preserves_verified_text(&emitted, &verified)
+            .expect("the untouched merge must satisfy the obligation");
+
+        // Find where __text lives in the file and flip a byte inside the SECOND
+        // function's body (its extent offset is > 0 by construction).
+        let (text, _base) =
+            extract_text_from_object(&emitted.bytes).expect("merged object has text");
+        let second = emitted
+            .text_extents
+            .iter()
+            .find(|extent| extent.offset > 0)
+            .expect("the second merged function sits past offset 0")
+            .clone();
+        let file_offset = find_subslice(&emitted.bytes, &text)
+            .expect("the text section bytes appear in the object file");
+        emitted.bytes[file_offset + second.offset as usize] ^= 0xff;
+
+        match assert_merged_object_preserves_verified_text(&emitted, &verified) {
+            Err(VerifyError::MergedBytesDiverged { function, detail }) => {
+                assert_eq!(function, second.name, "the corrupted function must be named");
+                assert!(
+                    detail.contains("differ from the"),
+                    "expected a byte-divergence diagnosis, got: {detail}"
+                );
+            }
+            other => panic!("a corrupted merged object MUST be refused, got {other:?}"),
+        }
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return None;
+        }
+        (0..=haystack.len() - needle.len()).find(|start| &haystack[*start..start + needle.len()] == needle)
     }
 
     // =======================================================================
@@ -7168,11 +9262,17 @@ mod tests {
         // and the emitted-bytes FNV-1a digest must be identical. add/sub are the
         // genuine [VALIDATED]->[PROVED] flips; and/xor are the #42 slow->O(1)
         // migrations — all four share the same fail-safe O(1) wiring.
-        let cases: [(&str, VerifiableFunction); 7] = [
+        let cases: [(&str, VerifiableFunction); 8] = [
             ("ADD", add_i32_fn()),
             ("SUB", binop_fn("det_sub_i32", BinOp::Sub, Ty::i32())),
             ("AND", binop_fn("det_and_u32", BinOp::BitAnd, Ty::u32())),
             ("XOR", binop_fn("det_xor_u32", BinOp::BitXor, Ty::u32())),
+            // OR joined this list when `Clean.BVC.bvf_or_cong` was proved. Until
+            // then only the one-sided `bvf_or_cong2` existed, so a machine `Orr`
+            // with two real operands had no O(1) route and fell back to
+            // bit-blasting: (c) MEASURED, `(x^y)|(x&y)` cost 20.94 s / 27.41 GB
+            // against 2.76 s / 0.99 GB for the same shape with `^` on top.
+            ("OR", binop_fn("det_or_u32", BinOp::BitOr, Ty::u32())),
             ("EQ", cmp_fn("det_eq_i32", BinOp::Eq, Ty::i32())),
             ("ULT", cmp_fn("det_ult_u32", BinOp::Lt, Ty::u32())),
             ("ULE", cmp_fn("det_ule_u32", BinOp::Le, Ty::u32())),
@@ -7363,6 +9463,232 @@ mod tests {
         assert!(ok.is_some(), "the correctly-paired and@32 obligation must discharge; got {ok:?}");
     }
 
+    /// SCOPING PROBE for the `&T` parameter blocker — is it the ABI gate or the
+    /// MEMORY FRAGMENT that actually stops a reference argument?
+    ///
+    /// `rustc_codegen_trust_cg`'s `scalar_register_abi_ty_supported` refused a
+    /// `&E` argument before anything else ran, so the ABI message was the one a
+    /// user saw — but the REAL constraint was this fragment: a load through a
+    /// PARAMETER reflects as `Select` over a bare `MEM`, memory the function never
+    /// wrote, and there was no lemma for that shape at all.
+    ///
+    /// Recorded as a test rather than prose because the design note that scoped
+    /// this blocker was an inference from reading `reflect_formula`, and two
+    /// earlier scopings in the same effort were wrong.
+    ///
+    /// The bare read is now IN the fragment, but only under the no-preceding-store
+    /// side condition (see
+    /// `a_bare_caller_memory_read_is_admitted_only_for_a_store_free_body`). What
+    /// this test still pins is the DEFAULT: under `ReflectCtx::closed` — the policy
+    /// every caller gets unless it has proved the side condition — a bare read is
+    /// refused, and refused for a DIFFERENT reason than an aliased one.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn a_bare_memory_read_is_outside_the_fragment_but_a_roundtrip_is_not() {
+        let addr = Formula::Var("P".to_string(), Sort::BitVec(64));
+        let val = Formula::Var("V".to_string(), Sort::BitVec(64));
+        let mem = Formula::Var("MEM".to_string(), Sort::BitVec(64));
+
+        // (1) `*p` where `p` is a parameter: Select over a BARE memory. Under the
+        //     FAIL-CLOSED default policy this is still outside the fragment.
+        let bare = Formula::Select(Box::new(mem.clone()), Box::new(addr.clone()));
+        let bare_err = reflect_formula(&bare)
+            .err()
+            .expect("a bare memory read must be REFUSED under the fail-closed policy");
+        assert!(
+            bare_err.contains("bare memory read outside fragment"),
+            "expected the bare-read refusal, got: {bare_err}"
+        );
+
+        // (2) store-then-load at the SAME address: inside the fragment today.
+        let roundtrip = Formula::Select(
+            Box::new(Formula::Store(
+                Box::new(mem.clone()),
+                Box::new(addr.clone()),
+                Box::new(val),
+            )),
+            Box::new(addr.clone()),
+        );
+        assert!(
+            reflect_formula(&roundtrip).is_ok(),
+            "the store-then-load roundtrip must still reflect"
+        );
+
+        // (3) load at a DIFFERENT address than the covering store: also out,
+        //     and by a DIFFERENT reason — aliasing, not bare-read. Pins that the
+        //     two exclusions are distinct rather than one catch-all.
+        let aliased = Formula::Select(
+            Box::new(Formula::Store(
+                Box::new(mem),
+                Box::new(addr),
+                Box::new(Formula::BitVec { value: 0, width: 64 }),
+            )),
+            Box::new(Formula::Var("Q".to_string(), Sort::BitVec(64))),
+        );
+        let alias_err = reflect_formula(&aliased)
+            .err()
+            .expect("an aliased read must be refused");
+        assert!(
+            alias_err.contains("address mismatch") || alias_err.contains("aliasing"),
+            "expected the aliasing refusal, got: {alias_err}"
+        );
+    }
+
+    /// THE `&T` PARAMETER FRAGMENT — a bare read of CALLER-PROVIDED memory is in,
+    /// and it is in ONLY for a body that never writes.
+    ///
+    /// `*e` for a `&u64` parameter reflects to `Select(MEM, P)`: a read of memory
+    /// the function never wrote. Neither read-over-write lemma applies (there is no
+    /// store to bridge through), which is what actually kept reference parameters
+    /// out of the fragment — the ABI refusal was only the message users saw.
+    ///
+    /// It is admitted through `Clean.BVC.selectAddrCong`, a congruence over
+    /// `bvSelect`'s ADDRESS at a fixed array, under one side condition checked
+    /// structurally over the WHOLE obligation: NO STORE on either side. Then both
+    /// sides read the same untouched pre-state and equal addresses give equal
+    /// values. With a store anywhere the argument is void — a read could be before
+    /// or after it — so it stays refused.
+    ///
+    /// This is also the MUTATION GUARD for that side condition: arms (2) and (3)
+    /// fail if `is_store_free` / `caller_memory_readable` is weakened.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn a_bare_caller_memory_read_is_admitted_only_for_a_store_free_body() {
+        // The memory sort the gate's own `trust_ir_semantics` produces for a load.
+        let mem_sort = || Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8)));
+        let mem = || Formula::Var("MEM".to_string(), mem_sort());
+        let p = || Formula::Var("P".to_string(), Sort::BitVec(64));
+        let q = || Formula::Var("Q".to_string(), Sort::BitVec(64));
+        let read = |m: Formula, a: Formula| Formula::Select(Box::new(m), Box::new(a));
+
+        // (1) POSITIVE — `*e` on both sides of a store-free obligation PROVES.
+        let machine = read(mem(), p());
+        let auto = read(mem(), p());
+        assert!(
+            reflect_formula_for(&machine, &machine, &auto).is_ok(),
+            "a bare caller-memory read must reflect for a store-free body"
+        );
+        let ok = crate::verify_output_instantiate::try_o1_instantiation_discharge(&machine, &auto);
+        assert!(
+            ok.as_deref().is_some_and(|t| t.contains("selectAddrCong")),
+            "the store-free caller-memory read must discharge via selectAddrCong; got {ok:?}"
+        );
+
+        // (2) SIDE CONDITION — the SAME read, with a store present on ONE side, is
+        //     REFUSED. Read-after-write and aliasing stay out of the fragment.
+        //     (Mutating `is_store_free` to admit `Store` turns this red.)
+        let with_store = Formula::BvAdd(
+            Box::new(read(mem(), p())),
+            Box::new(read(
+                Formula::Store(
+                    Box::new(mem()),
+                    Box::new(p()),
+                    Box::new(Formula::BitVec { value: 7, width: 64 }),
+                ),
+                p(),
+            )),
+            64,
+        );
+        assert!(
+            !store_free(&with_store),
+            "a formula containing a Store must NOT be classified store-free"
+        );
+        let refused = reflect_formula_for(&machine, &with_store, &auto)
+            .err()
+            .expect("a bare read must be refused once EITHER side writes memory");
+        assert!(
+            refused.contains("bare memory read outside fragment"),
+            "expected the bare-read refusal for a storing body, got: {refused}"
+        );
+        assert!(
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&with_store, &auto)
+                .is_none(),
+            "an obligation with a store must NOT discharge through the bare-read arm"
+        );
+
+        // (3) FAIL-CLOSED on nodes the walker cannot see into: an `Ite` is not in
+        //     the store-free whitelist, so it closes the door whatever it wraps.
+        //     (Mutating `is_store_free`'s catch-all to `true` turns this red.)
+        let opaque = Formula::Ite(
+            Box::new(Formula::Bool(true)),
+            Box::new(read(mem(), p())),
+            Box::new(read(mem(), p())),
+        );
+        assert!(
+            !store_free(&opaque),
+            "an unwhitelisted node must be treated as possibly-storing (fail closed)"
+        );
+
+        // (4) NO FALSE [PROVED] once the arm IS live: reads at DIFFERENT addresses,
+        //     and reads of DIFFERENTLY-NAMED memories, leave non-defeq cores and the
+        //     kernel DECLINES. The memory is an opaque axiom precisely so that this
+        //     is decided by the kernel and not by reduction.
+        let other_addr = read(mem(), q());
+        assert!(
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(
+                &machine,
+                &other_addr
+            )
+            .is_none(),
+            "reads at DIFFERENT addresses must not discharge"
+        );
+        let other_mem = read(Formula::Var("MEM2".to_string(), Sort::BitVec(64)), p());
+        assert!(
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&machine, &other_mem)
+                .is_none(),
+            "reads of DIFFERENTLY-NAMED memories must not discharge"
+        );
+
+        // (5) The address is reflected, not assumed: a read at `P + 8` on one side
+        //     against `P` on the other must not discharge, while the same wrapped
+        //     address on both sides must.
+        let bumped = read(
+            mem(),
+            Formula::BvAdd(Box::new(p()), Box::new(Formula::BitVec { value: 8, width: 64 }), 64),
+        );
+        assert!(
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&machine, &bumped)
+                .is_none(),
+            "a read at P+8 must not discharge against a read at P"
+        );
+        assert!(
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&bumped, &bumped)
+                .is_some(),
+            "the same computed address on both sides must discharge"
+        );
+    }
+
+    /// B4 BITWISE control (iv) — MIS-REFLECTION kernel-guarded for OR, the arm
+    /// added with `Clean.BVC.bvf_or_cong`.
+    ///
+    /// OR reached the O(1) path last, and it is the arm most worth guarding: the
+    /// general two-operand `BvOr` used to be an `Err` out of `reflect_formula`,
+    /// so every `|` fell back to bit-blasting. Now that it reflects, the ONLY
+    /// thing standing between a mis-paired obligation and a false [PROVED] is
+    /// the kernel `check_type`. This asserts that it discriminates: a machine
+    /// `X0|X1` against an auto `X0|X0` must DECLINE, while the correct pairing
+    /// discharges.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn b4_or_mis_reflection_is_kernel_guarded() {
+        let f = binop_fn("b4_or_misreflect", BinOp::BitOr, Ty::u32());
+        let (_o, code, base) = emit_text(&f).expect("emit");
+        let machine_out = symbolic_machine_output(&code, base, 32, false).expect("decode");
+        let auto_wrong = Formula::BvOr(b(wn(0)), b(wn(0)), 32);
+        let outcome = crate::verify_output_instantiate::try_o1_instantiation_discharge(
+            &machine_out,
+            &auto_wrong,
+        );
+        assert!(
+            outcome.is_none(),
+            "a MIS-PAIRED or obligation (machine X0|X1 vs auto X0|X0) must DECLINE; got {outcome:?}"
+        );
+        let auto = trust_ir_semantics(&f).expect("auto");
+        let ok =
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&machine_out, &auto);
+        assert!(ok.is_some(), "the correctly-paired or@32 obligation must discharge; got {ok:?}");
+    }
+
     /// B4 BITWISE control (iii) — MIS-REFLECTION kernel-guarded for xor: machine =
     /// real xor@32, but auto' = XOR vs the wrong operand -> declines; the correct
     /// pairing discharges. (xor shares the bare-zip lever with and; this guards
@@ -7513,15 +9839,37 @@ mod tests {
 
     #[cfg(feature = "kernel-recheck")]
     #[test]
-    fn gate_emits_proved_for_real_or() {
-        // BITWISE OR (the seed of this fragment) -> [PROVED], confirmed via the
-        // LIVE gate (not just the lowering helper).
+    fn gate_emits_proved_via_o1_for_real_or() {
+        // BITWISE OR: the SAME path migration `and` and `xor` made above — slow
+        // KernelRecheckable (bit-blast) -> fast O(1) KernelInstantiated. Still
+        // [PROVED], and ay leaves the cert chain.
+        //
+        // OR made this migration LAST, and only once `Clean.BVC.bvf_or_cong` was
+        // proved. Until then the only OR congruence was the one-sided
+        // `bvf_or_cong2`, which fixes the LEFT operand — enough for the
+        // `Orr Wd, WZR, Ws` register-move wrapper and nothing else — so a machine
+        // `Orr` with two real operands had no O(1) route and bit-blasted.
+        //
+        // (c) MEASURED with that fallback in place, one function through
+        // `--emit=link`, structure held constant and only the top operator
+        // varied: `(x ^ y) ^ (x & y)` cost 2.76 s / 0.99 GB while
+        // `(x ^ y) | (x & y)` cost 20.94 s / 27.41 GB — 28x, for an emission
+        // differing by ONE instruction (`eor` vs `orr`).
+        //
+        // This assertion previously read `kernel_proof().is_some()`, i.e. it
+        // required the `BvBlastProof` that ONLY the slow path attaches. That
+        // pinned the defect, exactly as the `and`/`xor` versions did before their
+        // own migrations; it is updated here for the same reason and in the same
+        // shape, and the grade it demands is STRICTLY STRONGER, not weaker.
         let verdict = verify_output_preserved(&binop_fn("proved_or_u32", BinOp::BitOr, Ty::u32()));
+        assert!(verdict.is_kernel_proved(), "or must stay kernel-[PROVED]; got {verdict:?}");
         assert!(
-            verdict.kernel_proof().is_some(),
-            "or(u32,u32) must be [PROVED] (KernelRecheckable), got {verdict:?}"
+            matches!(
+                verdict,
+                OutputVerdict::Proven { evidence: ProvenEvidence::KernelInstantiated { .. } }
+            ),
+            "or@32 migrated to the O(1) KernelInstantiated path; got {verdict:?}"
         );
-        verdict.kernel_proof().unwrap().validate().expect("or proof must re-check");
     }
 
     /// Trust: RUNG 1 ANTI-VACUITY (LOAD-BEARING). Take a REAL, ay-self-validating
@@ -8051,6 +10399,7 @@ mod tests {
     #[cfg(feature = "kernel-recheck")]
     use crate::verify_output_instantiate::test_support::{
         contains_wrapper, env_with_leaves as bvc_env_with_leaves, reflect_formula,
+        reflect_formula_for, store_free,
     };
 
     /// B2b END-TO-END: reflect the gate's REAL add@N machine_out + auto and
@@ -8291,5 +10640,874 @@ mod tests {
             move || run().expect("bvfEval differential vs trust_types bitvector semantics"),
         )
         .expect("differential kernel-check thread must complete");
+    }
+
+    // =======================================================================
+    // F — AN OBJECT THE MODEL CANNOT FULLY ACCOUNT FOR MUST NOT BE CERTIFIED
+    // =======================================================================
+    //
+    // THE GAP THIS ADDRESSES. This file has 19 byte-splicing sites and every
+    // one of them flips an opcode to build a MISCOMPILE and asserts `Refuted`.
+    // Not one splices a DECODABLE-BUT-UNMODELED instruction and asserts the
+    // gate declines to certify. So the whole suite tested the gate's ability to
+    // refute code it fully understands, and nothing tested its behaviour on
+    // code it does not — which is where both live soundness holes were: a
+    // discarded `Effect::PcUpdate`, and a `1u64 << 64` overflow in
+    // `decode_bitmask_immediate`. Both were the same failure — something
+    // SILENTLY DROPPED rather than refused — and a miscompile test cannot see
+    // that, because a dropped effect makes the machine side MATCH the spec.
+    //
+    // WHAT THESE TESTS DO NOT DO, stated because it was MEASURED rather than
+    // assumed: they do NOT catch either of those two bugs. Reintroducing the
+    // exact `PcUpdate` drop leaves every test in this block PASSING; only
+    // `taken_side_of_cbz_is_explored` / `..._tbz_...` fail. These tests pin the
+    // gate's response to instructions it does not model AT ALL; a dropped
+    // effect on an instruction it does model is a different failure, and the
+    // test that catches it is the one that asserts the taken edge is EXPLORED.
+    // Do not read this block as covering the bugs that motivated it.
+    //
+    // ANTI-VACUITY. Every negative test below is paired with a control that
+    // must still be `Proven` through the same splice harness
+    // (`f_splice_harness_control_*`). Without those, "the gate said Unknown"
+    // would be indistinguishable from "the harness broke the object", and this
+    // program has already shipped one mutation test that passed for the wrong
+    // reason.
+
+    /// Splice `word` into the emitted `__text` IMMEDIATELY BEFORE the
+    /// terminating `RET`, shifting the `RET` forward by one instruction.
+    ///
+    /// Insertion rather than overwrite is deliberate: overwriting an
+    /// instruction changes what the function computes, so a `Unknown` verdict
+    /// could not be attributed to the spliced word. Inserting leaves every
+    /// original instruction in place and in order, so a correctly-accounted-for
+    /// no-op keeps the ORIGINAL verdict — which is what the control tests
+    /// assert.
+    ///
+    /// Insertion moves every later instruction, so it is only valid on a
+    /// straight-line body with no PC-relative branch to displace. That is
+    /// CHECKED here, not assumed: any instruction before the `RET` whose
+    /// control flow is not `Fallthrough` panics the harness.
+    fn splice_before_ret(word: u32) -> impl Fn(&mut Vec<u8>, u64) {
+        move |code: &mut Vec<u8>, base: u64| {
+            let mut off = 0usize;
+            let mut pc = base;
+            while off + 4 <= code.len() {
+                let bytes: [u8; 4] = code[off..off + 4].try_into().expect("4-byte slice");
+                let insn = decode_aarch64(&bytes, pc)
+                    .unwrap_or_else(|e| panic!("emitted text must decode at {pc:#x}: {e:?}"));
+                if insn.opcode == Opcode::Ret {
+                    code.splice(off..off, word.to_le_bytes());
+                    return;
+                }
+                assert_eq!(
+                    insn.flow,
+                    trust_disasm::ControlFlow::Fallthrough,
+                    "splice_before_ret only handles a straight-line body: {:?} at {pc:#x} \
+                     is not Fallthrough, so inserting a word would displace a \
+                     PC-relative target",
+                    insn.opcode
+                );
+                pc += 4;
+                off += 4;
+            }
+            panic!("no RET found in the emitted text — nothing to splice before");
+        }
+    }
+
+    /// The gate's verdict for `func` with `word` spliced in before its `RET`.
+    fn verdict_with_spliced_word(func: &VerifiableFunction, word: u32) -> OutputVerdict {
+        with_text_corruptor(splice_before_ret(word), || verify_output_preserved(func))
+    }
+
+    /// The function every F test splices into: `fn(i32, i32) -> i32 { a + b }`,
+    /// whose emission is five straight-line words ending in `RET`.
+    fn f_host(name: &str) -> VerifiableFunction {
+        binop_fn(name, BinOp::Add, Ty::i32())
+    }
+
+    /// Assert every word in `rows` makes the gate DECLINE to certify.
+    ///
+    /// `Refuted` would also be a non-certification, but it is the WRONG answer
+    /// for these words: the gate cannot have found a counterexample to
+    /// semantics it never derived. `Unknown` is the honest verdict and the one
+    /// required here, so a future change that starts "refuting" unmodeled code
+    /// (which would be a fabricated claim) fails too.
+    fn assert_not_certified(rows: &[(u32, &str)], what: &str) {
+        for (word, asm) in rows {
+            let name = format!("f_unmodeled_{:08x}", word);
+            let verdict = verdict_with_spliced_word(&f_host(&name), *word);
+            assert!(
+                !verdict.is_proven(),
+                "{what}: `{asm}` ({word:#010x}) spliced into an emitted object was \
+                 CERTIFIED — the gate cannot account for this instruction, so a Proven \
+                 verdict is a claim about bytes it did not model. Got {verdict:?}"
+            );
+            assert!(
+                !verdict.is_kernel_proved(),
+                "{what}: `{asm}` ({word:#010x}) reached a KERNEL grade; got {verdict:?}"
+            );
+            assert!(
+                matches!(verdict, OutputVerdict::Unknown { .. }),
+                "{what}: `{asm}` ({word:#010x}) must be Unknown (fail-closed), not a \
+                 verdict about semantics the gate never derived; got {verdict:?}"
+            );
+        }
+    }
+
+    /// CONTROL (i) — the splice harness itself does not break the object.
+    ///
+    /// A `NOP` inserted before the `RET` changes nothing the gate reads, so the
+    /// verdict must be BIT-FOR-BIT the unspliced one, kernel grade included.
+    /// Without this, every `Unknown` below could be the harness corrupting the
+    /// object rather than the gate refusing an instruction.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn f_splice_harness_control_nop_keeps_the_original_verdict() {
+        // Assembler-derived (`clang --target=aarch64-apple-darwin` + `objdump -d`).
+        const NOP: u32 = 0xD503_201F;
+        let baseline = verify_output_preserved(&f_host("f_control_baseline"));
+        assert!(
+            baseline.is_kernel_proved(),
+            "the F host function must be kernel-[PROVED] unspliced, or the controls \
+             below prove nothing; got {baseline:?}"
+        );
+        let spliced = verdict_with_spliced_word(&f_host("f_control_baseline"), NOP);
+        assert_eq!(
+            spliced, baseline,
+            "splicing a NOP changed the verdict — the harness is corrupting the object, \
+             so no Unknown it produces can be attributed to the spliced instruction"
+        );
+    }
+
+    /// CONTROL (ii) — the harness survives a spliced instruction with REAL
+    /// effects, not just a no-op encoding.
+    ///
+    /// `add x9, x9, x9` produces a `RegWrite` the executor must thread through
+    /// a scratch register; `mov x9, x9` produces one too. Neither touches the
+    /// AAPCS64 result register, so the verdict must be unchanged. This is what
+    /// separates "the executor kept executing" from "the executor stopped".
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn f_splice_harness_control_live_instruction_keeps_the_original_verdict() {
+        // Assembler-derived.
+        for (word, asm) in [(0x8B09_0129u32, "add x9,x9,x9"), (0xAA09_03E9u32, "mov x9,x9")] {
+            let baseline = verify_output_preserved(&f_host("f_control_live"));
+            let spliced = verdict_with_spliced_word(&f_host("f_control_live"), word);
+            assert_eq!(
+                spliced, baseline,
+                "`{asm}` writes only a scratch register, so it must not change the \
+                 verdict; the executor either stopped or mis-threaded it"
+            );
+        }
+    }
+
+    /// A spliced BARRIER must not be certified.
+    ///
+    /// DMB/DSB/ISB/CLREX decode fine and produce `Effect::Aarch64SyncBoundary`,
+    /// which the gate's executor refuses. Nothing asserted that before: the
+    /// refusal arm was correct by inspection only, and the identically-shaped
+    /// `Effect::PcUpdate` arm two lines above it was WRONG for months.
+    #[test]
+    fn f_spliced_barrier_is_not_certified() {
+        assert_not_certified(
+            &[
+                (0xD503_3BBF, "dmb ish"),
+                (0xD503_3B9F, "dsb ish"),
+                (0xD503_3FDF, "isb"),
+                (0xD503_3F5F, "clrex"),
+            ],
+            "synchronization boundary",
+        );
+    }
+
+    /// A spliced ACQUIRE/RELEASE access must not be certified.
+    ///
+    /// LDAR/STLR carry a scalar data plane the executor COULD thread plus
+    /// `Effect::Aarch64AtomicAccess` ordering metadata it cannot. Certifying
+    /// them would silently drop the ordering fact — the same shape as dropping
+    /// the barrier, one level finer.
+    #[test]
+    fn f_spliced_acquire_release_is_not_certified() {
+        assert_not_certified(
+            &[
+                (0x88DF_FC20, "ldar w0,[x1]"),
+                (0xC8DF_FC20, "ldar x0,[x1]"),
+                (0x889F_FC20, "stlr w0,[x1]"),
+                (0xC89F_FC20, "stlr x0,[x1]"),
+            ],
+            "acquire/release access",
+        );
+    }
+
+    /// A spliced EXCLUSIVE pair must not be certified.
+    ///
+    /// LDXR/STXR/LDAXR/STLXR are refused one level earlier than the barrier
+    /// family — `Aarch64Semantics::effects` returns `UnsupportedAtomic` and no
+    /// effect is ever built. That is a DIFFERENT refusal path (semantics, not
+    /// executor), and it was equally untested: an executor that treated a
+    /// semantics error as "no effects" would have certified an STXR whose
+    /// conditional store and status write simply vanished.
+    #[test]
+    fn f_spliced_exclusive_pair_is_not_certified() {
+        assert_not_certified(
+            &[
+                (0x885F_7C22, "ldxr w2,[x1]"),
+                (0x8803_7C22, "stxr w3,w2,[x1]"),
+                (0x885F_FC22, "ldaxr w2,[x1]"),
+                (0x8803_FC22, "stlxr w3,w2,[x1]"),
+            ],
+            "exclusive monitor pair",
+        );
+    }
+
+    /// A spliced INDIRECT BRANCH must not be certified.
+    ///
+    /// `br x1` decodes and produces `Effect::Branch` with a SYMBOLIC target.
+    /// The executor needs a constant to continue, and the failure mode to guard
+    /// against is the tempting one: treat an unresolvable branch as
+    /// fallthrough. That would certify a function whose control flow the gate
+    /// never followed. `blr x1` is the same shape through the call path.
+    #[test]
+    fn f_spliced_indirect_branch_is_not_certified() {
+        assert_not_certified(
+            &[(0xD61F_0020, "br x1"), (0xD61F_0000, "br x0"), (0xD63F_0020, "blr x1")],
+            "indirect branch",
+        );
+    }
+
+    /// A spliced SYSTEM or TRAP instruction must not be certified.
+    #[test]
+    fn f_spliced_system_or_trap_is_not_certified() {
+        assert_not_certified(
+            &[
+                (0xD53B_4200, "mrs x0,nzcv"),
+                (0xD400_0001, "svc #0"),
+                (0xD420_0020, "brk #1"),
+                (0xD400_0002, "hvc #0"),
+                (0xD440_0000, "hlt #0"),
+                (0xD503_205F, "wfe"),
+                (0xD503_207F, "wfi"),
+            ],
+            "system/trap",
+        );
+    }
+
+    /// A word the DECODER refuses outright must not be certified.
+    ///
+    /// This is the outermost refusal — before any effect exists — and it covers
+    /// three distinct decoder verdicts, all of which must reach the same place:
+    ///
+    ///   * `UnallocatedEncoding` — a word the architecture does not define,
+    ///     including both families whose silent approximation was the live
+    ///     soundness hole (the reserved load/store-pair encodings around
+    ///     LDPSW, and the UNDEFINED bitmask-immediate encodings);
+    ///   * `UnmodeledAarch64Instruction` — a word the CPU DOES execute but this
+    ///     decoder deliberately declines to approximate (LDTR/STTR, FCMPE);
+    ///   * `UnknownEncoding` — a word outside every decode table.
+    #[test]
+    fn f_spliced_undecodable_word_is_not_certified() {
+        assert_not_certified(
+            &[
+                (0x0000_0000, "udf #0 (all-zero word)"),
+                (0xFFFF_FFFF, "all-ones word"),
+                (0xB840_0820, "ldtr w0,[x1] (unprivileged load)"),
+                (0xB800_0820, "sttr w0,[x1] (unprivileged store)"),
+                (0x1E21_2010, "fcmpe s0,s1 (signaling compare)"),
+                (0xE940_0440, "load/store pair opc=0b11 (reserved)"),
+                (0x6900_0440, "load/store pair opc=0b01,L=0 (STGP)"),
+                (0xB862_1820, "ldr [x1,x2,<option=0b000>] (reserved)"),
+                (0xB862_3820, "ldr [x1,x2,<option=0b001>] (reserved)"),
+                (0xB240_FC00, "orr x0,x0,#<all-ones element> (UNDEFINED)"),
+                (0xB200_FC00, "orr x0,x0,#<no element size> (UNDEFINED)"),
+            ],
+            "undecodable word",
+        );
+    }
+
+    /// The GPR<->FP `fmov` moves are MODELED — and the gate accounts for them.
+    ///
+    /// The SIMD register move is MODELED — so the gate accounting for it is
+    /// CORRECT, not a false verify.
+    ///
+    /// CORRECTION, measured 2026-08-16: `mov v0.16b,v2.16b` (0x4EA2_1C40) was
+    /// listed above as "SIMD, undecoded" and asserted to be un-certifiable. That
+    /// stopped being true. `trust_disasm` now decodes it as `Opcode::SimdMov`,
+    /// and `trust_machine_sem` models it — `Opcode::SimdMov => sem_fmov_reg`, a
+    /// full-width register copy — with `other => Err(UnsupportedOpcode)` still
+    /// failing closed on everything genuinely unhandled. The modeling landed
+    /// with its own coverage test
+    /// (`simd_register_move_is_modeled_and_its_siblings_still_fail_closed`) but
+    /// the word was never removed from the undecodable list here, so this test
+    /// went red asserting a gap that had been closed.
+    ///
+    /// The honest property is the `fmov`-shaped one below, not refusal: the move
+    /// writes V0 and cannot touch the AAPCS64 integer result register, so the
+    /// verdict must be UNCHANGED. Asserting non-certification instead would
+    /// demand the gate DECLINE code it correctly models, which is a different
+    /// error in the opposite direction.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn f_spliced_simd_register_move_is_accounted_for_not_dropped() {
+        // `mov v0.16b, v2.16b` == `orr v0.16b, v2.16b, v2.16b`. Assembler-derived.
+        const SIMD_MOV: u32 = 0x4EA2_1C40;
+
+        let baseline = verify_output_preserved(&f_host("f_simdmov_host"));
+        assert!(baseline.is_kernel_proved(), "host must be kernel-[PROVED]: {baseline:?}");
+
+        let spliced = verdict_with_spliced_word(&f_host("f_simdmov_host"), SIMD_MOV);
+        assert_eq!(
+            spliced, baseline,
+            "`mov v0.16b,v2.16b` writes only V0, so the integer verdict must be \
+             UNCHANGED. A different verdict means the executor lost its footing on an \
+             instruction it models."
+        );
+    }
+
+    /// CORRECTION TO THE BRIEF, measured: `fmov s0,w0` and `fmov w0,s0` are not
+    /// unmodeled. They decode as `Opcode::FmovReg` and `sem_fmov_reg` builds a
+    /// real bit-transfer effect for each direction. So the property to pin is
+    /// not "the gate declines" but "the gate does not DROP them", and the two
+    /// directions pin it from both sides:
+    ///
+    ///   * `fmov s0,w0` writes V0 and genuinely cannot change the integer
+    ///     result register, so the verdict must be UNCHANGED — anything else
+    ///     means the executor lost its footing on a modeled instruction;
+    ///   * `fmov w0,s0` OVERWRITES the AAPCS64 result register with V0's low
+    ///     lane, so the verdict must become `Refuted` — and it is exactly this
+    ///     half that a dropped `Effect::RegWrite` would turn back into
+    ///     `Proven`, certifying a function whose result the bytes clobber.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn f_spliced_gpr_fp_fmov_is_accounted_for_not_dropped() {
+        // Assembler-derived.
+        const FMOV_S0_W0: u32 = 0x1E27_0000;
+        const FMOV_W0_S0: u32 = 0x1E26_0000;
+
+        let baseline = verify_output_preserved(&f_host("f_fmov_host"));
+        assert!(baseline.is_kernel_proved(), "host must be kernel-[PROVED]: {baseline:?}");
+
+        let to_fp = verdict_with_spliced_word(&f_host("f_fmov_host"), FMOV_S0_W0);
+        assert_eq!(
+            to_fp, baseline,
+            "`fmov s0,w0` writes only V0, so the integer verdict must be unchanged"
+        );
+
+        let to_gpr = verdict_with_spliced_word(&f_host("f_fmov_host"), FMOV_W0_S0);
+        assert!(
+            matches!(to_gpr, OutputVerdict::Refuted { .. }),
+            "`fmov w0,s0` OVERWRITES the result register with V0's low lane, so the \
+             emitted bytes no longer compute `a + b`. A Proven verdict here means the \
+             move's RegWrite was DROPPED — the function's result is clobbered and the \
+             gate certified it anyway. Got {to_gpr:?}"
+        );
+        assert!(!to_gpr.is_proven() && !to_gpr.is_kernel_proved());
+    }
+
+    /// THE SHIPPING BOUNDARY: an object containing an unmodeled instruction is
+    /// REFUSED under the strict policy, and never counted as certified under the
+    /// permissive one.
+    ///
+    /// Every other F test asserts a VERDICT. This one asserts the consequence
+    /// the verdict exists for — what the build gate does with the bytes. A gate
+    /// that says `Unknown` and ships the object as [PROVED] anyway would pass
+    /// all of them.
+    #[test]
+    fn f_unmodeled_instruction_is_refused_at_the_build_gate() {
+        // `dmb ish` — decodable, and refused by the executor.
+        const DMB_ISH: u32 = 0xD503_3BBF;
+
+        let funcs = vec![f_host("f_gate_dmb")];
+
+        // StrictProvenOnly: the function must not ship at all.
+        let strict = with_text_corruptor(splice_before_ret(DMB_ISH), || {
+            emit_objects_verified_reported(&funcs, EmitPolicy::StrictProvenOnly)
+        });
+        match strict {
+            Err(VerifyError::Unknown { function, ref reason }) => {
+                assert_eq!(function, "f_gate_dmb");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "the refusal must name the fail-closed refusal, not a decode \
+                     accident; got {reason}"
+                );
+            }
+            other => panic!(
+                "an object containing an unmodeled instruction must be REFUSED under \
+                 StrictProvenOnly; got {other:?}"
+            ),
+        }
+
+        // AllowUnknown: it may ship, but ONLY as uncertified — never counted as
+        // [PROVED] or [VALIDATED].
+        let (objs, report) = with_text_corruptor(splice_before_ret(DMB_ISH), || {
+            emit_objects_verified_reported(&funcs, EmitPolicy::AllowUnknown)
+        })
+        .expect("AllowUnknown ships an undecided function");
+        assert_eq!(objs.len(), 1, "AllowUnknown ships the object");
+        assert_eq!(
+            (report.proved, report.validated, report.unknown),
+            (0, 0, 1),
+            "an object the gate could not model must be counted UNCERTIFIED, not \
+             proved or validated; got {report}"
+        );
+        assert_eq!(report.uncertified(), 1);
+    }
+
+    /// EVERY `Effect` variant has a MEASURED disposition at the output gate.
+    ///
+    /// This is the generic form of the tests above: not a list of instructions
+    /// somebody thought of, but a walk over the whole effect surface. Each row
+    /// names a variant, a real assembler-derived word that PRODUCES it, and
+    /// what the gate must do with it. Two things are asserted per row: that the
+    /// word really does produce that variant (so the row is not vacuous), and
+    /// that the end-to-end verdict matches the declared disposition.
+    ///
+    /// WHY THIS BREAKS ON A FOURTEENTH VARIANT. `Effect` is `#[non_exhaustive]`
+    /// and defined in another crate, so a wildcard-free match is impossible
+    /// HERE — a table is the only option that can fail. The build break lives
+    /// in the DEFINING crate instead, and the chain reaches this test:
+    ///
+    ///   1. `Effect::variant_name` (trust-machine-sem) is an exhaustive match
+    ///      with no wildcard => a new variant is `cargo build` error E0004;
+    ///   2. that match and `Effect::VARIANT_NAMES` are expanded from ONE token
+    ///      list by `declare_effect_census!`, so the edit that resolves (1) is
+    ///      the same edit that extends the name list — the two cannot drift.
+    ///      The generated match also carries `deny(unreachable_patterns)`, so
+    ///      silencing (1) by pasting rustc's suggested arm into the macro body
+    ///      instead of extending the list is itself a hard error;
+    ///   3. this test requires the table to cover `Effect::VARIANT_NAMES`
+    ///      exactly => the new variant cannot reach the gate without someone
+    ///      measuring what the gate does with it.
+    ///
+    /// So the answer to "which one actually breaks the build" is (1)+(2), in
+    /// trust-machine-sem; this test is the link that forces the MEASUREMENT.
+    /// (Until 2026-08-10 step 2 was a `const` assertion against
+    /// `core::mem::variant_count::<Effect>()`; that spent an unstable feature on
+    /// the compiler build graph and has been replaced by the single-source
+    /// expansion above.)
+    #[test]
+    fn f_every_effect_variant_has_a_measured_gate_disposition() {
+        use std::collections::BTreeSet;
+
+        /// What the output gate must do with an object containing this effect.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum GateDisposition {
+            /// The executor models it and reaches a decided verdict.
+            Decided,
+            /// A CONTROL-FLOW variant: modeled, and it must actually FORK the
+            /// symbolic state. `Decided` is too weak for these — it asserts only
+            /// "not Unknown", which a SILENTLY DROPPED branch effect satisfies
+            /// perfectly, since dropping it makes the machine side fall through
+            /// and agree with the spec. That is precisely how `Effect::PcUpdate`
+            /// survived: a row asserting `!Unknown` would have passed throughout.
+            DecidedAndForks,
+            /// The executor refuses it: `Unknown`, never `Proven`.
+            FailsClosed,
+        }
+        use GateDisposition::{Decided, DecidedAndForks, FailsClosed};
+
+        // (variant, word, asm, disposition, note)
+        // Every word is assembler-derived (`clang` + `objdump -d`); none is
+        // hand-encoded.
+        let rows: &[(&str, u32, &str, GateDisposition)] = &[
+            ("RegWrite", 0x8B09_0129, "add x9,x9,x9", Decided),
+            ("SpWrite", 0xD100_43FF, "sub sp,sp,#16", Decided),
+            ("MemWrite", 0xB900_0020, "str w0,[x1]", Decided),
+            ("MemRead", 0xB940_0029, "ldr w9,[x1]", Decided),
+            ("FlagUpdate", 0x6B09_0129, "subs w9,w9,w9", Decided),
+            ("Branch", 0x1400_0001, "b .+4", Decided),
+            ("ConditionalBranch", 0x5400_0020, "b.eq .+4", DecidedAndForks),
+            ("Call", 0x9400_0001, "bl .+4", FailsClosed),
+            ("Return", 0xD65F_03C0, "ret", Decided),
+            ("FpRegWrite", 0x1E27_0000, "fmov s0,w0", Decided),
+            ("Aarch64SyncBoundary", 0xD503_3BBF, "dmb ish", FailsClosed),
+            ("Aarch64AtomicAccess", 0x88DF_FC20, "ldar w0,[x1]", FailsClosed),
+            ("PcUpdate", 0x3400_0029, "cbz w9,.+4", DecidedAndForks),
+        ];
+
+        // COVERAGE: the table names every variant, and only real variants.
+        let covered: BTreeSet<&str> = rows.iter().map(|r| r.0).collect();
+        let declared: BTreeSet<&str> = Effect::VARIANT_NAMES.iter().copied().collect();
+        assert_eq!(
+            covered,
+            declared,
+            "the gate-disposition table does not cover every Effect variant. An \
+             uncovered variant is one the OUTPUT GATE was never measured against, \
+             which is exactly how `Effect::PcUpdate` came to be silently discarded. \
+             Missing: {:?}; unknown: {:?}",
+            declared.difference(&covered).collect::<Vec<_>>(),
+            covered.difference(&declared).collect::<Vec<_>>()
+        );
+
+        let sem = Aarch64Semantics;
+        let state = MachineState::symbolic();
+        for (variant, word, asm, disposition) in rows {
+            // (a) the row is not vacuous: this word really does produce this
+            //     variant. `ret` is the one row whose effects are produced but
+            //     never consumed (the executor returns at `Opcode::Ret` before
+            //     asking for them) — the production check still applies.
+            let insn = decode_aarch64(&word.to_le_bytes(), 0x1000)
+                .unwrap_or_else(|e| panic!("{variant}: `{asm}` must decode: {e:?}"));
+            let effects = sem
+                .effects(&state, &insn)
+                .unwrap_or_else(|e| panic!("{variant}: `{asm}` must have semantics: {e:?}"));
+            assert!(
+                effects.iter().any(|e| e.variant_name() == *variant),
+                "{variant}: `{asm}` produces {:?}, not the variant this row claims to \
+                 exercise",
+                effects.iter().map(Effect::variant_name).collect::<Vec<_>>()
+            );
+
+            // (b) the end-to-end gate disposition is the declared one.
+            let name = format!("f_surface_{}", variant.to_lowercase());
+            let verdict = verdict_with_spliced_word(&f_host(&name), *word);
+            match disposition {
+                Decided => assert!(
+                    !matches!(verdict, OutputVerdict::Unknown { .. }),
+                    "{variant}: `{asm}` is declared MODELED, but the gate failed closed \
+                     on it: {verdict:?}"
+                ),
+                DecidedAndForks => {
+                    assert!(
+                        !matches!(verdict, OutputVerdict::Unknown { .. }),
+                        "{variant}: `{asm}` is declared MODELED, but the gate failed \
+                         closed on it: {verdict:?}"
+                    );
+                    // The branch must actually SPLIT the state. A two-way body
+                    // whose arms return different values must derive an `Ite`;
+                    // if the effect is dropped the executor falls through and
+                    // derives the fall-through arm alone.
+                    let body = words(&[*word, 0xD65F_03C0, 0x5280_00A0, 0xD65F_03C0]);
+                    let derived = symbolic_machine_output(&body, 0, 32, false)
+                        .unwrap_or_else(|e| {
+                            panic!("{variant}: `{asm}` two-way body must be modeled: {e}")
+                        });
+                    assert!(
+                        matches!(derived, Formula::Ite(..)),
+                        "{variant}: `{asm}` did NOT fork the symbolic state — the taken \
+                         edge was not explored, so a miscompile on it is invisible to \
+                         the gate. Derived: {derived:?}"
+                    );
+                }
+                FailsClosed => {
+                    assert!(
+                        !verdict.is_proven() && !verdict.is_kernel_proved(),
+                        "{variant}: `{asm}` is declared UNMODELED, but the gate \
+                         CERTIFIED an object containing it: {verdict:?}"
+                    );
+                    assert!(
+                        matches!(verdict, OutputVerdict::Unknown { .. }),
+                        "{variant}: `{asm}` must fail closed to Unknown; got {verdict:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// THE GENERAL SELECT: `Formula::Ite` whose arms are DIFFERENT VALUES, lowered
+/// as the mask-mux `(sext(c) & a) | (~sext(c) & b)`.
+///
+/// The mux identity is the whole claim, so nothing here checks it by rebuilding
+/// the same expression and comparing structurally — that would only prove the
+/// lowering equals itself. Every correctness test below hands the lowered
+/// `BvExpr` to the REAL bit-blast solver against an INDEPENDENT formulation and
+/// requires a refutation of the disequality:
+///
+/// * against `b + ((a - b) & mask)` — the arithmetic select, which shares not a
+///   single gate with the bitwise one (ripple-carry adders vs. per-bit and/or);
+/// * against the arm itself, at a condition that is constantly true or
+///   constantly false — ground truth that does not mention a mask at all.
+///
+/// And the anti-vacuity row pairs the mux against the SWAPPED arms, which must
+/// NOT refute: otherwise "the solver agreed" would mean nothing.
+#[cfg(all(test, feature = "ay-proofs"))]
+mod tests_general_ite_mux {
+    use super::*;
+
+    /// An 8-bit named leaf — a genuine unknown VALUE, not a 0/1 flag, so the
+    /// compare-register matcher (`ite_pred_branches`) declines and the general
+    /// path is the one under test.
+    fn leaf(name: &str, width: u32) -> Formula {
+        Formula::Var(name.to_string(), Sort::BitVec(width))
+    }
+
+    /// A predicate inside the [PROVED] compare fragment: `W0 == 7`.
+    fn pred() -> Formula {
+        Formula::Eq(b(wn(0)), b(Formula::BitVec { value: 7, width: 32 }))
+    }
+
+    fn ite(cond: Formula, then_v: Formula, else_v: Formula) -> Formula {
+        Formula::Ite(b(cond), b(then_v), b(else_v))
+    }
+
+    /// `lhs` and `rhs` denote the same bitvector for every assignment — decided
+    /// by the SAME zero-trust exporter the [PROVED] grade runs on, and the
+    /// certificate is kernel-re-checked, so a bug in the export cannot make this
+    /// pass either.
+    fn assert_equivalent(lhs: &ay_proof::BvExpr, rhs: &ay_proof::BvExpr, why: &str) {
+        let proof = ay_proof::export_bv_blast_proof_expr(lhs, rhs).unwrap_or_else(|e| {
+            panic!("{why}: expected a refutation of the disequality, got {e:?}")
+        });
+        proof.validate().unwrap_or_else(|e| panic!("{why}: exported proof must re-check: {e:?}"));
+    }
+
+    /// THE MUX IDENTITY, against an arithmetic select that shares no gates with
+    /// it. Both arms are free 8-bit leaves and the condition is symbolic, so
+    /// this is the general case and not a folded one.
+    #[test]
+    fn general_select_equals_the_arithmetic_select() {
+        for width in [8u32, 16, 32] {
+            let (a, bb) = (leaf("A", width), leaf("B", width));
+            let lowered = formula_to_bvexpr(&ite(pred(), a.clone(), bb.clone()))
+                .unwrap_or_else(|e| panic!("width {width}: a general select must lower: {e}"));
+
+            // b + ((a - b) & mask), mask = sext(pred, width-1).
+            let mask =
+                ay_proof::BvExpr::sign_ext(predicate_to_bvexpr(&pred()).expect("pred"), width - 1);
+            let reference = ay_proof::BvExpr::add(
+                formula_to_bvexpr(&bb).expect("b"),
+                ay_proof::BvExpr::and(
+                    ay_proof::BvExpr::sub(
+                        formula_to_bvexpr(&a).expect("a"),
+                        formula_to_bvexpr(&bb).expect("b"),
+                    ),
+                    mask,
+                ),
+            );
+            assert_equivalent(&lowered, &reference, &format!("width {width} mask-mux"));
+        }
+    }
+
+    /// ANTI-VACUITY. The same comparison against the SWAPPED arms is a FALSE
+    /// identity, so the exporter must find a model instead of a refutation. If
+    /// this refuted, every `assert_equivalent` above would be meaningless.
+    #[test]
+    fn general_select_is_not_equal_to_its_own_swapped_arms() {
+        let (a, bb) = (leaf("A", 8), leaf("B", 8));
+        let lowered = formula_to_bvexpr(&ite(pred(), a.clone(), bb.clone())).expect("lower");
+        let swapped = formula_to_bvexpr(&ite(pred(), bb, a)).expect("lower swapped");
+        let result = ay_proof::export_bv_blast_proof_expr(&lowered, &swapped);
+        assert!(
+            matches!(result, Err(ay_proof::BvExprExportError::NoRefutation)),
+            "`c ? a : b` and `c ? b : a` differ whenever a != b: the export must find a \
+             model, got {result:?}"
+        );
+    }
+
+    /// GROUND TRUTH, with no mask in the reference at all: at a condition that
+    /// is constantly true the select IS the then-arm, and at a constantly false
+    /// one it IS the else-arm. Both are still lowered through the general path
+    /// (the arms are leaves, so the 0/1 compare-register matcher declines).
+    #[test]
+    fn a_constant_condition_selects_the_corresponding_arm() {
+        let (a, bb) = (leaf("A", 32), leaf("B", 32));
+        for (cond, want, which) in [
+            (Formula::Bool(true), &a, "true -> then"),
+            (Formula::Bool(false), &bb, "false -> else"),
+        ] {
+            let lowered =
+                formula_to_bvexpr(&ite(cond, a.clone(), bb.clone())).expect("lower constant-cond");
+            let reference = formula_to_bvexpr(want).expect("arm");
+            assert_equivalent(&lowered, &reference, which);
+        }
+    }
+
+    /// THE 1-BIT EDGE. At `tw == 1` there is no room for a `sign_ext`, so the
+    /// mask is the raw predicate; the identity must still hold. A `sign_ext(p,
+    /// 0)`-shaped slip would produce a 1-bit-too-wide expression and fail the
+    /// width assertion here before it ever reached the solver.
+    #[test]
+    fn general_select_at_width_1_uses_the_predicate_as_the_mask() {
+        let (a, bb) = (leaf("A", 1), leaf("B", 1));
+        let lowered = formula_to_bvexpr(&ite(pred(), a.clone(), bb.clone()))
+            .expect("a 1-bit general select must lower");
+        assert_eq!(bvexpr_width(&lowered), Some(1), "a 1-bit select stays 1 bit wide");
+
+        // xor(b, mask & xor(a, b)) — the third independent formulation.
+        let mask = predicate_to_bvexpr(&pred()).expect("pred");
+        let reference = ay_proof::BvExpr::xor(
+            formula_to_bvexpr(&bb).expect("b"),
+            ay_proof::BvExpr::and(
+                mask,
+                ay_proof::BvExpr::xor(
+                    formula_to_bvexpr(&a).expect("a"),
+                    formula_to_bvexpr(&bb).expect("b"),
+                ),
+            ),
+        );
+        assert_equivalent(&lowered, &reference, "1-bit mask-mux");
+    }
+
+    /// UNEQUAL ARM WIDTHS are not a select at all, and the refusal must SAY so
+    /// — a generic "outside the fragment" here would let a genuinely ill-formed
+    /// `Ite` be mistaken for an unsupported-but-harmless one.
+    #[test]
+    fn unequal_arm_widths_fail_closed() {
+        let err = formula_to_bvexpr(&ite(pred(), leaf("A", 8), leaf("B", 32)))
+            .expect_err("arms of different widths are not a well-formed select");
+        assert!(
+            err.contains("differ in width"),
+            "the refusal must name the width mismatch; got {err}"
+        );
+        assert!(err.contains("8") && err.contains("32"), "and report both widths; got {err}");
+    }
+
+    /// An arm outside the fragment still fails closed rather than being
+    /// mask-muxed into an obligation the exporter cannot mean.
+    ///
+    /// The two-leaf CONTROL is what makes this a statement about the ARM: with
+    /// no general select admitted at all, "a real-sorted arm is refused" is
+    /// vacuously true and says nothing.
+    #[test]
+    fn an_arm_outside_the_fragment_fails_closed() {
+        formula_to_bvexpr(&ite(pred(), leaf("A", 8), leaf("B", 8)))
+            .expect("control: two in-fragment arms ARE a select");
+
+        let outside = Formula::Var("F".to_string(), Sort::Int);
+        assert!(
+            formula_to_bvexpr(&ite(pred(), outside.clone(), leaf("B", 8))).is_err(),
+            "a non-bitvector then-arm must fail closed"
+        );
+        assert!(
+            formula_to_bvexpr(&ite(pred(), leaf("A", 8), outside)).is_err(),
+            "a non-bitvector else-arm must fail closed"
+        );
+        // A predicate outside the [PROVED] compare fragment takes the whole
+        // select with it: the mask has to BE the compare fragment's predicate.
+        assert!(
+            formula_to_bvexpr(&ite(
+                Formula::Var("P".to_string(), Sort::Bool),
+                leaf("A", 8),
+                leaf("B", 8)
+            ))
+            .is_err(),
+            "a condition outside the compare fragment must fail closed"
+        );
+    }
+
+    /// THE TWO `Ite` PATHS STAY DISTINCT. `pred ? 1 : 0` is the COMPARE-REGISTER
+    /// form and must still lower to the predicate itself (zero-extended) — the
+    /// pre-existing path must not have been swallowed by the general one — while
+    /// `pred ? a : b` must take the new mask-mux path and produce something
+    /// other than that predicate.
+    ///
+    /// Asserting both in one test is deliberate: the first half alone holds at
+    /// HEAD (where the general path does not exist) and so cannot witness this
+    /// change; the second half is what distinguishes the two paths at all.
+    #[test]
+    fn the_two_ite_paths_stay_distinct() {
+        let compare_register = ite(
+            pred(),
+            Formula::BitVec { value: 1, width: 32 },
+            Formula::BitVec { value: 0, width: 32 },
+        );
+        let lowered = formula_to_bvexpr(&compare_register).expect("compare-register form lowers");
+        let want = ay_proof::BvExpr::zero_ext(predicate_to_bvexpr(&pred()).expect("pred"), 31);
+        assert_eq!(lowered, want, "`pred ? 1 : 0` must stay the plain zero-extended predicate");
+
+        let general = formula_to_bvexpr(&ite(pred(), leaf("A", 32), leaf("B", 32)))
+            .expect("a general select must lower");
+        assert_ne!(
+            general, want,
+            "`pred ? a : b` must NOT collapse to the compare-register lowering"
+        );
+        assert_eq!(bvexpr_width(&general), Some(32), "and it must stay at the arms' width");
+    }
+}
+
+/// `reg_width` used to end in `_ => 32`: "any type I do not recognize occupies a
+/// 32-bit register". The most dangerous consumer is [`return_reg_width`], which
+/// decides how many bits of the return register the gate reads back out of the
+/// EMITTED OBJECT — answering 32 for an aggregate return would have compared the
+/// low half of W0 against the spec, and an aggregate return does not live in X0
+/// at all (AAPCS returns it indirectly through X8).
+#[cfg(test)]
+mod reg_width_fail_closed_tests {
+    use trust_types::Ty;
+
+    use super::*;
+
+    /// The scalar types that DO have a defined single-register slot, with the
+    /// width each occupies.
+    #[test]
+    fn scalar_types_keep_their_register_slot_width() {
+        let cases: &[(Ty, u32)] = &[
+            (Ty::Int { width: 8, signed: true }, 8),
+            (Ty::Int { width: 32, signed: false }, 32),
+            (Ty::Int { width: 64, signed: true }, 64),
+            (Ty::Bv(16), 16),
+            (Ty::Bool, 32),
+            (Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Bool) }, 64),
+            (Ty::Ref { mutable: true, inner: Box::new(Ty::Bool) }, 64),
+            (Ty::Float { width: 64 }, 64),
+            (Ty::Float { width: 32 }, 32),
+        ];
+        for (ty, want) in cases {
+            assert_eq!(
+                reg_width(ty).unwrap_or_else(|e| panic!("{ty:?} must have a slot width: {e}")),
+                *want,
+                "{ty:?}"
+            );
+        }
+    }
+
+    /// Everything else must REFUSE rather than answer 32.
+    ///
+    /// `PtrSizedInt`, `Char` and `Str` are the pointed cases: all three are
+    /// recent additions to `Ty` that landed straight in the old `_` arm and
+    /// silently acquired a 32-bit answer — `PtrSizedInt` is 64-bit and `Str` is
+    /// a fat pointer, so two of the three guesses were simply wrong.
+    #[test]
+    fn non_scalar_types_are_refused_rather_than_guessed_at_32_bits() {
+        let cases: &[Ty] = &[
+            Ty::PtrSizedInt { signed: false },
+            Ty::Char,
+            Ty::Str,
+            Ty::Slice { elem: Box::new(Ty::Int { width: 8, signed: false }) },
+            Ty::Array { elem: Box::new(Ty::Int { width: 8, signed: false }), len: 4 },
+        ];
+        for ty in cases {
+            let err = reg_width(ty)
+                .expect_err(&format!("{ty:?} has no register slot and must be refused"));
+            assert!(err.contains("no register-slot width"), "{ty:?} refusal should say why: {err}");
+        }
+    }
+
+    /// The refusal must PROPAGATE: `return_reg_width` is the caller that decides
+    /// how many bits of the return register the gate reads back from the emitted
+    /// object, and it must inherit the refusal rather than re-guess.
+    #[test]
+    fn a_return_type_with_no_register_slot_makes_the_return_width_unavailable() {
+        let mk = |ty: Ty| trust_types::VerifiableFunction {
+            name: "f".into(),
+            def_path: "verify_output::f".into(),
+            span: trust_types::SourceSpan::default(),
+            body: trust_types::VerifiableBody {
+                locals: vec![],
+                blocks: vec![],
+                arg_count: 0,
+                return_ty: ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+
+        for ty in
+            [Ty::Str, Ty::Slice { elem: Box::new(Ty::Bool) }, Ty::PtrSizedInt { signed: true }]
+        {
+            assert!(
+                return_reg_width(&mk(ty.clone())).is_err(),
+                "{ty:?} return must not yield a register width"
+            );
+        }
+        // ... and a scalar return still does.
+        assert_eq!(
+            return_reg_width(&mk(Ty::Int { width: 64, signed: true })).expect("i64 return"),
+            64
+        );
     }
 }

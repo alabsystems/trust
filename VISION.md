@@ -305,9 +305,9 @@ substitution, assertion insertion, caller propagation).
 `trust-ny-bridge` (→ ny neural certificates), `trust-wasm-bridge`
 (trust-types/trust-ir → WebAssembly).
 
-**Temporal** — `trust-temporal` (state-machine extraction), `trust-spec-temporal`
-(derived TLA+ from one source of truth), `trust-spec-temporal-macros`
-(`trust_model!` / `temporal_model!` compatibility shims, deprecated in place).
+**Temporal** — `trust-temporal` (state-machine extraction),
+`trust-spec-temporal` (Clean temporal notation and exact model-bound proof
+replay; the former Rust compatibility macros are retired).
 
 **Analysis and binary lifting** — `trust-symex` (symbolic execution,
 counterexample replay), `trust-transval` (translation validation),

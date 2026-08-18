@@ -173,7 +173,15 @@ main() {
 
     # `type -P` ignores inherited shell functions and aliases.  Isolated mode
     # keeps PYTHONPATH/PYTHONHOME and user site hooks out of the helper.
-    PYTHON_BIN=$(type -P python3 || true)
+    PYTHON_BIN=
+    local candidate
+    for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+        PYTHON_BIN=$(type -P "$candidate" || true)
+        if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ]; then
+            break
+        fi
+        PYTHON_BIN=
+    done
     if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
         printf 'FAIL: python3 executable is required for fail-closed auditing\n' >&2
         return 1

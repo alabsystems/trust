@@ -38,6 +38,7 @@ fn wrapping_neg_fn(ty: Ty, callee: &str) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

@@ -457,7 +457,10 @@ pub(super) fn sem_call_arg_operand(
         let opaque_call_value = match body.locals.get(place.local).map(|local| &local.ty) {
             Some(Ty::Ref { mutable: false, .. }) => !deref_write_exists(body, place.local),
             Some(Ty::RawPtr { .. }) => true,
-            Some(ty) if crate::assignment_types::modeled_enum_variant_count(ty).is_some() => {
+            Some(ty)
+                if crate::assignment_types::modeled_enum_variant_count(&body.datatype_defs, ty)
+                    .is_some() =>
+            {
                 // Unlike a pointer/reference handle, this `Var` denotes the enum
                 // parameter's complete entry value. Require the complete call-family
                 // write profile to be empty as well as the shared reassignment gate:
@@ -540,7 +543,11 @@ pub(super) fn sem_call_arg_ref_operand(
             [] => {
                 let index = param_index(referent.local)?;
                 let referent_ty = &body.locals.get(referent.local)?.ty;
-                if crate::assignment_types::modeled_enum_variant_count(referent_ty).is_none()
+                if crate::assignment_types::modeled_enum_variant_count(
+                    &body.datatype_defs,
+                    referent_ty,
+                )
+                .is_none()
                     || !call_family_local_writes(body, referent.local)
                         .is_some_and(|(assignments, calls)| assignments == 0 && calls.is_empty())
                 {
@@ -558,7 +565,11 @@ pub(super) fn sem_call_arg_ref_operand(
                 };
                 let Ty::Adt { fields, .. } = inner.as_ref() else { return None };
                 let (_, field_ty) = fields.get(*field)?;
-                if crate::assignment_types::modeled_enum_variant_count(field_ty).is_none()
+                if crate::assignment_types::modeled_enum_variant_count(
+                    &body.datatype_defs,
+                    field_ty,
+                )
+                .is_none()
                     || deref_write_exists(body, referent.local)
                 {
                     return None;
@@ -949,8 +960,9 @@ pub(crate) fn sem_call_return_of_mir(
     if resolved == func.def_path || *callee_str == func.def_path {
         return None;
     }
-    // Arity must match the certified callee's declared parameter count.
-    if fact.arg_count != args.len() {
+    // The actual signature must match the compiler-extracted certified
+    // signature exactly. MIR has already made every coercion explicit.
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) {
         return None;
     }
 
@@ -1320,7 +1332,7 @@ pub(crate) fn sem_call_then_pureop_of_mir(
     if resolved == func.def_path || *callee_str == func.def_path {
         return None; // self-recursion fails closed.
     }
-    if fact.arg_count != args.len() {
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) {
         return None;
     }
     if args.is_empty() {
@@ -1653,7 +1665,9 @@ pub(crate) fn sem_call_op_call_of_mir(
     {
         return None; // self-recursion fails closed.
     }
-    if fact1.arg_count != args1.len() || fact2.arg_count != args2.len() {
+    if !crate::mirsem::callee_signature_matches(func, args1, dest1, fact1)
+        || !crate::mirsem::callee_signature_matches(func, args2, dest2, fact2)
+    {
         return None;
     }
     if args1.is_empty() || args2.is_empty() {
@@ -1724,6 +1738,13 @@ pub(crate) fn sem_call_op_call_of_mir(
             )?
             .2;
             let Rvalue::CheckedBinaryOp(op, x, y) = checked else { return None };
+            // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — the shared assert
+            // license (see `checked_pair_int_reading_licensed`): this arm's old
+            // doc recited the separately-discharged-VC premise the round
+            // disproved (an assert-less checked op emits ZERO safety VCs).
+            if !crate::mirsem::checked_pair_int_reading_licensed(body, p.local, *op) {
+                return None;
+            }
             (op, match_operands(x, y)?)
         }
         _ => return None, // an unmodeled `_0` write — fail closed.
@@ -1937,7 +1958,7 @@ pub(crate) fn sem_call_or_call_of_mir(
 
     // FALSE arm: NO statements; its SOLE terminator is `callee_b`'s Call, writing
     // `_0` DIRECTLY (bare, unprojected — never a temp), reaching Return.
-    let (callee_b_str, args_b, target_b, atomic_b, foreign_b, unsafe_b) = {
+    let (callee_b_str, args_b, dest_b, target_b, atomic_b, foreign_b, unsafe_b) = {
         let blk = body.blocks.iter().find(|b| b.id == false_bb)?;
         if !blk.stmts.is_empty() {
             return None; // any statement here is outside this shape — fail closed.
@@ -1961,7 +1982,7 @@ pub(crate) fn sem_call_or_call_of_mir(
         if dest.local != 0 || !dest.projections.is_empty() {
             return None; // must write `_0` DIRECTLY — never a temp.
         }
-        (callee, args, (*target)?, atomic, *is_foreign, *is_unsafe_sig)
+        (callee, args, dest, (*target)?, atomic, *is_foreign, *is_unsafe_sig)
     };
     if foreign_b || atomic_b.is_some() || unsafe_b {
         return None;
@@ -1986,7 +2007,9 @@ pub(crate) fn sem_call_or_call_of_mir(
     {
         return None; // self-recursion fails closed.
     }
-    if fact_a.arg_count != args_a.len() || fact_b.arg_count != args_b.len() {
+    if !crate::mirsem::callee_signature_matches(func, args_a, dest_a, fact_a)
+        || !crate::mirsem::callee_signature_matches(func, args_b, dest_b, fact_b)
+    {
         return None;
     }
     if args_a.is_empty() || args_b.is_empty() {
@@ -2205,7 +2228,7 @@ pub(crate) fn sem_call_or_guarded_compare_of_mir(
         return None; // sole-writer — the field-read statement itself.
     }
 
-    let (callee_b_str, args_b, c_local, target_b, atomic_b, foreign_b, unsafe_b) = {
+    let (callee_b_str, args_b, dest_b, c_local, target_b, atomic_b, foreign_b, unsafe_b) = {
         let Terminator::Call {
             func: callee,
             args,
@@ -2225,7 +2248,7 @@ pub(crate) fn sem_call_or_guarded_compare_of_mir(
         if param_index(dest.local).is_some() {
             return None;
         }
-        (callee, args, dest.local, (*target)?, atomic, *is_foreign, *is_unsafe_sig)
+        (callee, args, dest, dest.local, (*target)?, atomic, *is_foreign, *is_unsafe_sig)
     };
     if foreign_b || atomic_b.is_some() || unsafe_b {
         return None;
@@ -2276,7 +2299,9 @@ pub(crate) fn sem_call_or_guarded_compare_of_mir(
     {
         return None;
     }
-    if fact_a.arg_count != args_a.len() || fact_b.arg_count != args_b.len() {
+    if !crate::mirsem::callee_signature_matches(func, args_a, dest_a, fact_a)
+        || !crate::mirsem::callee_signature_matches(func, args_b, dest_b, fact_b)
+    {
         return None;
     }
     if args_a.is_empty() || args_b.is_empty() {
@@ -2583,7 +2608,7 @@ pub(crate) fn sem_call_chain_pureop_of_mir(
     if resolved == func.def_path || *callee_str == func.def_path {
         return None; // self-recursion fails closed.
     }
-    if fact.arg_count != args.len() {
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) {
         return None;
     }
     if args.is_empty() {

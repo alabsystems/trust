@@ -96,7 +96,7 @@ fn func_of(
         name: name.rsplit("::").next().unwrap_or(name).into(),
         def_path: name.into(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty },
+        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],

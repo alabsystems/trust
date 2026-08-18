@@ -23,9 +23,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
+checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
 dependencies = [
  "libc",
 ]
@@ -82,15 +82,15 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.103"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "ar_archive_writer"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4087686b4b0a3427190bae57a1d9a478dbb2d40c5dc1bd6e2b6d797913bdd348"
+checksum = "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6"
 dependencies = [
  "object",
 ]
@@ -115,7 +115,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-allsat",
  "ay-chc",
@@ -126,15 +126,15 @@ dependencies = [
  "ay-milp",
  "ay-proof",
  "ay-translate",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-allsat"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -142,27 +142,27 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
- "num-bigint 0.4.6",
+ "num-bigint",
  "tracing",
 ]
 
 [[package]]
 name = "ay-bv"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-sys",
- "num-bigint 0.4.6",
+ "num-bigint",
  "stacker",
  "tracing",
 ]
 
 [[package]]
 name = "ay-chc"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -175,10 +175,10 @@ dependencies = [
  "ay-lia",
  "ay-sat",
  "ay-sys",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
@@ -190,15 +190,15 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
  "hashbrown 0.15.5",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "serde",
  "stacker",
  "thiserror",
@@ -206,36 +206,36 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-sat",
  "ay-sys",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
 ]
 
 [[package]]
 name = "ay-dispatch"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -261,10 +261,10 @@ dependencies = [
  "ay-strings",
  "ay-sys",
  "libc",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "serde_json",
  "sha2 0.10.9",
  "stacker",
@@ -274,16 +274,17 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-proof-common",
+ "ay-sys",
  "rustc-hash 2.1.2",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-dt"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -292,51 +293,51 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
- "num-bigint 0.4.6",
+ "num-bigint",
  "tracing",
 ]
 
 [[package]]
 name = "ay-fp"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "tracing",
 ]
 
 [[package]]
 name = "ay-frontend"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "logos 0.15.1",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "stacker",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-intsat"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
 name = "ay-jit"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "serde",
@@ -345,52 +346,53 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-intsat",
  "ay-lra",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "tracing",
 ]
 
 [[package]]
 name = "ay-lra"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-jit",
  "hashbrown 0.15.5",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "smallvec",
  "tracing",
 ]
 
 [[package]]
 name = "ay-map"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-dpll",
  "ay-lra",
  "ay-pb-core",
  "ay-sat",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "ay-sys",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -400,74 +402,74 @@ dependencies = [
 
 [[package]]
 name = "ay-model-check"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
 ]
 
 [[package]]
 name = "ay-multiset"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-lia",
  "ay-lra",
  "ay-nonlinear-common",
  "ay-sys",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "stacker",
  "tracing",
 ]
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
 ]
 
 [[package]]
 name = "ay-nra"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-lra",
  "ay-nonlinear-common",
  "hashbrown 0.15.5",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
+ "num-bigint",
+ "num-integer",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "stacker",
  "tracing",
 ]
 
 [[package]]
 name = "ay-pb-core"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-sat",
  "ay-sys",
  "libc",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
@@ -478,31 +480,31 @@ dependencies = [
 
 [[package]]
 name = "ay-prefetch"
-version = "0.5.0"
+version = "0.9.0"
 
 [[package]]
 name = "ay-proof"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-sat",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-proof-common"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -525,35 +527,35 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.5.0"
+version = "0.9.0"
 
 [[package]]
 name = "ay-seq"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
- "num-bigint 0.4.6",
+ "num-bigint",
 ]
 
 [[package]]
 name = "ay-set"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
- "num-bigint 0.4.6",
+ "num-bigint",
  "tracing",
 ]
 
 [[package]]
 name = "ay-sys"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -561,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "ay-translate"
-version = "0.5.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -604,9 +606,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.13.0"
+version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bitmaps"
@@ -619,9 +621,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.5"
+version = "1.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -657,22 +659,22 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytemuck"
-version = "1.25.1"
+version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 dependencies = [
  "bytemuck_derive",
 ]
 
 [[package]]
 name = "bytemuck_derive"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65693059b6b9c588b9f62fed1cedbf0a8b805631457ea162d68f0de186f3de5"
+checksum = "fc0e56a716f1e132ff6bf4bdac1c944a3fcdc1cae65f70a4a2a1ac3b401d2d1f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -683,9 +685,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.2.67"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
+checksum = "5d262e149917187838d5b42777c8253bcb64500067342904e7d429499a6f277e"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -707,7 +709,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "js-sys",
- "num-traits 0.2.19",
+ "num-traits",
  "serde",
  "wasm-bindgen",
  "windows-link",
@@ -715,9 +717,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.1"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -725,9 +727,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.0"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -737,14 +739,14 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.1"
+version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
+checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -755,7 +757,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-auto"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "ay",
@@ -768,7 +770,7 @@ dependencies = [
  "clean-kernel",
  "hashbrown 0.17.1",
  "httparse",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
  "percent-encoding",
  "rayon",
@@ -782,16 +784,16 @@ dependencies = [
 
 [[package]]
 name = "clean-ck0"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
- "num-bigint 0.4.6",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-traits",
  "thiserror",
 ]
 
 [[package]]
 name = "clean-compiler"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -800,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "clean-elab"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "clean-auto",
@@ -811,9 +813,9 @@ dependencies = [
  "clean-parser",
  "clean-runtime",
  "hashbrown 0.17.1",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -826,15 +828,15 @@ dependencies = [
 
 [[package]]
 name = "clean-kernel"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
  "hashbrown 0.17.1",
  "lz4_flex",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-rational",
- "num-traits 0.2.19",
+ "num-traits",
  "rayon",
  "serde",
  "serde_json",
@@ -855,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "clean-olean"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -875,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "clean-parser"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -893,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "clean-tla"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clean-auto",
  "clean-elab",
@@ -902,7 +904,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tla-core 0.2.0 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
+ "tla-core",
+]
+
+[[package]]
+name = "clean-verify"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clean-elab",
+ "clean-kernel",
+ "clean-parser",
+ "num-bigint",
+ "num-rational",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "thiserror",
 ]
 
 [[package]]
@@ -1069,9 +1087,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.16.0"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "equivalent"
@@ -1091,15 +1109,15 @@ dependencies = [
 
 [[package]]
 name = "fastrand"
-version = "2.4.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "26b73573e6edcd2af0cdf47bd6cb58f0b3839491263c314eaad1ccf24430e1de"
 
 [[package]]
 name = "fixedbitset"
@@ -1127,21 +1145,21 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "futures-core"
-version = "0.3.32"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
 name = "futures-task"
-version = "0.3.32"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
 
 [[package]]
 name = "futures-util"
-version = "0.3.32"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
+checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
  "futures-task",
@@ -1184,9 +1202,9 @@ dependencies = [
 
 [[package]]
 name = "glob"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "hashbrown"
@@ -1232,9 +1250,9 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "typenum",
 ]
@@ -1282,15 +1300,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indexmap"
-version = "2.14.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "equivalent",
- "hashbrown 0.17.1",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1314,9 +1323,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.103"
+version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53b44bfcdb3f8d5837a46dae1ca9660a837176eee74a28b229bc626816589102"
+checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -1331,9 +1340,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libloading"
@@ -1375,14 +1384,6 @@ dependencies = [
 
 [[package]]
 name = "logos"
-version = "0.14.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "logos-derive 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
-]
-
-[[package]]
-name = "logos"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff472f899b4ec2d99161c51f60ff7075eeb3097069a36050d8037a6325eb8154"
@@ -1400,21 +1401,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex-syntax",
- "syn",
-]
-
-[[package]]
-name = "logos-codegen"
-version = "0.14.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "beef",
- "fnv",
- "lazy_static",
- "proc-macro2",
- "quote",
- "regex-syntax",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1430,7 +1417,7 @@ dependencies = [
  "quote",
  "regex-syntax",
  "rustc_version",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1438,14 +1425,6 @@ name = "logos-derive"
 version = "0.14.2"
 dependencies = [
  "logos-codegen 0.14.2",
-]
-
-[[package]]
-name = "logos-derive"
-version = "0.14.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "logos-codegen 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
 ]
 
 [[package]]
@@ -1483,9 +1462,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
+checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
 dependencies = [
  "libc",
  "wasi",
@@ -1505,33 +1484,16 @@ dependencies = [
 name = "num-bigint"
 version = "0.4.6"
 dependencies = [
- "num-integer 0.1.46",
- "num-traits 0.2.19",
+ "num-integer",
+ "num-traits",
  "serde",
 ]
 
 [[package]]
-name = "num-bigint"
-version = "0.4.6"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "num-integer 0.1.46 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
-]
-
-[[package]]
 name = "num-integer"
 version = "0.1.46"
 dependencies = [
- "num-traits 0.2.19",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.46"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
+ "num-traits",
 ]
 
 [[package]]
@@ -1540,9 +1502,9 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "serde",
 ]
 
@@ -1554,18 +1516,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
 name = "object"
-version = "0.37.3"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "memchr",
 ]
@@ -1625,18 +1579,18 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.106"
+version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
 
 [[package]]
 name = "psm"
-version = "0.1.31"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "645dbe486e346d9b5de3ef16ede18c26e6c70ad97418f4874b8b1889d6e761ea"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
@@ -1644,9 +1598,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.46"
+version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
@@ -1719,7 +1673,7 @@ version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
 dependencies = [
- "num-traits 0.2.19",
+ "num-traits",
 ]
 
 [[package]]
@@ -1743,17 +1697,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rowan"
-version = "0.15.16"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "countme",
- "hashbrown 0.14.5",
- "rustc-hash 1.1.0",
- "text-size",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1762,11 +1705,6 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 [[package]]
 name = "rustc-hash"
 version = "2.1.2"
-
-[[package]]
-name = "rustc-hash"
-version = "2.1.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
 
 [[package]]
 name = "rustc_version"
@@ -1810,9 +1748,9 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
-version = "1.0.228"
+version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
@@ -1820,29 +1758,29 @@ dependencies = [
 
 [[package]]
 name = "serde_core"
-version = "1.0.228"
+version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
+checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
 dependencies = [
  "serde_derive",
 ]
 
 [[package]]
 name = "serde_derive"
-version = "1.0.228"
+version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "serde_json"
-version = "1.0.150"
+version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
  "itoa",
  "memchr",
@@ -1891,6 +1829,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -1902,6 +1841,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -1966,9 +1914,9 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1982,9 +1930,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stacker"
-version = "0.1.24"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "640c8cdd92b6b12f5bcb1803ca3bbf5ab96e5e6b6b96b9ab77dabe9e880b3190"
+checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
 dependencies = [
  "cc",
  "cfg-if",
@@ -2001,9 +1949,20 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "syn"
-version = "2.0.118"
+version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2042,22 +2001,22 @@ checksum = "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233"
 
 [[package]]
 name = "thiserror"
-version = "2.0.18"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.18"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2071,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arc"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -2079,20 +2038,11 @@ dependencies = [
 
 [[package]]
 name = "tla-arena"
-version = "0.2.0"
+version = "0.11.0"
 
 [[package]]
 name = "tla-ariadne"
 version = "0.4.1"
-dependencies = [
- "unicode-width",
- "yansi",
-]
-
-[[package]]
-name = "tla-ariadne"
-version = "0.4.1"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
 dependencies = [
  "unicode-width",
  "yansi",
@@ -2100,14 +2050,14 @@ dependencies = [
 
 [[package]]
 name = "tla-backend"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "tla-mc-core",
 ]
 
 [[package]]
 name = "tla-check"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "ahash",
  "chrono",
@@ -2118,9 +2068,9 @@ dependencies = [
  "dashmap",
  "libc",
  "memmap2",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
@@ -2132,13 +2082,13 @@ dependencies = [
  "tla-arc",
  "tla-arena",
  "tla-backend",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-dialect",
  "tla-eval",
  "tla-im",
  "tla-ir",
  "tla-jit-abi",
- "tla-lock 0.2.0",
+ "tla-lock",
  "tla-mc-core",
  "tla-resource",
  "tla-smallvec",
@@ -2153,62 +2103,43 @@ dependencies = [
 
 [[package]]
 name = "tla-core"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "crossbeam-epoch",
  "indexmap 2.14.0",
  "logos 0.14.2",
- "num-bigint 0.4.6",
- "num-traits 0.2.19",
- "rowan 0.15.16",
+ "num-bigint",
+ "num-traits",
+ "rowan",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "thiserror",
- "tla-ariadne 0.4.1",
+ "tla-ariadne",
  "tla-im",
- "tla-lock 0.2.0",
-]
-
-[[package]]
-name = "tla-core"
-version = "0.2.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "crossbeam-epoch",
- "indexmap 2.14.0 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "logos 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "num-bigint 0.4.6 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "rowan 0.15.16 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "rustc-hash 2.1.2 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "serde",
- "serde_json",
- "thiserror",
- "tla-ariadne 0.4.1 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "tla-lock 0.2.0 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
+ "tla-lock",
 ]
 
 [[package]]
 name = "tla-dialect"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tla-eval"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "indexmap 2.14.0",
- "num-bigint 0.4.6",
- "num-integer 0.1.46",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "thiserror",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-smallvec",
  "tla-stack",
  "tla-tir",
@@ -2217,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "tla-im"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "bitmaps",
  "rand_core",
@@ -2230,11 +2161,11 @@ dependencies = [
 
 [[package]]
 name = "tla-ir"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
- "num-traits 0.2.19",
+ "num-traits",
  "thiserror",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-jit-abi",
  "tla-tir",
  "tla-value",
@@ -2244,63 +2175,34 @@ dependencies = [
 
 [[package]]
 name = "tla-jit-abi"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
- "num-traits 0.2.19",
+ "num-traits",
  "serde",
  "thiserror",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-value",
  "xxhash-rust 0.8.15",
 ]
 
 [[package]]
 name = "tla-lock"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
- "tla-lock-api 0.2.0",
- "tla-lock-core 0.2.0",
-]
-
-[[package]]
-name = "tla-lock"
-version = "0.2.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
-dependencies = [
- "tla-lock-api 0.2.0 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
- "tla-lock-core 0.2.0 (git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7)",
+ "tla-lock-api",
+ "tla-lock-core",
 ]
 
 [[package]]
 name = "tla-lock-api"
-version = "0.2.0"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
-name = "tla-lock-api"
-version = "0.2.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
+version = "0.11.0"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-core"
-version = "0.2.0"
-dependencies = [
- "cfg-if",
- "libc",
- "redox_syscall",
- "smallvec",
- "windows-link",
-]
-
-[[package]]
-name = "tla-lock-core"
-version = "0.2.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=6faa02da64ce07a51d67b953b051de04d931ecc7#6faa02da64ce07a51d67b953b051de04d931ecc7"
+version = "0.11.0"
 dependencies = [
  "cfg-if",
  "libc",
@@ -2311,29 +2213,29 @@ dependencies = [
 
 [[package]]
 name = "tla-mc-core"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "crossbeam",
  "rustc-hash 2.1.2",
  "thiserror",
- "tla-lock 0.2.0",
+ "tla-lock",
  "tla-smallvec",
 ]
 
 [[package]]
 name = "tla-resource"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tla-rp"
-version = "0.2.0"
+version = "0.11.0"
 
 [[package]]
 name = "tla-smallvec"
-version = "0.2.0"
+version = "0.11.0"
 
 [[package]]
 name = "tla-stack"
@@ -2348,26 +2250,26 @@ dependencies = [
 
 [[package]]
 name = "tla-tir"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
- "num-traits 0.2.19",
+ "num-traits",
  "rustc-hash 2.1.2",
  "thiserror",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-value",
 ]
 
 [[package]]
 name = "tla-trust-cg"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "libloading",
- "num-bigint 0.4.6",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-traits",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-ir",
  "tla-jit-abi",
  "tla-tir",
@@ -2379,22 +2281,22 @@ dependencies = [
  "trust-cg-opt",
  "trust-ir",
  "trust-ir-build",
- "xxhash-rust 0.8.16",
+ "xxhash-rust 0.8.18",
 ]
 
 [[package]]
 name = "tla-value"
-version = "0.2.0"
+version = "0.11.0"
 dependencies = [
  "dashmap",
  "indexmap 2.14.0",
- "num-bigint 0.4.6",
- "num-traits 0.2.19",
+ "num-bigint",
+ "num-traits",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "thiserror",
- "tla-core 0.2.0",
+ "tla-core",
  "tla-im",
  "tla-rp",
  "tla-smallvec",
@@ -2402,9 +2304,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes",
  "libc",
@@ -2419,13 +2321,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.0"
+version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2488,7 +2390,7 @@ checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2641,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -2651,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -2661,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "trust-ir",
 ]
@@ -2674,29 +2576,22 @@ dependencies = [
  "clean-kernel",
  "clean-parser",
  "clean-tla",
+ "clean-verify",
+ "num-bigint",
  "serde",
  "serde_json",
  "tempfile 3.27.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tla-check",
- "tla-core 0.2.0",
+ "tla-core",
  "trust-ir",
- "trust-spec-temporal-macros",
-]
-
-[[package]]
-name = "trust-spec-temporal-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "trust-ir-build",
 ]
 
 [[package]]
 name = "twox-hash"
-version = "2.1.2"
+version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 
 [[package]]
 name = "typenum"
@@ -2763,9 +2658,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4"
+checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -2776,9 +2671,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "167ce5e579f6bcf889c4f7175a8a5a585de84e8ff93976ce393efa5f2837aab1"
+checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -2786,22 +2681,22 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3997c7839262f4ef12cf90b818d6340c18e80f263f1a94bf157d0ec4420380e"
+checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
 dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
  "wasm-bindgen-shared",
 ]
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
+checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
 ]
@@ -2827,7 +2722,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2838,7 +2733,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2968,9 +2863,9 @@ version = "0.8.15"
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.16"
+version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yansi"
@@ -2980,29 +2875,29 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.54"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
+checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.54"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
+checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "zmij"
-version = "1.0.22"
+version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2f034a4bebf216c9e4b7083603e024cf930873fd67830cfb083c9fa33129d9"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
@@ -3034,4 +2929,4 @@ dependencies = [
 
 [[patch.unused]]
 name = "ay-encode"
-version = "0.5.0"
+version = "0.9.0"

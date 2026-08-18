@@ -245,7 +245,25 @@ impl SendSyncChecker {
                     kind: VcKind::Assertion { message: v.message.clone() },
                     function: function.into(),
                     location: v.span.clone(),
-                    formula: Formula::Bool(false), // violation => unsatisfiable
+                    // POLARITY. This pipeline consumes VIOLATION formulas: SAT
+                    // means a counterexample exists, UNSAT means "no violation
+                    // reachable" and the row is PROVED (lib.rs:145,
+                    // trust-router/src/in_process_ay_backend.rs:24-29). These
+                    // rows are minted only for violations the Rust analysis
+                    // ALREADY FOUND, so `Bool(false)` asserted the exact
+                    // opposite of the finding and the constant folder graded
+                    // every detected violation `Proved`.
+                    //
+                    // `Bool(true)` makes a found violation an undischargeable
+                    // obligation, matching `memory_provenance.rs:411`
+                    // ("definite violation") and `ffi_vcgen.rs:27-46`.
+                    //
+                    // This is still a CONSTANT, i.e. over-rejection, not a
+                    // model — the same posture `data_race.rs` is in. CLAUDE.md's
+                    // standing hazard applies unchanged: do not route these
+                    // kinds to an engine until they carry a real
+                    // happens-before model.
+                    formula: Formula::Bool(true),
                     contract_metadata: None,
                     obligation: None,
                 }
@@ -374,7 +392,10 @@ impl DataRaceDetector {
                     kind: VcKind::Assertion { message: msg },
                     function: function.into(),
                     location: race.access1.span.clone(),
-                    formula: Formula::Bool(false),
+                    // Violation polarity — see `SendSyncChecker::to_vcs`. A race
+                    // the detector already found must not be handed to the
+                    // solver as "no violation reachable".
+                    formula: Formula::Bool(true),
                     contract_metadata: None,
                     obligation: None,
                 }
@@ -425,7 +446,15 @@ fn check_atomic_ordering(function: &str, atomics: &[AtomicOp]) -> Vec<Verificati
 
     for op in atomics {
         // Stores need at least Release ordering for publish semantics.
-        if op.is_store && !op.ordering.is_release() && op.ordering != AtomicOrdering::Relaxed {
+        //
+        // `Relaxed` used to be EXCLUDED here by an extra
+        // `&& op.ordering != AtomicOrdering::Relaxed` conjunct. With
+        // `is_release()` = {Release, AcqRel, SeqCst}, `!is_release()` is
+        // {Relaxed, Acquire}, so excluding Relaxed left the arm firing ONLY for
+        // an Acquire-ordered store — while the weakest ordering, the one this
+        // message exists to report, produced no VC at all. The check reported
+        // the odd case and dropped the dangerous one.
+        if op.is_store && !op.ordering.is_release() {
             vcs.push(VerificationCondition {
                 kind: VcKind::Assertion {
                     message: format!(
@@ -435,14 +464,18 @@ fn check_atomic_ordering(function: &str, atomics: &[AtomicOp]) -> Vec<Verificati
                 },
                 function: function.into(),
                 location: op.span.clone(),
-                formula: Formula::Bool(false),
+                // Violation polarity — see `SendSyncChecker::to_vcs`.
+                formula: Formula::Bool(true),
                 contract_metadata: None,
                 obligation: None,
             });
         }
 
         // Loads need at least Acquire ordering for consume semantics.
-        if !op.is_store && !op.ordering.is_acquire() && op.ordering != AtomicOrdering::Relaxed {
+        // Same `Relaxed` exclusion as the store arm above, same consequence:
+        // `!is_acquire()` is {Relaxed, Release}, so the arm fired only for a
+        // Release-ordered load and never for a Relaxed one.
+        if !op.is_store && !op.ordering.is_acquire() {
             vcs.push(VerificationCondition {
                 kind: VcKind::Assertion {
                     message: format!(
@@ -452,7 +485,8 @@ fn check_atomic_ordering(function: &str, atomics: &[AtomicOp]) -> Vec<Verificati
                 },
                 function: function.into(),
                 location: op.span.clone(),
-                formula: Formula::Bool(false),
+                // Violation polarity — see `SendSyncChecker::to_vcs`.
+                formula: Formula::Bool(true),
                 contract_metadata: None,
                 obligation: None,
             });

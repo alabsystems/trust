@@ -125,6 +125,7 @@ fn fixture_arithmetic_overflow_add_i32() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -227,6 +228,7 @@ fn fixture_arithmetic_overflow_sub_u8() {
             ],
             arg_count: 2,
             return_ty: Ty::u8(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -298,6 +300,7 @@ fn fixture_arithmetic_overflow_mul_i64() {
             ],
             arg_count: 2,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -366,6 +369,7 @@ fn fixture_shift_overflow_shl() {
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -428,6 +432,7 @@ fn fixture_shift_overflow_shr() {
             ],
             arg_count: 2,
             return_ty: Ty::i16(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -494,6 +499,7 @@ fn fixture_division_by_zero() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -565,6 +571,7 @@ fn fixture_remainder_by_zero() {
             ],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -650,6 +657,7 @@ fn fixture_index_out_of_bounds() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -778,6 +786,7 @@ fn fixture_slice_bounds_check() {
                 mutable: false,
                 inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
             },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -860,6 +869,7 @@ fn fixture_cast_overflow() {
             ],
             arg_count: 1,
             return_ty: Ty::u8(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -927,6 +937,7 @@ fn fixture_negation_overflow() {
             ],
             arg_count: 1,
             return_ty: Ty::i8(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -1003,6 +1014,7 @@ fn fixture_unreachable() {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -1069,6 +1081,7 @@ fn fixture_assertion() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
     );
 
@@ -1121,6 +1134,7 @@ fn fixture_precondition() {
             ],
             arg_count: 1,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Requires,
@@ -1201,6 +1215,7 @@ fn fixture_postcondition() {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
@@ -1325,6 +1340,7 @@ fn fixture_combined_div_overflow_and_divzero() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1463,6 +1479,7 @@ fn content_hash_differs_across_fixtures() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     );
 
@@ -1499,6 +1516,7 @@ fn content_hash_differs_across_fixtures() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     );
 

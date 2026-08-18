@@ -6,6 +6,34 @@
 
 use super::*;
 
+/// Whether a canonical `len()` call has the `isize::MAX` result bound.
+/// `str`/`String` count bytes; a slice counts elements and therefore needs a
+/// receiver whose extracted element type is provably non-ZST. `Vec<T>` stays
+/// excluded because the verifier's current container type may erase `T`.
+pub(super) fn len_call_result_has_isize_bound(
+    func: &VerifiableFunction,
+    callee: &str,
+    args: &[Operand],
+) -> bool {
+    if args.len() != 1 {
+        return false;
+    }
+    if trust_types::total_call_summaries::total_summary_len_bound(callee) {
+        return true;
+    }
+    if !trust_types::total_call_summaries::total_summary_slice_len_call(callee) {
+        return false;
+    }
+    let Some(receiver_ty) = crate::operand_ty_cow(func, &args[0]) else {
+        return false;
+    };
+    let mut receiver_ty = receiver_ty.as_ref();
+    while let Ty::Ref { inner, .. } = receiver_ty {
+        receiver_ty = inner;
+    }
+    matches!(receiver_ty, Ty::Slice { elem } if ty_is_definitely_non_zst(elem))
+}
+
 pub(super) fn has_intrinsic_unsafe_surface(func: &VerifiableFunction) -> bool {
     if func.body.locals.iter().any(|local| ty_contains_raw_ptr(&local.ty)) {
         return true;
@@ -13,6 +41,16 @@ pub(super) fn has_intrinsic_unsafe_surface(func: &VerifiableFunction) -> bool {
 
     for block in &func.body.blocks {
         for stmt in &block.stmts {
+            // The modeled `copy_nonoverlapping` statement reads and writes raw
+            // memory, so it IS an intrinsic unsafe surface. Its src/dst are
+            // normally raw-pointer LOCALS (caught by the `ty_contains_raw_ptr`
+            // scan above), but gate on the statement itself so a body whose
+            // pointer operands are not locals still reaches the sep engine —
+            // this gate guards the ONLY lane that mints the copy's
+            // bounds/overlap obligations (see `SepEngine::interpret_statement`).
+            if let Statement::CopyNonOverlapping { .. } = stmt {
+                return true;
+            }
             let Statement::Assign { place, rvalue, .. } = stmt else {
                 continue;
             };
@@ -365,7 +403,8 @@ pub(super) fn build_semantic_guard_map_impl(
             // (replacing the deleted terminator kill).
             let term_dest_name = crate::place_to_var_name(func, dest);
             let mut term_facts: Vec<Formula> = Vec::new();
-            if trust_types::total_call_summaries::total_summary_len_bound(callee)
+            if trust_types::total_call_summaries::total_summary_len_call(callee)
+                && args.len() == 1
                 && dest.projections.is_empty()
             {
                 let dest_name = crate::place_to_var_name(func, dest);
@@ -373,10 +412,12 @@ pub(super) fn build_semantic_guard_map_impl(
                     Box::new(Formula::Var(dest_name.clone(), Sort::Int)),
                     Box::new(Formula::Int(0)),
                 ));
-                term_facts.push(Formula::Le(
-                    Box::new(Formula::Var(dest_name, Sort::Int)),
-                    Box::new(Formula::Int(i64::MAX as i128)),
-                ));
+                if len_call_result_has_isize_bound(func, callee, args) {
+                    term_facts.push(Formula::Le(
+                        Box::new(Formula::Var(dest_name, Sort::Int)),
+                        Box::new(Formula::Int(i64::MAX as i128)),
+                    ));
+                }
             }
 
             // Model the ordered-min/max/clamp stdlib calls with their defining

@@ -20,7 +20,7 @@ fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Ver
         name: name.to_string(),
         def_path: format!("test::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 0, return_ty },
+        body: VerifiableBody { locals, blocks, arg_count: 0, return_ty, datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],

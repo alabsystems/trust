@@ -28,3 +28,4 @@ trust-disasm = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+trust-disasm = { workspace = true, features = ["test-construct"] }

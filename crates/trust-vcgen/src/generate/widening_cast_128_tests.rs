@@ -22,6 +22,7 @@ fn single_block_fn(
             blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
             arg_count: 1,
             return_ty: Ty::u128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -122,6 +123,54 @@ fn value_preserving_widening_classifier_is_tight() {
     assert!(!v2_is_value_preserving_widening(&Ty::u128(), &Ty::i128()));
     //   * narrowing.
     assert!(!v2_is_value_preserving_widening(&Ty::u128(), &Ty::u32()));
+}
+
+#[test]
+fn u8_to_char_is_total_but_other_char_sources_fail_closed() {
+    let func = single_block_fn(
+        "u8_to_char",
+        vec![
+            LocalDecl { index: 0, ty: Ty::Char, name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u8(), name: Some("byte".into()) },
+            LocalDecl { index: 2, ty: Ty::Char, name: Some("ch".into()) },
+        ],
+        vec![assign(2, Rvalue::Cast(Operand::Copy(Place::local(1)), Ty::Char))],
+    );
+    let block = &func.body.blocks[0];
+    assert!(
+        v2_build_cast_vc(
+            &func,
+            block,
+            &Operand::Copy(Place::local(1)),
+            &Ty::Char,
+            &SourceSpan::default(),
+            0,
+        )
+        .is_none(),
+        "every u8 is a valid Unicode scalar"
+    );
+
+    let wider = single_block_fn(
+        "u16_to_char_is_not_a_rust_cast",
+        vec![
+            LocalDecl { index: 0, ty: Ty::Char, name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u16(), name: Some("wide".into()) },
+            LocalDecl { index: 2, ty: Ty::Char, name: Some("ch".into()) },
+        ],
+        vec![],
+    );
+    assert!(
+        v2_build_cast_vc(
+            &wider,
+            &wider.body.blocks[0],
+            &Operand::Copy(Place::local(1)),
+            &Ty::Char,
+            &SourceSpan::default(),
+            0,
+        )
+        .is_some(),
+        "a wider fabricated int-to-char MIR shape must remain fail-closed"
+    );
 }
 
 /// A NON-value-preserving cast into u128 (`i128 as u128`, a same-width

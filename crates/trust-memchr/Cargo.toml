@@ -1,0 +1,70 @@
+# trust-memchr — first-party, verification-clean reimplementation of `memchr`.
+#
+# API contract source: https://github.com/BurntSushi/memchr (Unlicense OR MIT),
+# by Andrew Gallant. The public API, its semantics and its feature table are
+# reproduced here; the implementation is not — it is written from scratch in
+# pure safe scalar Rust so that Trust can actually prove it.
+#
+# Why this exists: Trust is a verifying compiler, and every external crate in
+# its own bootstrap graph is code we can neither prove nor fix. Upstream memchr
+# is hand-vectorised over raw pointers and does not verify. This crate is the
+# first conversion of that class of dependency to first-party code.
+#
+# Keep the package name `memchr` so `[patch.crates-io]` can redirect the whole
+# dependency graph without a `package =` rename at every consumer site; the
+# directory carries the Trust-family identity. Same split as
+# `first-party/ty/crates/tla-hash-fx`.
+#
+# Manifest values are spelled literally rather than inherited from a workspace
+# root: this crate is consumed as a path patch from four other workspace roots
+# (root, crates/, targo-trust/, src/bootstrap/, library/), and `*.workspace`
+# inheritance resolving against the wrong root is a documented failure mode of
+# this repo.
+[package]
+name = "memchr"
+version = "2.8.3"
+edition = "2021"
+rust-version = "1.61"
+license = "Unlicense OR MIT"
+authors = [
+    "Andrew Yates <andrewyates.name@gmail.com>",
+    "Andrew Gallant <jamslam@gmail.com>",
+]
+description = "Scalar, verification-clean routines for 1, 2 or 3 byte search and single substring search (first-party Trust replacement for the memchr crate)."
+homepage = "https://github.com/BurntSushi/memchr"
+repository = "https://github.com/BurntSushi/memchr"
+keywords = ["memchr", "memmem", "substring", "find", "search"]
+
+[lib]
+name = "memchr"
+path = "src/lib.rs"
+bench = false
+
+# The upstream feature table, reproduced so that every existing dependent
+# resolves unchanged.
+#
+#   alloc   — enables the owned-needle APIs (`into_owned`, `build_*_owned`).
+#   std     — upstream uses it for runtime SIMD dispatch; there is no SIMD here,
+#             so it only implies `alloc`, exactly as upstream declares.
+#   libc    — a no-op upstream since 2.6; a no-op here.
+#   logging — upstream emits `log` traces naming the SIMD strategy it picked.
+#             There is one strategy here, so there is nothing to trace and the
+#             `log` dependency is deliberately not carried (it would be an
+#             external dep in the toolchain, which is the thing being removed).
+#   use_std — deprecated upstream alias for `std`.
+#   rustc-dep-of-std — MANDATORY: `object` forwards it when `std` builds it, and
+#             it must map `core` to `rustc-std-workspace-core` exactly as
+#             upstream does or the library workspace fails to build.
+[features]
+alloc = []
+default = ["std"]
+libc = []
+logging = []
+rustc-dep-of-std = ["core"]
+std = ["alloc"]
+use_std = ["std"]
+
+[dependencies.core]
+version = "1.0.0"
+optional = true
+package = "rustc-std-workspace-core"

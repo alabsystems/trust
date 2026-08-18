@@ -205,14 +205,17 @@ fn store_bytes_le(memory: Formula, address: &Formula, value: &Formula, width_byt
     mem
 }
 
+/// The name carried by [`ApplyEffectError::Unmodeled`].
+///
+/// This used to be a four-arm match ending in `_ => "unmodeled effect"`, which
+/// is the same drop-arm shape as the effect gaps this module fails closed on:
+/// every variant added after those four reported itself under a generic label,
+/// so the refusal named no instruction class and a reader could not tell which
+/// surface was missing. [`Effect::variant_name`] is exhaustive in the crate that
+/// defines `Effect`, so a new variant is a build error rather than a new way to
+/// print "unmodeled effect".
 fn effect_name(effect: &Effect) -> &'static str {
-    match effect {
-        Effect::Call { .. } => "Call",
-        Effect::ConditionalBranch { .. } => "ConditionalBranch",
-        Effect::Aarch64SyncBoundary { .. } => "Aarch64SyncBoundary",
-        Effect::Aarch64AtomicAccess { .. } => "Aarch64AtomicAccess",
-        _ => "unmodeled effect",
-    }
+    effect.variant_name()
 }
 
 /// Error from symbolically applying an [`Effect`] to a [`MachineState`].

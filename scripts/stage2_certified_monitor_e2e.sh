@@ -34,6 +34,7 @@ EXPECTED_HEAD="${TRUST_CERTIFIED_MONITOR_EXPECTED_HEAD:-}"
 
 TESTS=(
     "tests::real_targo_test_instruments_library_used_by_integration_test"
+    "tests::real_targo_test_executes_loop_invariant_violation"
     "tests::real_targo_test_executes_authorized_satisfying_integration_test"
     "tests::real_targo_test_rejects_unharnessed_test_target_before_execution"
 )
@@ -383,14 +384,16 @@ hash_stable_stage2_tree() {
                 | while IFS= read -r -d '' entry; do
                     local_path="$root/${entry#./}"
                     if [[ -L "$entry" ]]; then
-                        case "$entry" in
-                            ./lib/rustlib/rustc-src/rust|./lib/rustlib/src/rust)
-                                ;;
-                            *)
-                                echo "error: stage2 sysroot contains an unreviewed symlink: $entry" >&2
-                                exit 1
-                                ;;
-                        esac
+                        # Bash 3.2 misparses a `case` pattern close-paren while
+                        # the whole traversal is inside `$(...)`. Keep this
+                        # equivalent admission check in ordinary conditionals
+                        # so the supported macOS system shell can execute the
+                        # authenticated tree walk.
+                        if [[ "$entry" != ./lib/rustlib/rustc-src/rust \
+                            && "$entry" != ./lib/rustlib/src/rust ]]; then
+                            echo "error: stage2 sysroot contains an unreviewed symlink: $entry" >&2
+                            exit 1
+                        fi
                         link_target="$(canonical_directory "$entry")" || {
                             echo "error: stage2 rust-src link is dangling: $entry" >&2
                             exit 1

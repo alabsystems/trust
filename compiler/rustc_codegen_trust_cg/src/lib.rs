@@ -52,10 +52,18 @@ mod trust_ir_emission;
 #[cfg(feature = "trust-ir-codegen")]
 mod trust_ir_codegen;
 
+// Trust (F1, trust-ir-frontend): the CONSUMER of `trust_ir_of`. Unlike the two
+// modules above it is NOT feature-gated — it is selected at run time by
+// `-Ztrust-cg-frontend=trust-ir`, off by default. A cargo feature could not be
+// varied per invocation, so it could not support the one claim this work has to
+// make good on: that the DEFAULT path is byte-identical, proved by diffing two
+// objects out of the SAME compiler binary.
+mod trust_ir_frontend;
+
 use std::any::Any;
 use std::fs;
 
-use rustc_abi::{CanonAbi, ExternAbi};
+use rustc_abi::{BackendRepr, CanonAbi, ExternAbi};
 use rustc_ast::expand::allocator::{NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name};
 use rustc_codegen_ssa::back::archive::ArArchiveBuilderBuilder;
 use rustc_codegen_ssa::back::link::link_binary;
@@ -380,6 +388,15 @@ impl TrustCgCodegenBackend {
         // gate-verified bytes (below), instead of discarding them and re-emitting
         // a separate artifact. This closes the emit-time TOCTOU: the bytes the
         // gate VERIFIED are byte-for-byte the bytes trustc ships.
+        //
+        // ONE OBJECT PER CGU. Emission is per codegen unit, not per function: an
+        // `Internal`-linkage mono-item is a LOCAL symbol, unreachable from any
+        // other object, so a per-function split cannot represent it (and every
+        // program that calls `core` has such items). The per-function PROOF is
+        // untouched — the gate still verifies each function in isolation — and
+        // the merge carries one additional, checked obligation: each verified
+        // function's bytes appear VERBATIM in the shipped object at the offset
+        // that object's own symbol table assigns it. A violation is a REFUSAL.
         let gate_mode = output_gate_mode(sess);
         let exact_builtin_host = target_is_exact_builtin_host(sess);
         if !output_gate_allows_unreconciled_target(gate_mode, exact_builtin_host) {
@@ -390,113 +407,324 @@ impl TrustCgCodegenBackend {
                 sess.opts.target_triple,
             ));
         }
-        let mut gate_captured =
-            run_output_preservation_gate(bridge, bridge_module, sess, gate_mode);
+        let module_object = run_module_output_preservation_gate(
+            bridge,
+            bridge_module,
+            sess,
+            gate_mode,
+        );
 
-        let emitted_objects = match bridge.emit_module_objects(bridge_module) {
-            Ok(objects) => objects,
-            Err(e) => sess.dcx().fatal(format!(
-                "trust-cg: failed to emit object(s) for `{}`: {e}",
+        // The bytes written below are, per function, the exact bytes the gate
+        // verified: `emit_module_object_verified_reported_with_backend` refuses
+        // the whole module unless every verified function's machine code appears
+        // VERBATIM in this artifact at the offset the artifact's own symbol table
+        // assigns it. There is no separate re-emission to reconcile.
+        if module_object.bytes.is_empty() {
+            sess.dcx().fatal(format!(
+                "trust-cg: object emission for `{}` produced an empty artifact",
                 bridge_module.name
-            )),
+            ));
+        }
+
+        let object_path = outputs.temp_path_for_cgu(OutputType::Object, &bridge_module.name);
+        if let Err(e) = fs::write(&object_path, &module_object.bytes) {
+            sess.dcx().fatal(format!(
+                "trust-cg: failed to write object for `{}`: {e}",
+                bridge_module.name
+            ));
+        }
+
+        vec![CompiledModule {
+            name: bridge_module.name.clone(),
+            kind: ModuleKind::Regular,
+            object: Some(object_path),
+            global_asm_object: None,
+            dwarf_object: None,
+            bytecode: None,
+            assembly: None,
+            llvm_ir: None,
+            links_from_incr_cache: Vec::new(),
+        }]
+    }
+
+    /// Trust (F1): `codegen_crate` for `-Ztrust-cg-frontend=trust-ir`.
+    ///
+    /// The shipped path builds `VerifiableFunction`s from MIR and never asks
+    /// for the trust-ir the producer already makes. This one does the opposite:
+    /// it forces `tcx.trust_ir_of` for every reachable mono-item and routes each
+    /// resulting `trust_ir::Module` through `trust_cg_bridge::lower_module_to_lir`,
+    /// into the SAME object emitter. That is the whole of F1's missing consumer.
+    ///
+    /// It is FAIL-CLOSED at every joint and there is no MIR fallback anywhere in
+    /// it. Refusals are ACCUMULATED rather than short-circuited — one run then
+    /// reports the complete per-item work list, which is the measurement this
+    /// path exists to produce — but the compilation still ERRORS. A flag that
+    /// quietly fell back to MIR would tell you nothing, which is exactly why the
+    /// earlier log-only probe never measured F1.
+    fn codegen_crate_from_trust_ir<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        crate_name: String,
+    ) -> Box<dyn Any> {
+        let sess = tcx.sess;
+
+        // (1) The PRODUCER has to be running. `trust_ir_of` returns `None` for
+        // every body unless the direct frontend is enabled, and `None` is a
+        // refusal here — so without this check the flag's only observable effect
+        // would be "everything is refused", which reads like a coverage result
+        // and is actually a missing flag.
+        if !sess.trust_ir_lower_enabled() {
+            tcx.dcx().fatal(
+                "-Ztrust-cg-frontend=trust-ir requires the direct source (THIR) -> trust-ir \
+                 producer: pass -Ztrust-ir-lower, or leave batteries-on verification on. \
+                 Without it `trust_ir_of` declines every body and this frontend, which never \
+                 falls back to MIR, has nothing to compile",
+            );
+        }
+
+        // (2) THE M-POS PROVEN-OUTPUT GATE NOW RUNS ON THIS PATH. It used to be
+        // structurally impossible: the gate derived a function's intended
+        // semantics from a `VerifiableFunction`, which this frontend never
+        // builds, so any non-`off` gate mode was a hard error here.
+        //
+        // `trust_cg_bridge::verify_output_trust_ir` supplies the missing half —
+        // a specification derived from the PRODUCER's `trust_ir::Function`,
+        // discharged against the EMITTED BYTES by the same machine-side
+        // executor. The refusal is therefore gone, and the emission path
+        // (`emit_rustc_module_for_trust_ir_module`) runs the gate.
+        //
+        // WHAT IS NOT RELAXED: `source_functions` is still `None` on this
+        // module, and that `None` must never again read as "nothing to verify".
+        // The trust-ir work list is carried SEPARATELY and the emission path
+        // FATALS if it is absent or not 1:1 with the LIR — a module cannot reach
+        // the linker by having no spec.
+        let gate_mode = output_gate_mode(sess);
+
+        // (3) THE SAME INVENTORY the production path compiles — same collection,
+        // same linkage/visibility gate, same ordering.
+        let instances = collect_production_mono_instances(tcx).unwrap_or_else(|reason| {
+            tcx.dcx().fatal(format!(
+                "trust-cg cannot faithfully materialize rustc's reachable mono-item graph: {reason}"
+            ))
+        });
+        let reachable = instances.len();
+
+        // (4) The allocator shim is SYNTHESIZED by the backend from a rustc
+        // spec, not lowered from any source body, so there is no `trust_ir_of`
+        // artifact for it. Refuse rather than emit a MIR-path shim beside
+        // trust-ir functions and call the result an F1 artifact.
+        match allocator_module_spec_for_tcx(tcx, &crate_name) {
+            Ok(None) => {}
+            Ok(Some(_)) => tcx.dcx().fatal(
+                "-Ztrust-cg-frontend=trust-ir does not build the rustc allocator shim: the shim \
+                 is synthesized from a rustc spec rather than lowered from a source body, so no \
+                 `trust_ir_of` artifact exists for it",
+            ),
+            Err(e) => tcx.dcx().fatal(format!("trust-cg allocator shim planning failed: {e}")),
+        }
+
+        // (5) SOURCE -> `trust_ir_of` -> LIR, per reachable item.
+        let mut lowered = Vec::with_capacity(reachable);
+        let mut linkage = Vec::with_capacity(reachable);
+        let mut refusals: Vec<String> = Vec::new();
+        for (_symbol, instance, item_linkage) in instances {
+            match trust_ir_frontend::lower_instance(
+                tcx,
+                instance,
+                validate_codegen_instance_abi_trust_ir,
+            ) {
+                Ok(function) => {
+                    lowered.push(function);
+                    linkage.push(item_linkage);
+                }
+                Err(refusal) => refusals.push(refusal.to_string()),
+            }
+        }
+
+        tracing::info!(
+            crate_name = %crate_name,
+            reachable,
+            completed = lowered.len(),
+            refused = refusals.len(),
+            "[trust_cg] trust-ir frontend: source -> trust_ir_of -> lower_module_to_lir"
+        );
+        sess.dcx().note(format!(
+            "trust-cg trust-ir frontend: {}/{reachable} reachable function(s) completed \
+             source -> trust_ir_of -> lower_module_to_lir",
+            lowered.len()
+        ));
+
+        if !refusals.is_empty() {
+            let listed = refusals.iter().map(|r| format!("  {r}")).collect::<Vec<_>>().join("\n");
+            tcx.dcx().fatal(format!(
+                "-Ztrust-cg-frontend=trust-ir refused {} of {reachable} reachable function(s); \
+                 this frontend never falls back to the MIR path:\n{listed}",
+                refusals.len()
+            ));
+        }
+
+        if lowered.is_empty() {
+            // A linking compilation with no functions is the MIR path's
+            // "type-only library" case, which it handles by emitting no object.
+            return Box::new(OngoingTrustCgCodegen {
+                bridge_ongoing: None,
+                trust_ir_module: None,
+                trust_ir_gate_sources: Vec::new(),
+                crate_name,
+                function_count: 0,
+            });
+        }
+
+        let function_count = lowered.len();
+        let (module, gate_sources) =
+            trust_ir_frontend::compiled_module(&crate_name, lowered, linkage).unwrap_or_else(
+                |reason| {
+                    tcx.dcx().fatal(format!(
+                        "trust-cg: refusing to emit a trust-ir codegen unit for `{crate_name}`: \
+                         {reason}"
+                    ))
+                },
+            );
+        let _ = gate_mode;
+        Box::new(OngoingTrustCgCodegen {
+            bridge_ongoing: None,
+            trust_ir_module: Some(module),
+            trust_ir_gate_sources: gate_sources,
+            crate_name,
+            function_count,
+        })
+    }
+
+    /// Trust (F1): emit the object for a codegen unit the trust-ir frontend
+    /// produced.
+    ///
+    /// THE GATE RUNS HERE. `sources` is the trust-ir work list the frontend
+    /// carried alongside the LIR; `verify_output_trust_ir` derives each
+    /// function's specification from it and discharges that specification
+    /// against the EMITTED BYTES. The bytes written below are, per function, the
+    /// exact bytes the gate verified: the module gate refuses unless every
+    /// verified function's machine code appears VERBATIM in this artifact at the
+    /// offset the artifact's own symbol table assigns it.
+    ///
+    /// FAIL-CLOSED, and specifically NOT in the shape the old
+    /// `source_functions: None` hole had: an absent or mis-sized work list is a
+    /// FATAL error, never an "ungated" emission. The only way to emit here
+    /// without a proof is the explicit `-Ztrust-cg-output-gate=off`
+    /// acknowledgement, which prints that the bytes are unverified.
+    fn emit_rustc_module_for_trust_ir_module(
+        &self,
+        bridge: &BridgeBackend,
+        bridge_module: &bridge_backend::CompiledModule,
+        sources: &[trust_cg_bridge::verify_output_trust_ir::TrustIrGateSource],
+        sess: &Session,
+        outputs: &OutputFilenames,
+    ) -> CompiledModule {
+        use trust_cg_bridge::verify_output::EmitPolicy;
+        use trust_cg_bridge::verify_output_trust_ir::emit_trust_ir_module_object_verified;
+
+        let gate_mode = output_gate_mode(sess);
+
+        // THE WORK LIST IS NOT OPTIONAL. A trust-ir module whose spec list is
+        // missing or not 1:1 with its LIR cannot be gated, and "cannot be gated"
+        // is a compile error on this path — never a quiet ungated emission.
+        if sources.len() != bridge_module.lir_functions.len() {
+            sess.dcx().fatal(format!(
+                "trust-cg internal error: trust-ir module `{}` carries {} LIR function(s) but \
+                 {} gate specification(s); refusing to emit bytes the gate cannot be matched to",
+                bridge_module.name,
+                bridge_module.lir_functions.len(),
+                sources.len()
+            ));
+        }
+        for (index, source) in sources.iter().enumerate() {
+            if source.symbol != bridge_module.lir_functions[index].name {
+                sess.dcx().fatal(format!(
+                    "trust-cg internal error: trust-ir module `{}` position {index} ships LIR \
+                     for `{}` but carries a specification for `{}`; refusing to verify one \
+                     function and emit another",
+                    bridge_module.name,
+                    bridge_module.lir_functions[index].name,
+                    source.symbol
+                ));
+            }
+        }
+
+        let bytes = if gate_mode == OutputGateMode::Off {
+            // EXPLICIT acknowledgement. `-Ztrust-cg-output-gate=off` (which
+            // itself refuses to combine with batteries-on strict verification)
+            // is the only way to get bytes out of this path unproven, and it
+            // says so on every such compilation.
+            let emitted = match bridge.emit_module_object(bridge_module) {
+                Ok(emitted) => emitted,
+                Err(e) => sess.dcx().fatal(format!(
+                    "trust-cg: failed to emit object for trust-ir module `{}`: {e}",
+                    bridge_module.name
+                )),
+            };
+            sess.dcx().note(format!(
+                "trust-cg: module `{}` was emitted by the TRUST-IR FRONTEND with the \
+                 proven-output gate explicitly DISABLED (-Ztrust-cg-output-gate=off) — its {} \
+                 function(s) carry NO output-preservation proof",
+                bridge_module.name, bridge_module.function_count
+            ));
+            emitted.bytes
+        } else {
+            let policy = match gate_mode {
+                OutputGateMode::Strict => EmitPolicy::StrictProvenOnly,
+                // AllowUnknown is the default; Off returned above.
+                _ => EmitPolicy::AllowUnknown,
+            };
+            match emit_trust_ir_module_object_verified(
+                sources,
+                &bridge_module.linkage,
+                policy,
+                bridge,
+            ) {
+                Ok((module_object, report)) => {
+                    sess.dcx().note(format!(
+                        "trust-cg TRUST-IR certification report for module `{}`: {} ({}); \
+                         {} function(s) byte-preserved into one object",
+                        bridge_module.name,
+                        report,
+                        policy_label(policy),
+                        module_object.preserved.len()
+                    ));
+                    module_object.bytes
+                }
+                Err(e) => sess.dcx().fatal(format!(
+                    "trust-cg: REFUSING to emit trust-ir module `{}` — the in-compiler \
+                     proven-output gate rejected it: {e}",
+                    bridge_module.name
+                )),
+            }
         };
 
-        // Trust (RUNG 2): reconcile the freshly-emitted artifacts against the
-        // gate-verified bytes. For every object whose source function the gate
-        // VERIFIED, the shipped bytes MUST equal the verified bytes — assert this
-        // per function and fail closed (fatal, no object written) on any
-        // divergence. Then SHIP the verified bytes themselves, so the artifact on
-        // disk is provably the artifact the gate checked. Under advisory
-        // AllowUnknown/Off, functions the gate did not cover may still ship the
-        // backend bytes unchanged. Under Strict/full, every emitted object must
-        // consume exactly one matching verified entry; missing, extra, or
-        // duplicate names fail closed.
-        // The gate now receives this exact configured bridge, including target,
-        // lowering policy, and optimization level. Even when a cross-target
-        // decoder is unavailable under AllowUnknown, the uncertified bytes it
-        // captures are the same candidate bytes reconciled and shipped here.
-        let emitted_objects: Vec<bridge_backend::EmittedObject> = emitted_objects
-            .into_iter()
-            .map(|mut emitted| {
-                if let Some(captured_bytes) = gate_captured.remove(&emitted.source_name) {
-                    if emitted.bytes != captured_bytes {
-                        sess.dcx().fatal(format!(
-                            "trust-cg: RUNG 2 violation — the shipped object for `{}` diverged \
-                             from the bytes the proven-output gate captured (captured {} bytes, \
-                             re-emitted {} bytes). Refusing to ship unverified bytes.",
-                            emitted.source_name,
-                            captured_bytes.len(),
-                            emitted.bytes.len()
-                        ));
-                    }
-                    // Ship the gate-captured bytes (single source of truth). In
-                    // AllowUnknown they may be explicitly uncertified, but the
-                    // report says so and these remain the exact evaluated bytes.
-                    emitted.bytes = captured_bytes;
-                } else if gate_mode == OutputGateMode::Strict {
-                    sess.dcx().fatal(format!(
-                        "trust-cg: strict/full output preservation produced no exact-byte proof \
-                         for emitted function `{}`; refusing an unverified artifact",
-                        emitted.source_name
-                    ));
-                }
-                emitted
-            })
-            .collect();
-
-        if gate_mode == OutputGateMode::Strict && !gate_captured.is_empty() {
-            // Hash iteration only feeds this vector; sorting below owns the
-            // diagnostic order before it becomes observable.
-            #[allow(rustc::potential_query_instability)]
-            let mut unmatched = gate_captured.keys().cloned().collect::<Vec<_>>();
-            unmatched.sort();
+        if bytes.is_empty() {
             sess.dcx().fatal(format!(
-                "trust-cg: strict/full output preservation proved artifact(s) with no matching \
-                 emitted function: {}; refusing name/cardinality drift",
-                unmatched.join(", ")
-            ));
-        }
-
-        if emitted_objects.is_empty() {
-            sess.dcx().fatal(format!(
-                "trust-cg: object emission for `{}` produced no artifacts",
+                "trust-cg: object emission for `{}` produced an empty artifact",
                 bridge_module.name
             ));
         }
 
-        emitted_objects
-            .into_iter()
-            .map(|emitted| {
-                if emitted.bytes.is_empty() {
-                    sess.dcx().fatal(format!(
-                        "trust-cg: object emission for `{}` produced an empty artifact `{}`",
-                        emitted.source_name, emitted.artifact_name
-                    ));
-                }
+        let object_path = outputs.temp_path_for_cgu(OutputType::Object, &bridge_module.name);
+        if let Err(e) = fs::write(&object_path, &bytes) {
+            sess.dcx().fatal(format!(
+                "trust-cg: failed to write object for `{}`: {e}",
+                bridge_module.name
+            ));
+        }
 
-                let object_path =
-                    outputs.temp_path_for_cgu(OutputType::Object, &emitted.artifact_name);
-
-                if let Err(e) = fs::write(&object_path, &emitted.bytes) {
-                    sess.dcx().fatal(format!(
-                        "trust-cg: failed to write object `{}` for `{}`: {e}",
-                        emitted.artifact_name, emitted.source_name
-                    ));
-                }
-
-                CompiledModule {
-                    name: emitted.artifact_name,
-                    kind: ModuleKind::Regular,
-                    object: Some(object_path),
-                    global_asm_object: None,
-                    dwarf_object: None,
-                    bytecode: None,
-                    assembly: None,
-                    llvm_ir: None,
-                    links_from_incr_cache: Vec::new(),
-                }
-            })
-            .collect()
+        CompiledModule {
+            name: bridge_module.name.clone(),
+            kind: ModuleKind::Regular,
+            object: Some(object_path),
+            global_asm_object: None,
+            dwarf_object: None,
+            bytecode: None,
+            assembly: None,
+            llvm_ir: None,
+            links_from_incr_cache: Vec::new(),
+        }
     }
 
     fn emit_rustc_allocator_module_for_bridge_module(
@@ -601,6 +829,32 @@ enum OutputGateMode {
     AllowUnknown,
 }
 
+/// Trust (F1): which producer supplies the backend's per-function input.
+///
+/// `Mir` is the shipped path and the default. `TrustIr` is the source-first F1
+/// path: `trust_ir_of` -> `trust_cg_bridge::lower_module_to_lir` -> object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustCgFrontend {
+    Mir,
+    TrustIr,
+}
+
+#[allow(rustc::bad_opt_access)]
+fn trust_cg_frontend(sess: &Session) -> TrustCgFrontend {
+    match trust_cg_frontend_from_name(&sess.opts.unstable_opts.trust_cg_frontend) {
+        Ok(frontend) => frontend,
+        Err(reason) => sess.dcx().fatal(reason),
+    }
+}
+
+fn trust_cg_frontend_from_name(frontend: &str) -> Result<TrustCgFrontend, &'static str> {
+    match frontend {
+        "mir" => Ok(TrustCgFrontend::Mir),
+        "trust-ir" => Ok(TrustCgFrontend::TrustIr),
+        _ => Err("invalid -Ztrust-cg-frontend value reached the trust-cg backend"),
+    }
+}
+
 #[allow(rustc::bad_opt_access)]
 fn output_gate_mode(sess: &Session) -> OutputGateMode {
     match output_gate_mode_for_verification(
@@ -646,35 +900,56 @@ fn output_gate_allows_unreconciled_target(mode: OutputGateMode, exact_builtin_ho
     exact_builtin_host || output_gate_allows_unverified_artifact(mode)
 }
 
-/// Run the proven-output gate over a bridge module's source functions. On a
-/// Refuted (miscompile) or policy-refused Unknown verdict, this calls
-/// `sess.dcx().fatal(..)` and codegen aborts — no object is emitted. Returns
-/// (allowing emission to proceed) only when the gate clears the module.
+/// Run the proven-output gate over a bridge module's source functions and
+/// return THE ONE OBJECT this codegen unit ships.
 ///
-/// Trust (RUNG 2): returns a map from source function name to the exact candidate
-/// bytes the gate evaluated and captured. Strict mode returns only verified
-/// bytes; AllowUnknown may also return explicitly reported uncertified bytes.
-/// The caller reconciles and ships this single source of truth. An empty map
-/// means the gate was off or the module had no source functions.
-fn run_output_preservation_gate(
+/// On a Refuted (miscompile) verdict, a policy-refused Unknown, or a violated
+/// merge obligation, this calls `sess.dcx().fatal(..)` and codegen aborts — no
+/// object is written.
+///
+/// Trust (RUNG 2, module form): the returned bytes ARE the bytes the gate
+/// verified. Each function is still proved in ISOLATION, exactly as before; what
+/// the module form adds is the discharged claim that this artifact carries each
+/// of those verified instruction streams verbatim, at the offset its own symbol
+/// table assigns. There is no second emission to reconcile against.
+fn run_module_output_preservation_gate(
     bridge: &BridgeBackend,
     bridge_module: &bridge_backend::CompiledModule,
     sess: &Session,
     mode: OutputGateMode,
-) -> FxHashMap<String, Vec<u8>> {
-    use trust_cg_bridge::verify_output::{EmitPolicy, emit_objects_verified_reported_with_backend};
+) -> trust_cg_bridge::verify_output::VerifiedModuleObject {
+    use trust_cg_bridge::verify_output::{
+        EmitPolicy, VerifiedModuleObject, emit_module_object_verified_reported_with_backend,
+    };
+
+    // Emit WITHOUT the gate. Reachable only when the gate is explicitly `off`,
+    // or for a synthesized module that carries no source functions to verify
+    // (e.g. an allocator shim); both already refuse strict mode elsewhere.
+    let ungated = |reason: &str| -> VerifiedModuleObject {
+        match bridge.emit_module_object(bridge_module) {
+            Ok(emitted) => {
+                tracing::debug!(
+                    module = %bridge_module.name,
+                    reason,
+                    "[trust_cg] module object emitted without the proven-output gate"
+                );
+                VerifiedModuleObject { bytes: emitted.bytes, preserved: Vec::new() }
+            }
+            Err(e) => sess.dcx().fatal(format!(
+                "trust-cg: failed to emit object for `{}`: {e}",
+                bridge_module.name
+            )),
+        }
+    };
 
     if mode == OutputGateMode::Off {
-        return FxHashMap::default();
+        return ungated("gate disabled");
     }
-
-    // Only regular modules carry source functions; synthesized modules (e.g. the
-    // allocator shim) have `source_functions == None` and nothing to verify.
     let Some(sources) = bridge_module.source_functions.as_ref() else {
-        return FxHashMap::default();
+        return ungated("module carries no source functions");
     };
     if sources.is_empty() {
-        return FxHashMap::default();
+        return ungated("module carries no source functions");
     }
 
     let policy = match mode {
@@ -684,10 +959,10 @@ fn run_output_preservation_gate(
     };
 
     // The gate emits each function to bytes ONCE, discharges output-preservation
-    // against the auto-derived IR semantics over THOSE bytes, and (RUNG 2) returns
-    // the verified bytes. A Refuted function is rejected under every policy; an
-    // Unknown one only under StrictProvenOnly. We KEEP the returned bytes and
-    // ship them, instead of discarding and re-emitting a separate artifact.
+    // against the auto-derived IR semantics over THOSE bytes, and returns them.
+    // A Refuted function is rejected under every policy; an Unknown one only
+    // under StrictProvenOnly. It then merges the CGU into one object and REFUSES
+    // unless every verified function's bytes survived the merge unchanged.
     //
     // Trust (RUNG 3 — CERTIFICATION REPORT): the gate also returns a per-module
     // tally of the output-preservation GRADE assigned each emitted function
@@ -696,15 +971,22 @@ fn run_output_preservation_gate(
     // kernel-re-checkable proof is COUNTED and reported, never silently treated
     // as if covered. (Under StrictProvenOnly only kernel-[PROVED] functions ship;
     // [VALIDATED] and Unknown are refused, landing in the Err arm below.)
-    match emit_objects_verified_reported_with_backend(sources, policy, bridge) {
-        Ok((verified, report)) => {
+    match emit_module_object_verified_reported_with_backend(
+        sources,
+        &bridge_module.linkage,
+        policy,
+        bridge,
+    ) {
+        Ok((module_object, report)) => {
             sess.dcx().note(format!(
-                "trust-cg certification report for module `{}`: {} ({})",
+                "trust-cg certification report for module `{}`: {} ({}); \
+                 {} function(s) byte-preserved into one object",
                 bridge_module.name,
                 report,
-                policy_label(policy)
+                policy_label(policy),
+                module_object.preserved.len()
             ));
-            verified.into_iter().collect()
+            module_object
         }
         Err(e) => {
             sess.dcx().fatal(format!(
@@ -727,19 +1009,154 @@ fn policy_label(policy: trust_cg_bridge::verify_output::EmitPolicy) -> &'static 
     }
 }
 
-fn scalar_register_abi_ty_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+/// Whether the caller's frontend models a fieldless enum's carrier width.
+///
+/// This is NOT a policy knob. It records a measured asymmetry between the two
+/// frontends, and it exists because `scalar_register_abi_ty_supported` is
+/// SHARED by both: widening it widens admission on the default MIR path too.
+///
+/// * `Admit` — the trust-ir (F1) frontend. Its converter and its gate both read
+///   the carrier width from ONE function, `module_to_lir::fieldless_enum_carrier`,
+///   which takes it from the producer's `EnumLayoutDescriptor` — filled by
+///   `trust_thir_lower` from rustc's own layout query and emitted as `Direct`
+///   only when the def's canonical tag repr equals rustc's tag scalar.
+/// * `Refuse` — the MIR frontend, which has NO access to that descriptor.
+///   Measured: `ty_convert::lower_enum_adt` hardcodes the `__tag` field as
+///   `Int { width: pointer_width(tcx), signed: true }` (64-bit signed on
+///   aarch64), `mapping::map_type` discards `enum_layout` into
+///   `LirType::Struct`, and `verify_output::reg_width` has no ADT arm and
+///   falls through to 32. For `enum Three { X, Y, Z }` that is three live
+///   widths — rustc 8, LIR 64, gate 32 — against rustc's `i8` tag.
+///
+/// Today `trust_mir_extract::codegen_ty_issue` rejects `Ty::Adt` unconditionally,
+/// so the MIR path never reaches those three consumers. That barrier lives in
+/// another crate and is maintained for layout fidelity, not for this: it makes
+/// the widening unreachable, not sound. This enum makes the boundary explicit
+/// where the risk is, rather than depending on a distant invariant holding.
+///
+/// Measured cost of refusing on the MIR path: ZERO. Across 35 enum shapes and a
+/// 2,293-crate registry sweep, the MIR path ships no fieldless enum either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumAbi {
+    Admit,
+    Refuse,
+}
+
+fn scalar_register_abi_ty_supported<'tcx>(
+    arg: &ArgAbi<'tcx, Ty<'tcx>>,
+    enum_abi: EnumAbi,
+) -> bool {
     let PassMode::Direct(attrs) = &arg.mode else {
         return false;
     };
     // InReg and integer extension are observable caller/callee contracts. The
     // current bridge carries neither attribute into LIR/object emission.
+    //
+    // These two are the COMPLETE set of `ArgAttributes` that change how a value
+    // is passed, and that is rustc's own statement, not an inference: `ArgAttributes::eq_abi`
+    // (compiler/rustc_target/src/callconv/mod.rs) compares exactly `InReg` and
+    // `arg_ext` and says of the rest "Everything else is things like noalias,
+    // dereferenceable, nonnull, ...". So `NonNull | NoUndef` — the attributes a
+    // `&T` argument carries, and the ones that made the refusal message for a
+    // reference look ABI-shaped — are UB/optimization metadata about a value
+    // already placed by the mode, not placement or representation contracts.
     if attrs.contains(ArgAttribute::InReg) || attrs.arg_ext != ArgExtension::None {
         return false;
     }
     if arg.layout.size.bits() == 0 || arg.layout.size.bits() > 64 {
         return false;
     }
-    matches!(arg.layout.ty.kind(), ty::Bool | ty::Int(_) | ty::Uint(_))
+    match arg.layout.ty.kind() {
+        ty::Bool | ty::Int(_) | ty::Uint(_) => true,
+        // A THIN SHARED REFERENCE is one pointer-sized integer register, passed
+        // exactly like a `usize`.
+        //
+        // A wide reference never reaches this arm, but NOT for the reason it is
+        // tempting to write down. MEASURED on aarch64-apple-darwin (stage1
+        // trustc, `fn f(e: &[u64]) -> usize`): `&[u64]` arrives as
+        // `PassMode::Cast { cast: CastTarget { rest: Uniform { unit: Integer(8),
+        // total: Size(16) } } }` — NOT `PassMode::Pair`. So what excludes it is
+        // the `let PassMode::Direct(attrs) = &arg.mode` guard at the top of this
+        // function, which the target-specific `Pair`-vs-`Cast` choice cannot get
+        // past either way. The `BackendRepr::Scalar` test below is therefore a
+        // defence-in-depth CHECK of thinness, not the thing doing the excluding;
+        // it is kept so a future `Direct`-mode aggregate cannot slip through.
+        //
+        // Deliberately NOT widened to `&mut T` or `*mut T`: those admit writes
+        // through the pointer, and the verification fragment on the other side of
+        // this gate covers reads of caller memory only (`Clean.BVC.selectAddrCong`
+        // under a no-store body). Keeping the two boundaries aligned means a
+        // program this gate admits is one the verifier can still speak about.
+        ty::Ref(_, _, mir::Mutability::Not) => {
+            matches!(arg.layout.backend_repr, BackendRepr::Scalar(_))
+        }
+        // A `char` IS one 32-bit unsigned integer register. It reaches this arm
+        // with `PassMode::Direct` and `arg_ext: None` — MEASURED on
+        // aarch64-apple-darwin: `fn f(a: char)` yields
+        // `Direct(ArgAttributes { regular: NoUndef, arg_ext: None, .. })` — so
+        // the caller owes nothing above the declared 32 bits and nothing below
+        // them is re-encoded. The `Size(32 bits)` test is not decoration: it
+        // PINS rustc's side of the width to the 32 the two consumers hardcode
+        // (`module_to_lir::map_scalar_int_ty` maps `Ty::Char` to `LirType::I32`,
+        // and `verify_output_trust_ir::scalar_reg_width` reads it at 32), so the
+        // slot the emitter writes and the slot the gate models are the same slot
+        // by construction rather than by coincidence.
+        //
+        // `NoUndef` plus char's validity range (a scalar Unicode value) is a
+        // property of the VALUE, not of its placement — the same category as the
+        // `NonNull | NoUndef` on the `&T` arm above, which this backend has
+        // always admitted for exactly that reason.
+        ty::Char => {
+            matches!(arg.layout.backend_repr, BackendRepr::Scalar(_))
+                && arg.layout.size.bits() == 32
+        }
+        // A FIELDLESS (C-like) enum: every variant carries zero fields, so the
+        // value IS its discriminant tag and rustc lays the whole type out as ONE
+        // integer scalar. `#[derive]`-free `enum Round { Up, Down }`-shaped types
+        // are the largest admissible family in the refusal census of real crates.
+        //
+        // What makes this exact rather than hopeful:
+        //
+        // * `BackendRepr::Scalar(Int)` is checked here, so rustc itself says the
+        //   whole value is one integer register — a payload-carrying or
+        //   niche-spread enum has a different `BackendRepr` and never gets here.
+        // * `arg_ext == None` was already required above. That is what excludes
+        //   the 2-variant 0/1 tag, which rustc classifies `Scalar::is_bool()` and
+        //   marks `Zext` (MEASURED on `hashbrown::raw::Fallibility`): its caller
+        //   contract is an extension promise this backend does not carry into
+        //   LIR, so it stays refused, exactly like `bool`.
+        // * The size bound above (`> 64` refused) keeps it inside one register.
+        // * The consumers do NOT guess the tag's width. `module_to_lir::
+        //   fieldless_enum_carrier` derives it from the producer's
+        //   `EnumLayoutDescriptor`, which `trust_thir_lower` fills from rustc's
+        //   OWN layout query and only emits as `Direct` when the def's canonical
+        //   tag repr equals rustc's tag scalar — so the LIR carrier and the gate's
+        //   read width are rustc's tag type. The SAME function is the gate's
+        //   width rule, so there is one derivation, not two. THAT IS TRUE OF THE
+        //   TRUST-IR FRONTEND ONLY, which is why this arm is gated on `EnumAbi`:
+        //   the MIR path has three other derivations and reads none of them from
+        //   the descriptor. See `EnumAbi` above.
+        // * VALUE validity (`NoUndef` over the discriminant range) is discharged
+        //   downstream, not assumed: the converter admits an enum type at only
+        //   four sites — signature, block parameters and `Inst::Const` — and
+        //   refuses an enum-typed constant whose tag is not a DECLARED
+        //   discriminant, so a function that gets past it can only ever return a
+        //   declared tag or a tag its own caller supplied.
+        ty::Adt(def, _)
+            if enum_abi == EnumAbi::Admit
+                && def.is_enum()
+                && def.variants().iter().all(|v| v.fields.is_empty()) =>
+        {
+            matches!(
+                arg.layout.backend_repr,
+                BackendRepr::Scalar(rustc_abi::Scalar::Initialized {
+                    value: rustc_abi::Primitive::Int(..),
+                    ..
+                })
+            )
+        }
+        _ => false,
+    }
 }
 
 fn ignored_return_abi_ty_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
@@ -830,10 +1247,11 @@ fn scalar_register_argument_limit(target_triple: &str) -> Option<usize> {
 /// single integer registers of at most 64 bits (or a unit/never result). This is
 /// checked for definitions and every direct callee, so an LLVM-built dependency
 /// cannot silently introduce an incompatible hidden/pass-mode contract.
-fn validate_codegen_instance_abi<'tcx>(
+fn validate_codegen_instance_abi_with<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
     mir_arg_count: usize,
+    enum_abi: EnumAbi,
 ) -> Result<(), String> {
     let attrs = tcx.codegen_instance_attrs(instance.def);
     if let Some(reason) = codegen_attrs_issue(&attrs) {
@@ -890,14 +1308,14 @@ fn validate_codegen_instance_abi<'tcx>(
         ));
     }
     for (index, arg) in fn_abi.args.iter().enumerate() {
-        if !scalar_register_abi_ty_supported(arg) {
+        if !scalar_register_abi_ty_supported(arg, enum_abi) {
             return Err(format!(
                 "argument {index} uses unsupported ABI type/pass mode `{}` / {:?}",
                 arg.layout.ty, arg.mode
             ));
         }
     }
-    if !scalar_register_abi_ty_supported(&fn_abi.ret)
+    if !scalar_register_abi_ty_supported(&fn_abi.ret, enum_abi)
         && !ignored_return_abi_ty_supported(&fn_abi.ret)
     {
         return Err(format!(
@@ -906,6 +1324,26 @@ fn validate_codegen_instance_abi<'tcx>(
         ));
     }
     Ok(())
+}
+
+/// The MIR frontend's ABI admission. Fieldless enums are REFUSED here: this path
+/// does not read the producer's declared enum layout. See `EnumAbi`.
+fn validate_codegen_instance_abi<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    mir_arg_count: usize,
+) -> Result<(), String> {
+    validate_codegen_instance_abi_with(tcx, instance, mir_arg_count, EnumAbi::Refuse)
+}
+
+/// The trust-ir (F1) frontend's ABI admission. Fieldless enums are admitted:
+/// converter and gate share one producer-derived carrier width. See `EnumAbi`.
+fn validate_codegen_instance_abi_trust_ir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    mir_arg_count: usize,
+) -> Result<(), String> {
+    validate_codegen_instance_abi_with(tcx, instance, mir_arg_count, EnumAbi::Admit)
 }
 
 /// Resolve a direct call in an already-monomorphized body to the exact symbol
@@ -978,16 +1416,44 @@ fn production_function_symbol_contract_supported(
     linkage: Linkage,
     visibility: Visibility,
 ) -> bool {
-    // The current object emitter creates one strong definition per function.
-    // Internal is not safe to promote: rustc may create CGU-local copies, and
-    // splitting every function into its own object prevents us from preserving
-    // local visibility across direct calls. Weak/link-once/common semantics are
-    // likewise not strong definitions. Its object writers also mark every
-    // function globally visible/default; silently promoting a Hidden symbol or
-    // making a Protected symbol interposable changes dynamic-link behavior.
-    // Admit only the exact emitted contract until both properties travel
-    // through LIR/object emission.
-    linkage == Linkage::External && visibility == Visibility::Default
+    // LINKAGE. `External` and `Internal` are the two definitions the object
+    // emitters can now express: the function-symbol path carries a per-function
+    // `FunctionSymbolBinding` (Mach-O `N_EXT` / ELF `STB_GLOBAL` vs a local
+    // definition), and the CGU is emitted as ONE object, so a local callee is
+    // reachable from every caller rustc placed beside it. Internalization is
+    // exactly what `u64::from(u8)`, `wrapping_add`, and `rotate_left` hit, so
+    // refusing it refused every program that calls `core`.
+    //
+    // rustc assigns linkage at CGU granularity and PROMOTES a symbol to
+    // `External` whenever it is needed across CGUs, so `Internal` is sound
+    // precisely when the CGU is the object boundary — which trust-cg enforces
+    // twice over: `-Ccodegen-units != 1` is refused outright, and the CGU is
+    // emitted as a single object.
+    //
+    // Weak/link-once/common are still refused: they are not strong definitions.
+    //
+    // VISIBILITY stays `Default`-only. The object writers carry no `N_PEXT` /
+    // `STV_HIDDEN` / `STV_PROTECTED` channel, so promoting a Hidden symbol or
+    // making a Protected symbol interposable would silently change dynamic-link
+    // behavior. This costs nothing for the case at hand: rustc's internalization
+    // pass sets `visibility = Default` alongside `linkage = Internal`
+    // (`rustc_monomorphize::partitioning`), so internalized mono-items land in
+    // the admitted quadrant.
+    matches!(linkage, Linkage::External | Linkage::Internal) && visibility == Visibility::Default
+}
+
+/// Map rustc's `Linkage` onto the two definition shapes trust-cg emits.
+///
+/// Only linkages the gate above admits reach this function; anything else is a
+/// bug in the gate and fails closed rather than being silently exported.
+fn bridge_function_linkage(linkage: Linkage) -> Result<bridge_backend::FunctionLinkage, String> {
+    match linkage {
+        Linkage::External => Ok(bridge_backend::FunctionLinkage::External),
+        Linkage::Internal => Ok(bridge_backend::FunctionLinkage::Internal),
+        other => Err(format!(
+            "{other:?} linkage reached symbol emission despite the mono-item gate (fail-closed)"
+        )),
+    }
 }
 
 fn extract_mono_verifiable_function<'tcx>(
@@ -1030,12 +1496,19 @@ fn extract_mono_verifiable_function<'tcx>(
     }
 }
 
-/// Build the single deterministic production inventory used by every output
-/// path. No reachable item may be skipped: omission would produce a linkable
-/// artifact whose behavior differs from rustc's mono-item graph.
-fn build_production_mono_functions<'tcx>(
+/// Collect the single deterministic production INVENTORY: every reachable
+/// monomorphic function rustc's mono-item graph names, with its output symbol
+/// and admitted linkage, in a stable order.
+///
+/// This is the shared front half of `build_production_mono_functions`. It is
+/// factored out so the trust-ir codegen frontend (`-Ztrust-cg-frontend=trust-ir`)
+/// compiles THE SAME SYMBOL SET as the shipped MIR path — same collection, same
+/// linkage/visibility gate, same collision check, same ordering — and the two
+/// paths differ ONLY in where each function's IR comes from. A second inventory
+/// would make any comparison between them meaningless.
+fn collect_production_mono_instances<'tcx>(
     tcx: TyCtxt<'tcx>,
-) -> Result<Vec<VerifiableFunction>, String> {
+) -> Result<Vec<(String, ty::Instance<'tcx>, bridge_backend::FunctionLinkage)>, String> {
     use rustc_middle::mono::MonoItem;
 
     let mut instances = Vec::new();
@@ -1057,6 +1530,7 @@ fn build_production_mono_functions<'tcx>(
                             data.visibility,
                         ));
                     }
+                    let linkage = bridge_function_linkage(data.linkage)?;
                     let symbol = tcx.symbol_name(instance).name.to_string();
                     if let Some(previous) = symbols.insert(symbol.clone(), instance) {
                         if previous != instance {
@@ -1067,7 +1541,7 @@ fn build_production_mono_functions<'tcx>(
                         }
                         continue;
                     }
-                    instances.push((symbol, instance));
+                    instances.push((symbol, instance, linkage));
                 }
                 MonoItem::Static(def_id) => {
                     return Err(format!(
@@ -1084,17 +1558,36 @@ fn build_production_mono_functions<'tcx>(
         }
     }
 
-    instances.sort_by(|(left, _), (right, _)| left.cmp(right));
+    instances.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+    Ok(instances)
+}
+
+/// Build the single deterministic production inventory used by every output
+/// path. No reachable item may be skipped: omission would produce a linkable
+/// artifact whose behavior differs from rustc's mono-item graph.
+fn build_production_mono_functions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<(Vec<VerifiableFunction>, Vec<bridge_backend::FunctionLinkage>), String> {
+    let instances = collect_production_mono_instances(tcx)?;
+    // The linkage vector is built in the SAME order as the function vector and
+    // returned beside it; the two are consumed strictly index-aligned.
+    let linkage =
+        instances.iter().map(|(_, _, linkage)| *linkage).collect::<Vec<_>>();
     let functions = instances
         .into_iter()
-        .map(|(_, instance)| extract_mono_verifiable_function(tcx, instance))
+        .map(|(_, instance, _)| extract_mono_verifiable_function(tcx, instance))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let internal = linkage
+        .iter()
+        .filter(|linkage| **linkage == bridge_backend::FunctionLinkage::Internal)
+        .count();
     tracing::info!(
         extracted = functions.len(),
+        internal_linkage = internal,
         "[trust_cg] reachable monomorphic extraction complete"
     );
-    Ok(functions)
+    Ok((functions, linkage))
 }
 
 fn lang_item_symbol<'tcx>(tcx: TyCtxt<'tcx>, lang_item: LangItem) -> Result<String, String> {
@@ -1227,8 +1720,29 @@ fn allocator_module_spec_for_tcx<'tcx>(
 // Trust: CodegenBackend adapter for trust-cg integration (#829).
 struct OngoingTrustCgCodegen {
     /// Bridge-level ongoing codegen result. `None` when rustc requested only
-    /// backend-independent outputs such as MIR/metadata.
+    /// backend-independent outputs such as MIR/metadata, and on the trust-ir
+    /// frontend path (which never enters the bridge's MIR-fed `codegen_crate`).
     bridge_ongoing: Option<Box<dyn Any>>,
+    /// Trust (F1): the codegen unit assembled by the trust-ir frontend
+    /// (`-Ztrust-cg-frontend=trust-ir`), carrying LIR produced from
+    /// `trust_ir_of` rather than from MIR.
+    ///
+    /// EXACTLY ONE of this and `bridge_ongoing` is `Some` on a linking
+    /// compilation; both are `None` for metadata/MIR-only work. It is a separate
+    /// field rather than a synthesized `bridge_backend::OngoingCodegen` because
+    /// that type's fields are `pub(crate)` to the bridge, and — more to the
+    /// point — because a module with no `source_functions` must not be able to
+    /// masquerade as one the MIR path produced.
+    trust_ir_module: Option<bridge_backend::CompiledModule>,
+    /// Trust (F1 gate): the trust-ir specification work list for
+    /// `trust_ir_module`, 1:1 and in the same order as its `lir_functions`.
+    ///
+    /// This is what makes the F1 path GATEABLE. It is deliberately a SEPARATE,
+    /// non-optional vector rather than a field on `CompiledModule`: a missing or
+    /// mis-sized work list must be a compile error at emission time, not a
+    /// `None` that some caller could read as "nothing to verify" — which is
+    /// exactly the laundering shape `source_functions: None` used to have.
+    trust_ir_gate_sources: Vec<trust_cg_bridge::verify_output_trust_ir::TrustIrGateSource>,
     /// Crate name for diagnostics.
     crate_name: String,
     /// Number of functions extracted from MIR (for diagnostics).
@@ -1318,10 +1832,42 @@ impl CodegenBackend for TrustCgCodegenBackend {
                      pipeline; use --emit=mir for analysis or a production Wasm backend",
                 );
             }
+            // The refusal is UNCHANGED; only its stated reason is corrected, because
+            // the old one ("until invoke, cleanup, personality, LSDA, and resume
+            // semantics are emitted") is measurably stale and sent readers to the
+            // wrong layer. trust-cg's BACKEND already emits those semantics and they
+            // link and RUN: `trust_cg_codegen::exception_handling` builds the LSDA
+            // call-site/action tables and resolves the personality symbol, and the
+            // e2e tests `e2e_aarch64_eh_invoke_trust_ir` / `e2e_aarch64_eh_resume_trust_ir`
+            // drive `Inst::Invoke` / `Inst::LandingPad` / `Inst::Resume` through the
+            // real compiler pipeline, link with c++, and execute the catch/resume.
+            //
+            // The two blockers are UPSTREAM of codegen and IN THE PROOF:
+            //   * PRODUCER — no production path constructs `Inst::Invoke` /
+            //     `LandingPad` / `Resume` (only tests do), and
+            //     `trust_mir_extract::extract_function_for_codegen` refuses every
+            //     unwind-carrying MIR terminator (any non-`Unreachable` call unwind
+            //     action, and every `Assert` / `Drop` / `UnwindResume` /
+            //     `UnwindTerminate`) before codegen sees it. `-Cpanic=unwind` and
+            //     `-Cpanic=abort` produce byte-identical `--emit=trust-ir`.
+            //   * PROOF — the M-POS proven-output gate's obligation is
+            //     `forall args. machine_ret(args) == ir_ret(args)`: ONE value, over
+            //     the paths its executor can walk from the entry PC. An unwind edge
+            //     is a second exit reached by the unwinder from the LSDA, so cleanup
+            //     bytes are never decoded and never enter the obligation — they would
+            //     ship unverified inside a `[PROVED]` object. See the measurements
+            //     pinned by `verify_output::tests::unwind_scope_*`.
+            //
+            // Lifting this therefore means extending the gate's obligation to an
+            // exit-tagged relation FIRST, then teaching the producer to emit the
+            // edges — not adding backend EH support, which exists.
             if sess.panic_strategy().unwinds() {
                 sess.dcx().fatal(
-                    "panic=unwind is not supported by trust-cg until invoke, cleanup, personality, \
-                     LSDA, and resume semantics are emitted; compile with -Cpanic=abort",
+                    "panic=unwind is not supported by trust-cg: unwind edges are dropped before \
+                     codegen (MIR extraction refuses cleanup/Assert/Drop/UnwindResume terminators, \
+                     and no producer emits invoke/landing-pad/resume), and the proven-output gate \
+                     proves only the normal-return path, so cleanup code could not be verified; \
+                     compile with -Cpanic=abort",
                 );
             }
             if sess.opts.cg.target_cpu.is_some() {
@@ -1515,6 +2061,8 @@ impl CodegenBackend for TrustCgCodegenBackend {
             // verification, and lowering for metadata/dep-info/MIR-only work.
             return Box::new(OngoingTrustCgCodegen {
                 bridge_ongoing: None,
+                trust_ir_module: None,
+                trust_ir_gate_sources: Vec::new(),
                 crate_name,
                 function_count: 0,
             });
@@ -1534,7 +2082,18 @@ impl CodegenBackend for TrustCgCodegenBackend {
             ));
         }
 
-        let functions = build_production_mono_functions(tcx).unwrap_or_else(|reason| {
+        // Trust (F1): the source-first frontend. `-Ztrust-cg-frontend=trust-ir`
+        // routes every reachable mono-item through the ALREADY-SHIPPING
+        // `trust_ir_of` query and the Module->LIR converter instead of through
+        // MIR extraction, so "source -> TrustIR -> object" exists as an executed
+        // path rather than an offline measurement. It is off by default and this
+        // branch is the ONLY thing the option changes: with `mir` (the default)
+        // control falls straight through to the code below, untouched.
+        if trust_cg_frontend(tcx.sess) == TrustCgFrontend::TrustIr {
+            return self.codegen_crate_from_trust_ir(tcx, crate_name);
+        }
+
+        let (functions, linkage) = build_production_mono_functions(tcx).unwrap_or_else(|reason| {
             tcx.dcx().fatal(format!(
                 "trust-cg cannot faithfully materialize rustc's reachable mono-item graph: {reason}"
             ))
@@ -1599,7 +2158,7 @@ impl CodegenBackend for TrustCgCodegenBackend {
         };
 
         let bridge_crate_info =
-            bridge_backend::CrateInfo { crate_name: crate_name.clone(), functions };
+            bridge_backend::CrateInfo { crate_name: crate_name.clone(), functions, linkage };
 
         let mut bridge_ongoing =
             match BridgeCodegenBackend::codegen_crate(&bridge, &bridge_crate_info) {
@@ -1628,6 +2187,8 @@ impl CodegenBackend for TrustCgCodegenBackend {
 
         Box::new(OngoingTrustCgCodegen {
             bridge_ongoing: Some(bridge_ongoing),
+            trust_ir_module: None,
+            trust_ir_gate_sources: Vec::new(),
             crate_name,
             function_count,
         })
@@ -1643,6 +2204,28 @@ impl CodegenBackend for TrustCgCodegenBackend {
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
         let ongoing = ongoing_codegen.downcast::<OngoingTrustCgCodegen>().unwrap();
+
+        // Trust (F1): the trust-ir frontend's codegen unit. It never entered the
+        // bridge's MIR-fed `codegen_crate`, so there is no bridge `OngoingCodegen`
+        // to join — the LIR is already in hand and only needs emission.
+        if let Some(trust_ir_module) = &ongoing.trust_ir_module {
+            let bridge = self.bridge_for_session(sess);
+            let module = self.emit_rustc_module_for_trust_ir_module(
+                &bridge,
+                trust_ir_module,
+                &ongoing.trust_ir_gate_sources,
+                sess,
+                outputs,
+            );
+            sess.dcx().note(format!(
+                "trust-cg: compiled {} function(s) in 1 module(s) via the trust-ir frontend",
+                ongoing.function_count
+            ));
+            return (
+                CompiledModules { modules: vec![module], allocator_module: None },
+                WorkProductMap::default(),
+            );
+        }
 
         let Some(bridge_ongoing) = ongoing.bridge_ongoing else {
             return (

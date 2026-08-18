@@ -127,6 +127,7 @@ use trust_ir::{
     Inst,
     InstrNode,
     SourceSpan,
+    SourceLoopProvenance,
     Linkage,
     Module,
     OverflowOp,
@@ -143,6 +144,8 @@ pub mod flip;
 pub mod flip_registry;
 pub mod lineage;
 pub mod mir_differential;
+pub mod remap_certificate;
+mod source_provenance;
 pub mod to_mir;
 
 /// Trust (totality Batch B): depth fuel for the `(DefId, args)`-keyed ADT visit stacks
@@ -197,6 +200,62 @@ pub(crate) fn layout_query_is_reentrant_safe(ty: RustcTy<'_>) -> bool {
             .walk()
             .filter_map(|arg| arg.as_type())
             .any(|inner| matches!(inner.kind(), ty::CoroutineWitness(..)))
+}
+
+/// Trust (#48): `layout_query_is_reentrant_safe` plus the FIELDS of a local ADT.
+///
+/// The flag test above reads only the type's OWN flags, and layout recursion does
+/// not stop there. `struct Inner { x: X }` where `pub type X = impl Tr;` is
+/// `ty::Adt(Inner, [])` — no alias flag anywhere on it — so the flag test says
+/// "safe", and then `layout_of(Inner)` descends into the field, normalizes `X`,
+/// and reveals the TAIT from inside `mir_built`. Measured on
+/// `tests/ui/type-alias-impl-trait/normalize-alias-type.rs`, whose cycle reads
+/// `building MIR for tr2` -> `computing layout of Inner` -> `computing layout of
+/// X` -> `normalizing X`.
+///
+/// Only LOCAL ADTs are descended into. A foreign ADT cannot name this crate's
+/// unrevealed TAIT except through its generic arguments, and those ARE on the
+/// outer type's flags, so the check above already covers them. Depth is bounded
+/// and each `AdtDef` is visited once, so a recursive type terminates; exhausting
+/// either answers "not safe", which only declines a layout.
+pub(crate) fn layout_query_is_reentrant_safe_deep<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: RustcTy<'tcx>,
+) -> bool {
+    fn go<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        ty: RustcTy<'tcx>,
+        depth: u32,
+        seen: &mut Vec<rustc_span::def_id::DefId>,
+    ) -> bool {
+        const MAX_FIELD_DEPTH: u32 = 6;
+        if !layout_query_is_reentrant_safe(ty) {
+            return false;
+        }
+        let ty::Adt(def, args) = ty.kind() else {
+            return true;
+        };
+        if !def.did().is_local() {
+            return true;
+        }
+        if depth >= MAX_FIELD_DEPTH {
+            return false;
+        }
+        if seen.contains(&def.did()) {
+            return true;
+        }
+        seen.push(def.did());
+        let safe = def.all_fields().all(|field| {
+            // `skip_normalization` deliberately: normalizing here would be the very
+            // reveal this guard exists to prevent. The unnormalized field type still
+            // carries the alias, which is all the check needs to see.
+            let fty = tcx.type_of(field.did).instantiate(tcx, args).skip_normalization();
+            !free_alias_reaches_opaque(tcx, fty) && go(tcx, fty, depth + 1, seen)
+        });
+        seen.pop();
+        safe
+    }
+    go(tcx, ty, 0, &mut Vec::new())
 }
 
 /// Trust (wave-EF): the PINNED 64-bit reference pointer width. Every downstream gate — the
@@ -446,17 +505,27 @@ fn enum_variant_field_byte_offset<'tcx>(
 /// CANONICAL tag repr. `LowerCx::register_enum` fills the field with that decline as `None`, and
 /// a param-lane enum ALWAYS has `layout: None`.
 ///
-/// # KNOWN GAP, recorded rather than silently widened: the SINGLE-LEVEL lane does not gate on this
+/// # THE GAP THIS ONCE RECORDED IS CLOSED — and this paragraph was stale in TWO waves
 ///
-/// The wave-L4G single-level by-REF binding (`match &e { E::V(x) => .. }`) GEPs a rustc offset
-/// with NO descriptor-presence check, and the same argument applies to it verbatim. MEASURED
-/// 2026-08-01 on `enum Lit { Nat(u64), Str(u32), Unit }` (whose `Direct` tag rustc widens to 4
-/// bytes, so the descriptor declines): the producer emits `gep i8, ptr %0, 4` for `&Lit::Str.0`
-/// while the only consumer that can lay that def out places the field at byte 8
-/// (`payload_offset_bytes=8`, tag `U8` at 0) — a 4-byte wrong address in a body the coverage
-/// artifact reports as `lowered: true`. 286 of 1,061 registered enums (27%) in a 66-crate corpus
-/// dump carry no descriptor. Closing it NARROWS an already-landed lane, which is a verdict change
-/// and therefore a separate decision; wave-NR does not make it, and must not be read as having.
+/// What stood here through wave-NR was "KNOWN GAP … the SINGLE-LEVEL lane does not gate on
+/// this", with the measurement that made the case: on `enum Lit { Nat(u64), Str(u32), Unit }`
+/// (whose `Direct` tag rustc widens to 4 bytes, so [`producer_enum_layout_descriptor`]
+/// declines) the producer emitted `gep i8, ptr %0, 4` for `&Lit::Str.0` while the only consumer
+/// that can lay that def out places the field at byte 8 — a 4-byte wrong address in a body the
+/// coverage artifact reported as `lowered: true`; 286 of 1,061 registered enums (27%) in a
+/// 66-crate corpus dump carry no descriptor. That measurement is still true of the LAYOUTS. It
+/// is no longer true of the LANE:
+///
+/// * **wave-NRF** gave the single-level by-REF payload lane a descriptor-PRESENCE gate;
+/// * **wave-DA** replaced presence with AGREEMENT at BOTH by-REF sites, through the one shared
+///   [`variant_field_offset_agrees`] — and edited this very lane to do it, without correcting
+///   the paragraph below it.
+///
+/// So an auditor reading wave-DA's HEAD was told, in the doc of the function the gate calls,
+/// that the gate does not exist. It does: `lower_enum_match_arm_general` refuses with
+/// `EnumMatch(ref payload layout disagreement)` before any GEP is emitted, and the nested lane
+/// refuses through the same predicate. Fixed in wave-DZ; if a future wave narrows or widens
+/// either lane, this paragraph is part of the change.
 ///
 /// `TyCtxt`-free so the presence decision is invertible in a `--lib` test on its own.
 pub(crate) fn declared_variant_field_offset(
@@ -468,6 +537,89 @@ pub(crate) fn declared_variant_field_offset(
     let ed = enums.iter().find(|ed| ed.id == eid)?;
     let desc = ed.layout.as_ref()?;
     desc.variant_field_offsets.get(variant)?.get(field).copied()
+}
+
+/// Trust (wave-DA): **the agreement predicate** — does the byte offset this producer is about to
+/// GEP equal the byte offset the CONSUMER will use for that same `(enum, variant, field)`?
+///
+/// [`declared_variant_field_offset`] answers "does the consumer HAVE a table for this slot".
+/// That is a PRESENCE question, and presence is not agreement: it proves the interpreter will
+/// read *some* declared byte, not that the byte it reads is the one being emitted. The two
+/// numbers are expected to coincide by construction — `producer_enum_layout_descriptor` fills the
+/// descriptor from `vl.field_offsets` (lib.rs:24963) while [`enum_variant_field_byte_offset`]
+/// reads `for_variant(v).fields.offset(k)`, and `for_variant` is defined as
+/// `FieldsShape::Arbitrary { offsets: layout.field_offsets.clone(), .. }`
+/// (`compiler/rustc_abi/src/layout/simple.rs:152`) whose `offset(i)` is `offsets[FieldIdx::new(i)]`
+/// (`compiler/rustc_abi/src/lib.rs:1710`) — the SAME `IndexVec` entry, read twice. But that is a
+/// DERIVATION over two rustc internals, held in a doc comment; an upstream bump that separated
+/// them would silently mint a wrong interior pointer, and nothing downstream would catch it
+/// (every body in this shape is `interpreter/not-run` — "address walk into variant-bearing ADT
+/// interior"). So the derivation is CHECKED, at every emission site, per body.
+///
+/// ONE implementation, called by BOTH by-REF payload lanes (single-level wave-L4G/wave-DA and
+/// nested wave-NR) for the same reason the offset arithmetic itself is shared: a hand-copied twin
+/// is exactly the edit that lets one lane's check drift from the other's. `TyCtxt`-free, so the
+/// refusal is invertible in a `--lib` test with a deliberately disagreeing descriptor.
+pub(crate) fn variant_field_offset_agrees(
+    enums: &[trust_ir::EnumDef],
+    eid: trust_ir::EnumId,
+    variant: usize,
+    field: usize,
+    emitted: u64,
+) -> bool {
+    declared_variant_field_offset(enums, eid, variant, field) == Some(emitted)
+}
+
+/// Trust (wave-DZ): **is a ZERO displacement one the CONSUMER also derives?** — the struct twin
+/// of [`variant_field_offset_agrees`], and the answer to the hole wave-DA left open.
+///
+/// # Why a zero needs a check at all, which is the whole point
+///
+/// Both struct-interior producer sites short-circuit a zero byte offset —
+/// `if off == 0 { return Some(pv) }` — and emit NO GEP: the field address IS the struct
+/// pointer, so there is no arithmetic to spell. wave-DA's differential gate
+/// (`first_adt_interior_byte_arithmetic`) recognizes the emitted `gep inbounds i8, +K`. A
+/// displacement of zero leaves NO SUCH TRACE, so the gate never sees it, and the invariant
+/// wave-DA claimed to make "unconditional" was unconditional for the emitted-GEP SPELLING only.
+///
+/// That is not a corner. `repr(Rust)` sorts fields by DECREASING alignment, so the field rustc
+/// puts at byte 0 is typically the WIDEST one — not the first-declared one. MEASURED on
+/// `struct Mixed { a: u8, b: u64, c: u8 }`: rustc places `b` at 0 while
+/// `interpret::struct_layout` (declaration order, C-style, `FieldDef::offset` ignored) places
+/// it at 8. `fn s01_b(s: &Mixed) -> &u64 { &s.b }` therefore lowers to a bare `ret %0` that
+/// asserts an address the consumer's own image contradicts by 8 bytes — with nothing in the IR
+/// to say so. 137 clean-kernel structs carry such a field.
+///
+/// # The predicate, and why it needs no layout query
+///
+/// `interpret::aggregate_layout` starts at `offset = 0`, places each field at
+/// `align_up(offset, align(field))`, and then ADVANCES by that field's size. So:
+///
+/// * field 0 is at `align_up(0, a) == 0` for every alignment — ALWAYS, and with no dependence
+///   on any field type. A zero displacement at field 0 is a tautology on BOTH sides.
+/// * for `k > 0`, the offset is zero only if every preceding field has size 0, because the
+///   running offset never decreases and only advances by a size.
+///
+/// `field == 0` is therefore SUFFICIENT for agreement, decidable with no layout query, no
+/// `TyCtxt`, and no hand-copied twin of the interpreter's layout algorithm — which is exactly
+/// the edit that would let the two drift. It is NOT necessary: a struct whose leading fields are
+/// all zero-sized also agrees at `k > 0`. That direction is DECLINED deliberately — proving it
+/// needs `interpret::byte_size` mirrored into the producer, and getting that mirror subtly wrong
+/// is the fail-OPEN direction. Refusing the shortcut costs an emitted `gep inbounds i8, +0`,
+/// which is the same address; admitting a wrong one costs an address.
+///
+/// # What the caller does with a `false`, and why it is not a narrowing
+///
+/// It does NOT decline the lane. It falls through to the ordinary GEP emission with `off == 0`,
+/// so the body still lowers, the address is bit-identical (`base + 0`), codegen is unaffected —
+/// and the emitted `gep inbounds i8, +0` is now VISIBLE to
+/// `first_adt_interior_byte_arithmetic`, which refuses the interpreter channel for that body's
+/// whole reachable closure. The contested address stops being invisible; nothing stops being
+/// compiled.
+///
+/// Pure and `TyCtxt`-free, so both directions are invertible in a `--lib` test.
+pub(crate) fn zero_displacement_agrees(field: u32) -> bool {
+    field == 0
 }
 
 /// Trust (wave-L4G): the single-level by-REF payload lane's tag for each offset refusal. A
@@ -1011,7 +1163,8 @@ pub(crate) enum SharedReborrowArm {
     /// never in `borrow_ptrs` because the param-binding gate only registers thin `Ty::Ptr`s.
     FatSharedRef,
     /// wave-TR: an unledgered THIN shared reference (`&Expr` from a call result, a by-ref match
-    /// binding, a ref-typed local). This is the ONLY arm that sets `Lowered::thin_reborrow`.
+    /// binding, a ref-typed local). This is the ONLY arm that appends to
+    /// `Lowered::thin_reborrows`.
     ThinReborrow,
     /// No arm admits: the value stays fail-closed under `Borrow(non-local place)`.
     Refuse,
@@ -1021,8 +1174,8 @@ pub(crate) enum SharedReborrowArm {
 ///
 /// All three return the IDENTICAL `ValueId` — `&*r == r` for a shared reference — so their relative
 /// order is NOT load-bearing for the module that gets emitted. It IS load-bearing for the wave-TR
-/// FLIP LEDGER: only [`SharedReborrowArm::ThinReborrow`] sets `Lowered::thin_reborrow`, and a body
-/// that merely forwards a LEDGER-registered pointer must stay exactly as flip-eligible as it was
+/// FLIP LEDGER: only [`SharedReborrowArm::ThinReborrow`] appends to `Lowered::thin_reborrows`, and
+/// a body that merely forwards a LEDGER-registered pointer must stay exactly as flip-eligible as it was
 /// before wave-TR rather than be demoted because the new predicate also happens to hold on it. On
 /// the OVERLAP (a registered ref param that is also a thin identity reborrow) the ledger arm
 /// therefore wins.
@@ -1044,6 +1197,108 @@ pub(crate) fn shared_reborrow_arm(
     } else {
         SharedReborrowArm::Refuse
     }
+}
+
+/// Trust (wave-TR provenance ledger): WHERE the `&T` value a body forwarded through
+/// [`SharedReborrowArm::ThinReborrow`] came from, as the PRODUCER saw it — the record the flip gate
+/// used to have no way to ask for.
+///
+/// The pre-ledger gate was a single `bool` and it refused for ABSENCE OF EVIDENCE: "the producer
+/// holds no record it could hand the flip about where the pointer came from"
+/// (`flip_registry::thin_reborrows_allow_flip`). The classes below are that record. They are
+/// deliberately COARSE — a class is a claim about what kind of thing the producer can go on to
+/// CHECK against the emitted module, not a taxonomy of Rust syntax. Only [`Self::CallResult`]
+/// names a class whose members have a DEFINING INSTRUCTION in the body this lowering emitted; the
+/// others name values that arrive from outside the instruction stream, which is exactly why
+/// `flip_registry` can certify the first and still refuses the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinReborrowProvenance {
+    /// The reborrowed expression is a THIR **call** (`ExprKind::Call`): `&*f(..)`.
+    ///
+    /// The forwarded `&T` is the RETURN VALUE of a call THIS lowering emitted, so the module the
+    /// flip is about to hand codegen contains the instruction that mints the pointer. That is what
+    /// `flip_registry::call_result_reborrow_is_confined` goes on to verify against the module
+    /// itself — the class tag alone certifies nothing.
+    ///
+    /// This is `Level::is_zero`'s provenance, three times over
+    /// (`_7 = <LevelArc as Deref>::deref(move _8)` then `_6 = &(*_7)`), and the a6 minimal pair's
+    /// `chain_callresult`.
+    CallResult,
+    /// The reborrowed expression is a **binding read** (`ExprKind::VarRef` / `ExprKind::UpvarRef`):
+    /// a ref-typed local, a by-ref match binding, a ref-typed parameter the param-binding gate did
+    /// not register (it registers only thin scalar-pointee params), or a closure upvar.
+    ///
+    /// REFUSED. The value is not minted by any instruction in this body — it is whatever the
+    /// binding was bound to, possibly in a predecessor block, possibly by a `match` arm, possibly
+    /// by the caller. There is no defining instruction to hand the flip, so the ledger has nothing
+    /// to certify and the original refusal stands unchanged.
+    Binding,
+    /// The reborrowed expression is a **place projection read** (`ExprKind::Field`,
+    /// `ExprKind::Index`, `ExprKind::Deref`): `&*s.r`, `&*a[i]`, `&**p`.
+    ///
+    /// REFUSED. The pointer is read out of memory whose contents this lowering does not model; the
+    /// producer can name the projection but not the provenance of what it loaded.
+    ///
+    /// NOTE ON `&*a[i]` AND `&**p`: those spellings reach this class only for BUILTIN indexing and
+    /// deref (arrays/slices, `&`/`Box`). An OVERLOADED `Index`/`Deref` is not a projection in THIR
+    /// at all — `rustc_mir_build::thir::cx::expr::overloaded_place` builds
+    /// `Deref { arg: Call { .. } }` — so `&*v[i]` on a `Vec`/`HashMap`, and `&**p` on an `Rc`/`Arc`,
+    /// peel to a call and classify [`Self::CallResult`]. That is CORRECT (they genuinely are call
+    /// results, and `call_result_reborrow_is_confined` re-derives the claim from the module), but
+    /// it means the admitted population is materially wider than the `Deref::deref` shapes that
+    /// motivated the wave: every `f(&container[i])` is in it. Anyone sizing the class from this
+    /// doc's examples will undercount.
+    Projection,
+    /// Anything else the peel can bottom out at (a const, a block expression, a cast, …).
+    ///
+    /// REFUSED. The catch-all is a class in its own right rather than a fold into
+    /// [`Self::Binding`]: a future THIR shape must land somewhere that is refused BY NAME, never in
+    /// a bucket some later wave has taught the gate to admit.
+    Other,
+}
+
+/// Trust (wave-TR provenance ledger): resolve the provenance class in ONE pure function, in the
+/// [`shared_reborrow_arm`] idiom — the classification is then a property a test can execute and
+/// mutate, not the order three `match` guards happen to be written in.
+///
+/// The three inputs are DISJOINT by construction at the call site (a THIR expr has one `ExprKind`),
+/// but the function does not assume that: it resolves in a fixed order and the exhaustive
+/// `test_thin_reborrow_provenance_is_a_total_disjoint_classification` pins every one of the eight
+/// input vectors, so no future call site can produce a vector this function has not been asked
+/// about.
+pub(crate) fn thin_reborrow_provenance(
+    is_call: bool,
+    is_binding: bool,
+    is_projection: bool,
+) -> ThinReborrowProvenance {
+    if is_call {
+        ThinReborrowProvenance::CallResult
+    } else if is_binding {
+        ThinReborrowProvenance::Binding
+    } else if is_projection {
+        ThinReborrowProvenance::Projection
+    } else {
+        ThinReborrowProvenance::Other
+    }
+}
+
+/// Trust (wave-TR provenance ledger): one forwarded unledgered thin shared reborrow, as the
+/// producer recorded it.
+///
+/// `value` is the `ValueId` the arm returned VERBATIM for `&*r` (`&*r == r` for a shared
+/// reference), i.e. the value that flows on into the rest of the body with no ledger entry behind
+/// it. `provenance` is the producer's claim about where it came from.
+///
+/// The pair is the WHOLE point of the wave: the pre-ledger flag could say only "this happened
+/// somewhere in this body", which is unfalsifiable and therefore uncertifiable. A `(value, class)`
+/// row can be CHECKED against the module the flip is about to consume, and
+/// `flip_registry::call_result_reborrow_is_confined` checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinReborrow {
+    /// The forwarded reference value — the one the arm returned instead of emitting a reborrow.
+    pub value: ValueId,
+    /// The producer's provenance claim for [`Self::value`].
+    pub provenance: ThinReborrowProvenance,
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,28 +1924,38 @@ pub struct Lowered {
     /// Net effect, stated plainly: such a body counts as `lowered` and can NEVER be `spliced`,
     /// flipped, or interpreted. Coverage moves; no trust claim is made.
     pub fnptr_adapter: bool,
-    /// Trust (wave-TR): true iff this body FORWARDED an unledgered THIN SHARED REBORROW — `&*r`
-    /// admitted by [`SharedReborrowArm::ThinReborrow`], where `r` is a `&T` value this lowering did
-    /// not itself produce (a call result, a by-ref match binding, a ref-typed local) and which is
-    /// therefore in NO pointer ledger.
+    /// Trust (wave-TR provenance ledger): one row per unledgered THIN SHARED REBORROW this body
+    /// FORWARDED — `&*r` admitted by [`SharedReborrowArm::ThinReborrow`], where `r` is a `&T` value
+    /// this lowering did not itself produce and which is therefore in NO pointer ledger. Empty for
+    /// a body that forwarded none.
+    ///
+    /// **THIS FIELD WAS A `bool`, AND THE UPGRADE IS THE WAVE.** A bare flag can express only "it
+    /// happened, somewhere in this body", which is a fact the flip can do nothing with except
+    /// refuse — and refuse it did, unconditionally
+    /// (`flip_registry::thin_reborrow_allows_flip` was literally `!thin_reborrow`). The refusal
+    /// was correct AS STATED: "the producer holds no record it could hand the flip about where the
+    /// pointer came from". It refused for ABSENCE OF EVIDENCE, not for a known hazard. Supplying
+    /// the record is therefore a CERTIFICATION, not a relaxation: the gate now asks for evidence
+    /// it can check, and still refuses every class for which no such check exists.
     ///
     /// Like [`Lowered::union_lane`] and UNLIKE [`Lowered::opaque_collapse`] this GATES:
-    /// `flip_registry::record_green` refuses the body (`thin_reborrow_allows_flip`).
+    /// `flip_registry::record_green` refuses the body unless
+    /// `flip_registry::thin_reborrows_allow_flip` certifies EVERY row.
     ///
-    /// STATED AS OUR OWN DECISION, and that is the whole point of the field. `to_mir` refuses the
-    /// DOMINANT provenance today — a `&T`-returning callee falls out of the call fragment at
-    /// `to_mir.rs`'s "Call(callee return outside the fragment: …)" arm — but that is a call
-    /// RETURN-FIDELITY gate written for an unrelated reason, not a statement about reborrow
-    /// provenance, and it says nothing about the other provenances (a by-ref match binding lowers
-    /// through `ExtractField`, with its own separate gates). Relying on it would be relying on
-    /// unreachability. The arm itself emits ZERO instructions and mints no allocation, so nothing
-    /// here is a memory-model claim; the refusal is about the differential's ability to VOUCH for a
-    /// value whose provenance the producer's ledgers do not record.
+    /// STATED AS OUR OWN DECISION, and that is still the whole point of the field. `to_mir` used to
+    /// refuse the DOMINANT provenance anyway — a `&T`-returning callee fell out of the call
+    /// fragment at `to_mir.rs`'s "Call(callee return outside the fragment: …)" arm — but that is a
+    /// call RETURN-FIDELITY gate written for an unrelated reason, and T2d/T2e have since widened
+    /// exactly that arm, so it no longer refuses the class at all. Relying on it would have been
+    /// relying on unreachability. The arm itself emits ZERO instructions and mints no allocation,
+    /// so nothing here is a memory-model claim; the refusal is about the flip's ability to VOUCH
+    /// for a value whose provenance the producer's ledgers do not record — and a row here is
+    /// exactly that vouching, when (and only when) the module bears it out.
     ///
     /// The SPLICE deliberately does NOT refuse on this field: the arm's instruction stream is
     /// byte-identical to what the body would have emitted with the tag, minus the tag, so an
     /// assembled module containing it makes no claim the pre-wave-TR assembler did not.
-    pub thin_reborrow: bool,
+    pub thin_reborrows: Vec<ThinReborrow>,
     /// Trust: identity ledger for every callee `admit_callee` admitted — direct free-fn callees,
     /// resolved method/operator callees, and reified fn-pointer targets (`Constant::FnDef`) alike.
     /// The emitted `Inst::Call { callee }` / `Constant::FnDef` `FuncId` is DefIndex-derived, so on
@@ -1713,6 +1978,26 @@ pub struct Lowered {
     /// must skip it (a placeholder is never interpreted), and splicing without a successful
     /// finalizer patch is forbidden.
     pub pending_consts: Vec<PendingConst>,
+    /// Trust (enum-switch provenance): the block id of every `Inst::Switch` this body emitted
+    /// for an EXHAUSTIVE enum match — one whose `default` edge carries the arm of the LAST
+    /// variant, popped by `lower_enum_match_general` step 4 because its case would be redundant.
+    /// A switch ABSENT from this set whose default is a `_` WILDCARD body is a different program
+    /// shape even when the two are indistinguishable in the IR.
+    ///
+    /// WHY THIS CANNOT BE RE-DERIVED FROM THE IR, which is the whole reason it is carried: both
+    /// provenances emit `cases + default`, and when the wildcard happens to cover EXACTLY ONE
+    /// variant the two are byte-identical. But rustc distinguishes them (`matches/test.rs`,
+    /// `TestKind::Switch`): it emits a case per variant that HAS AN ARM and routes `otherwise` to
+    /// the `Failure` branch — so an exhaustive match yields `all tags explicit + Unreachable
+    /// otherwise`, while `matches!(x, A | C)` yields `named tags only + otherwise -> the _ arm`.
+    /// `to_mir`'s wave-V reshape must reproduce built's choice, and it used to GUESS
+    /// ("exactly one tag missing ⇒ exhaustive fold"). The guess is right for the exhaustive case
+    /// and wrong for a one-variant wildcard, which is why `Multiplicity::allows_zero`,
+    /// `OriginTrust::is_unpinned` and `CofibAtom::value` all landed as `DerivedMismatch`.
+    ///
+    /// Fail-closed either way — a wrong reshape can only MISS a flip, never miscompile, because
+    /// the comparator re-verifies derived ≡ built. This field converts that miss into a hit.
+    pub enum_fold_switch_blocks: std::collections::HashSet<trust_ir::BlockId>,
 }
 
 /// Trust: one named const the hook could not safely evaluate at hook time, deferred to the
@@ -1846,6 +2131,21 @@ pub struct CalleeRef {
     /// would let a THIRD site resurrect a type two earlier sites had already contradicted. Once
     /// set, `ret_ty` is never written again and crate assembly treats the callee as unknown.
     pub ret_ty_conflict: bool,
+    /// Trust (#180): does this callee use the RUST calling convention?
+    ///
+    /// A bodyless declaration is minted for every unresolvable callee, and `Function::new` leaves
+    /// `calling_conv` at its `C` default — so every declaration silently CLAIMED the C ABI for a
+    /// Rust function. That is false on its own, and it made trust-ir's repr(Rust)-at-a-foreign-
+    /// boundary check fire on ordinary Rust cross-crate calls, which agree on layout by
+    /// construction (253 occurrences).
+    ///
+    /// ONLY ASKED FOR NON-LOCAL CALLEES. `tcx.fn_sig` is a query, and a query issued from inside
+    /// `mir_built` can close a fatal E0391 — this codebase has been bitten three times now, the
+    /// third being my own first cut of this field, which ICEd 44 corpus files. A CROSS-CRATE
+    /// callee's signature is already in loaded metadata, so it cannot cycle back into this
+    /// compilation. A LOCAL callee keeps the conservative `false`: it stays treated as a foreign
+    /// boundary, which is the pre-existing behaviour and never a new claim.
+    pub is_rust_abi: bool,
 }
 
 /// Trust (#178): the trust-ir `Ty` for a BARE SCALAR rustc type, computed WITHOUT touching the
@@ -1935,6 +2235,42 @@ pub enum SiteArg {
     /// pinning callee identity (`mir_differential::raw_calls_in_dfs_order`), so a region-only
     /// difference is region-blind (SOUND — region-only-different `FnDef`s codegen identically).
     ErasedRegion,
+    /// Trust (#197 follow-up): a CONST arg. The slice wave-C deferred — its comment said "a CONST
+    /// arg is still un-encodable in this slice → fail closed (a later slice adds
+    /// `SiteArg::Const`)". This is that slice.
+    ///
+    /// Unlike a region, a const arg CAN be carried losslessly: a `ConstKind::Value` is a
+    /// (type, valtree) pair and both halves are re-materializable, so the rebuild is intern-equal
+    /// rather than region-blind. Every other `ConstKind` (`Param`, `Unevaluated`, `Infer`,
+    /// `Bound`, `Placeholder`, `Expr`, `Error`) is NOT a concrete value and keeps failing closed.
+    Const(SiteConst),
+}
+
+/// Trust (#197 follow-up): a re-materializable encoding of a concrete const arg.
+///
+/// Only `ConstKind::Value` is representable — anything else means the const is not a value at this
+/// site, which is exactly the case the caller must fail closed on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiteConst {
+    /// A `ConstKind::Value`: the value's own TYPE plus its valtree. Both are needed —
+    /// `ty::Const::new_value` takes the pair, and two consts with equal valtrees but different
+    /// types are different consts.
+    Value(SiteTy, SiteValTree),
+}
+
+/// Trust (#197 follow-up): a re-materializable encoding of a `ty::ValTreeKind`.
+///
+/// Mirrors the rustc shape exactly: a `Leaf` is one `ScalarInt`, and a `Branch` holds full
+/// `ty::Const`s (NOT bare valtrees — each branch element carries its own type), which is why this
+/// recurses back through [`SiteConst`] rather than through itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiteValTree {
+    /// `ValTreeKind::Leaf` — the scalar's raw bits plus its width in BYTES. The width is part of
+    /// the value's identity: `ScalarInt` is (bits, size), and rebuilding at the wrong size yields a
+    /// different `ScalarInt` and so a different interned valtree.
+    Leaf(u128, u64),
+    /// `ValTreeKind::Branch` — a struct/array/tuple const, element order significant.
+    Branch(Vec<SiteConst>),
 }
 
 /// Trust (wave-C): a lifetime-free encoding of a concrete type appearing in a site's `GenericArgs`.
@@ -1972,10 +2308,44 @@ fn encode_site_args<'tcx>(
             // args region-blindly — SOUND, see `SiteArg::ErasedRegion`). A CONST arg is still
             // un-encodable in this slice → fail closed (a later slice adds `SiteArg::Const`).
             ty::GenericArgKind::Lifetime(_) => out.push(SiteArg::ErasedRegion),
-            ty::GenericArgKind::Const(_) => return None,
+            // Trust (#197 follow-up): a CONST arg is now encodable when it is a concrete VALUE —
+            // see `SiteArg::Const`. Anything else still fails the whole site closed.
+            ty::GenericArgKind::Const(c) => out.push(SiteArg::Const(encode_site_const(tcx, c, 0)?)),
         }
     }
     Some(out)
+}
+
+/// Trust (#197 follow-up): encode one concrete const arg, or `None` (fail closed).
+///
+/// Depth-bounded for the same reason `valtree_to_constant` is: a valtree is a tree and this walks
+/// it eagerly. The bound is a tripwire, not a semantic limit — a 32-deep const-generic value does
+/// not occur, and hitting it declines the site rather than looping.
+fn encode_site_const<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    c: ty::Const<'tcx>,
+    depth: usize,
+) -> Option<SiteConst> {
+    if depth > 32 {
+        return None;
+    }
+    // Only a concrete VALUE is re-materializable. `Param`/`Unevaluated`/`Infer`/`Bound`/
+    // `Placeholder`/`Expr`/`Error` are not values at this site — decline, exactly as the
+    // pre-slice code declined every const.
+    let ty::ConstKind::Value(v) = c.kind() else {
+        return None;
+    };
+    let sty = encode_ty(tcx, v.ty)?;
+    let vt = match &**v.valtree {
+        ty::ValTreeKind::Leaf(si) => SiteValTree::Leaf(si.to_bits(si.size()), si.size().bytes()),
+        ty::ValTreeKind::Branch(elems) => SiteValTree::Branch(
+            elems
+                .iter()
+                .map(|e| encode_site_const(tcx, e, depth + 1))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    };
+    Some(SiteConst::Value(sty, vt))
 }
 
 /// Trust (wave-C): encode a concrete type to `SiteTy`, or `None` (fail closed) for anything outside
@@ -2184,9 +2554,11 @@ fn lower_module_inner<'tcx>(
             // The cap fires BEFORE any expression is walked, so no adapter was minted.
             fnptr_adapter: false,
             // ... and for the same reason no `Borrow` arm ran, so no reborrow was forwarded.
-            thin_reborrow: false,
+            thin_reborrows: Vec::new(),
             callees: Vec::new(),
             pending_consts: Vec::new(),
+            // The cap fires BEFORE any expression is walked, so no enum match was lowered.
+            enum_fold_switch_blocks: std::collections::HashSet::new(),
             symbolic: false,
             // The cap fires BEFORE any type is mapped, so no value went opaque.
             opaque_collapse: false,
@@ -2198,6 +2570,8 @@ fn lower_module_inner<'tcx>(
             enum_declines: Vec::new(),
         };
     }
+    let source_loop_plans = source_provenance::source_loop_plans(tcx, def);
+    let source_loop_plan_error = source_loop_plans.is_err();
     let mut cx = LowerCx {
         tcx,
         thir,
@@ -2205,6 +2579,7 @@ fn lower_module_inner<'tcx>(
         body_def: def.to_def_id(),
         next_value: 0,
         next_block: 1, // 0 is reserved for the entry block
+        enum_fold_switch_blocks: std::collections::HashSet::new(),
         blocks: Vec::new(),
         cur: Vec::new(),
         cur_id: BlockId::new(0),
@@ -2225,9 +2600,9 @@ fn lower_module_inner<'tcx>(
         pending_adapters: Vec::new(),
         adapter_keys: Vec::new(),
         fnptr_adapter: false,
-        // Trust (wave-TR): the unledgered thin-shared-reborrow forwarding flag, false until the
-        // `ExprKind::Borrow` arm admits one.
-        thin_reborrow: false,
+        // Trust (wave-TR provenance ledger): the unledgered thin-shared-reborrow record, empty
+        // until the `ExprKind::Borrow` arm admits one.
+        thin_reborrows: Vec::new(),
         callees: Vec::new(),
         pending_consts: Vec::new(),
         pending_func_tys: Vec::new(),
@@ -2254,17 +2629,24 @@ fn lower_module_inner<'tcx>(
         // ... and its two upward closures, which can only be non-empty if the ledger is.
         enum_param_lane_enums: std::collections::HashSet::new(),
         enum_param_lane_structs: std::collections::HashSet::new(),
-        unsupported: Vec::new(),
+        unsupported: if source_loop_plan_error {
+            vec![("body".to_string(), "SourceProvenance(query catalog)")]
+        } else {
+            Vec::new()
+        },
         collect_all,
         struct_ids: Vec::new(),
         adt_visit_stack: Vec::new(),
         pending_structs: Vec::new(),
+        alias_opaque_struct: None,
         enum_ids: Vec::new(),
         enum_declined: Vec::new(),
         // Trust (wave-EF): empty unless `TRUST_ENUM_DECLINE_CENSUS=1`.
         enum_decline_reasons: Vec::new(),
         pending_enums: Vec::new(),
         loop_stack: Vec::new(),
+        source_loop_plans: source_loop_plans.unwrap_or_default(),
+        source_loop_provenance: Vec::new(),
         borrow_ptrs: Vec::new(),
         ref_param_ptrs: Vec::new(),
         // Trust (wave-16): promoted-borrow GlobalAddr pointers (return-escape allow-list).
@@ -2336,6 +2718,33 @@ fn lower_module_inner<'tcx>(
     // resolves inside THIS mini-module. Crate assembly re-interns per spliced function.
     module.files = std::mem::take(&mut cx.files);
 
+    // Trust (E4/E5 provenance): seal only after every semantic module table
+    // and file has reached its final value. Missing, duplicate, or reordered
+    // source loops fail the body closed before any flip can consume it.
+    if !cx.source_loop_plans.is_empty() {
+        let exact_loops = cx.source_loop_provenance.len() == cx.source_loop_plans.len()
+            && cx
+                .source_loop_provenance
+                .iter()
+                .zip(&cx.source_loop_plans)
+                .all(|(actual, expected)| {
+                    actual.source_loop_id == expected.source_loop_id
+                        && actual.hir_local_id == expected.hir_local_id
+                });
+        if !exact_loops {
+            cx.unsupported.push(("body".to_string(), "SourceProvenance(loop mapping)"));
+        } else if source_provenance::seal_source_provenance(
+            tcx,
+            def,
+            &mut module,
+            std::mem::take(&mut cx.source_loop_provenance),
+        )
+        .is_err()
+        {
+            cx.unsupported.push(("body".to_string(), "SourceProvenance(seal)"));
+        }
+    }
+
     Lowered {
         module,
         body_kind,
@@ -2355,11 +2764,13 @@ fn lower_module_inner<'tcx>(
         // Trust (fn-ptr adapter lane): a body whose module carries a function with no rustc
         // counterpart. GATES splice / flip / seam — see the field docs.
         fnptr_adapter: cx.fnptr_adapter,
-        // Trust (wave-TR): a body that forwarded an unledgered thin shared reborrow. GATES the
-        // FLIP by its own predicate — see the field docs.
-        thin_reborrow: cx.thin_reborrow,
+        // Trust (wave-TR provenance ledger): every unledgered thin shared reborrow this body
+        // forwarded, with the producer's provenance claim for each. GATES the FLIP by its own
+        // predicate — see the field docs.
+        thin_reborrows: cx.thin_reborrows,
         callees: cx.callees,
         pending_consts: cx.pending_consts,
+        enum_fold_switch_blocks: cx.enum_fold_switch_blocks,
         // Trust (totality Batch C): non-empty symbolic-const ledger ⇒ symbolic body.
         // wave-PO: an opaque-param body joins the symbolic class for the same reason a
         // value-less symbolic const does — it lowers, but its values are not modelled.
@@ -2674,6 +3085,10 @@ struct LowerCx<'a, 'tcx> {
     next_value: u32,
     /// Block-id allocator. The entry block is always `BlockId::new(0)`; fresh blocks take 1, 2, …
     next_block: u32,
+    /// Trust (enum-switch provenance): accumulates the block of every EXHAUSTIVE-fold enum-match
+    /// switch, surfaced as [`Lowered::enum_fold_switch_blocks`]. See that field for why the
+    /// distinction cannot be recovered from the emitted IR.
+    enum_fold_switch_blocks: std::collections::HashSet<trust_ir::BlockId>,
     /// SEALED blocks (already terminated), in creation order. The currently-open block is NOT here
     /// until `seal_with` moves it in.
     blocks: Vec<Block>,
@@ -2747,12 +3162,19 @@ struct LowerCx<'a, 'tcx> {
     /// SEPARATE from `pending_adapters.is_empty()` so the gate survives the flush emptying the
     /// vector, and so the flush's own fail-closed path cannot silently clear it.
     fnptr_adapter: bool,
-    /// Trust (wave-TR): see the public flag — set by the `ExprKind::Borrow` arm, and ONLY on the
-    /// [`SharedReborrowArm::ThinReborrow`] accept. Deliberately NOT derived from a ledger vector:
-    /// the arm's whole point is that the forwarded value enters NO ledger (see the `borrow_ptrs`
-    /// posture note at the accept site), so a "non-empty ledger" formulation is unavailable here
-    /// and the flag is the only record that the forwarding happened.
-    thin_reborrow: bool,
+    /// Trust (wave-TR provenance ledger): see the public field — appended by the `ExprKind::Borrow`
+    /// arm, and ONLY on the [`SharedReborrowArm::ThinReborrow`] accept.
+    ///
+    /// **NOT A POINTER LEDGER, and the distinction is load-bearing.** The `borrow_ptrs` /
+    /// `ref_param_ptrs` / `global_ptrs` / `interior_ptrs` / `mut_borrow_ptrs` vectors are
+    /// CAPABILITY ledgers: membership WIDENS what a `ValueId` may do (a `Deref` read gate, four
+    /// match-scrutinee gates and both return-escape guards consult them), so registering the
+    /// forwarded value there would newly CONSTRAIN every unrelated use of that same `ValueId`,
+    /// keyed on whether a syntactic reborrow happened elsewhere in the body — the asymmetry the
+    /// accept site's posture note refuses. This vector is a pure OBSERVATION ledger: nothing in
+    /// the lowering reads it, no gate in this file consults it, and its only consumer is
+    /// `flip_registry`, at the one seam (codegen) where the provenance question is live.
+    thin_reborrows: Vec<ThinReborrow>,
     /// Trust: callee identity ledger (see `Lowered::callees`) — appended by
     /// `admit_callee` (via `resolve_callee` / `resolve_reify_target`), deduplicated on full
     /// identity so a callee invoked twice records once but a genuine index collision (two
@@ -2927,6 +3349,17 @@ struct LowerCx<'a, 'tcx> {
     /// `Wrapper<u32>` to whichever registered first — a confirmed latent field-type bug).
     struct_ids: Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>, trust_ir::StructId)>,
     pending_structs: Vec<trust_ir::StructDef>,
+    /// Trust (#201, B8 slice 1): the single collapsed OPAQUE ZERO-FIELD struct standing for every
+    /// pre-monomorphization alias in this body — the producer half of the oracle's
+    /// `"opaque_alias::pre_monomorphization"` registration (`trust-ir-bridge/src/lower.rs:2487`).
+    ///
+    /// ONE slot, not a ledger keyed by the alias's `(DefId, GenericArgs)`, because the ORACLE
+    /// collapses: its `type_cache` is keyed on the marker `Ty` value, and extraction erases every
+    /// alias to the SAME `Ty::Unsupported { PRE_MONO_ALIAS_KIND, PRE_MONO_ALIAS_DETAIL }`
+    /// (`trust-mir-extract/src/ty_convert.rs:2223`), so `<S as Serializer>::Ok` and `::Error`
+    /// share one struct there. Minting per-alias structs here would spell the same module a
+    /// different way on the two sides for no gain — the sort is fact-free either way.
+    alias_opaque_struct: Option<trust_ir::StructId>,
     /// Trust: enum registration ledger — the enum counterpart of `struct_ids`/`pending_structs`
     /// and the sole first-class `Ty::Enum(id)` path. Dedup is by
     /// `(DefId, GenericArgs)` — NOT `DefId` alone — because two instantiations of one generic
@@ -2976,8 +3409,15 @@ struct LowerCx<'a, 'tcx> {
     /// `Break`/`Continue` resolve to the innermost entry; the loop's `region::Scope` label is recorded
     /// so a labeled `break 'l`/`continue 'l` that does NOT target the innermost loop fails closed
     /// (we do not model multi-level breakout yet). Non-empty ⇒ a loop already in flight, so a NESTED
-    /// `Loop` fails closed (single-loop scope for now — see `lower_loop`).
+    /// `Loop` fails closed. Sequential loops are supported because each completed loop pops its
+    /// context before the next header is lowered (see `lower_loop`).
     loop_stack: Vec<LoopCtx>,
+    /// Fresh compiler-query source-loop catalog. Contract binding parameters
+    /// are emitted as a canonical prefix of the matching IR header.
+    source_loop_plans: Vec<source_provenance::SourceLoopPlan>,
+    /// Exact per-loop carriers accumulated during lowering and sealed after
+    /// the containing module reaches its final semantic form.
+    source_loop_provenance: Vec<SourceLoopProvenance>,
     /// Trust: `ValueId`s that hold a borrow-produced `Ty::Ptr` (from the `ExprKind::Borrow` arm),
     /// plus (wave-5) REF-TYPED scalar-pointee PARAMS registered at binding time in `lower_fn` —
     /// a `&T`/`&mut T` param is the CALLER's slot pointer, consumed by exactly the same
@@ -3150,6 +3590,11 @@ struct LoopCtx {
     /// header block-param `ValueId` each is bound to on header entry. Back-edge/`continue` `Br`s pass
     /// these locals' CURRENT values as args.
     carried: Vec<(LocalVarId, ValueId, Ty)>,
+    /// Trust (#192): set by `lower_break` when a `break` actually branches to `exit`. A `loop {}`
+    /// with no reachable `break` never gives `exit` a predecessor, and opening it anyway produced
+    /// an unreachable block that `finish_body` then sealed with a 0-value `Return` — ill-formed
+    /// against a non-unit signature (`UnreachableBlock` + `ReturnArityMismatch`).
+    broke: bool,
 }
 
 impl<'a, 'tcx> LowerCx<'a, 'tcx> {
@@ -3208,11 +3653,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // different path-rendering modes, and the differential caught exactly
         // that as trait_id sig-divergences when the oracle side gained the
         // no_visible/resolve wrappers.
-        let path = rustc_middle::ty::print::with_resolve_crate_name!(
-            rustc_middle::ty::print::with_no_visible_paths!(
-                rustc_middle::ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(principal))
-            )
-        );
+        //
+        // So CALL the oracle's renderer instead of re-deriving its wrapper stack.
+        // This was the second producer of one identity, and it silently drifted
+        // once already: the oracle side is now also
+        // `with_def_path_disambiguators` (see `safe_def_path_str`), and a hand-copy
+        // that missed that flag would spell a block-scoped principal differently on
+        // the two sides and fail the differential for no semantic reason.
+        let path = trust_mir_extract::safe_def_path_str(self.tcx, principal);
         let id = trust_ir::stable_trait_object_id(&path);
         match self.trait_object_ids.iter().find(|(existing_id, _)| *existing_id == id) {
             Some((_, existing_path)) if *existing_path != path => None,
@@ -3582,12 +4030,52 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         Ty::Unit
                     }
                 },
-                // Trait-object raw pointers are fat too, but this producer does not
-                // yet carry the vtable component. Never silently respell them thin.
-                ty::Dynamic(..) => {
-                    self.unsupported.push((format!("{ty:?}"), "Ty(raw-ptr fat/array pointee)"));
-                    Ty::Unit
-                }
+                // Trust (wave-RD): a raw `*const dyn Trait` / `*mut dyn Trait` → the SAME
+                // first-class `Ty::FatPtr(FatPtrKind::TraitObject { trait_id })` the shared-ref
+                // arm above signs. This arm used to fail closed with the note "this producer does
+                // not yet carry the vtable component"; it does now — B2-3 built it for `&dyn`, and
+                // a raw trait-object pointer is the identical (data, vtable) pair. Measured: the
+                // `Ty(raw-ptr fat/array pointee)` bucket is **100% `*const dyn`** (25 of 25
+                // occurrences across the 19 sole-blocker bodies), so this arm IS that bucket.
+                //
+                // MUTABILITY IS DELIBERATELY NOT PART OF THE GATE, unlike the ref arm. A `&dyn` is
+                // shared-only there because `&mut dyn` rides the generic thin `&mut` arm (a
+                // pre-existing coherent-but-unfaithful 8-byte spelling that the `&mut` fat-ref
+                // lane retires). Raw pointers have no such split: `*const T` and `*mut T` have one
+                // layout, the oracle's `Ty::RawPtr { pointee, .. }` ignores mutability, and both
+                // spellings reach the SAME arm on both sides. Gating on `*const` alone would leave
+                // `*mut dyn` thin on this side and thin on the oracle — coherent, but it would
+                // split one bucket into two for no reason.
+                //
+                // TWO-SIDED, and it had to be: `trust-ir-bridge`'s stateless mapper sent every
+                // `Ty::RawPtr { .. }` to a THIN `TrustIrTy::Ptr`, and said so
+                // ("...as do `&mut dyn` and raw `*dyn` (producer fail-closed)"). Emitting fat here
+                // alone would MANUFACTURE the fat-vs-thin signature divergence the wave-19 DST
+                // gate exists to catch. The oracle's raw-ptr arm gains the mirror case in this
+                // same change, keyed the same way and minting `trait_id` through the ONE shared
+                // `trust_ir::stable_trait_object_id`, so `tys_agree` compares these positions by
+                // value with no table.
+                //
+                // The two fail-closed sub-cases are the ref arm's, verbatim and for its reasons: a
+                // trait-id COLLISION cannot be spelled, and a PRINCIPAL-LESS `*const dyn Send` has
+                // no def path to hash (the oracle keeps its thin `"dyn"` sentinel there, so that
+                // pair must stay uncompared rather than share a sentinel id).
+                ty::Dynamic(preds, ..) => match preds.principal_def_id() {
+                    Some(principal) => match self.trait_object_id(principal) {
+                        Some(trait_id) => {
+                            Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id })
+                        }
+                        None => {
+                            self.unsupported
+                                .push((format!("{ty:?}"), "Ty(dyn trait-id collision)"));
+                            Ty::Unit
+                        }
+                    },
+                    None => {
+                        self.unsupported.push((format!("{ty:?}"), "Ty(dyn no principal)"));
+                        Ty::Unit
+                    }
+                },
                 // Trust (T5, 2026-07-29): the catch-all is the OTHER half of the same defect the
                 // `ty::Ref` arm above documents, and it is the one that actually bites the
                 // crystal: `*const ArcInner<str>` — inside `Arc<str>`, inside
@@ -3601,10 +4089,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // whole-value `Load`/`Store` of that struct drops the metadata.
                 //
                 // A `str`/`[T]` tail therefore gets the same `(data, len)` pair the `ty::Slice |
-                // ty::Str` arm above signs; a `dyn` tail joins the fail-closed `ty::Dynamic` arm
-                // (same tag — the bucket means the same thing, and #181's lesson is not to
-                // explode tag cardinality); an `extern type` tail is genuinely thin; an
+                // ty::Str` arm above signs; a `dyn` tail keeps THIS arm's `Ty(raw-ptr fat/array
+                // pointee)` tag (same tag — the bucket means the same thing, and #181's lesson is
+                // not to explode tag cardinality); an `extern type` tail is genuinely thin; an
                 // undeterminable tail keeps the pre-existing thin spelling (see `PointeeMeta`).
+                //
+                // Trust (wave-RD): that sentence used to justify the dyn-tail case by saying it
+                // "joins the fail-closed `ty::Dynamic` arm". The `ty::Dynamic` arm above is no
+                // longer fail-closed — a BARE `*const dyn Trait` is now first-class
+                // `FatPtr(TraitObject)`. A dyn TAIL is a different shape (`*const Wrapper<dyn Tr>`:
+                // a sized container whose last field is unsized), `container_pointee_ty` still
+                // returns `None` for it, and it still fails closed here. Only the justification
+                // moved; the behaviour is byte-identical.
                 _ => match container_pointee_ty(self.pointee_meta(*pointee)) {
                     Some(mapped) => mapped,
                     None => {
@@ -3614,12 +4110,28 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 },
             },
             // Trust: a FIXED-SIZE array `[T; N]` → a `Ty::Tuple([T; N])` of N identical (recursively
-            // mapped) element types. We do NOT use `Ty::Array(TyId, N)`: that needs an interned `TyId`
-            // this single-function producer never mints, whereas a `Ty::Tuple` of the element type is
-            // built directly and the pinned interpreter materializes it from a `Const`-seeded aggregate
-            // (the exact tuple/struct machinery). Construction (`ExprKind::Array`/`Repeat`) and indexing
-            // (`ExprKind::Index`) operate over this tuple aggregate via `InsertField`/`ExtractField`/
-            // `ExtractElement`.
+            // mapped) element types, built directly, which the pinned interpreter materializes from a
+            // `Const`-seeded aggregate (the exact tuple/struct machinery). Construction
+            // (`ExprKind::Array`/`Repeat`) and CONSTANT indexing (`ExprKind::Index`) operate over this
+            // tuple aggregate via `InsertField`/`ExtractField`.
+            //
+            // Trust (#202): this comment used to justify the spelling with "`Ty::Array(TyId, N)` needs
+            // an interned `TyId` this single-function producer never mints". That is FALSE — there are
+            // ten live `pend_ty` call sites, and two of them already mint NON-zero-length `Ty::Array`
+            // (`lower_repeat_compact` for `N >= REPEAT_COMPACT_MIN`, and `emit_bytes_global`). Anyone
+            // re-deriving the array spelling from that sentence would conclude the respell is easy.
+            //
+            // The REAL blocker is the opposite shape: `Ty::Array` is not a legal `InsertField` /
+            // `ExtractField` aggregate, so respelling would make CONSTRUCTION and the CONST-index path
+            // ill-formed in exchange for fixing the dynamic-index path — circular. It would also
+            // silently break three walkers that match `Ty::Tuple` (`union_lane_ty_transitive` and
+            // `param_lane_ty_transitive`, both SOUNDNESS gates that would answer `false` rather than
+            // refuse, and `def_field_ok`, which would drop bodies from the splice with no tag).
+            // Retiring the tuple spelling therefore requires FIRST widening the format to give
+            // `Ty::Array` field ops, and moving the oracle (`trust-ir-bridge/src/lower.rs:2218`
+            // already spells arrays first-class) in the same batch. That is a two-sided change.
+            //
+            // The consequence today: DYNAMIC indexing fails closed — see the `ExprKind::Index` arm.
             //
             // FAIL-CLOSED: a non-const length (a generic const param `[T; N]` whose `N` is not a
             // concrete usize — `try_to_target_usize` returns `None`), or a non-scalar element type whose
@@ -3630,6 +4142,30 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 let n = match len.try_to_target_usize(self.tcx) {
                     Some(n) => n as usize,
                     None => {
+                        // Trust (#203, census honesty — the wave-PO rule, applied to CONST params):
+                        // `[T; N]` with a const-generic `N` is exactly as generic as `<T as Tr>::Assoc`
+                        // is over a type param, and must be marked SYMBOLIC for the identical reason:
+                        // a body whose shape depends on a caller's const argument was never modelled
+                        // here, and recording it NON-symbolic inflates the addressable denominator of
+                        // every coverage analysis.
+                        //
+                        // It measurably did. `param_opaque` had exactly two setters — the alias arm
+                        // and the bare `ty::Param` arm below — and NEITHER fires for a const-param
+                        // array length, so all 22 sole-blocker bodies of this tag were counted
+                        // "non-generic" in the 2026-08-09 frontier ranking: 11 in tests/ui/const-generics
+                        // and 8 SIMD via `pub struct Simd<T, const N: usize>(pub [T; N])`. That put a
+                        // 22-body lane in the MODELLED-capable column which can never yield a modelled
+                        // body at all.
+                        //
+                        // Scoped like wave-PO: the test is on the WHOLE array type, so an unevaluated
+                        // NAMED const (`[u8; SOME_CONST]`, no param anywhere) keeps the old
+                        // non-symbolic classification — that one really is monomorphic, merely
+                        // unevaluated here, and is a different lane. Fail-closed either way: the tag
+                        // below still stops the body lowering, so this changes the CENSUS
+                        // CLASSIFICATION, never a verdict.
+                        if ty.has_non_region_param() {
+                            self.param_opaque = true;
+                        }
                         self.unsupported.push((format!("{ty:?}"), "Ty(array non-const len)"));
                         return Ty::Unit;
                     }
@@ -3707,27 +4243,72 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             //     result re-enters this arm on a strictly smaller type and fails closed at its
             //     own fixpoint).
             ty::Alias(..) => {
-                if ty.has_non_region_param()
-                    || ty.has_non_region_infer()
+                // Trust (#201, B8 slice 1): a PRE-MONOMORPHIZATION alias — one that still carries
+                // a non-region generic parameter — is not a gap, it is a SORT. Lower it to a
+                // registered opaque zero-field struct, mirroring the oracle, which reaches the
+                // identical decision through `normalize_alias`'s FIRST guard
+                // (`trust-mir-extract/src/ty_convert.rs:2223`: `alias_ty.has_non_region_param()`
+                // -> the shared `PRE_MONO_ALIAS_{KIND,DETAIL}` marker) and then registers
+                // `"opaque_alias::pre_monomorphization"` (`trust-ir-bridge/src/lower.rs:2487`).
+                //
+                // ORDER IS THE POINT: this test runs BEFORE the `has_opaque_types` disjunct
+                // below, exactly as it does on the oracle side, where BOTH `AliasTyKind::Opaque`
+                // and `Projection`/`Inherent` funnel into `normalize_alias`
+                // (`ty_convert.rs:2101` / `:2117`). So an `impl Trait` that still mentions a
+                // caller's `T` is pre-mono FIRST and opaque second, and both sides agree.
+                //
+                // SOUNDNESS is the oracle's, unchanged: a zero-field struct is a per-binding
+                // opaque symbol with no interpreted equality and no arithmetic sort, so a value
+                // of this type can never discharge (or falsely satisfy) an arith/bounds/switch
+                // obligation — if a primitive op ever ranged over it, module validation rejects
+                // the module rather than silently reading it as 0. That is why the spelling is a
+                // zero-field STRUCT and not `Unit`, which trust-mc concretizes to a single value.
+                //
+                // NOT extended to the other three disjuncts, and specifically NOT to a zero-arg
+                // `Opaque` (an unrevealed RPIT/TAIT): the oracle fails those closed with a
+                // DIFFERENT detail ("opaque alias has no typing env to reveal against") and a
+                // regression test pins that they keep failing closed
+                // (`trust-ir-bridge/src/tests.rs`: `test_monomorphic_alias_details_still_fail_
+                // type_mapping`). Revealing one here would also mean asking for a hidden type
+                // from inside `mir_built` — the E0391 reentrancy family (#179).
+                if ty.has_non_region_param() {
+                    // The body stays SYMBOLIC for the wave-PO census reason spelled out below:
+                    // this is a value-less opaque carrier, never a modelled value.
+                    self.param_opaque = true;
+                    return Ty::Struct(self.mint_alias_opaque_struct());
+                }
+                // Trust (#48): `free_alias_reaches_opaque` for the SAME reason it guards
+                // `cycle_safe_normalize` — `pub type X = impl Tr;` carries
+                // HAS_TY_FREE_ALIAS, not HAS_TY_OPAQUE, so `has_opaque_types()` alone
+                // lets it through and the normalize below REVEALS it. The comment
+                // above already names the hazard ("asking for a hidden type from
+                // inside `mir_built` — the E0391 reentrancy family"); it just tested
+                // the wrong flag for the free-alias spelling. Measured:
+                // `tests/ui/type-alias-impl-trait/normalize-alias-type.rs` cycles
+                // `building MIR for tr2` -> `normalizing X` -> `type of X::{opaque#0}`.
+                if ty.has_non_region_infer()
                     || ty.has_opaque_types()
+                    || free_alias_reaches_opaque(self.tcx, ty)
+                    // Trust (#48): the PROJECTION spelling. `<Bar as Trait>::Assoc`
+                    // under `impl_trait_in_assoc_type` carries only
+                    // HAS_TY_PROJECTION, so the three tests around it all miss it
+                    // and the normalize below reveals the associated opaque from
+                    // inside `mir_built`.
+                    || projection_reaches_opaque(self.tcx, ty)
                     || ty.has_escaping_bound_vars()
                 {
-                    // Trust (wave-PO, census-honesty fix): a projection OVER A TYPE PARAM
+                    // Trust (wave-PO, census-honesty fix — SUPERSEDED IN PART by #201 above):
+                    // wave-PO set `param_opaque` here because a projection OVER A TYPE PARAM
                     // (`Self::Result`, `<T as Trait>::Assoc`) is exactly as generic as the bare
-                    // `ty::Param` arm below, and must be marked SYMBOLIC for the same reason:
-                    // two sides that both spell it `Unit` would "agree" about a function neither
-                    // modelled. Reaching this arm first meant `param_opaque` was never set, so
-                    // such bodies were recorded NON-symbolic and inflated the addressable
-                    // denominator of every coverage analysis (measured: 6 in the ExprVisitor /
-                    // MemoryModel default-method family alone; project-wide unknown).
-                    //
-                    // Fail-closed either way — the `Ty` tag below already stops the body from
-                    // lowering, so this changes the CENSUS CLASSIFICATION, not any verdict.
-                    // Scoped to the param case on purpose: `has_opaque_types` (RPIT) and
-                    // `has_non_region_infer` are not genericity over a caller's type.
-                    if ty.has_non_region_param() {
-                        self.param_opaque = true;
-                    }
+                    // `ty::Param` arm below and must be marked SYMBOLIC for the same reason: two
+                    // sides that both spell it `Unit` would "agree" about a function neither
+                    // modelled. #201 moved the whole `has_non_region_param` case out of this
+                    // block — it now lowers to the opaque struct and sets `param_opaque` there —
+                    // so the flag-setting that used to live here is unreachable and gone. What
+                    // remains in this block is the genuinely closed set: infer vars, an
+                    // unrevealed zero-arg opaque, and escaping bound vars. None of those is
+                    // genericity over a CALLER's type, which is why wave-PO deliberately did not
+                    // mark them symbolic either.
                     self.unsupported.push((format!("{ty:?}"), "Ty"));
                     return Ty::Unit;
                 }
@@ -4059,6 +4640,31 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `admit_callee` runs BEFORE the `Inst::Call` is emitted, so it cannot know it here.
                 ret_ty: None,
                 ret_ty_conflict: false,
+                // Trust (#180/#190): the callee's REAL ABI, read by whichever route is safe for
+                // this def. `tcx.fn_sig` on a LOCAL def closes the E0391 reentrancy family from
+                // inside `mir_built` (measured: 44 ICEs), so local defs are read off HIR instead —
+                // HIR is fully constructed before any `mir_built` runs (this very query consumes
+                // THIR, which is built FROM HIR), so a header read cannot cycle.
+                //
+                // #190: the previous spelling was `!def_id.is_local() && ...`, which left every
+                // local declaration on `CallingConv`'s `C` DEFAULT — i.e. the producer stated the
+                // C ABI for ordinary local Rust functions. That is a false claim in the IR (a
+                // codegen consumer reads `calling_conv`), and it was the whole residue of
+                // `FfiStructReprUnpinned`: `fn foo_bar<I: Foo<A=Bar>>(x: I) -> Bar` — no `extern`
+                // anywhere — was held to FFI repr rules because it is generic, hence declared
+                // bodyless. Absence of evidence for Rust is not evidence of C.
+                is_rust_abi: {
+                    use rustc_abi::ExternAbi;
+                    let abi = if let Some(local) = def_id.as_local() {
+                        self.tcx.hir_node_by_def_id(local).fn_sig().map(|s| s.header.abi)
+                    } else {
+                        Some(self.tcx.fn_sig(def_id).skip_binder().abi())
+                    };
+                    matches!(
+                        abi,
+                        Some(ExternAbi::Rust | ExternAbi::RustCall | ExternAbi::RustCold)
+                    )
+                },
             });
         }
         func_id
@@ -4147,6 +4753,63 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// value) on both sides → admitted; this is sound because any UNSIZED concrete instantiation of
     /// the OUTER caller is itself rejected at that outer call site (the gate runs at every site), so
     /// a fat value can never actually reach the thin slot. Side-effect-free (no `map_ty`, no interning).
+    /// Trust (#197 item 3c): does the callee's IDENTITY-lowered signature — the one the assembled
+    /// crate module records under this `DefIndex` — still describe the call when instantiated at
+    /// this site's args?
+    ///
+    /// This is the test wave-C's admission comment assumed rather than performed. `sig_shapes_coherent`
+    /// (wave-19) already asks a NARROWER question — whether any position changes fat/thin pointer
+    /// CLASS — because that is the one that miscompiles. This asks whether the signature changes AT
+    /// ALL, because `map_ty` interns per spelling: two spellings of one Rust ADT are two `StructId`s
+    /// in the module, and a link across them is an ill-typed call the validator catches
+    /// (`CallArgTypeMismatch`). See the call site for the measured instance.
+    ///
+    /// `true` (link) for:
+    ///  - a NON-LOCAL callee — never spliced, so the link is a havoc extern either way (same
+    ///    reasoning as `sig_shapes_coherent`, and the same reason not to regress `std` calls);
+    ///  - EMPTY args — there is nothing to instantiate, so the two signatures are the same object;
+    ///  - a def-kind with no `fn_sig` — the query ICEs on those, and none of them reach a spliced
+    ///    body through this arm.
+    ///
+    /// Regions are erased on both sides: they carry no ABI, `map_ty` cannot see them, and the
+    /// comparator's raw-call channel already erases them before pinning callee identity — a
+    /// lifetime-only difference is not a different signature to anything downstream.
+    fn link_sig_is_instantiation_invariant(
+        &self,
+        callee: rustc_span::def_id::DefId,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> bool {
+        if !callee.is_local() || args.is_empty() {
+            return true;
+        }
+        let tcx = self.tcx;
+        use rustc_hir::def::DefKind;
+        if !matches!(tcx.def_kind(callee), DefKind::Fn | DefKind::AssocFn) {
+            return true;
+        }
+        // `skip_normalization` is the point, not a shortcut: see the `no normalization` paragraph
+        // at the call site. `fn_sig` hands back an `Unnormalized<_>` precisely so that reading it
+        // raw is a deliberate act, and reading it raw is what keeps this out of the E0391 family.
+        let sig = tcx.fn_sig(callee);
+        let identity = tcx.erase_and_anonymize_regions(sig.instantiate_identity().skip_normalization());
+        let at_site = tcx.erase_and_anonymize_regions(sig.instantiate(tcx, args).skip_normalization());
+        if identity == at_site {
+            return true;
+        }
+        // Log the DECLINE only. Logging both outcomes puts a `Debug` render of two signatures on
+        // the hot path of every generic call; the decline is the rare, diagnosable event, and it is
+        // the one worth being able to read off a log — this event is how the defect below was
+        // localized after a gate sited on the wrong path silently never fired.
+        tracing::debug!(
+            callee = ?callee,
+            args = ?args,
+            identity = ?identity,
+            at_site = ?at_site,
+            "trust-ir-lower: callee link declined (signature not instantiation-invariant)"
+        );
+        false
+    }
+
     fn sig_shapes_coherent(
         &self,
         callee: rustc_span::def_id::DefId,
@@ -4420,6 +5083,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // fat and fails closed, while a generic-caller-forwarded param stays coherent (both sides
         // thin/opaque) and a non-local free fn is havoc → admitted unconditionally.
         if from_hir_call && matches!(def_kind, rustc_hir::def::DefKind::Fn) {
+            // Trust (#197 item 3c): and it must ALSO be instantiation-invariance-gated, for the
+            // same structural reason the paragraph above gives for the DST gate — this fast path
+            // skips `Instance::try_resolve`, so a gate sited only on the resolve path below never
+            // sees a free fn. That is exactly how the measured defect survived: `fn foo<const N,
+            // const M>(_: Bar<N, M>)` is a free fn, so `foo(Bar::<2, {[1; 2]}>)` came through here
+            // and linked to the identity record. See `link_sig_is_instantiation_invariant` and the
+            // matching gate on the resolve path for the full argument.
+            if !self.link_sig_is_instantiation_invariant(def_id, gen_args) {
+                return Ok(CalleeKind::Direct(self.admit_havoc_callee(def_id)));
+            }
             if self.sig_shapes_coherent(def_id, gen_args) {
                 // Trust (wave-C): a free fn IS its own site identity — record `site_args` so a
                 // concrete-generic call (`id::<i32>(x)`) can flip; zero-generic stays `[]` (wave-6).
@@ -4542,6 +5215,37 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // spells `FnDef(site_def_id, site_args)` and fails closed if the args are not
                         // in the encodable concrete fragment → the body stays clean-only. The wave-19
                         // `sig_shapes_coherent` gate above is untouched.
+                        // Trust (#197 item 3c): the paragraph above states a PREMISE — "a spliced
+                        // generic body is instantiation-INDEPENDENT (every instantiation-dependent
+                        // construct fails closed during its own lowering)". That premise was never
+                        // tested for the SIGNATURE, and it is false for one shape: a generic body
+                        // whose parameter/return types are all ZSTs. `map_ty` lays a struct out
+                        // exactly when it can, so `Bar<N, M>` (a ZST) gets a layout and its body
+                        // splices — but `map_ty` INTERNS PER SPELLING, so the identity record's
+                        // parameter is `struct @Bar<N, M>` while the site passes `struct
+                        // @Bar<2, *b"\x01\x01">`. Two `StructId`s, one Rust ADT, and the link says
+                        // they are the same type. Measured: 2 `CallArgTypeMismatch` on
+                        // tests/ui/const-generics/generic_const_parameter_types/inferred_from_arg.rs.
+                        //
+                        // The layout-lessness signal (#197 item 3b, `signature_is_identity_spelled`)
+                        // is BLIND here precisely because both spellings are laid out. So test the
+                        // real question instead of a proxy for it: instantiate the callee's own
+                        // signature at this site's args and ask whether it moved. Invariant ⇒ the
+                        // identity record describes this call exactly and the wave-C link stands
+                        // (`fn f<T>(x: u32) -> u32` at `T = i32` is untouched). Not invariant ⇒ this
+                        // is a MONOMORPHIZATION of a signature the record spells in parameters, so
+                        // it takes the wave-20 forced-havoc lane: a bodyless declaration, sound at
+                        // every instantiation, which `crate_module` declares and never links.
+                        //
+                        // No normalization on either side, deliberately: normalizing inside
+                        // `mir_built` is the E0391 reentrancy family (three instances so far), and a
+                        // purely SYNTACTIC comparison can only over-fire — an alias pair that would
+                        // normalize equal costs a link, never buys a wrong one. B8 (per-`Instance`
+                        // lowering) is what retires this by giving each monomorphization its own
+                        // record; until then the declaration is the honest artifact.
+                        if !self.link_sig_is_instantiation_invariant(resolved, inst.args) {
+                            return Ok(CalleeKind::Direct(self.admit_havoc_callee(def_id)));
+                        }
                         Ok(CalleeKind::Direct(self.admit_callee_site(
                             resolved,
                             site_def_id,
@@ -4852,7 +5556,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let field_ids: Vec<ExprId> = fields.iter().copied().collect();
             // Untupled closure args are never diverging-dropped (the diverging-arg-skip is a
             // direct/indirect-call concern; keep closure calls fail-closed on an unloweable arg).
-            return self.lower_call_args(expr_span, &field_ids, false, false, false);
+            // Trust (#196): `diverges`/`recv_fallback`/`unit_sink` are all `false` here, so no drop
+            // or carrier lane can fire — the callee-locality flag is inert either way.
+            return self.lower_call_args(expr_span, &field_ids, false, false, false, false);
         }
         let fail = |cx: &mut Self| {
             cx.unsupported.push((format!("{expr_span:?}"), "Call(closure untuple unsupported)"));
@@ -5836,7 +6542,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // The same CFG as `if <test> { <payload body> } else { break }`. No wave-IL prologue —
         // this desugar's payload binds are the opaque carriers `lower_let_opaque_test` already
         // set, so the then block owes nothing (byte-identical to the pre-wave call).
-        self.lower_if_value(expr_ty, span, test, payload_body, Some(exit_body), None)
+        self.lower_if_value(expr_ty, span, test, payload_body, Some(exit_body), None, false)
     }
 
     /// Trust (wave-ER): the structural READ-ONLY-ESCAPE scan for `try_lower_foreach_summary`
@@ -6181,22 +6887,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         diverges: bool,
         recv_fallback: bool,
         unit_sink: bool,
+        // Trust (#196): does this call link to a LOCAL callee whose own body splices into this
+        // module? If so its `Function` carries REAL params, and dropping an arg makes the module
+        // ill-typed (`CallArgCountMismatch`). See the drop lanes below.
+        callee_is_local: bool,
     ) -> Option<Vec<ValueId>> {
         let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len());
         let mut collect_failed = false;
         for &a in args {
-            // Trust (wave-RS, ON BY DEFAULT `TRUST_SHARED_RECV_PLACE`; `=0` disables): a SHARED borrow of a
-            // NON-scalar field-chain lane in explicit-call position PREEMPTS the general
-            // Borrow lowering (which would otherwise succeed UNATTRIBUTABLY — the raw base
-            // ptr at offset 0 / a byte-offset gep) and carries the receiver PLACE instead
-            // (the wave-MC `&mut` treatment extended to `&`). Flag off: dead code,
-            // byte-identical dumps. Gated to explicit method/fn calls (`recv_fallback`).
-            if recv_fallback {
-                if let Some(v) = self.try_lower_shared_recv_place(a) {
-                    arg_vals.push(v);
-                    continue;
-                }
-            }
             let mark = self.unsupported.len();
             match self.lower_expr(a) {
                 Some(v) => arg_vals.push(v),
@@ -6243,6 +6941,46 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // borrow's decline tags on success. Gated to explicit method/fn
                     // calls (`recv_fallback`), never operator desugars.
                     if recv_fallback {
+                        // Trust (wave-RS, ON BY DEFAULT `TRUST_SHARED_RECV_PLACE`; `=0` disables):
+                        // a SHARED borrow of a NON-scalar field-chain lane in explicit-call
+                        // position carries the receiver PLACE (the wave-MC `&mut` treatment
+                        // extended to `&`). Gated to explicit method/fn calls (`recv_fallback`).
+                        //
+                        // RELOCATED (#197 item 2) from BEFORE `lower_expr` to here, the `None`
+                        // fallback. It used to PREEMPT the general Borrow lowering on the stated
+                        // grounds that that lowering "would otherwise succeed UNATTRIBUTABLY —
+                        // the raw base ptr at offset 0 / a byte-offset gep". That premise was
+                        // measured and is false in the cases that matter: the displaced lowering
+                        // is faithful at a NONZERO field offset (`gep inbounds i8, ptr %0, 8`),
+                        // not offset-0 luck. Preempting it substituted a place VALUE for a
+                        // POINTER, and when the callee is a spliced local whose param really is
+                        // declared `ptr`, that is an ill-typed call the validator rejects:
+                        //
+                        //   CallArgTypeMismatch { callee: "Trait::bar", arg_index: 0,
+                        //                         expected: "ptr", actual: "struct.0" }
+                        //
+                        // measured on `tests/ui/delegation/{explicit-paths-pass,
+                        // method-call-priority}.rs` and `.../unelided-lifetime-in-sig-ice-156848.rs`
+                        // (5 occurrences). Faithful pointer lowering now WINS whenever it exists;
+                        // the place carrier is the fallback for when it does not, which is the
+                        // only position from which it cannot mint an ill-typed call.
+                        //
+                        // If place-path ATTRIBUTION is wanted at a site the pointer lowering
+                        // handles, carry it as instruction metadata (the `#names`/place-path
+                        // channel) — never as the argument VALUE.
+                        //
+                        // KNOWN CONSEQUENCE, deliberately accepted: this lane also REGISTERS the
+                        // field-chain lane (`struct_ty_rmw_opaque`) as a side effect of deciding
+                        // eligibility. That registration used to run unconditionally and now runs
+                        // only when `lower_expr` declined. Corpus-swept for the coverage cost
+                        // rather than argued — see the wave note in the commit.
+                        if let Some(v) = self.try_lower_shared_recv_place(a) {
+                            // `place_path_carrier` is set inside the lane itself (B3-2c seam
+                            // guard, value-instead-of-pointer receiver); do not re-set it here.
+                            self.unsupported.truncate(mark);
+                            arg_vals.push(v);
+                            continue;
+                        }
                         if let Some(v) = self.try_lower_receiver_place_value(a) {
                             // Trust (B3-2c seam guard): value-for-pointer carrier
                             // (either internal path) — CLEAN-ONLY, seam-ineligible.
@@ -6293,7 +7031,21 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // the call keeps failing closed. The emitted short-arity `Inst::Call` keeps
                     // `contains_call = true` (NotRun / never flipped / never certified; the
                     // FuncId is a bodyless declaration with no arity check — wave-28's posture).
-                    if (diverges || unit_sink) && self.is_read_only_plumbing(a) {
+                    //
+                    // Trust (#196): the parenthetical above — "the FuncId is a bodyless declaration
+                    // with no arity check" — is the lane's own load-bearing premise, and it is FALSE
+                    // for a LOCAL callee that splices. A bodyless declaration is signed
+                    // `params: [], is_vararg: true` (the params-side "unknown" encoding), so a short
+                    // arity is vacuous against it; a spliced local function has REAL params and the
+                    // short call is simply ill-typed. Measured: 9 `CallArgCountMismatch`, all the
+                    // `unit_sink` half, e.g. `f(S { _t: &42_i8 })` emitting `call @func.0()` with
+                    // zero args and `unsupported: []`. Those bodies were skipped by the seam for
+                    // INCIDENTAL reasons (callee-set asymmetry, live havoc) — luck, not a gate.
+                    // Restore the premise by testing it instead of asserting it.
+                    if (diverges || unit_sink)
+                        && !callee_is_local
+                        && self.is_read_only_plumbing(a)
+                    {
                         self.unsupported.truncate(mark);
                         continue;
                     }
@@ -6313,7 +7065,26 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         arg_vals.push(v);
                         continue;
                     }
-                    self.unsupported.push((format!("{expr_span:?}"), "Call(unsupported arg)"));
+                    // Trust (diagnostics): RECORD THE LEAF THIS ROW IS MASKING.
+                    //
+                    // `mark` was taken immediately before `lower_expr(a)`, so `unsupported[mark..]`
+                    // is exactly what THIS argument pushed, innermost first. Naming the first of
+                    // them turns an aggregator row into an attributable one.
+                    //
+                    // Why the DETAIL and not the tag: the tag slot is `&'static str`, so a
+                    // per-callsite name cannot be minted there. The detail is a `String` and is
+                    // already the census's per-tag example channel, which is where a reader looks
+                    // anyway. The tag is untouched, so every existing count stays comparable.
+                    //
+                    // This matters because the histogram is otherwise unplannable: measured on
+                    // clean-kernel, `Call(unsupported arg)` is the ONLY tag on 0 of 3,329 bodies
+                    // (0.0%) — it never once stands alone. Summing it counts other people's leaves.
+                    let masked = self.unsupported.get(mark).map(|(_, t)| *t);
+                    let detail = match masked {
+                        Some(leaf) => format!("{expr_span:?} [masking: {leaf}]"),
+                        None => format!("{expr_span:?} [masking: <none recorded>]"),
+                    };
+                    self.unsupported.push((detail, "Call(unsupported arg)"));
                     // Trust (v2 Phase 0b): in collect-all mode keep walking the REMAINING args so
                     // their subtrees' leaf tags are recorded too ('Call(unsupported arg)' is the
                     // #1 aggregator: 3793 events, 98.6% masked) — then still fail the call closed.
@@ -6426,6 +7197,33 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// values, and every call to it must therefore declare zero results as well. Non-unit calls
     /// declare exactly one result. Keeping this decision at the THIR call site prevents linked
     /// interpretation from seeing a malformed one-result-call/zero-result-callee pair.
+    /// Trust (#33 step 2): emit a call stamped with THIR's `fn_span` — "the span
+    /// of the function, without the dot and receiver" (rustc_middle/src/thir.rs:303).
+    ///
+    /// For a Call terminator, codegen does NOT use `terminator.source_info.span`:
+    /// `rustc_codegen_ssa/src/mir/block.rs` substitutes `fn_span` before
+    /// `set_debug_loc`. Step 1 made the SHIM pass the call site's span instead of
+    /// the body-constant def_span; this makes the PRODUCER stamp the same
+    /// sub-span built uses, which for a method call is the callee, not the whole
+    /// expression. `self.bar()` wants the `b` of `bar`, and the enclosing
+    /// `lower_expr` wrapper supplies the `s` of `self`.
+    ///
+    /// A NO-OP for a plain call: `thir/cx/expr.rs` sets
+    /// `fn_span = if receiver.is_some() { func.span } else { expr.span }`, so
+    /// without a receiver this re-stamps the span the wrapper already set.
+    fn emit_call_at(
+        &mut self,
+        fn_span: rustc_span::Span,
+        inst: Inst,
+        result_rty: RustcTy<'tcx>,
+    ) -> Option<ValueId> {
+        let saved = self.cur_span;
+        self.cur_span = self.to_source_span(fn_span).or(saved);
+        let result = self.emit_call(inst, result_rty);
+        self.cur_span = saved;
+        result
+    }
+
     fn emit_call(&mut self, inst: Inst, result_rty: RustcTy<'tcx>) -> Option<ValueId> {
         self.contains_call = true;
         let node = InstrNode::new(inst);
@@ -7948,7 +8746,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         self.push_node(InstrNode::new(Inst::ExtractField { ty: leaf_ty, aggregate: w0, field })
                 .with_result(w1),
         );
-        if off == 0 {
+        // Trust (wave-DZ): the wave-25 tautology is a tautology for the CONSUMER too only when
+        // the projected field is field 0 — see `zero_displacement_agrees`. rustc's `repr(Rust)`
+        // reordering routinely puts a LATER-declared field at byte 0, where the interpreter's
+        // declaration-order image does not; taking the shortcut there emits a body with no trace
+        // of the contested address at all. On `false` this falls through to the ordinary GEP
+        // below with `off == 0`: same address, same lowering, but now VISIBLE to
+        // `first_adt_interior_byte_arithmetic`, which refuses the interpreter channel for it.
+        if off == 0 && zero_displacement_agrees(field) {
             // The field address IS the struct pointer (wave-25 tautology).
             return Some(pv);
         }
@@ -8112,6 +8917,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// Value-consuming sites use this to fail closed if such a pointer would ESCAPE the only
     /// supported shape — a `Deref` immediately consuming it. See the `borrow_ptrs` field. A `&mut`
     /// slot pointer is registered into `borrow_ptrs` too, so the same escape guards cover it.
+    /// Trust (#197c): does this fn's signature carry ZERO returns? `()` and `!` BOTH do — the
+    /// MIR-side oracle uses exactly this rule (`matches!(.., Ty::Unit | Ty::Never) => vec![]` at
+    /// `crates/trust-ir-bridge/src/lower.rs:17593`, and the same test at `:15817` / `:18212`).
+    ///
+    /// This exists as a NAMED predicate because the rule was spelled `is_unit()` at three sites
+    /// that must agree — the signature in `lower_fn` plus the two `Inst::Return` epilogues — and
+    /// fixing only the signature traded `InstrResultArityMismatch` for `ReturnArityMismatch` on
+    /// tests/ui/never_type/basic/call-fn-never-arg.rs. One rule, one name, three callers.
+    fn fn_returns_no_values(&self) -> bool {
+        self.fn_return_rty.is_some_and(|t| t.is_unit() || t.is_never())
+    }
+
     fn is_borrow_ptr(&self, v: ValueId) -> bool {
         self.borrow_ptrs.contains(&v)
     }
@@ -8174,6 +8991,89 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         self.promoted_tys.push((var, ty));
     }
 
+    /// Trust (wave-ABI): the SIGNATURE-BOUNDARY guard — an OPAQUE-LANE enum whose lane spelling
+    /// is a SCALAR must never reach an ABI-visible position. Records
+    /// `Ty(option-flag in signature)` (⇒ the body is unlowered) when it does.
+    ///
+    /// WHY THE SCALAR CONJUNCT IS THE WHOLE POINT. Both opaque lanes model a declined enum by
+    /// its NON-payload remainder: wave-EL's `Ty::Unit` keeps nothing, and the wave-SEAM
+    /// `option_flag_lanes_enabled` lane keeps the DISCRIMINANT as `Ty::Bool`. Inside a body
+    /// that is legitimate — the lane exists so `is_some`/`is_none` on an `Option<T>` with a
+    /// non-seedable payload can lower — and this guard deliberately leaves it alone. What is
+    /// never legitimate is letting it cross into a SIGNATURE, because the consumer then mints a
+    /// real rustc type from it: `to_mir`'s `param_rty`/return arms answer `scalar_rustc_ty`
+    /// FIRST, so a scalar lane is adopted as its denotation (`Ty::Bool` → `tcx.types.bool`)
+    /// without ever consulting the built type. `Option<(u32,u32)>` in a signature therefore
+    /// produced a bool-returning derived `mir::Body` for an `Option`-returning function — an
+    /// ABI LIE, `expr::shift_bvar_range` measured (`built ret:enum:core::option::Option` vs
+    /// `derived ret:bool`).
+    ///
+    /// The `Ty::Unit` sibling escaped this only by luck of spelling: `Unit` is NOT a scalar, so
+    /// `param_rty`'s `Ty::Unit` arm demands `built.is_unit()` and the consumer fails CLOSED. The
+    /// Option-flag lane converted that fail-closed gap into a lie, and the conjunct here is
+    /// exactly the difference between the two. Stating the gate over `is_scalar_ty(mapped)`
+    /// rather than over the literal `Ty::Bool` keeps it correct if a future lane spells an
+    /// opaque enum as another scalar, and keeps the wave-EL `Ty::Unit` class byte-identical (it
+    /// is not a scalar, so this never fires for it — the existing decline stands, at its
+    /// existing site, with its existing tag).
+    ///
+    /// EXACT COVERAGE, stated rather than implied: `is_scalar_ty` is bool + the fixed-width ints
+    /// + isize/usize/char. `to_mir::SCALAR_CANDS` — the set that actually gets adopted — is that
+    /// plus `F32`/`F64`. The two therefore differ by the floats, and this guard would NOT catch a
+    /// float-spelled opaque lane. That is not a live hole: `map_ty`'s decline arm emits exactly
+    /// `Ty::Bool` or `Ty::Unit`, so no opaque enum can reach a float today. It is called out
+    /// because the `to_mir` cross-check added alongside this guard covers the whole
+    /// `scalar_rustc_ty` set including the floats — belt to this braces.
+    ///
+    /// This is `map_fn_ptr_ty`'s guard ("an ABI lie at an indirect-call boundary") applied to
+    /// the DIRECT-call boundary `lower_fn` owns. It is deliberately WEAKER than that one: a
+    /// fn-ptr sig declines EVERY opaque-lane enum, because a `Ty::Unit` hole in a spliced
+    /// indirect-call signature is unrecoverable at the call site. Here the `Ty::Unit` class
+    /// already fails closed downstream, so widening to match `map_fn_ptr_ty` would only convert
+    /// sound rejections into earlier rejections — a coverage loss buying no soundness.
+    ///
+    /// Cheap conjunct first: `is_scalar_ty` is a match on a mapped `Ty`, while
+    /// `is_opaque_lane_enum` probes `register_enum`. A registered `Option<u32>` maps to
+    /// `Ty::Enum` and short-circuits here without any probe at all.
+    fn guard_sig_position_ty(&mut self, rty: RustcTy<'tcx>, mapped: &Ty, position: &str) {
+        // Trust (wave-RD follow-up): the `Ty::Unit` sibling, at the RETURN position only.
+        //
+        // The paragraph above argues the `Ty::Unit` class needs no guard because "`param_rty`'s
+        // `Ty::Unit` arm demands `built.is_unit()` and the consumer fails CLOSED". That is true of
+        // the CONSUMER and says nothing about the MODULE: a fn whose declared return is a declined
+        // opaque-lane enum signs `returns: [Unit]` while its body constructs and returns the real
+        // `Ty::Enum`, so the assembled module carries an ill-typed `Return` —
+        // `ReturnTypeMismatch { expected: "()", actual: "enum.0" }`, the #189 family.
+        //
+        // Latent until wave-RD, and that is the only reason it is being fixed here rather than
+        // then: these bodies were DIRTY for other reasons, so they never spliced and never reached
+        // `validate_module`. Making raw `*dyn` first-class cleaned one of them
+        // (`tests/ui/trust/trust_ir_lower_rpit_no_cycle.rs`: `fn ages() -> Result<impl Iterator,
+        // ()>`, whose `Result` declines on its opaque payload) and the pre-existing defect became
+        // observable. Measured: INVALID 0 -> 1 on the wave-RD sweep, back to 0 with this clause.
+        //
+        // RETURN ONLY, deliberately. A PARAM in the same shape is a different question — the
+        // caller passes the value, `param_rty` demands `built.is_unit()`, and the consumer's
+        // fail-close is real there — so widening this to params would convert sound rejections
+        // into earlier ones and cost coverage for no validity gain. That is exactly the trade the
+        // paragraph above declined, and it is still the right call for params.
+        //
+        // Its own tag, not the `option-flag` one: #181's lesson is not to explode tag cardinality,
+        // but these are different MECHANISMS (a scalar lane adopted as a denotation vs a Unit lane
+        // contradicting a real enum) with different fixes, and one bucket would hide whichever is
+        // smaller.
+        if position == "ret" && matches!(mapped, Ty::Unit) && self.is_opaque_lane_enum(rty) {
+            self.unsupported.push((format!("{position}: {rty:?}"), "Ty(opaque-lane enum return)"));
+            return;
+        }
+        if !is_scalar_ty(mapped) {
+            return;
+        }
+        if opaque_lane_is_abi_lie(mapped, self.is_opaque_lane_enum(rty)) {
+            self.unsupported.push((format!("{position}: {rty:?}"), "Ty(option-flag in signature)"));
+        }
+    }
+
     /// Build the (possibly multi-block) `trust_ir::Function` and push it onto the module.
     fn lower_fn(
         &mut self,
@@ -8190,8 +9090,31 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // `[Unit]` spelling was the single largest differential-divergence class (every
         // 'signature divergence: THIR []->[Unit] vs MIR []->[]' verdict — 890 bodies in the
         // 2026-07-01 ui-sample scorecard), masking any real semantic comparison on unit fns.
-        let returns =
-            if fn_sig.output().is_unit() { Vec::new() } else { vec![self.map_ty(fn_sig.output())] };
+        // Trust (wave-ABI): the RETURN crosses into the signature here — guard it (see
+        // `guard_sig_position_ty`). `map_ty` still runs and its result is still signed, so the
+        // Module a REJECTED body emits is byte-identical to the pre-guard one; only the
+        // `unsupported` tag is new, and that is what makes the body unlowered
+        // (`lowered = function.is_some() && unsupported.is_empty()`, crate_module).
+        // Trust (#197c): `!` joins `()` on the ZERO-RETURN side. This branched on `is_unit()`
+        // alone, so `fn forever() -> !` was signed `() -> (!)` — one return — while NOTHING on
+        // either end ever produces that value: `emit_call`'s #188 path binds 0 results for a
+        // `!`-returning call, and the epilogue's `values` is empty. The MIR-side oracle ALREADY
+        // uses the joint convention (`crates/trust-ir-bridge/src/lower.rs:17593`,
+        // `matches!(body.return_ty, Ty::Unit | Ty::Never) { vec![] }`, and the same test at
+        // `:15817`/`:18212`), so the PRODUCER was the outlier and the two signatures disagreed
+        // on every diverging function. Measured: 4 `InstrResultArityMismatch`
+        // (`expected 1, actual 0`) against spliced `() -> (!)` definitions, plus 1
+        // `ReturnArityMismatch` and 1 `UnreachableBlock` in
+        // tests/ui/for-loop-while/loop-diverges.rs sharing this root cause with #192.
+        // Same rule as `fn_returns_no_values` (used by both `Inst::Return` epilogues); spelled
+        // out here because `self.fn_return_rty` is not yet bound at this point.
+        let returns = if fn_sig.output().is_unit() || fn_sig.output().is_never() {
+            Vec::new()
+        } else {
+            let out = self.map_ty(fn_sig.output());
+            self.guard_sig_position_ty(fn_sig.output(), &out, "ret");
+            vec![out]
+        };
         // Trust: closure-environment signature convention — a closure BODY's param 0 is the
         // closure environment, then the declared params. THIR already carries the env as
         // `thir.params[0]` (pat `None`; see `rustc_mir_build::thir::cx::closure_env_param`,
@@ -8212,7 +9135,17 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // fail-closed with precise tags in `closure_env_param_ty` — never guessed.
         let mut params: Vec<Ty> = Vec::with_capacity(fn_sig.inputs().len() + 1);
         params.extend(self.closure_env_param_ty(def));
-        params.extend(fn_sig.inputs().iter().map(|t| self.map_ty(*t)));
+        // Trust (wave-ABI): every DECLARED param crosses into the signature here — guard each
+        // (see `guard_sig_position_ty`); the measured lie showed up in ARG position too
+        // (`built arg1:enum:core::option::Option` vs `derived arg1:bool`). The closure-env param
+        // above is exempt by construction: `closure_env_param_ty` yields `&{closure}` / a ZST
+        // closure ty, never an enum. Position names are 1-based to match the differential's
+        // `arg1`/`arg2` rendering (MIR `_1..=_n`), so a census row points at the exact local.
+        for (i, t) in fn_sig.inputs().iter().enumerate() {
+            let mapped = self.map_ty(*t);
+            self.guard_sig_position_ty(*t, &mapped, &format!("arg{}", i + 1));
+            params.push(mapped);
+        }
         // Trust: a C-variadic body's THIR carries a trailing implicit `VaList` param that is
         // NOT in `fn_sig.inputs()` (see `rustc_hir_typeck::check::check_fn`), which would
         // mis-align `param_vars` exactly like the closure-env case above. Fail closed.
@@ -8544,7 +9477,37 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // initializer body that is the const's type (`typeck_results.node_type`, threaded via
         // `BodyTy::Const` — the RETURN_PLACE type NLL equates the body with).
         self.fn_return_rty = Some(const_rty);
-        let returns = if const_rty.is_unit() { Vec::new() } else { vec![self.map_ty(const_rty)] };
+        // Trust (wave-ABI R2): the initializer's type CROSSES into a signature here — the SECOND
+        // such point, guarded exactly as `lower_fn`'s return is (same `guard_sig_position_ty`,
+        // same `Ty(option-flag in signature)` tag, same `"ret"` position name).
+        //
+        // `0a53c47bca` called `lower_fn` "the single point where a type CROSSES into a
+        // signature". That sentence was FALSE and this line is the counterexample: it carried the
+        // identical pre-fix spelling, ~20 lines below the patched one, in the same file, and the
+        // fix left it byte-identical. Reproduced with the HEAD stage1 producer (which predates
+        // that fix, and whose `lower_const_body` bytes are therefore the HEAD bytes):
+        //
+        //     functy.0 = () -> (bool)
+        //     fn @C_LIE::{const-init}(functy.0)     ; real type Option<(u32,u32)>
+        //     fn @S_LIE::{static-init}(functy.0)    ; real type Option<(u32,u32)>
+        //     fn @C_BOOL::{const-init}(functy.0)    ; real type bool
+        //     functy.1 = () -> (enum.0)
+        //     fn @C_OK::{const-init}(functy.1)      ; real type Option<u32>  <- control
+        //
+        // A lying initializer and a real `bool` initializer shared ONE interned `FuncTy`, and the
+        // rows shipped `lowered`+`spliced` with `unsupported: []` into the published
+        // `.trust-ir.bin`/`.txt` — the exact producer-side harm that commit gave as its reason
+        // for refusing a `to_mir`-only fix. The consumer happens to be closed on this class twice
+        // over (the CTFE seam's `_0` comparison at `flip.rs:243-250`, and that commit's `to_mir`
+        // return cross-check, which both seams share), so there is no miscompile to point at —
+        // but "no miscompile today" is a downstream accident, not a guarded producer.
+        let returns = if const_rty.is_unit() {
+            Vec::new()
+        } else {
+            let out = self.map_ty(const_rty);
+            self.guard_sig_position_ty(const_rty, &out, "ret");
+            vec![out]
+        };
         let func_ty_id =
             module.add_func_type(FuncTy { params: Vec::new(), returns, is_vararg: false });
 
@@ -8604,8 +9567,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     self.unsupported.push(("body".to_string(), "Return(borrow ptr escapes tail)"));
                 }
             }
-            // Unit-returning fns return no values (the bridge convention; see `lower_fn`).
-            let values = if self.fn_return_rty.is_some_and(|t| t.is_unit()) {
+            // Unit- AND never-returning fns return no values (see `fn_returns_no_values`).
+            let values = if self.fn_returns_no_values() {
                 Vec::new()
             } else {
                 tail.into_iter().collect()
@@ -9039,6 +10002,48 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         Some(Ty::Struct(sid))
     }
 
+    /// Trust (#201, B8 slice 1): register — once per body — the collapsed OPAQUE ZERO-FIELD
+    /// struct that every pre-monomorphization alias lowers to, and return its `StructId`.
+    ///
+    /// This is the producer half of `trust-ir-bridge/src/lower.rs:2487`, and the NAME is copied
+    /// from there verbatim — but NOT because the differential needs it. Be precise about this,
+    /// because the obvious assumption is wrong: the cross-side comparison is STRUCTURAL. Its
+    /// struct arm (`differential.rs`, `tys_agree`) resolves both `StructDef`s, rejects on
+    /// differing field COUNT, then zips `tys_agree` over the field types; `name`, `size`, `align`
+    /// and `repr` are never read. Two zero-field structs therefore agree unconditionally, whatever
+    /// they are called. The name is copied for forward-compatibility with the SPLICE, which does
+    /// compare names (`trust-ir`'s `struct_def_structurally_eq` -> `add_struct_def` dedup) and
+    /// which this lane cannot reach today only because `splice_ok` refuses symbolic bodies first.
+    /// Matching the string costs nothing and stops that from becoming a latent divergence.
+    ///
+    /// Registration is unconditional and infallible: a zero-field struct has no field types to
+    /// map, so unlike `register_struct` there is nothing here that can fail closed, and no
+    /// `map_ty` recursion that could push a tag. Layout is left absent (`size`/`align` `None`) —
+    /// the same choice the oracle makes, and the honest one: the whole point of the sort is that
+    /// its layout is not knowable before monomorphization.
+    ///
+    /// The struct is NOT entered into the `struct_ids` ledger: that ledger is keyed by
+    /// `(DefId, GenericArgs)` for ADT dedup, and this struct deliberately stands for MANY
+    /// distinct alias `(DefId, GenericArgs)` pairs at once. The id therefore comes from
+    /// `pending_structs.len()`, which is the vec whose index the assembly seam actually checks.
+    fn mint_alias_opaque_struct(&mut self) -> trust_ir::StructId {
+        if let Some(id) = self.alias_opaque_struct {
+            return id;
+        }
+        let id = trust_ir::StructId::new(self.pending_structs.len() as u32);
+        self.pending_structs.push(trust_ir::StructDef {
+            id,
+            // Byte-identical to the oracle's `trust-ir-bridge/src/lower.rs:2487`.
+            name: "opaque_alias::pre_monomorphization".to_string(),
+            fields: Vec::new(),
+            size: None,
+            align: None,
+            repr: trust_ir::StructRepr::Rust,
+        });
+        self.alias_opaque_struct = Some(id);
+        id
+    }
+
     /// Trust: register a struct `AdtDef` ONCE (dedup by its `DefId`), returning the assigned
     /// `StructId`. The `StructDef` carries the struct's name and (interpretable) field types; the
     /// runtime struct *value* is FIRST-CLASS `Ty::Struct(id)` (the pinned interpreter materializes
@@ -9073,7 +10078,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
         // Positional id: matches `Module::add_struct` pushing by `sd.id` and the count of
         // already-registered structs (we are the only registrant in this single-function module).
-        let id = trust_ir::StructId::new(self.struct_ids.len() as u32);
+        //
+        // Trust (#201): sourced from `pending_structs`, NOT `struct_ids`. The two are pushed
+        // together at the tail of this function so the counts were equal and this is a no-op for
+        // every ADT — but `mint_alias_opaque_struct` registers a struct that has no
+        // `(DefId, GenericArgs)` ledger key, and `pending_structs` is the vec whose INDEX the
+        // assembly seam checks (`crate_module.rs`: `sd.id.as_usize() != i` rejects the whole
+        // body). Keying the counter off the ledger instead of the table is what would silently
+        // hand out a duplicate id.
+        let id = trust_ir::StructId::new(self.pending_structs.len() as u32);
         // Instantiation-qualified identity keeps distinct generic layouts
         // deterministic across bodies and registration order.
         let name = rustc_middle::ty::print::with_no_trimmed_paths!(
@@ -9090,7 +10103,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // re-entrancy pre-gate mirrors `lower_offset_of`: `layout_of` on a
         // param/infer/opaque/bound-bearing type can ICE in a query, not `Err`.
         let struct_rty = ty::Ty::new_adt(self.tcx, adt, args);
-        let layout = if layout_query_is_reentrant_safe(struct_rty) {
+        let layout = if layout_query_is_reentrant_safe_deep(self.tcx, struct_rty) {
             let te = ty::TypingEnv::fully_monomorphized();
             self.tcx.layout_of(te.as_query_input(struct_rty)).ok()
         } else {
@@ -9153,10 +10166,34 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // vector shape). Bounds-check and drop the offset instead of
                 // aborting the compile (producer totality: fail closed to a
                 // missing offset, never to an ICE).
+                // Trust (#204): ALSO drop the offset when rustc placed the field at exactly
+                // the struct size. That is rustc's legal placement for a ZERO-SIZED field —
+                // `enum TyS { Nil }` (one variant, no payload) is a ZST, so in
+                // `struct RawT { struct_: TyS, cname: Option<String>, hash: usize }` rustc lays
+                // `cname` at 0, `hash` at 24, and `struct_` at offset 32 == size 32.
+                //
+                // The declared SIZE is rustc's truth, but the field TYPES are our MODEL, and the
+                // two disagree here: the producer models every enum as discriminant-carrying, so
+                // `ty_is_zero_sized_in` cannot prove this field is zero-sized. The validator's
+                // rule is exactly `offset > size || (offset == size && !is_zst)`, so it rejected
+                // the module — "field offset is outside the declared struct size" — for a struct
+                // whose Rust source is entirely ordinary. MEASURED: 1 occurrence,
+                // tests/ui/codegen/alias-uninit-value.rs.
+                //
+                // Dropping the offset is the honest resolution and is information-free: a field
+                // at offset == size is zero-sized BY CONSTRUCTION (nothing else fits), so the
+                // offset tells a consumer nothing it cannot re-derive. Emitting it asserts a
+                // layout fact our own model contradicts. The alternative — teaching the model
+                // that a single-variant fieldless enum is a ZST — is a real modelling change
+                // that has to move the ORACLE too, and is not this fix.
+                //
+                // Note the ordering: `offset == size` is checked against the DECLARED size, so
+                // this only fires when a layout was actually filled.
                 offset: layout
                     .as_ref()
                     .filter(|l| i < l.fields.count())
-                    .map(|l| l.fields.offset(i).bytes()),
+                    .map(|l| l.fields.offset(i).bytes())
+                    .filter(|off| size.is_none_or(|sz| *off != sz)),
             })
             .collect();
         self.pending_structs.push(trust_ir::StructDef { id, name, fields, size, align, repr });
@@ -10231,11 +11268,45 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// Fails closed to `None` on ANY tag, so a degraded placeholder `Ty::Unit` can never be
     /// mistaken for a real mapping — the trap that produced +25 `ReturnTypeMismatch` in the
     /// broad, mutating first cut of #178.
+    ///
+    /// Trust (wave-ABI R2): the THIRD point where a type crosses into a signature — a bodyless
+    /// DECLARATION's `returns` (`emit_call` records this on `CalleeRef::ret_ty`; `decl_ret` reads
+    /// it back and `crate_module` interns it into the declaration's `FuncTy`). The scalar-spelled
+    /// opaque lane must not type one, for the same reason it must not type a definition: a
+    /// declaration signature is ABI-visible, and `to_mir`'s scalar arms respell it as a real
+    /// rustc type.
+    ///
+    /// THE TAG-FREEDOM THAT LETS IT THROUGH IS MEASURED, NOT ASSUMED. The guard above this one
+    /// keys on the `map_ty` decline arm being SILENT — and it is: the probe crate's `C_LIE`
+    /// (`const C_LIE: Option<(u32,u32)>`) lowered with `unsupported: []`, and `map_ty` ran on
+    /// exactly that type to produce it. So the transaction above cannot catch this class; the
+    /// tag it looks for is never pushed.
+    ///
+    /// DECLINE, DO NOT TAG. This is the one ABI-visible position where
+    /// `guard_sig_position_ty`'s `self.unsupported.push` would be the WRONG shape: the tag would
+    /// land on the CALLER, killing a body whose own lowering is clean merely for calling an
+    /// `Option`-returning function — precisely the trap this function's own doc comment records
+    /// as costing 41 clean bodies on the first cut of #178. `None` is this position's existing,
+    /// documented fail-closed spelling ("unknown" = the honest empty `returns`), and
+    /// `crate_module`'s own rule for it is already written down: *never guess; a wrong signature
+    /// is worse than an absent one*. The decision function and its cheap-conjunct-first
+    /// evaluation order are `guard_sig_position_ty`'s, unchanged — only the outcome differs,
+    /// because only the position differs.
+    ///
+    /// UNREPRODUCED, and here is exactly why. The declaration-return lane does not exist in the
+    /// HEAD stage1 binary (built 2026-07-29 22:33; `probe_ret_ty` landed 2026-08-02 in
+    /// `818fb6fe3d`), so a probe against it declares EVERY callee `(...) -> ()` — including a
+    /// plain `-> u32` one, which `scalar_ret_ty` alone would have typed. The lie is therefore
+    /// argued from source plus that measured tag-freedom, not dumped. Rebuilding to dump it
+    /// needs x.py.
     fn probe_ret_ty(&mut self, rty: RustcTy<'tcx>) -> Option<Ty> {
         let before = self.unsupported.len();
         let mapped = self.map_ty(rty);
         if self.unsupported.len() != before {
             self.unsupported.truncate(before);
+            return None;
+        }
+        if is_scalar_ty(&mapped) && opaque_lane_is_abi_lie(&mapped, self.is_opaque_lane_enum(rty)) {
             return None;
         }
         Some(mapped)
@@ -11651,7 +12722,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 let ty = self.map_ty(expr_ty);
                 self.emit_arith_binop(expr_span, *op, ty, signed, rhs_rty, l, r)
             }
-            ExprKind::Call { fun, args, from_hir_call, .. } => {
+            ExprKind::Call { fun, args, from_hir_call, fn_span, .. } => {
                 // Trust: SLICE `s.len()` — the `<[T]>::len(&self) -> usize` lang-item method. rustc
                 // lowers it to a `Call` to the `slice_len_fn` lang item with the slice fat pointer as
                 // the sole receiver argument. We recognize it and read the LENGTH lane directly:
@@ -11709,12 +12780,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             // Trust (wave-ER): a unit-returning callee is a candidate
                             // logging SINK for the read-only-plumbing arg drop.
                             expr_ty.is_unit(),
+                            // Trust (#196): read `is_local` off the admitted `CalleeRef`. A local
+                            // callee may splice, so its params are real and no arg may be dropped.
+                            self.callees.iter().any(|c| c.func_id == callee && c.is_local),
                         )?;
                         // Trust (merge): the parallel session's `emit_call` gives a unit-returning
                         // call ZERO results (the IR's unit convention); a non-unit call gets one.
                         // An opaque-lane Option is a non-unit rustc type, so the wave-SEAM ledger
                         // below layers cleanly onto the `Some(res)` it returns.
-                        let res = self.emit_call(Inst::Call { callee, args: arg_vals }, expr_ty);
+                        let res =
+                            self.emit_call_at(*fn_span, Inst::Call { callee, args: arg_vals }, expr_ty);
                         // Trust (wave-SEAM): ledger a LOCAL callee's opaque-lane-Option result
                         // as a PROVEN discriminant value (`option_lane_values`). A LOCAL fn's
                         // declaration carries `lower_fn`'s mapped signature, whose return for
@@ -11807,7 +12882,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         let mut args = Vec::with_capacity(untupled.len() + 1);
                         args.push(env);
                         args.extend(untupled);
-                        self.emit_call(Inst::Call { callee, args }, expr_ty)
+                        self.emit_call_at(*fn_span, Inst::Call { callee, args }, expr_ty)
                     }
                     // Trust: INDIRECT call through a fn-pointer value — `Inst::CallIndirect`
                     // with the callee's mapped `FuncTy` signature (the pended per-body id;
@@ -11850,8 +12925,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             expr_ty.is_never(),
                             false,
                             false,
+                            // Trust (#196): an indirect call has no `FuncId` and therefore no
+                            // spliced callee to disagree with.
+                            false,
                         )?;
-                        self.emit_call(
+                        self.emit_call_at(
+                            *fn_span,
                             Inst::CallIndirect {
                                 callee: callee_val,
                                 sig,
@@ -11894,9 +12973,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                     None => Vec::new(),
                 };
-                // Unit-returning fns return no values (the bridge convention; see `lower_fn`) —
-                // covers `return;` and `return unit_expr;` alike.
-                let values = if self.fn_return_rty.is_some_and(|t| t.is_unit()) {
+                // Unit- AND never-returning fns return no values (see `fn_returns_no_values`) —
+                // covers `return;`, `return unit_expr;`, and a `return` in a `-> !` fn alike.
+                let values = if self.fn_returns_no_values() {
                     Vec::new()
                 } else {
                     values
@@ -13117,6 +14196,52 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         return None;
                     }
                 };
+                // Trust (#199): the extract's `field_ty` comes from the FIELD's own rustc type,
+                // while the HOLDER's lane comes from whichever builder registered it first. When
+                // those disagree the module claims to read a type out of a lane that does not
+                // carry it. Measured: `StringBuffer::append` loaded a holder registered
+                // `struct @StringBuffer { () }` and then `extractfield struct.8 %2, 0` — a whole
+                // 24-byte `String` materialized out of a lane the model declares
+                // zero-information, and handed to a call. `lowered: true, unsupported: []`.
+                //
+                // The arm's own justification was that "`register_struct` dedups by `DefId` — read
+                // and write agree on the registration". That guarantees a stable **id**, not a
+                // stable **lane**: the wave-EL opaque collapse can degrade a field to `Ty::Unit`
+                // in the registration while `expr_ty` still names the real type.
+                //
+                // PLACEMENT IS LOAD-BEARING, twice over. It must come AFTER `lower_expr(lhs)` —
+                // that is what registers the holder, and for a `&mut self` receiver `map_ty` thin-
+                // collapses to `Ty::Ptr` and drops the pointee, so at `field_ty`'s site the struct
+                // is not in `struct_ids` yet and the check would be inert. And it must come after
+                // the wave-EL/RS branch above has already returned, because that lane DELIBERATELY
+                // reads a `Ty::Unit` field through a degraded holder and polices itself.
+                //
+                // Read the registered lane WITHOUT `map_ty`/`struct_ty_rmw_opaque` — both mutate
+                // (they intern and can perturb `StructId` assignment for bodies that already
+                // lower); `struct_ids`/`pending_structs` are plain `&self` scans.
+                if let ty::Adt(holder, hargs) = self.thir.exprs[lhs].ty.kind() {
+                    if let Some((_, _, sid)) = self
+                        .struct_ids
+                        .iter()
+                        .find(|(d, a, _)| *d == holder.did() && a == hargs)
+                        .copied()
+                    {
+                        // Look up BY `sd.id`, not by position — that is the convention the rest
+                        // of this file uses (`pending_structs.iter().find(|sd| sd.id == sid)`), and
+                        // `StructId` is not a `pending_structs` index.
+                        let declared = self
+                            .pending_structs
+                            .iter()
+                            .find(|sd| sd.id == sid)
+                            .and_then(|sd| sd.fields.get(field as usize))
+                            .map(|f| f.ty.clone());
+                        if declared.as_ref().is_some_and(|d| *d != field_ty) {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "Field(aggregate lane disagrees)"));
+                            return None;
+                        }
+                    }
+                }
                 let res = self.fresh();
                 self.push_node(InstrNode::new(Inst::ExtractField { ty: field_ty, aggregate: agg, field })
                         .with_result(res),
@@ -13285,14 +14410,23 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // is a `Ty::Tuple` aggregate (see the construction arms); indexing reads one element out.
             //   * CONSTANT index `arr[0]` → `Inst::ExtractField` at the literal offset (clean, like a
             //     tuple `.0`). The interpreter's `eval_extract_field` reads aggregate field N directly.
-            //   * DYNAMIC index `arr[i]` (runtime `i`) → `Inst::ExtractElement` with the runtime index
-            //     `ValueId`. The interpreter's `eval_extract_element` accepts a runtime integer index
-            //     over an `Aggregate` value and TRAPS (`UndefinedBehavior`) on out-of-bounds — exactly
-            //     MIR's bounds-check-panic semantics, so the bounds obligation is discharged by the
-            //     interpreter's OOB trap (no separate `Assert` needed for differential equivalence).
+            //   * DYNAMIC index `arr[i]` (runtime `i`) → FAILS CLOSED since #202. It used to emit
+            //     `Inst::ExtractElement`, justified by the INTERPRETER: `eval_extract_element` does
+            //     accept a runtime index over an `Aggregate` and does trap on out-of-bounds, so the
+            //     bounds obligation really was discharged and the emitted code really did execute
+            //     correctly. What that argument never checked is the VALIDATOR — `ExtractElement`
+            //     requires `supports_element_ops()`, i.e. `Ty::Vector | Ty::Array`, and this array is
+            //     spelled `Ty::Tuple`. Every dynamic index therefore emitted an ill-formed module.
+            //     The full rationale, and why respelling arrays as `Ty::Array` is circular rather
+            //     than a fix, is on the dynamic branch below.
+            //
+            //     The general lesson, which is why this comment keeps its history: "the interpreter
+            //     accepts it" is an argument about EXECUTION and says nothing about WELL-FORMEDNESS.
+            //     #191 made the same mistake one branch up — it borrowed this comment's OOB-trap
+            //     justification for the CONSTANT path, where it did not hold at all.
             //
             // FAIL-CLOSED: a non-array `lhs` (slice/`&[T]`/`Vec` — not `ty::Array`), a non-scalar element
-            // type, an unsupported `lhs`/`index`, or a borrow-ptr operand.
+            // type, an unsupported `lhs`, a borrow-ptr operand, or ANY dynamic index.
             ExprKind::Index { lhs, index } => {
                 let lhs = *lhs;
                 let index = *index;
@@ -13332,6 +14466,30 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
                 // CONSTANT index fast-path: a literal `arr[K]` lowers to `ExtractField K`.
                 if let Some(k) = self.const_index_value(index) {
+                    // Trust (#191, REAL MISCOMPILE): a constant index is NOT automatically in
+                    // bounds. `arr[10]` on a `[u32; 5]` is a guaranteed Rust panic — built MIR
+                    // emits a bounds `Assert` and the function diverges. This arm used to emit a
+                    // bare `ExtractField 10` with no check, turning a diverging function into a
+                    // value-returning one, and the body was recorded `lowered, unsupported: []`
+                    // (i.e. CLEAN). The surrounding comment's justification — "the interpreter
+                    // TRAPS on out-of-bounds" — holds only for the DYNAMIC path below; nothing
+                    // forces this module through the interpreter, and codegen would just take
+                    // the offset. Fail closed until the bounds `Assert` is modelled.
+                    // Regression: tests/ui/trust/trust_ir_const_index_oob_fails_closed.rs
+                    let len = match lhs_rty.kind() {
+                        ty::Array(_, l) => l.try_to_target_usize(self.tcx),
+                        _ => None,
+                    };
+                    match len {
+                        Some(n) if u64::from(k) < n => {}
+                        _ => {
+                            self.unsupported.push((
+                                format!("{expr_span:?}"),
+                                "Index(const index out of bounds)",
+                            ));
+                            return None;
+                        }
+                    }
                     let res = self.fresh();
                     self.push_node(InstrNode::new(Inst::ExtractField {
                             ty: elem_ty,
@@ -13342,28 +14500,46 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     );
                     return Some(res);
                 }
-                // DYNAMIC index: lower the runtime index operand and emit `ExtractElement`.
-                let idx_val = match self.lower_expr(index) {
-                    Some(v) => v,
-                    None => {
-                        self.unsupported
-                            .push((format!("{expr_span:?}"), "Index(unsupported index)"));
-                        return None;
-                    }
-                };
-                if self.is_borrow_ptr(idx_val) {
-                    self.unsupported.push((format!("{expr_span:?}"), "Index(borrow ptr index)"));
-                    return None;
-                }
-                let res = self.fresh();
-                self.push_node(InstrNode::new(Inst::ExtractElement {
-                        ty: elem_ty,
-                        array: agg,
-                        index: idx_val,
-                    })
-                    .with_result(res),
-                );
-                Some(res)
+                // DYNAMIC index (`a[i]`, runtime `i`) — Trust (#202): FAIL CLOSED.
+                //
+                // This used to emit `Inst::ExtractElement { array: agg, .. }`, and `agg` is the
+                // ARRAY value, which `map_ty` spells `Ty::Tuple([T; N])` for `N > 0` (the
+                // `ty::Array` arm above). `ExtractElement` requires an operand whose type
+                // `supports_element_ops()`, and that is `Ty::Vector | Ty::Array` ONLY
+                // (first-party/trust-ir/crates/trust-ir/src/ty.rs:367-369) — so every dynamic
+                // index emitted an ILL-FORMED MODULE: `InvalidVectorElementOp`
+                // ("operand must be vector or array") from
+                // first-party/trust-ir/crates/trust-ir-build/src/validate.rs:3868.
+                // MEASURED: 7 occurrences over 2 files in the 2026-08-10 corpus run.
+                //
+                // NOT a live miscompile — the interpreter's `eval_extract_element` accepts an
+                // `Aggregate` value and traps out-of-bounds, so the emitted code executed
+                // correctly. But an ill-formed module is never acceptable, and the VALIDATOR is
+                // right: a runtime index over a TUPLE is ill-typed in general, because tuple
+                // elements may differ in type and `ExtractElement` carries a single result `ty`.
+                //
+                // WHY NOT JUST RESPELL ARRAYS AS `Ty::Array` (matching the MIR oracle, which
+                // does exactly that at trust-ir-bridge/src/lower.rs:2218)? Because it is
+                // CIRCULAR: `Ty::Array` is not a legal `InsertField`/`ExtractField` aggregate
+                // either, so array CONSTRUCTION (`build_array_aggregate`) and the CONST-index
+                // fast path immediately above — both of which work today — would become
+                // ill-formed in exchange. It also silently breaks three walkers that match
+                // `Ty::Tuple` and would simply stop matching: `union_lane_ty_transitive` and
+                // `param_lane_ty_transitive` (SOUNDNESS gates — they would answer `false`
+                // instead of refusing) and `def_field_ok` (bodies drop out of the splice with
+                // no tag). Retiring the tuple spelling therefore requires widening the FORMAT
+                // to give `Ty::Array` field ops FIRST; that is a two-sided change, not this fix.
+                //
+                // And do NOT "fix" this by widening `supports_element_ops` to accept a
+                // homogeneous `Ty::Tuple`: it clears the class at zero coverage cost, which is
+                // exactly why it is tempting, and it makes the producer/oracle spelling
+                // divergence PERMANENT in the format.
+                //
+                // Refuse BEFORE lowering the index operand, so a body that is going to be
+                // discarded does not first accumulate dead index-computation instructions.
+                self.unsupported
+                    .push((format!("{expr_span:?}"), "Index(dynamic index over tuple-spelled array)"));
+                None
             }
             // Trust: `loop { body }` (and the `while c {b}` / `loop`-without-break-value that desugar
             // to it) → a loop-header block carrying the loop-carried locals as block-params, a back-edge
@@ -13631,6 +14807,37 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             self.fat_shape(inner_rty, &mut Vec::new()) == FatShape::Thin,
                             self.fat_shape(expr_ty, &mut Vec::new()) == FatShape::Thin,
                         ) && matches!(self.map_ty(expr_ty), Ty::Ptr);
+                        // Trust (wave-TR provenance ledger): the producer's claim about WHERE the
+                        // forwarded `&T` comes from, read off the SAME peeled `inner` expression
+                        // the shape gate above was asked about. Three disjoint `ExprKind` reads,
+                        // resolved by a pure function (`thin_reborrow_provenance`) in the
+                        // `shared_reborrow_arm` idiom, so the classification is a property a test
+                        // can execute rather than the order of three `match` guards.
+                        //
+                        // Read BEFORE `lower_expr(inner)` because this must describe the SOURCE
+                        // shape, not whatever the lowering happened to leave behind: a classifier
+                        // that inspected the emitted instruction would be reading its own output
+                        // and could only ever agree with it. `flip_registry` does the disagreeing —
+                        // it re-checks this claim against the module and refuses when the two do
+                        // not line up.
+                        //
+                        // `ExprKind::Deref` is grouped with the PROJECTIONS, not with the
+                        // bindings: `&**p` reads a pointer out of memory this lowering does not
+                        // model, exactly as `&*s.r` does.
+                        let inner_kind = &self.thir.exprs[inner].kind;
+                        let provenance = thin_reborrow_provenance(
+                            matches!(inner_kind, ExprKind::Call { .. }),
+                            matches!(
+                                inner_kind,
+                                ExprKind::VarRef { .. } | ExprKind::UpvarRef { .. }
+                            ),
+                            matches!(
+                                inner_kind,
+                                ExprKind::Field { .. }
+                                    | ExprKind::Index { .. }
+                                    | ExprKind::Deref { .. }
+                            ),
+                        );
                         match self.lower_expr(inner) {
                             // The three accepts return the IDENTICAL value; which one fires decides
                             // only the wave-TR flip ledger, so the resolution is a pure function
@@ -13644,20 +14851,38 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                     return Some(v);
                                 }
                                 SharedReborrowArm::ThinReborrow => {
-                                    // The ONLY writer of the flip gate — see `Lowered::thin_reborrow`.
-                                    self.thin_reborrow = true;
+                                    // The ONLY writer of the flip ledger — see
+                                    // `Lowered::thin_reborrows`. Records the forwarded VALUE
+                                    // together with the producer's provenance claim for it; the
+                                    // pre-ledger cut set a bare `bool` here, which could say only
+                                    // "somewhere in this body" and was therefore uncheckable by the
+                                    // one consumer that needs to check it.
+                                    self.thin_reborrows.push(ThinReborrow { value: v, provenance });
                                     return Some(v);
                                 }
+                                // Trust (diagnostics split): this is a REAL leaf refusal — the
+                                // reborrow reached `ReborrowTarget::Ptr` and `shared_reborrow_arm`
+                                // declined the shape on its own predicate. It shared a tag with two
+                                // unrelated sites below, which made the census histogram
+                                // unplannable: summing one name over three meanings measures
+                                // nothing. Named for what it refuses.
                                 SharedReborrowArm::Refuse => {
-                                    self.unsupported
-                                        .push((format!("{expr_span:?}"), "Borrow(non-local place)"));
+                                    self.unsupported.push((
+                                        format!("{expr_span:?}"),
+                                        "Borrow(ptr reborrow refused)",
+                                    ));
                                     return None;
                                 }
                             },
                             // `lower_expr(inner)` recorded its own precise gap; masking unchanged.
+                            //
+                            // Trust (diagnostics split): an ECHO, not demand. The inner expression
+                            // already pushed its own leaf tag; this row only says "and therefore
+                            // the borrow failed too". Classified CASCADE in `CASCADE_TAGS` so it
+                            // stops inflating the primary counts.
                             None => {
                                 self.unsupported
-                                    .push((format!("{expr_span:?}"), "Borrow(non-local place)"));
+                                    .push((format!("{expr_span:?}"), "Borrow(inner unlowered)"));
                                 return None;
                             }
                         }
@@ -13794,7 +15019,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 if let Some(off) = self.field_byte_offset(struct_rty, field) {
                                     if let Some(pv) = self.lower_expr(ptr_expr) {
                                         if self.ref_param_ptrs.contains(&pv) {
-                                            if off == 0 {
+                                            // Trust (wave-DZ): the wave-25 offset-0 tautology
+                                            // holds for the CONSUMER only at field 0 — see
+                                            // `zero_displacement_agrees`. A `repr(Rust)`
+                                            // reordering that lifts a later-declared field to
+                                            // byte 0 falls through to the GEP below with
+                                            // `off == 0`: identical address, but now visible to
+                                            // `first_adt_interior_byte_arithmetic`.
+                                            if off == 0 && zero_displacement_agrees(field) {
                                                 return Some(pv);
                                             }
                                             // Defense-in-depth: only synthesize the interior ptr when
@@ -14295,6 +15527,54 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     self.unsupported.push((format!("{expr_span:?}"), "Unsize(dyn upcast)"));
                     return None;
                 }
+                // Trust (wave-UD): a REAL trait-object unsize (`&T → &dyn Trait`) — MIRROR the
+                // oracle's convention instead of failing closed. `trust-mir-extract`'s
+                // `convert.rs` lowers exactly this shape to
+                // `Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst))` — a deliberate sound
+                // over-approximation, so the function PROCEEDS rather than wedging the whole
+                // obligation at `unsupported_mir`, and (its words) "never falsely Proved
+                // (unconstrained value)". The slice unsize one arm above it is lowered PRECISELY,
+                // because a slice carries its length; only trait objects go opaque, because their
+                // metadata is a vtable nobody in the modelled fragment reads — dyn DISPATCH has
+                // been forced-havoc since B2-3 slice 2.
+                //
+                // The producer's analogue of `OpaqueConst` is the wave-CP VALUE-LESS SYMBOLIC
+                // GLOBAL (`Global { initializer: None, linkage: External }` + `GlobalAddr` +
+                // `Load`), which is why this reuses `lower_symbolic_opaque_value` rather than
+                // inventing a spelling. Registering in `symbolic_consts` marks the body SYMBOLIC
+                // through the existing `Lowered::symbolic` rule, so it is excluded from the
+                // interpretation differential and the crate splice at their own seams — which is
+                // the honest bucket for an unconstrained value and is exactly what the oracle's
+                // over-approximation means.
+                //
+                // A FRESH global per coercion SITE, deliberately not deduped by target type: two
+                // `&T → &dyn Tr` coercions may yield different data pointers, so sharing one
+                // global would make them `Load`-equal and over-constrain a value the oracle leaves
+                // unconstrained. Per-site is the conservative direction.
+                //
+                // DO NOT "improve" this into a structured `PtrFromParts(data, vtable_global)`. An
+                // initializer-less `Global` is a legal vtable spelling (verified: `Global.
+                // initializer` is `Option<Constant>`; `validate.rs` only shape-checks it when
+                // present), but emitting a structured fat value against an oracle that emits an
+                // opaque one is the fat-vs-thin divergence wave-RD had to move BOTH sides to
+                // avoid, wearing a new costume. Moving this lane to a real vtable means moving
+                // `convert.rs` first.
+                // The predicate is the ORACLE's, verbatim — `unsize_target_is_trait_object_ref`
+                // (convert.rs:2197) matches `Ref(_, inner, _) | RawPtr(inner, _)` with a
+                // `Dynamic` pointee. Mutability-blind on both sides (`&mut dyn` unsizes to the
+                // same opaque as `&dyn`), and RAW pointers included: the oracle already emits
+                // `OpaqueConst` for a `*const dyn` / `*mut dyn` unsize target, so leaving them
+                // fail-closed here was coverage given away, not safety bought. Keeping the two
+                // predicates textually parallel is the point — they must move together, and the
+                // reason wave-RD had to be two-sided is that they once did not.
+                let unsize_to_dyn = matches!(
+                    expr_ty.kind(),
+                    ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _)
+                        if matches!(pointee.kind(), ty::Dynamic(..))
+                );
+                if unsize_to_dyn {
+                    return self.lower_symbolic_opaque_value(expr_span, expr_ty, "unsize-dyn");
+                }
                 // Only the `&[T; N] → &[T]` unsize is faithful here: this expr's type must be `&[T]`.
                 let is_slice_ref = matches!(
                     expr_ty.kind(),
@@ -14619,23 +15899,27 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `map_ty` at the `let` binding) matches this constructed value.
                 let elem_tys: Vec<Ty> = upvar_tys.iter().map(|t| self.map_ty(t)).collect();
                 let env_ty = Ty::Tuple(elem_tys.clone());
-                // Seed: Ptr lanes = `PhantomData` (the sole type-agnostic Ptr-lane constant, as in
-                // `build_fat_ptr_from_parts`), scalar lanes = `seed_constant`'s zero. Every lane is
-                // overwritten by an `InsertField` below.
+                // Seed: every lane is overwritten by an `InsertField` below, which is exactly
+                // `SeedLane::Overwritten`'s precondition — so use the shared seeder rather than a
+                // local one.
+                //
+                // Trust (#193): this arm used to spell the `Ty::Ptr` lane `Constant::PhantomData`
+                // by analogy with `build_fat_ptr_from_parts`. But `shape_matches_ty` admits
+                // `PhantomData` only against `Ty::Unit`, so the seed was ill-typed against its own
+                // declared `env_ty` (`ConstTypeMismatch { expected: "ptr", actual: "phantomdata" }`),
+                // and the file's own "Candidate A" note had already rejected that spelling.
+                // `seed_overwritten_ty` maps `Ty::Ptr` to a null `Constant::Int(0)`, which both
+                // `shape_matches_ty` and `constant_to_value` accept.
                 let mut seed_consts = Vec::with_capacity(elem_tys.len());
                 for t in &elem_tys {
-                    let c = match t {
-                        Ty::Ptr => Constant::PhantomData,
-                        _ => match seed_constant(t) {
-                            Some(c) => c,
-                            None => {
-                                self.unsupported
-                                    .push((format!("{expr_span:?}"), "Closure(value position)"));
-                                return None;
-                            }
-                        },
-                    };
-                    seed_consts.push(c);
+                    match self.seed_overwritten_ty(t, 0) {
+                        Some(c) => seed_consts.push(c),
+                        None => {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "Closure(value position)"));
+                            return None;
+                        }
+                    }
                 }
                 let mut agg = self.fresh();
                 self.push_node(InstrNode::new(Inst::Const {
@@ -15469,6 +16753,63 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///     is only lossless for region args). Evaluating it from inside `mir_built` would
     ///     re-enter this crate's MIR building (E0391 cycles, a CTFE type-const ICE, or a
     ///     silently swallowed hook tail), so it stays fail-closed.
+    /// Trust (wave-UD): materialize an UNCONSTRAINED value of `expr_ty` as a value-less symbolic
+    /// global (`GlobalAddr` + `Load`) — the producer's spelling of the oracle's
+    /// `ConstValue::OpaqueConst`.
+    ///
+    /// Extracted from [`Self::lower_const_param`], which is the same three instructions with a
+    /// different key; the two lanes deliberately share the `symbolic_consts` ledger so there stays
+    /// ONE symbolic-body rule (`Lowered::symbolic` is `!symbolic_consts.is_empty()`) rather than a
+    /// second, parallel notion of "this body carries an unmodelled value".
+    ///
+    /// FRESH per call: the ledger entry is keyed by the pending-global INDEX, never deduped by
+    /// type, so two occurrences load two globals and no equality is manufactured between values
+    /// the oracle leaves unrelated. `label` only shapes the emitted name, for readability in a
+    /// dumped module.
+    ///
+    /// Declines (with a precise tag) if the type has no trust-ir spelling — an opaque VALUE still
+    /// needs a well-formed TYPE, or the `Load` would be ill-typed and the module invalid.
+    fn lower_symbolic_opaque_value(
+        &mut self,
+        span: rustc_span::Span,
+        expr_ty: RustcTy<'tcx>,
+        label: &str,
+    ) -> Option<ValueId> {
+        let ty = self.map_ty(expr_ty);
+        if matches!(ty, Ty::Unit) {
+            // `map_ty` already pushed its own tag on the way to `Unit`; adding a second one would
+            // double-count the same body in the histogram.
+            return None;
+        }
+        let idx = self.pending_globals.len();
+        self.pending_globals.push(Global {
+            name: format!("__trust_opaque_{label}_{idx}__"),
+            ty: ty.clone(),
+            mutable: false,
+            initializer: None,
+            linkage: Linkage::External,
+            tls: None,
+            align: None,
+        });
+        let global = GlobalId::new(idx as u32);
+        // Keyed on the CRATE root DefId with empty args: this lane has no DefId of its own (a
+        // coercion site is not a definition), and the ledger is read only for its emptiness, never
+        // looked up by key. Recorded so the body is SYMBOLIC, which is the whole point.
+        self.symbolic_consts.push((
+            rustc_span::def_id::CRATE_DEF_ID.to_def_id(),
+            ty::List::empty(),
+            global,
+        ));
+        let _ = span;
+        let ptr = self.fresh();
+        self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
+        let res = self.fresh();
+        self.push_node(
+            InstrNode::new(Inst::Load { ty, ptr, volatile: false, align: None }).with_result(res),
+        );
+        Some(res)
+    }
+
     /// Trust (wave-CP): lower a const-generic parameter READ to a value-less symbolic global
     /// (`GlobalAddr` + `Load`). See the call site for the rationale; the body is marked SYMBOLIC
     /// by the existing `symbolic_consts` bookkeeping, so it is excluded from the interpretation
@@ -17094,7 +18435,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Slice(non-scalar element)"));
             return None;
         }
-        let array_ty = Ty::Tuple(vec![elem_ty.clone(); len as usize]);
+        // Trust (#195): match `map_ty`'s ratified spelling at `len == 0`. `map_ty` maps `[T; 0]`
+        // to `Ty::Array(_, 0)` (deliberately, to agree with the MIR oracle), but
+        // `vec![elem; 0]` collapses to `Ty::Tuple([])` — so the `Alloca`/`Store` disagreed with the
+        // value's own declared type (`OperandTypeMismatch`). Zero-sized either way; spelling only.
+        let array_ty = if len == 0 {
+            Ty::Array(self.pend_ty(elem_ty.clone()), 0)
+        } else {
+            Ty::Tuple(vec![elem_ty.clone(); len as usize])
+        };
         // Lower the literal as a value (the `ExprKind::Array`/`Repeat` arm).
         let arr_val = self.lower_expr(arr_expr)?;
         let data_ptr = self.fresh();
@@ -17162,7 +18511,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Slice(non-scalar element)"));
             return None;
         }
-        let array_ty = Ty::Tuple(vec![elem_ty.clone(); len as usize]);
+        // Trust (#195): match `map_ty`'s ratified spelling at `len == 0`. `map_ty` maps `[T; 0]`
+        // to `Ty::Array(_, 0)` (deliberately, to agree with the MIR oracle), but
+        // `vec![elem; 0]` collapses to `Ty::Tuple([])` — so the `Alloca`/`Store` disagreed with the
+        // value's own declared type (`OperandTypeMismatch`). Zero-sized either way; spelling only.
+        let array_ty = if len == 0 {
+            Ty::Array(self.pend_ty(elem_ty.clone()), 0)
+        } else {
+            Ty::Tuple(vec![elem_ty.clone(); len as usize])
+        };
         // Read the array local's CURRENT aggregate value directly (the `Ty::Tuple([T; N])` the
         // construction arms built and bound). We read the local rather than re-lowering the place
         // expression so the non-scalar `Borrow`/`Deref` chain is never traversed.
@@ -17830,6 +19187,38 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///
     /// Returns `Some(%r)` if the if produces a value (mapped result `Ty` != Unit), else `None`. If
     /// BOTH arms diverge the join is unreachable: leave the function sealed and return `None`.
+    /// Trust (condition-position `!`): peel `!` (through `Scope` wrappers) off a BRANCH CONDITION,
+    /// returning the innermost condition and whether the branch's two targets must trade places.
+    ///
+    /// This mirrors rustc's `then_else_break_inner` (`rustc_mir_build/src/builder/matches/mod.rs`,
+    /// the `ExprKind::Unary { op: UnOp::Not, arg }` arm), which lowers `!e` in condition position by
+    /// lowering `e` and SWAPPING the success/failure blocks. It never materializes a `Not` rvalue.
+    /// The producer used to evaluate the condition as a VALUE, so `!e` became the bool-not idiom and
+    /// `to_mir` faithfully turned it into a MIR `Not` — faithful to the producer, and structurally
+    /// unlike built, which is how `DeclarationTrustSummary::is_fully_verified` (`!self.has_sorry()
+    /// && …`) landed as a `DerivedMismatch`.
+    ///
+    /// ONLY `bool` operands are peeled. On an integer `!` is BITWISE NOT, a real computation with no
+    /// branch-target reading; peeling it would be a miscompile, not a normalization. rustc never has
+    /// to make this check because `then_else_break_inner` is only ever reached with a bool-typed
+    /// condition — here the guard is explicit.
+    ///
+    /// Peeling repeatedly (`!!e`) is correct and matches rustc, which recurses.
+    fn peel_condition_not(&mut self, cond: ExprId) -> (ExprId, bool) {
+        let mut e = cond;
+        let mut inverted = false;
+        loop {
+            match &self.thir.exprs[e].kind {
+                ExprKind::Scope { value, .. } => e = *value,
+                ExprKind::Unary { op: MirUnOp::Not, arg } if self.thir.exprs[e].ty.is_bool() => {
+                    inverted = !inverted;
+                    e = *arg;
+                }
+                _ => return (e, inverted),
+            }
+        }
+    }
+
     fn lower_if(
         &mut self,
         result_rty: RustcTy<'tcx>,
@@ -17846,7 +19235,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if let Some(r) = self.try_lower_if_let_ref_enum(result_rty, span, cond, then, else_opt) {
             return r;
         }
-        // 1. Condition into the current (predecessor) block.
+        // 1. Condition into the current (predecessor) block. Trust (condition-position `!`): peeled
+        //    first, so `if !x { A } else { B }` branches on `x` with the arms traded — built's shape
+        //    (`switch(x)[0 -> A, otherwise -> B]`) — instead of minting a `Not` built never has.
+        let (cond, invert) = self.peel_condition_not(cond);
         let cond_val = match self.lower_expr(cond) {
             Some(v) => v,
             None => {
@@ -17854,7 +19246,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
         };
-        self.lower_if_value(result_rty, span, cond_val, then, else_opt, None)
+        self.lower_if_value(result_rty, span, cond_val, then, else_opt, None, invert)
     }
 
     /// Trust (wave-IL): lower `if let E::V(<subpats>) = <expr : &E>` — the SHARED-REF `if let`
@@ -18137,6 +19529,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             then,
             else_opt,
             Some(ThenPrologue { vidx, binds, scrut_ptr: scrut_val, agg, variant_field_tys }),
+            false,
         ))
     }
 
@@ -18158,6 +19551,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         then: ExprId,
         else_opt: Option<ExprId>,
         prologue: Option<ThenPrologue>,
+        // Trust (condition-position `!`): the caller peeled a `!` off `cond_val`'s expression, so
+        // the TRUE edge must reach the ELSE arm and vice versa. Only the CondBr's two targets
+        // trade places — the arms are lowered exactly as before, and every join/merge below is
+        // symmetric in them. Callers that branch on something other than a peeled condition (the
+        // `if let` discriminant tests) pass `false`.
+        invert: bool,
     ) -> Option<ValueId> {
         // 2. Join shape from the result type. The interpreter cannot materialize a `Ty::Unit` value,
         //    so a unit-typed `if` uses a zero-param join; a non-Unit result gets one join param.
@@ -18171,11 +19570,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
 
         // 4. Seal the predecessor with the conditional branch (arms take no incoming params — the
         //    join-incoming args are carried on each ARM's `Br` to the join, set in step 7).
+        let (br_then, br_else) = if invert { (else_id, then_id) } else { (then_id, else_id) };
         self.seal_with(Inst::CondBr {
             cond: cond_val,
-            then_target: then_id,
+            then_target: br_then,
             then_args: vec![],
-            else_target: else_id,
+            else_target: br_else,
             else_args: vec![],
         });
 
@@ -18441,6 +19841,96 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// same `merged_locals` / `seal_arm_into_join` helpers rather than hand-rolling `Br` args. If a
     /// future join is added here, use those helpers too — a hand-rolled `Br` to a join is the shape
     /// this bug takes.
+    /// Trust (short-circuit CHAIN FLATTENING): lower `cond` into the CURRENTLY OPEN block as a
+    /// pure BRANCH — control reaches `true_target` when it holds and `false_target` when it does
+    /// not — without ever materializing its value.
+    ///
+    /// This is the producer's `then_else_break` (rustc `matches/mod.rs`), whose two arms this
+    /// mirrors exactly:
+    ///
+    /// ```text
+    ///   a && b   lhs false -> false_target;  lhs true -> a fresh mid block holding `b`
+    ///   a || b   lhs true  -> true_target;   lhs false -> a fresh mid block holding `b`
+    /// ```
+    ///
+    /// WHY IT MATTERS: rustc lowers a chain's LHS in CONDITION position, so `a || b || c || d`
+    /// never materializes an intermediate bool — every short-circuit edge runs straight to the
+    /// result. The producer used to lower the LHS as a VALUE, so each `||` produced a join whose
+    /// `Bool` block param the next test then switched on; the comparator renders that as
+    /// `switch(phi[c:bool:true; cs2])` where built has plain `switch(cs2)`. That was the last
+    /// `DerivedMismatch` (`cert::def_eq::…::try_type_directed_eq`).
+    ///
+    /// rustc inserts a `success_block` to converge `||`'s two true edges; both edges here branch
+    /// straight to `true_target` instead. That block is a pure `Goto`, which the comparator threads
+    /// onto its edges, so the canonical forms agree — the convergence is not observable.
+    ///
+    /// `dominating` says the condition lowers into a block that DOMINATES the join (true only for
+    /// the chain's first leaf, which lands in the caller's already-open block). Every later leaf
+    /// sits in a `mid` block that does not, so a rebinding there would escape the join un-merged —
+    /// the #182 ill-formed-SSA shape. Rather than grow a merge for a construct that essentially
+    /// never appears in a kernel condition (`a || { x = 1; true }`), this fails the body CLOSED.
+    /// It cannot cost a flip: only chains reach this path, and every chain mismatches today.
+    fn lower_condition_branch(
+        &mut self,
+        span: rustc_span::Span,
+        cond: ExprId,
+        true_target: BlockId,
+        false_target: BlockId,
+        dominating: bool,
+    ) -> Option<()> {
+        // A `!` swaps the two continuations — the same rewrite `peel_condition_not` documents,
+        // applied at every level of the chain rather than only at its root.
+        let (cond, invert) = self.peel_condition_not(cond);
+        let (true_target, false_target) =
+            if invert { (false_target, true_target) } else { (true_target, false_target) };
+
+        // `and_then_mid` is the target the LHS's CONTINUING edge takes; which edge continues is
+        // what distinguishes the two operators.
+        let split = match &self.thir.exprs[cond].kind {
+            ExprKind::LogicalOp { op: LogicalOp::And, lhs, rhs } => Some((true, *lhs, *rhs)),
+            ExprKind::LogicalOp { op: LogicalOp::Or, lhs, rhs } => Some((false, *lhs, *rhs)),
+            _ => None,
+        };
+        if let Some((is_and, lhs, rhs)) = split {
+            let mid = self.fresh_block_id();
+            if is_and {
+                // `a && b`: `a` false short-circuits; `a` true continues into `b`.
+                self.lower_condition_branch(span, lhs, mid, false_target, dominating)?;
+            } else {
+                // `a || b`: `a` true short-circuits; `a` false continues into `b`.
+                self.lower_condition_branch(span, lhs, true_target, mid, dominating)?;
+            }
+            self.start_block(mid, vec![]);
+            // The RHS never dominates the join — it is reached only when the LHS did not decide.
+            return self.lower_condition_branch(span, rhs, true_target, false_target, false);
+        }
+
+        // Leaf: a real test. Lower it as a value and branch on it.
+        let pre_locals = if dominating { None } else { Some(self.locals.clone()) };
+        let Some(cond_val) = self.lower_expr(cond) else {
+            self.unsupported.push((format!("{span:?}"), "LogicalOp(lhs unsupported)"));
+            return None;
+        };
+        if let Some(pre_locals) = pre_locals {
+            if self.locals != pre_locals {
+                // See `dominating` above: this operand rebound a local from a block that does not
+                // dominate the join. Refuse rather than emit a value whose definition does not
+                // dominate its later reads.
+                self.unsupported
+                    .push((format!("{span:?}"), "LogicalOp(short-circuit operand rebinds a local)"));
+                return None;
+            }
+        }
+        self.seal_with(Inst::CondBr {
+            cond: cond_val,
+            then_target: true_target,
+            then_args: vec![],
+            else_target: false_target,
+            else_args: vec![],
+        });
+        Some(())
+    }
+
     fn lower_logical_op(
         &mut self,
         span: rustc_span::Span,
@@ -18448,14 +19938,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         lhs: ExprId,
         rhs: ExprId,
     ) -> Option<ValueId> {
-        // 1. Evaluate the lazily-evaluated LHS (the branch condition) in the current block.
-        let cond_val = match self.lower_expr(lhs) {
-            Some(v) => v,
-            None => {
-                self.unsupported.push((format!("{span:?}"), "LogicalOp(lhs unsupported)"));
-                return None;
-            }
-        };
+        // 1. Trust (condition-position `!`): peel it FIRST — see `peel_condition_not`. `!a && b`
+        //    must branch on `a` with swapped targets, exactly as built does; lowering `!a` as a
+        //    VALUE mints a `Not` that built never has (`is_fully_verified` was that mismatch).
+        let (lhs, invert) = self.peel_condition_not(lhs);
 
         // 2. Three successors: the RHS-continuation arm, the short-circuit (constant) arm, and the
         //    Bool join. `&&` continues on `true` / short-circuits to `false`; `||` continues on
@@ -18464,21 +19950,55 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             LogicalOp::And => (false, true),
             LogicalOp::Or => (true, false),
         };
-        let rhs_id = self.fresh_block_id();
-        let short_id = self.fresh_block_id();
-        let join_id = self.fresh_block_id();
 
-        // CondBr: the arm taken when the condition is TRUE goes to `then_target`. For `&&` that's the
-        // RHS arm; for `||` that's the short-circuit (`true`) arm.
-        let (then_target, else_target) =
-            if cond_true_is_rhs { (rhs_id, short_id) } else { (short_id, rhs_id) };
-        self.seal_with(Inst::CondBr {
-            cond: cond_val,
-            then_target,
-            then_args: vec![],
-            else_target,
-            else_args: vec![],
-        });
+        // Trust (short-circuit CHAIN FLATTENING): is the LHS itself a short-circuit operator? Only
+        // then does built's shape differ from the value-based lowering — for a two-operand `a && b`
+        // both sides branch on `a` directly and the join threads away, which is why
+        // `is_fully_verified` agrees. The split keeps the NON-chain path byte-identical (same block
+        // and value numbering, same emitted bytes) so this change can only move bodies that
+        // mismatch today. See `lower_condition_branch`.
+        let lhs_is_chain = matches!(&self.thir.exprs[lhs].kind, ExprKind::LogicalOp { .. });
+
+        let (rhs_id, short_id, join_id) = if lhs_is_chain {
+            let rhs_id = self.fresh_block_id();
+            let short_id = self.fresh_block_id();
+            let join_id = self.fresh_block_id();
+            let (true_target, false_target) =
+                if cond_true_is_rhs { (rhs_id, short_id) } else { (short_id, rhs_id) };
+            let (true_target, false_target) =
+                if invert { (false_target, true_target) } else { (true_target, false_target) };
+            // The whole LHS chain lowers as a branch: no intermediate bool, no join, no phi.
+            self.lower_condition_branch(span, lhs, true_target, false_target, true)?;
+            (rhs_id, short_id, join_id)
+        } else {
+            let cond_val = match self.lower_expr(lhs) {
+                Some(v) => v,
+                None => {
+                    self.unsupported.push((format!("{span:?}"), "LogicalOp(lhs unsupported)"));
+                    return None;
+                }
+            };
+            let rhs_id = self.fresh_block_id();
+            let short_id = self.fresh_block_id();
+            let join_id = self.fresh_block_id();
+
+            // CondBr: the arm taken when the condition is TRUE goes to `then_target`. For `&&`
+            // that's the RHS arm; for `||` that's the short-circuit (`true`) arm.
+            let (then_target, else_target) =
+                if cond_true_is_rhs { (rhs_id, short_id) } else { (short_id, rhs_id) };
+            // A peeled `!` inverts the sense of `cond_val`, so the two arms trade places. The arms
+            // themselves are unchanged — only which one the TRUE edge reaches.
+            let (then_target, else_target) =
+                if invert { (else_target, then_target) } else { (then_target, else_target) };
+            self.seal_with(Inst::CondBr {
+                cond: cond_val,
+                then_target,
+                then_args: vec![],
+                else_target,
+                else_args: vec![],
+            });
+            (rhs_id, short_id, join_id)
+        };
 
         // The Bool result merged at the join. (Allocated HERE, before the arms are lowered, purely so
         // value numbering is byte-identical to the pre-#182 producer in the overwhelmingly common
@@ -19283,6 +20803,32 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     if saw_default {
                         self.unsupported
                             .push((format!("{span:?}"), "Match(case arm after default)"));
+                        return None;
+                    }
+                    // Trust (#187): a literal already claimed by an EARLIER arm must fail the body
+                    // closed. Step 5 maps `case_lits` 1:1 into `Inst::Switch` cases with no dedup
+                    // (the sibling general-enum path at `lower_enum_match_general` DOES dedup via
+                    // `seen_discr`; this path never got the same treatment), so two arms on the
+                    // same value emitted `switch %v [ 42: bbA  42: bbB  default: .. ]` — ambiguous
+                    // dispatch a consumer may resolve either way.
+                    //
+                    // Two arms CAN legitimately carry one literal: `const BOO: &i32 = &42;`
+                    // matched beside an explicit `&42` (rustc's `const_to_pat` expands the
+                    // reference-typed const to the same `Deref{Constant{42}}` shape, and the test
+                    // that found this carries `#[allow(unreachable_patterns)]` — rustc itself
+                    // saying the second arm is dead).
+                    //
+                    // DEDUPING IS NOT SOUND, which is why this refuses instead. If the FIRST arm
+                    // holding the literal is GUARDED, the later same-literal arm is genuinely
+                    // LIVE: `match x { 42 if g() => 1, 42 => 2, _ => 3 }` must yield 2 when the
+                    // guard fails, but a guard-false edge jumps to the default chain, so dropping
+                    // the second case would answer 3. Dedup would trade a validator error for a
+                    // WRONG ANSWER. Refusing at classification (rather than at step 5) also avoids
+                    // orphaning the dropped arm's block, which would only trade the error for
+                    // `UnreachableBlock`.
+                    if case_lits.iter().any(|(prev, _, _)| *prev == lit) {
+                        self.unsupported
+                            .push((format!("{span:?}"), "Match(duplicate case literal)"));
                         return None;
                     }
                     case_lits.push((lit, guard, body));
@@ -21205,6 +22751,24 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         sp.field.as_u32() as usize,
                     )
                     .map_err(ref_payload_offset_tag)?;
+                    // Trust (wave-DA): AGREEMENT, not merely presence — the consistency tripwire
+                    // the NESTED lane has carried since wave-NR (lib.rs:22829), now on the
+                    // single-level lane it was extracted from. The presence gate above proves the
+                    // consumer HAS a table for this slot; it does not prove that the number about
+                    // to be GEP'd is the number IN it. Expected to hold by construction (see
+                    // `variant_field_offset_agrees` for the two rustc definitions that make the
+                    // descriptor entry and this query the same `IndexVec` slot) — and checked
+                    // anyway, because the derivation lives in a doc comment and this lane emits an
+                    // ADDRESS. Refusing costs one arm; a wrong address is a miscompile.
+                    if !variant_field_offset_agrees(
+                        enums,
+                        enum_id,
+                        variant_index.as_u32() as usize,
+                        sp.field.as_u32() as usize,
+                        off,
+                    ) {
+                        return Err("EnumMatch(ref payload layout disagreement)");
+                    }
                     binds.push((*var, sp.field.as_u32(), Some(off)));
                 }
                 // Trust (B3-2c E4): the `()` pattern on a UNIT field
@@ -21347,22 +22911,26 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 // in this shape is `interpreter/not-run` ("address walk into
                                 // variant-bearing ADT interior"), so no differential in this
                                 // program ever executes the pointer.
-                                let Some(declared_outer) = declared_variant_field_offset(
+                                if declared_variant_field_offset(
                                     enums,
                                     enum_id,
                                     variant_index.as_usize(),
                                     field as usize,
-                                ) else {
+                                )
+                                .is_none()
+                                {
                                     return Err("EnumMatch(nested payload ref outer layout absent)");
-                                };
-                                let Some(declared_inner) = declared_variant_field_offset(
+                                }
+                                if declared_variant_field_offset(
                                     enums,
                                     nested_eid,
                                     nested_variant,
                                     nested_field as usize,
-                                ) else {
+                                )
+                                .is_none()
+                                {
                                     return Err("EnumMatch(nested payload ref nested layout absent)");
-                                };
+                                }
                                 // The two rustc offsets, through the SHARED single-level machinery
                                 // (`layout_query_is_reentrant_safe` gates BOTH `layout_of` calls
                                 // inside it). The OUTER lookup is keyed on the SCRUTINEE enum
@@ -21396,7 +22964,26 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 // consumer HAS a table, not that the number being GEP'd is the
                                 // number in it; if an upstream rustc bump ever separated the two,
                                 // this refuses instead of minting a wrong address.
-                                if declared_outer != outer_off || declared_inner != inner_off {
+                                //
+                                // Trust (wave-DA): routed through the SHARED
+                                // `variant_field_offset_agrees` so this lane and the single-level
+                                // lane provably run the same predicate. The verdict is unchanged —
+                                // `declared_variant_field_offset(..) == Some(off)` is exactly the
+                                // `declared_outer != outer_off` this replaces, with the presence
+                                // half already discharged by the two gates above.
+                                if !variant_field_offset_agrees(
+                                    enums,
+                                    enum_id,
+                                    variant_index.as_usize(),
+                                    field as usize,
+                                    outer_off,
+                                ) || !variant_field_offset_agrees(
+                                    enums,
+                                    nested_eid,
+                                    nested_variant,
+                                    nested_field as usize,
+                                    inner_off,
+                                ) {
                                     return Err("EnumMatch(nested payload ref layout disagreement)");
                                 }
                                 let composed = compose_nested_payload_offset(outer_off, inner_off)?;
@@ -21994,6 +23581,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             Option<ExprId>,
             ExprId,
         )>;
+        // Trust (enum-switch provenance): WHICH of the two provenances this switch's `default`
+        // edge will carry, captured HERE — at the only point where the answer is known — and
+        // published on `Lowered` for `to_mir`'s wave-V reshape. `None` means the match is
+        // exhaustive and step 4 below pops the LAST variant arm into `default`; `Some` means the
+        // default IS a `_` wildcard body, which built keeps as a live `otherwise` edge.
+        let default_is_exhaustive_fold = wild_body.is_none();
         match wild_body {
             Some(wb) => {
                 default_arm = (Vec::new(), None, wb);
@@ -22087,6 +23680,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 args: vec![],
             })
             .collect();
+        // Trust (enum-switch provenance): record the switch's OWN block before sealing it —
+        // `seal_with` consumes the open block, and `cur_id` is the id this switch lands in.
+        if default_is_exhaustive_fold {
+            self.enum_fold_switch_blocks.insert(self.cur_id);
+        }
         self.seal_with(Inst::Switch {
             value: tag_val,
             default: default_id,
@@ -22525,19 +24123,66 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         loop_scope: region::Scope,
         body: ExprId,
     ) -> Option<ValueId> {
-        // Single-loop scope for now: a nested loop would need the carried-local merge to compose
-        // across two headers (and break/continue to pick the right level). Fail closed rather than
-        // force it — the loop stack is kept so this is a clean future extension.
+        // One active loop NESTING level for now: a nested loop would need the carried-local merge
+        // to compose across two simultaneously-live headers (and break/continue to pick the right
+        // level). Sequential loops are fine because the first context is popped before the second
+        // reaches this point. Fail closed on nesting rather than force it — the loop stack is kept
+        // so this is a clean future extension.
         if !self.loop_stack.is_empty() {
             self.unsupported.push((format!("{span:?}"), "Loop(nested)"));
             return None;
         }
 
+        // A source clause is keyed by the compiler-owned HIR id carried by
+        // the loop's THIR Scope. Clone the small canonical plan so the
+        // subsequent SSA mutations cannot borrow through the catalog.
+        let source_plan = self
+            .source_loop_plans
+            .iter()
+            .find(|plan| plan.hir_local_id == loop_scope.local_id.as_u32())
+            .cloned();
+
         // 1. Loop-carried locals: every local assigned anywhere in `body`, in stable first-seen order,
         //    that is currently bound (a pre-loop `let`) and has a recorded `Ty`. A carried local not
         //    bound before the loop, or without a type, fails closed (we cannot seed/type its param).
-        let assigned = self.collect_assigned_locals(body);
         let mut carried_init: Vec<(LocalVarId, ValueId, Ty)> = Vec::new();
+        // Provenance bindings are ALWAYS the canonical header-param prefix.
+        // This makes `LoopParameter(i)` independently predictable from a
+        // fresh query: i is the binding's name-sorted catalog ordinal, never a
+        // producer-chosen debug/name heuristic.
+        if let Some(plan) = &source_plan {
+            for binding in &plan.bindings {
+                let Some(var) = self
+                    .local_tys
+                    .iter()
+                    .rev()
+                    .find(|(var, _)| var.0.local_id.as_u32() == binding.hir_local_id)
+                    .map(|(var, _)| *var)
+                else {
+                    self.unsupported
+                        .push((format!("{span:?}"), "SourceProvenance(binding unavailable)"));
+                    return None;
+                };
+                if self.is_promoted(var) {
+                    self.unsupported
+                        .push((format!("{span:?}"), "SourceProvenance(promoted binding)"));
+                    return None;
+                }
+                let Some(init) = self.local_value(var) else {
+                    self.unsupported
+                        .push((format!("{span:?}"), "SourceProvenance(binding unbound)"));
+                    return None;
+                };
+                let Some(ty) = self.local_ty(var) else {
+                    self.unsupported
+                        .push((format!("{span:?}"), "SourceProvenance(binding untyped)"));
+                    return None;
+                };
+                carried_init.push((var, init, ty));
+            }
+        }
+
+        let assigned = self.collect_assigned_locals(body);
         for var in assigned {
             // Trust: a PROMOTED local is memory-backed (its assignments are `Store`s, its reads
             // `Load`s) — it is NOT SSA, so it must NOT become a loop-carried block-param. Its memory
@@ -22545,6 +24190,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // pass). Skip it here so the SSA merge never double-handles it (it isn't in `locals`,
             // and `local_value` would be `None`, which would otherwise fail the loop closed).
             if self.is_promoted(var) {
+                continue;
+            }
+            if carried_init.iter().any(|(carried, _, _)| *carried == var) {
                 continue;
             }
             let init = match self.local_value(var) {
@@ -22594,6 +24242,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             })
             .collect();
 
+        if let Some(plan) = &source_plan {
+            self.source_loop_provenance.push(source_provenance::binding_carrier(
+                plan.source_loop_id,
+                plan.hir_local_id,
+                header_id,
+                &plan.bindings,
+            ));
+        }
+
         // 5. Push the loop context so Break/Continue inside the body resolve. We need the loop's
         //    `region::Scope` label: an unlabeled `break`/`continue` inside `loop { … }` carries the
         //    loop body's enclosing scope. We capture it lazily from the FIRST break/continue we see
@@ -22604,6 +24261,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             header: header_id,
             exit: exit_id,
             carried: carried.clone(),
+            broke: false,
         });
 
         // 6. Lower the body in the header block. Its result is discarded (loop body is unit-typed).
@@ -22621,7 +24279,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
 
         // 8. Pop the loop context, open the exit, and bind carried locals to the exit params.
         //    The loop expression is unit (`None`).
-        self.loop_stack.pop();
+        let broke = self.loop_stack.pop().is_some_and(|c| c.broke);
+        // Trust (#192): a loop no `break` ever targeted does not terminate. Leave `self.sealed` set
+        // so `finish_body` emits no tail `Return`, and never open `exit_id` — that matches built
+        // MIR for `fn forever() -> ! { loop {} }` (`bb0: goto bb1; bb1: goto bb1`, no return block).
+        // Opening it produced a predecessor-less block whose `Return { values: [] }` contradicted a
+        // non-unit signature. `continue`-only loops are covered too: `lower_continue` targets the
+        // HEADER, so it correctly leaves `broke == false`.
+        if !broke {
+            return None;
+        }
         // Trust (#183): open the exit with its params and rebind each carried local to ITS EXIT
         // PARAM, not to the header param. The header param is the value at iteration entry; the exit
         // param is the value the breaking edge actually carried.
@@ -22645,8 +24312,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Break(with value)"));
             return None;
         }
-        let (exit, carried) = match self.loop_stack.last() {
-            Some(ctx) if ctx.scope == label => (ctx.exit, ctx.carried.clone()),
+        let (exit, carried) = match self.loop_stack.last_mut() {
+            Some(ctx) if ctx.scope == label => {
+                // Trust (#192): record that `exit` now has a predecessor.
+                ctx.broke = true;
+                (ctx.exit, ctx.carried.clone())
+            }
             Some(_) => {
                 // Labeled break aimed at an outer loop (multi-level breakout) — not modeled.
                 self.unsupported.push((format!("{span:?}"), "Break(non-innermost label)"));
@@ -23334,7 +25005,10 @@ pub(crate) fn cycle_safe_layout_of<'tcx>(
     te: ty::TypingEnv<'tcx>,
     ty: RustcTy<'tcx>,
 ) -> Option<ty::layout::TyAndLayout<'tcx>> {
-    if !layout_query_is_reentrant_safe(ty) {
+    // Trust (#48): the DEEP guard. The flag test alone reads only this type's own
+    // flags, and `layout_of` recurses into a local ADT's fields — where an
+    // unrevealed TAIT can sit invisibly. See `layout_query_is_reentrant_safe_deep`.
+    if !layout_query_is_reentrant_safe_deep(tcx, ty) {
         return None;
     }
     tcx.layout_of(te.as_query_input(ty)).ok()
@@ -23370,7 +25044,11 @@ fn enum_tag_repr_of_scalar(s: rustc_abi::Scalar) -> Option<trust_ir::EnumTagRepr
 /// not expressible in the v31 grammar. LOCKSTEP MIRROR of the oracle chain
 /// (extractor `extractor_enum_layout_info` + bridge canonical-width gate) —
 /// keep the decline set identical on both sides:
-/// * `Variants::Single`/`Empty` — no tag lane to describe;
+/// * `Variants::Empty` — no variant to describe at all;
+/// * `Variants::Single` over a def that does NOT declare exactly one variant —
+///   the tag-free (v37 `Untagged`) case is now EMITTED, by
+///   [`producer_untagged_enum_layout_descriptor`], but only for a genuinely
+///   one-variant def; see that function for why the two are different tests;
 /// * a tag/niche scalar that is not a mappable integer (float or i128;
 ///   `Pointer` pins to U64 on the 64-bit reference target);
 /// * Direct whose rustc tag scalar disagrees with the def's CANONICAL tag
@@ -23388,6 +25066,14 @@ fn producer_enum_layout_descriptor<'tcx>(
 ) -> Option<trust_ir::EnumLayoutDescriptor> {
     use rustc_abi::{TagEncoding, Variants};
     let repr_of_scalar = enum_tag_repr_of_scalar;
+    // Trust (#205R): `Variants::Single` is rustc's verdict that NO discriminant
+    // is stored — the enum's image is its sole variant's payload. Handled
+    // first; the tagged path below is inapplicable (no tag lane, no per-variant
+    // layout list). LOCKSTEP with the oracle's
+    // `extractor_untagged_enum_layout_info`.
+    if let Variants::Single { .. } = l.layout.variants() {
+        return producer_untagged_enum_layout_descriptor(def, adt, l);
+    }
     let Variants::Multiple { tag, tag_encoding, tag_field, variants: vlayouts } =
         l.layout.variants()
     else {
@@ -23444,6 +25130,63 @@ fn producer_enum_layout_descriptor<'tcx>(
     })
 }
 
+/// Trust (#205R): the `Variants::Single` half of
+/// [`producer_enum_layout_descriptor`] — a tag-FREE enum image, e.g.
+/// `enum UnOp { Not(Vec<()>) }`, which IS its 24-byte payload. Before v37 the
+/// descriptor grammar could not SAY this, so this case declined; a
+/// descriptor-less enum then falls back to trust-ir's canonical tagged-union
+/// layout, which budgets a tag — and that is what made `Option<UnOp>` fail
+/// validation with "variant 1 field 0 entirely within size 24 / offset 0, field
+/// size 32" even though every layout involved was correct.
+///
+/// LOCKSTEP TWIN of the oracle's `extractor_untagged_enum_layout_info`; the two
+/// must decline on exactly the same inputs, or a body mentioning such an enum
+/// becomes a fill-asymmetry `Err` in `tys_agree`.
+///
+/// NOT keyed on "one variant". rustc drops the tag only when
+/// `present_second.is_none() && !repr.inhibit_enum_layout_opt()`, and `inhibit`
+/// is `repr.c() || repr.int.is_some()` — so `#[repr(C)] enum H { X(u8) }`
+/// (size 8, field at 4) and `#[repr(u8)] enum C2 { X(u8) }` (size 2, field at
+/// 1) BOTH keep a real discriminant and must keep using `Direct`. Reading
+/// rustc's own `Variants::Single` verdict is what gets those right; counting
+/// variants would mislabel all three.
+///
+/// The one-variant test below is a different, additional requirement: rustc
+/// also reaches `Variants::Single` when a multi-variant enum has all but one
+/// variant UNINHABITED (`enum E { A(!), B(u8) }` is `Single { index: 1 }`).
+/// The trust-ir descriptor still lists every declared variant, and nothing in a
+/// tag-free image could pick between them, so its validator, `shape` queries
+/// and interpreter each reject a multi-variant untagged descriptor. Declining
+/// keeps that case exactly as it is today.
+fn producer_untagged_enum_layout_descriptor<'tcx>(
+    def: &trust_ir::EnumDef,
+    adt: ty::AdtDef<'tcx>,
+    l: &ty::layout::TyAndLayout<'tcx>,
+) -> Option<trust_ir::EnumLayoutDescriptor> {
+    let [variant] = &adt.variants().raw[..] else {
+        return None;
+    };
+    if def.variants.len() != 1 {
+        return None;
+    }
+    // With `Variants::Single` the enum layout IS the sole variant's layout, so
+    // its own `FieldsShape` carries the payload offsets (there is no per-variant
+    // layout list to index). Bounds-check before `offset`, which PANICS rather
+    // than returning an Option — producer totality: lowering fails closed to
+    // tags, never to an ICE.
+    let fields = l.layout.fields();
+    if variant.fields.len() > fields.count() {
+        return None;
+    }
+    let offsets = (0..variant.fields.len()).map(|i| fields.offset(i).bytes()).collect();
+    Some(trust_ir::EnumLayoutDescriptor {
+        encoding: trust_ir::EnumTagEncoding::Untagged,
+        size: l.size.bytes(),
+        align: l.align.abi.bytes(),
+        variant_field_offsets: vec![offsets],
+    })
+}
+
 /// Trust (wave-TW): pin a hint-less def's TAG LANE to the width rustc actually chose for THIS
 /// enum's `Direct` tag, returning `Some((was, now))` when it moved.
 ///
@@ -23483,6 +25226,96 @@ pub(crate) fn cycle_safe_needs_drop<'tcx>(
 /// Fallible normalize, skipped for an unrevealed opaque (returned unchanged —
 /// both differential sides render the SAME unrevealed alias, so equality
 /// comparisons stay meaningful; a mismatch fails closed exactly as before).
+/// Trust: does `t` contain a FREE alias (`type T = ..;`) whose expansion reaches
+/// an opaque?
+///
+/// `has_opaque_types()` alone is not enough. A free alias carries
+/// `HAS_TY_FREE_ALIAS`, NOT `HAS_TY_OPAQUE`, so for `type T = impl Sized;` the
+/// opaque sits one indirection down and the guard below waves it through —
+/// `try_normalize_erasing_regions` then REVEALS the TAIT, re-entering
+/// `type_of_opaque` -> borrowck -> the in-flight `mir_built`, and the compile
+/// dies with E0391. That is the whole of trust #17:
+/// `tests/ui/type-alias-impl-trait/issue-65679-inst-opaque-ty-from-val-twice.rs`
+/// (upstream, `//@ check-pass`, no exception-ledger entry) failed under the
+/// DEFAULT lane.
+///
+/// It is NOT a flag swap. Widening the guard to `has_aliases()` also stops
+/// resolving CONCRETE projections, and that asymmetry — identity vs concrete —
+/// is exactly what the wave-19 DST-coherence gate reads to catch a thin-vs-fat
+/// pointer flip (`sig_shapes_coherent`, `fat_shape`). Weakening it could admit a
+/// fat value into a thin record slot, trading a cycle ICE for a wrong-code lane.
+/// So this asks the exact question instead: expand the free aliases and look.
+///
+/// Expansion is the compiler's own `expand_free_alias_tys`, which substitutes
+/// each alias for its RHS with the standard recursion limit. It yields the
+/// opaque as a TYPE and does not reveal it — `type_of_opaque`, the cycle, is
+/// never reached.
+pub(crate) fn free_alias_reaches_opaque<'tcx>(tcx: TyCtxt<'tcx>, t: RustcTy<'tcx>) -> bool {
+    t.has_type_flags(ty::TypeFlags::HAS_TY_FREE_ALIAS)
+        && tcx.expand_free_alias_tys(t).has_opaque_types()
+}
+
+/// Trust (#48): does a PROJECTION in `t` resolve to an opaque?
+///
+/// The third spelling of the same reveal hazard. `<Bar as Trait>::Assoc` under
+/// `impl_trait_in_assoc_type` carries neither HAS_TY_OPAQUE nor
+/// HAS_TY_FREE_ALIAS — it is `HAS_TY_PROJECTION` — so both guards above miss it
+/// and `try_normalize_erasing_regions` reveals the associated opaque from inside
+/// `mir_built`. Measured on
+/// `tests/ui/type-alias-impl-trait/struct-assignment-validity.rs`, whose cycle is
+/// `building MIR for foo` -> `normalizing <Bar as Trait>::Assoc`.
+///
+/// I first recorded this as unfixable by the expand-and-look method, on the
+/// reasoning that expanding a projection IS normalization. That was wrong, and
+/// the distinction is the point: NORMALIZING the projection means selecting an
+/// impl and revealing the hidden type. Asking what an IMPL WROTE does not.
+/// `type_of` on the impl's associated item returns the `impl Debug` as an opaque
+/// TYPE, exactly as it does for a free alias; `type_of_opaque` — the cycle — is
+/// still never reached.
+///
+/// Scope is deliberately narrow. Only LOCAL impls are inspected: a foreign impl
+/// cannot define its associated type as an opaque that this crate's `mir_built`
+/// is mid-flight on. And the whole walk is skipped unless the type actually
+/// carries a projection, so a body without one pays nothing.
+///
+/// Conservative on purpose — it asks "does ANY local impl of this trait write an
+/// opaque for this associated item", not "does the impl selected for THIS self
+/// type". Selecting would be the reveal. The over-approximation only declines
+/// more, never less.
+pub(crate) fn projection_reaches_opaque<'tcx>(tcx: TyCtxt<'tcx>, t: RustcTy<'tcx>) -> bool {
+    if !t.has_type_flags(ty::TypeFlags::HAS_TY_PROJECTION) {
+        return false;
+    }
+    t.walk().filter_map(|arg| arg.as_type()).any(|inner| {
+        let &ty::Alias(_, ty::AliasTy { kind: ty::Projection { def_id }, .. }) = inner.kind()
+        else {
+            return false;
+        };
+        let assoc_def_id = def_id;
+        let Some(trait_def_id) = tcx.opt_associated_item(assoc_def_id).and_then(|item| {
+            item.trait_container(tcx)
+        }) else {
+            return false;
+        };
+        let impls = tcx.trait_impls_of(trait_def_id);
+        let candidates = impls
+            .blanket_impls()
+            .iter()
+            .copied()
+            .chain(impls.non_blanket_impls().values().flatten().copied());
+        candidates.filter(|impl_did| impl_did.is_local()).any(|impl_did| {
+            tcx.associated_items(impl_did)
+                .filter_by_name_unhygienic(tcx.item_name(assoc_def_id))
+                .any(|item| {
+                    tcx.type_of(item.def_id)
+                        .instantiate_identity()
+                        .skip_normalization()
+                        .has_opaque_types()
+                })
+        })
+    })
+}
+
 pub(crate) fn cycle_safe_normalize<'tcx>(
     tcx: TyCtxt<'tcx>,
     te: ty::TypingEnv<'tcx>,
@@ -23493,6 +25326,8 @@ pub(crate) fn cycle_safe_normalize<'tcx>(
         || t.has_non_region_placeholders()
         || t.has_opaque_types()
         || t.has_escaping_bound_vars()
+        || free_alias_reaches_opaque(tcx, t)
+        || projection_reaches_opaque(tcx, t)
     {
         t
     } else {
@@ -23532,6 +25367,48 @@ fn is_scalar_ty(ty: &Ty) -> bool {
             | Ty::Usize
             | Ty::Char
     )
+}
+
+/// Trust (wave-ABI R1): the PURE decision behind `LowerCx::guard_sig_position_ty`, split out so
+/// it is testable — the same discipline `enum_decline_census_from_env` follows, and for the same
+/// reason: the guard itself needs a `LowerCx` and a `TyCtxt`, so the only property a test could
+/// otherwise reach is the source text.
+///
+/// `true` iff mapping `mapped` at an ABI-visible position would be an ABI LIE: the type is an
+/// OPAQUE-LANE enum (`opaque_lane_enum` — `register_enum` declined it, so no payload is modeled)
+/// AND its lane spelling is a SCALAR, which `to_mir` will denote as a real rustc scalar type.
+///
+/// The four rows that matter, all pinned in `option_flag_signature_guard_tests`:
+///   * `(Ty::Bool, true)`  → LIE. The wave-SEAM Option-flag lane in a signature; the defect.
+///   * `(Ty::Unit, true)`  → **LIE** (#189). This row used to read "fine — not a scalar, so
+///     `to_mir`'s `Ty::Unit` arm demands `built.is_unit()` and fails CLOSED on its own." That
+///     argument is about the FLIP CONSUMER and says nothing about the EMITTED MODULE: the
+///     signature is written from the UNREVEALED type while the body's constructor sees the
+///     REVEALED one, so the module ships `functy = (..) -> (())` over a body whose `ret` carries
+///     `enum.1` — spliced, `unsupported: []`. Pinned by
+///     `the_unit_opaque_lane_is_an_abi_lie_in_signature_position`.
+///   * `(Ty::Enum(_), _)`  → fine. `register_enum` ADMITTED it; a first-class enum is the real
+///     type, not a lane. This is the `Option<u32>` path that must keep working.
+///   * `(Ty::Bool, false)` → fine. A real `bool`. The `opaque_lane_enum` conjunct is what keeps
+///     the guard from rejecting every predicate in the corpus.
+fn opaque_lane_is_abi_lie(mapped: &Ty, opaque_lane_enum: bool) -> bool {
+    // Trust (#189): `Ty::Unit` counts too. `map_ty`'s decline arm mints exactly two spellings —
+    // `Ty::Bool` (wave-SEAM) and `Ty::Unit` (wave-EL) — and this predicate used to admit only the
+    // scalar one, so the entire Unit collapse walked through the signature guard.
+    //
+    // The exclusion was deliberate, its rationale being that `to_mir`'s Unit arm demands
+    // `built.is_unit()` and fails closed. That is true of the FLIP CONSUMER and says nothing about
+    // the EMITTED MODULE: the signature is written from the UNREVEALED type (`register_enum`
+    // declines an alias field it cannot prove a layout for -> opaque lane -> `Ty::Unit`) while the
+    // body's constructor sees the REVEALED type (different generic args, a different
+    // `register_enum` key, admitted -> `Ty::Enum`). Two evaluations of the same return type, two
+    // answers, and the module ships `functy = (..) -> (())` over a body whose `ret` carries
+    // `enum.1` — `ReturnTypeMismatch`, spliced, `unsupported: []`.
+    //
+    // Still gated on `opaque_lane_enum`, so a type that legitimately maps to `Ty::Unit` (a ZST,
+    // `PhantomData`) is untouched, and this predicate is only consulted from
+    // `guard_sig_position_ty` — VALUE positions keep the collapse the wave-EL lanes rely on.
+    opaque_lane_enum && (is_scalar_ty(mapped) || matches!(mapped, Ty::Unit))
 }
 
 /// Trust (wave-SP): may an entry `Load` COPY OUT a value of mapped type `pointee` through the
@@ -25198,7 +27075,10 @@ mod container_pointee_spelling_tests {
 /// Trust (wave-TR): the thin-shared-reborrow gate and the three-arm resolution, pinned.
 #[cfg(test)]
 mod thin_shared_reborrow_tests {
-    use super::{SharedReborrowArm, shared_reborrow_arm, thin_shared_reborrow_shape_admits};
+    use super::{
+        SharedReborrowArm, ThinReborrowProvenance, shared_reborrow_arm, thin_reborrow_provenance,
+        thin_shared_reborrow_shape_admits,
+    };
 
     /// The five GROUND-TRUTH conjuncts, in the order [`thin_shared_reborrow_shape_admits`] takes
     /// them: inner is `&T`, result is `&T`, identical modulo regions, inner thin, result thin.
@@ -25330,6 +27210,49 @@ mod thin_shared_reborrow_tests {
             SharedReborrowArm::LedgerPtr,
             "the overlap case, stated explicitly: a registered ref param that is ALSO a thin \
              identity reborrow leaves through the LEDGER arm and never sets the flip flag"
+        );
+    }
+
+    /// Trust (wave-TR provenance ledger): **THE CLASSIFICATION IS TOTAL AND DISJOINT.** Every one
+    /// of the eight input vectors is pinned, so no future call site can hand the classifier a
+    /// combination it has not been asked about, and no class can be silently widened to absorb
+    /// another.
+    ///
+    /// The `CallResult` row is the only one `flip_registry` will go on to certify, so its
+    /// boundary is the one that matters: `is_call` must decide it ALONE, and no other input
+    /// combination may reach it. The all-false row is `Other` — a REFUSED class, so an
+    /// unrecognized THIR shape fails closed rather than landing in a bucket a later wave has
+    /// taught the gate to admit.
+    #[test]
+    fn test_thin_reborrow_provenance_is_a_total_disjoint_classification() {
+        for bits in 0u8..8 {
+            let (call, binding, projection) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let class = thin_reborrow_provenance(call, binding, projection);
+            let expected = if call {
+                ThinReborrowProvenance::CallResult
+            } else if binding {
+                ThinReborrowProvenance::Binding
+            } else if projection {
+                ThinReborrowProvenance::Projection
+            } else {
+                ThinReborrowProvenance::Other
+            };
+            assert_eq!(
+                class, expected,
+                "({call},{binding},{projection}) must classify as {expected:?}"
+            );
+            assert_eq!(
+                class == ThinReborrowProvenance::CallResult,
+                call,
+                "the ONE certifiable class must be decided by `is_call` alone: any other input \
+                 reaching it would hand `flip_registry` a call-result claim for a value no call \
+                 mints ({call},{binding},{projection})"
+            );
+        }
+        assert_eq!(
+            thin_reborrow_provenance(false, false, false),
+            ThinReborrowProvenance::Other,
+            "an unrecognized THIR shape must land in a REFUSED class, by name"
         );
     }
 
@@ -25513,19 +27436,75 @@ mod thin_shared_reborrow_tests {
              conjunct, so its side effects fire only on a shape all five already admitted",
         );
 
-        // ---- (5) EXACTLY ONE WRITER OF THE FLIP GATE, AND IT IS THIS ARM --------------------
-        let flip_write = format!("self.{} = true", "thin_reborrow");
+        // ---- (5) EXACTLY ONE WRITER OF THE FLIP LEDGER, AND IT IS THIS ARM ------------------
+        //
+        // UPDATED HONESTLY, NOT DELETED. The pre-ledger writer was `self.thin_reborrow = true`
+        // and this assertion pinned that exact source text. `Lowered::thin_reborrow` is now
+        // `Lowered::thin_reborrows: Vec<ThinReborrow>` and the writer is a `push`, so the needle
+        // changed — but the OBLIGATION is unchanged and is if anything stronger: a second writer
+        // would mean another lane silently mints a provenance claim the flip gate will act on.
+        let flip_write = format!("self.{}.push(", "thin_reborrows");
         assert_eq!(
             producer.matches(flip_write.as_str()).count(),
             1,
-            "`Lowered::thin_reborrow` must have exactly ONE writer: a second would mean another \
-             lane silently claims the wave-TR flip refusal, and a missing one would mean an \
-             admitted body flips on a value no producer ledger records",
+            "`Lowered::thin_reborrows` must have exactly ONE writer: a second would mean another \
+             lane silently claims (or, worse, CERTIFIES) a forwarded value's provenance, and a \
+             missing one would mean an admitted body flips on a value no producer ledger records",
         );
         let write_at = producer.find(flip_write.as_str()).expect("the writer must exist");
         assert!(
             write_at > shared_at && write_at < shared_end,
             "and that writer must sit INSIDE the shared `Ptr` arm, on the wave-TR branch",
+        );
+
+        // ---- (6) THE PROVENANCE CLAIM IS READ OFF THE SOURCE SHAPE -------------------------
+        //
+        // The record the flip gate acts on is `(value, provenance)`. (5) pins the value: it is
+        // `v`, the value the arm returns. This pins the provenance: it must be resolved by the
+        // pure classifier, from the peeled `inner` expression's own `ExprKind`, with no literal
+        // in any position — the `by_value_env` / `thin_shared_reborrow_shape_admits` precedent,
+        // for the same reason. A call site passing `true` for `is_call` would certify every
+        // forwarded reborrow in the crate no matter how carefully `flip_registry` is written.
+        let classifier = format!("{}(", "thin_reborrow_provenance");
+        assert_eq!(
+            production.matches(classifier.as_str()).count(),
+            2,
+            "the provenance classifier must appear exactly twice in production — DEFINED once and \
+             CALLED once by the `Borrow` arm",
+        );
+        let class_at =
+            shared_arm.find(classifier.as_str()).expect("the classifier must be CALLED by the arm");
+        let class_end = class_at
+            + shared_arm[class_at..].find(';').expect("the classifier call ends a statement");
+        let class_args = &shared_arm[class_at..class_end];
+        for literal in ["true", "false"] {
+            assert!(
+                !class_args.contains(literal),
+                "no provenance input may be a hard-coded `{literal}`: a literal `is_call` would \
+                 hand `flip_registry` a `CallResult` claim for every forwarded reborrow",
+            );
+        }
+        for read in ["ExprKind::Call", "ExprKind::VarRef", "ExprKind::Field"] {
+            assert!(
+                class_args.contains(read),
+                "the classification must be read off `{read}` — the SOURCE shape of the reborrowed \
+                 expression, never a property of the value the lowering already emitted",
+            );
+        }
+        assert!(
+            class_args.contains("inner_kind"),
+            "and it must classify the PEELED `inner` expression — the same one the shape gate was \
+             asked about — not the outer borrow",
+        );
+        // The claim must be minted BEFORE `lower_expr(inner)` runs. A classifier that read the
+        // emitted instruction would be inspecting its own output and could only ever agree with
+        // it; the whole value of the record is that `flip_registry` can DISAGREE with it.
+        let lower_at = shared_arm
+            .find(&format!("self.{}(inner)", "lower_expr"))
+            .expect("the arm must lower the inner expression");
+        assert!(
+            class_at < lower_at,
+            "the provenance claim must be read from THIR before the inner expression is lowered",
         );
     }
 }
@@ -28338,8 +30317,19 @@ mod seed_lane_tests {
         // so a `field_vals`-shaped site can never claim the exemption;
         // `array_seed_lanes_are_total_by_construction` pins what it rests on.
         let array_call = format!("self.{}(e, 0)", "seed_overwritten_ty");
+        // Trust (#193): the CLOSURE-ENV site is the second exemption, on the same grounds and a
+        // STRONGER proof than the array's. It walks `for t in &elem_tys`, and its `InsertField`
+        // loop below has no skip arm at all — any capture that fails to lower declines the WHOLE
+        // env (`return None`), so a lane is never left seeded-but-unwritten. An arity guard
+        // upstream (`upvar_ids.len() != upvar_tys.len()` -> decline) makes the two lists the same
+        // length, which is what lets `for` cover every lane. Recognised by its own loop header, so
+        // a `field_vals`-shaped site cannot claim it;
+        // `closure_env_seed_lanes_are_total_by_construction` pins what it rests on.
+        let closure_loop = format!("for t in &{} {{", "elem_tys");
         for i in sites {
-            if lines[i].contains(array_call.as_str()) {
+            if lines[i].contains(array_call.as_str())
+                || lines[i - 1].trim_end().ends_with(closure_loop.as_str())
+            {
                 continue;
             }
             let prev = lines[i - 1].trim_end();
@@ -28350,6 +30340,53 @@ mod seed_lane_tests {
                 i + 1,
             );
         }
+    }
+
+    /// THE CLOSURE-ENV SITE'S TOTALITY (#193), pinned as three facts — the second exemption in
+    /// `every_widened_seed_call_is_guarded_by_an_overwrite_witness`.
+    ///
+    /// Its widened seed is unconditional over `elem_tys`, so if any of these stopped holding a
+    /// lane would carry a null that nothing overwrites, and unlike the per-lane sites there is no
+    /// witness to notice. A TRIPWIRE, NOT A WALL: the underlying facts are enforced by control
+    /// flow, not by this test. What it adds is a named statement of WHICH facts the exemption
+    /// rests on, so a refactor that quietly introduces a skip arm goes red here.
+    #[test]
+    fn closure_env_seed_lanes_are_total_by_construction() {
+        // Production source with comment lines stripped: this module's comments quote its own
+        // code, and a needle matching prose has produced false results in this file before.
+        let src = include_str!("lib.rs");
+        let bound = src
+            .find(&format!("\n#[cfg({})]", "test"))
+            .expect("the file must have a test section to bound production at");
+        let code: String = src[..bound]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tag = format!("\"Closure(value {})\"", "position");
+        let first = code.find(tag.as_str()).expect("the closure value-position arm must exist");
+        // Bound to the arm: from its first fail-closed tag to the `Some(agg)` that ends it.
+        let end = first
+            + code[first..].find("Some(agg)").expect("the arm must end by returning the aggregate");
+        let arm = &code[first..end];
+
+        // (1) ARITY GUARD — the two lists are the same length, which is what lets a `for` over
+        // `elem_tys` cover every lane the InsertField loop writes.
+        assert!(
+            arm.contains(&format!("upvar_ids.len() != upvar_tys.{}()", "len")),
+            "the arm must decline when the capture id and type lists disagree in length",
+        );
+        // (2) NO SKIP ARM. A `continue` here would leave a seeded lane unwritten — the exact
+        // shape the per-lane witness exists to prevent at the other sites.
+        assert!(
+            !arm.contains(&format!("{};", "continue")),
+            "the closure env InsertField loop must not skip a lane",
+        );
+        // (3) A FAILED CAPTURE DECLINES THE WHOLE ENV, rather than omitting one field.
+        assert!(
+            arm.contains(&format!("let Some(val) = self.lower_expr(*upvar_id) {}", "else")),
+            "a capture that does not lower must decline the whole env",
+        );
     }
 
     /// THE ARRAY SITE'S TOTALITY, pinned as three separate facts. Its widened seed is
@@ -29257,7 +31294,7 @@ mod nested_payload_ref_lane_tests {
     use super::nested_payload_lane_tests::{fn_span, production_code};
     use super::{
         VariantFieldOffsetErr, compose_nested_payload_offset, declared_variant_field_offset,
-        nested_ref_payload_offset_tag, ref_payload_offset_tag,
+        nested_ref_payload_offset_tag, ref_payload_offset_tag, variant_field_offset_agrees,
     };
     use trust_ir::Ty;
 
@@ -29374,6 +31411,146 @@ mod nested_payload_ref_lane_tests {
         assert_eq!(declared_variant_field_offset(&enums, trust_ir::EnumId::new(3), 1, 0), Some(40));
     }
 
+    /// **THE RED PROOF OF THE AGREEMENT GATE (wave-DA).** Presence is not agreement. This is the
+    /// construction the whole gate exists for: a def whose descriptor DOES reach the slot — so
+    /// every presence gate in both by-REF lanes is satisfied — but whose declared byte is not the
+    /// byte the producer is about to GEP. That is precisely the state an upstream rustc change
+    /// separating `for_variant(v).fields.offset(k)` from `variants[v].field_offsets[k]` would put
+    /// this producer in, and it is exactly the state in which nothing downstream would notice:
+    /// every body in this shape is `interpreter/not-run`.
+    ///
+    /// The def is the real corpus shape (`def_with_layout`, offsets 8/16 and 40), so the numbers
+    /// that disagree are the numbers a real descriptor carries.
+    #[test]
+    fn test_variant_field_offset_agrees_refuses_a_descriptor_that_disagrees_with_the_emitted_byte() {
+        let enums = vec![def_with_layout(3)];
+        let eid = trust_ir::EnumId::new(3);
+        // The descriptor SAYS 8 for (variant 0, field 0). Every other emitted byte is a wrong
+        // address, and the presence gate cannot tell — it answers `Some(8)` in all of these.
+        assert_eq!(declared_variant_field_offset(&enums, eid, 0, 0), Some(8), "presence is satisfied");
+        for wrong in [0u64, 4, 7, 9, 16, 40, u64::MAX] {
+            assert!(
+                !variant_field_offset_agrees(&enums, eid, 0, 0, wrong),
+                "emitting {wrong} against a descriptor that says 8 must REFUSE",
+            );
+        }
+        // ACCEPT CONTROL — without it a predicate that returned `false` unconditionally would
+        // pass every refusal above and make both by-REF lanes dead source.
+        assert!(
+            variant_field_offset_agrees(&enums, eid, 0, 0, 8),
+            "the byte the descriptor declares must be accepted",
+        );
+        // And it must agree per SLOT, not per def: the other two slots have their own bytes.
+        assert!(variant_field_offset_agrees(&enums, eid, 0, 1, 16), "variant 0 field 1");
+        assert!(variant_field_offset_agrees(&enums, eid, 1, 0, 40), "variant 1 field 0");
+        assert!(
+            !variant_field_offset_agrees(&enums, eid, 0, 1, 8),
+            "field 1 must not accept field 0's byte — a per-def predicate would pass this",
+        );
+        assert!(
+            !variant_field_offset_agrees(&enums, eid, 1, 0, 8),
+            "variant 1 must not accept variant 0's byte",
+        );
+    }
+
+    /// The agreement predicate must also REFUSE where the presence gate refuses — an absent
+    /// descriptor, an unregistered id, and a slot the table does not reach are all "no declared
+    /// number to agree with", and `Option::None == Some(off)` is false for every `off`. Stated as
+    /// its own test so the gate cannot be weakened to "agrees, or no opinion".
+    #[test]
+    fn test_variant_field_offset_agrees_refuses_every_shape_with_no_declared_byte() {
+        let eid = trust_ir::EnumId::new(3);
+        let absent = vec![def_without_layout(3)];
+        let present = vec![def_with_layout(3)];
+        for off in [0u64, 8, 16, 40] {
+            assert!(
+                !variant_field_offset_agrees(&absent, eid, 0, 0, off),
+                "a def with NO descriptor has no byte to agree with (emitted {off})",
+            );
+            assert!(
+                !variant_field_offset_agrees(&present, trust_ir::EnumId::new(4), 0, 0, off),
+                "an unregistered id has no byte to agree with (emitted {off})",
+            );
+            assert!(
+                !variant_field_offset_agrees(&present, eid, 2, 0, off),
+                "a variant past the table has no byte to agree with (emitted {off})",
+            );
+            assert!(
+                !variant_field_offset_agrees(&present, eid, 1, 1, off),
+                "a field past that variant's offsets has no byte to agree with (emitted {off})",
+            );
+        }
+        // ACCEPT CONTROL.
+        assert!(variant_field_offset_agrees(&present, eid, 0, 0, 8));
+    }
+
+    /// **The single-level by-REF lane is wired to the gate**, at the ARGUMENTS, and the check runs
+    /// AFTER the rustc offset exists (it compares against it) and BEFORE the bind that carries the
+    /// displacement to the emitter. Wiring no `--lib` test can reach — the arm needs a `TyCtxt` —
+    /// so it is source-pinned against comment-stripped production text, exactly as the nested
+    /// lane's is.
+    #[test]
+    fn test_the_single_level_ref_lane_checks_agreement_before_binding_the_offset() {
+        let code = production_code();
+        let classifier =
+            flat(fn_span(&code, "classify_enum_payload_binds", "lower_enum_match_general"));
+
+        let agree = format!(
+            "if !{}( enums, enum_id, variant_index.as_u32() as usize, sp.field.as_u32() as usize, off, )",
+            "variant_field_offset_agrees",
+        );
+        assert_eq!(
+            classifier.matches(agree.as_str()).count(),
+            1,
+            "the single-level lane must check the emitted byte against the declared one, at the \
+             SINGLE-LEVEL slot",
+        );
+        assert_eq!(
+            code.matches("\"EnumMatch(ref payload layout disagreement)\"").count(),
+            1,
+            "the single-level disagreement refusal must have exactly one production site",
+        );
+        // Its tag must be DISTINGUISHABLE from the nested lane's, for the same census reason the
+        // two offset-error maps are disjoint.
+        assert_ne!(
+            "EnumMatch(ref payload layout disagreement)",
+            "EnumMatch(nested payload ref layout disagreement)",
+        );
+        // ORDER: after the offset query (there is nothing to compare before it), and before the
+        // bind that hands the displacement to the emitter.
+        let query_at = classifier
+            .find(&format!("let off = {}( tcx, enum_rty, variant_index,", "enum_variant_field_byte_offset"))
+            .expect("the single-level offset query must exist");
+        let agree_at = classifier.find(agree.as_str()).expect("just counted it");
+        let bind_at = classifier
+            .find("binds.push((*var, sp.field.as_u32(), Some(off)));")
+            .expect("the single-level bind must exist");
+        assert!(query_at < agree_at, "there is nothing to compare before the offset exists");
+        assert!(
+            agree_at < bind_at,
+            "a disagreeing byte must refuse BEFORE it is bound — the emitter GEPs whatever it is \
+             handed",
+        );
+        // The presence gate it strengthens must still be there, and still FIRST: an absent
+        // descriptor keeps its own census tag rather than being re-reported as a disagreement.
+        let presence_at = classifier
+            .find(&format!(
+                "if {}( enums, enum_id, variant_index.as_u32() as usize, sp.field.as_u32() as usize, ) .is_none()",
+                "declared_variant_field_offset",
+            ))
+            .expect("the wave-NRF presence gate must survive");
+        assert!(
+            presence_at < agree_at,
+            "the presence refusal must keep its tag — it must not be reclassified as a \
+             disagreement",
+        );
+        assert_eq!(
+            code.matches("\"EnumMatch(ref payload no layout descriptor)\"").count(),
+            1,
+            "the wave-NRF presence tag must still have exactly one production site",
+        );
+    }
+
     /// The composition is the SUM. Pinned with two distinct, non-commutative-looking operands so
     /// `outer`, `inner`, `max`, and `outer - inner` are each falsified — a source-pinned needle
     /// could not tell those apart, which is why this arithmetic is a function at all.
@@ -29487,11 +31664,11 @@ mod nested_payload_ref_lane_tests {
             flat(fn_span(&code, "classify_enum_payload_binds", "lower_enum_match_general"));
 
         let outer_lookup = format!(
-            "let Some(declared_outer) = {}( enums, enum_id, variant_index.as_usize(), field as usize, )",
+            "if {}( enums, enum_id, variant_index.as_usize(), field as usize, ) .is_none()",
             "declared_variant_field_offset",
         );
         let inner_lookup = format!(
-            "let Some(declared_inner) = {}( enums, nested_eid, nested_variant, nested_field as usize, )",
+            "if {}( enums, nested_eid, nested_variant, nested_field as usize, ) .is_none()",
             "declared_variant_field_offset",
         );
         assert_eq!(
@@ -29525,8 +31702,30 @@ mod nested_payload_ref_lane_tests {
         // The agreement check is a CONSISTENCY TRIPWIRE between the descriptor and the query —
         // expected to hold by construction (both read one rustc layout), not what carries the
         // soundness. It is pinned so a later edit cannot drop it silently.
-        let agree = format!("if declared_outer != outer_off || declared_inner != {} {{", "inner_off");
-        assert_eq!(classifier.matches(agree.as_str()).count(), 1, "the tripwire must survive");
+        //
+        // Trust (wave-DA): the tripwire now runs through the SHARED `variant_field_offset_agrees`
+        // — the same predicate the single-level lane was given, so the two by-REF lanes cannot
+        // drift apart on the one question that decides whether the number being GEP'd is an
+        // address. Pinned at BOTH calls with their own arguments, because a twin keyed on the
+        // outer id twice would check the nested displacement against the wrong table.
+        let agree_outer = format!(
+            "if !{}( enums, enum_id, variant_index.as_usize(), field as usize, outer_off, )",
+            "variant_field_offset_agrees",
+        );
+        let agree_inner = format!(
+            "|| !{}( enums, nested_eid, nested_variant, nested_field as usize, inner_off, )",
+            "variant_field_offset_agrees",
+        );
+        assert_eq!(
+            classifier.matches(agree_outer.as_str()).count(),
+            1,
+            "the OUTER tripwire must survive, against the OUTER id and the OUTER offset",
+        );
+        assert_eq!(
+            classifier.matches(agree_inner.as_str()).count(),
+            1,
+            "the NESTED tripwire must survive, against the NESTED id and the NESTED offset",
+        );
     }
 
     /// The by-REF nested arm is `deref_scrut`-gated and sits BEFORE the pre-existing unconditional
@@ -29746,6 +31945,86 @@ mod nested_payload_ref_lane_tests {
     }
 }
 
+/// Trust (wave-DZ): the ZERO-DISPLACEMENT struct-interior case — the shape wave-DA's
+/// emitted-GEP recognizer cannot see, because at displacement zero there is no GEP.
+#[cfg(test)]
+mod zero_displacement_tests {
+    use super::nested_payload_lane_tests::{fn_span, production_code};
+    use super::zero_displacement_agrees;
+
+    fn flat(code: &str) -> String {
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The predicate itself, both directions. Field 0 agrees because
+    /// `interpret::aggregate_layout` starts its running offset at 0 and places field 0 at
+    /// `align_up(0, a) == 0` for EVERY alignment; no later field can be at 0 unless every
+    /// preceding field is zero-sized, which this predicate deliberately does not try to prove.
+    #[test]
+    fn test_zero_displacement_agrees_only_at_field_zero() {
+        assert!(zero_displacement_agrees(0), "field 0 is at byte 0 in BOTH layouts, always");
+        for field in [1u32, 2, 3, 7, 63, u32::MAX] {
+            assert!(
+                !zero_displacement_agrees(field),
+                "field {field} at rustc byte 0 is a REORDERING — the consumer's declaration-order \
+                 image does not put it there, and the shortcut would leave no trace",
+            );
+        }
+    }
+
+    /// **THE HOLE, PINNED SHUT AT BOTH SITES.** Two struct-interior producer sites short-circuit
+    /// a zero displacement (`try_lower_deref_accessor_interior_mut`, the wave-DP deref accessor;
+    /// and the wave-25/25b `&self.field` interior return). Neither may take that shortcut
+    /// unguarded — an unguarded `if off == 0 { return Some(pv) }` is exactly the emission that
+    /// asserts a contested address with nothing in the IR to say so.
+    ///
+    /// Source-pinned rather than executed for the same reason the by-REF lane's gate is: both
+    /// arms are `LowerCx` methods that need a `TyCtxt` no `--lib` test can build.
+    #[test]
+    fn test_both_struct_zero_displacement_shortcuts_are_guarded() {
+        let code = flat(&production_code());
+        let guarded = format!("if off == 0 && {}(field) {{", "zero_displacement_agrees");
+        assert_eq!(
+            code.matches(guarded.as_str()).count(),
+            2,
+            "BOTH struct-interior zero-displacement shortcuts must consult the predicate",
+        );
+        // THE FALSIFIER: no unguarded spelling may survive anywhere in production.
+        assert_eq!(
+            code.matches("if off == 0 { return Some(pv); }").count(),
+            0,
+            "an unguarded zero-displacement shortcut emits no GEP and is therefore invisible to \
+             `first_adt_interior_byte_arithmetic`",
+        );
+    }
+
+    /// The guard must sit where the shortcut is — INSIDE each arm, after the rustc offset exists
+    /// and before the tautological `return`. A check hoisted above `field_byte_offset` would be
+    /// checking a field index against nothing.
+    #[test]
+    fn test_the_zero_displacement_guard_runs_after_the_offset_query() {
+        let code = production_code();
+        let accessor = flat(fn_span(
+            &code,
+            "try_lower_deref_accessor_interior_mut",
+            "lower_deref_mut_chain_ptr",
+        ));
+        let query_at = accessor
+            .find("let off = self.field_byte_offset(struct_rty, field)?;")
+            .expect("the accessor lane's offset query must exist");
+        let guard_at = accessor
+            .find(&format!("if off == 0 && {}(field)", "zero_displacement_agrees"))
+            .expect("the accessor lane must carry the guard");
+        assert!(query_at < guard_at, "there is no displacement to judge before the query");
+        // ACCEPT CONTROL: the ordinary GEP the `false` branch falls through to is still there,
+        // so a `false` LOWERS (with a visible `+0`) rather than declining the lane.
+        assert!(
+            accessor.contains("pointee_ty: Ty::I8,"),
+            "the fall-through must still emit the flat-byte GEP the gate recognizes",
+        );
+    }
+}
+
 /// Trust (wave-NRF): BOTH by-REF payload lanes must gate on the layout DESCRIPTOR before they
 /// emit a rustc-computed byte offset.
 ///
@@ -29773,31 +32052,53 @@ mod ref_payload_descriptor_gate_tests {
     /// what makes this total: the single-level lane makes one query and the nested lane composes
     /// two, so three queries need three descriptor lookups guarding them. If a fourth query is ever
     /// added without a guard, this goes red rather than silently emitting an unbacked address.
+    ///
+    /// Trust (wave-DA): and every query must ALSO be checked for AGREEMENT — presence proves the
+    /// consumer has a table for the slot, not that the number being GEP'd is the number in it. So
+    /// the totality claim is now two counts, not one, and a fourth query added with a presence
+    /// gate but no agreement check goes red here just as an unguarded one does.
     #[test]
     fn every_ref_offset_query_is_guarded_by_a_descriptor_lookup() {
         let code = production();
         let query = format!("{}(", "enum_variant_field_byte_offset");
         let guard = format!("{}(", "declared_variant_field_offset");
+        let agree = format!("{}(", "variant_field_offset_agrees");
         // CALL SITES, not raw occurrences. An earlier revision of this test counted matches and
         // compared 3 to 4 — the guard's `fn` definition matched its own needle while the query's
         // did not (it is generic, `fn …<'tcx>(`), so the two names are not comparable raw. A
         // count that is off by a definition is a count that cannot detect an unguarded query.
+        //
+        // Trust (wave-DA): the ONE line inside `variant_field_offset_agrees`'s own body that reads
+        // the ledger is excluded too, by the `== Some(emitted)` it is spelled with. It is the
+        // shared predicate's IMPLEMENTATION, not a lane call site; counting it made this test red
+        // at 3 queries vs 4 lookups while the lanes were in fact MORE guarded than before, which
+        // is the shape of a test that would eventually be relaxed to shut it up.
         let call_sites = |needle: &str| {
             code.lines()
                 .filter(|l| {
                     let t = l.trim_start();
-                    l.contains(needle) && !t.starts_with("fn ") && !t.starts_with("pub(crate) fn ")
+                    l.contains(needle)
+                        && !t.starts_with("fn ")
+                        && !t.starts_with("pub(crate) fn ")
+                        && !l.contains("== Some(emitted)")
                 })
                 .count()
         };
         let queries = call_sites(query.as_str());
         let guards = call_sites(guard.as_str());
+        let agreements = call_sites(agree.as_str());
         assert!(queries >= 2, "both by-ref lanes must query a rustc offset");
         assert_eq!(
             queries, guards,
             "every rustc offset query must have a descriptor lookup guarding it — {queries} \
              queries but {guards} lookups; an unguarded query emits an address the interpreter \
              does not agree with",
+        );
+        assert_eq!(
+            queries, agreements,
+            "every rustc offset query must ALSO be checked against the byte the descriptor \
+             declares — {queries} queries but {agreements} agreement checks; a presence-only \
+             gate proves the consumer HAS a table, not that the emitted number is in it",
         );
     }
 
@@ -30269,6 +32570,400 @@ mod generic_iterator_opaque_carrier_tests {
                 !lane.contains(emitting),
                 "`lower_for_desugar_outer` must emit no memory/offset instruction ({emitting}) — \
                  wave-GI widens an ADMISSION, it does not add a computed address",
+            );
+        }
+    }
+}
+
+/// Trust (wave-ABI): the SIGNATURE-BOUNDARY guard on the scalar-spelled opaque enum lane.
+///
+/// THE DEFECT THIS PINS. `map_ty`'s enum-decline arm models an `Option<T>` that `register_enum`
+/// declines (any non-seedable payload — a tuple, a ref, a `String`, a nested ADT) as its
+/// DISCRIMINANT ONLY, `Ty::Bool`. `lower_fn` put that straight into the signature, and
+/// `to_mir`'s `[t] => scalar_rustc_ty(..)` arm — which never consulted the built type — adopted
+/// `tcx.types.bool` as the return's denotation. The result was a derived `mir::Body` declaring
+/// `_0: bool` for a function whose real return type is `Option<(u32,u32)>`
+/// (`clean-kernel`'s `expr::shift_bvar_range`), in both signature positions:
+///
+///   built `arg1:enum:core::option::Option`  vs  derived `arg1:bool`
+///   built `ret:enum:core::option::Option`   vs  derived `ret:bool`
+///
+/// WHY ONLY THIS CLASS ESCAPED, and why that shape is the test plan. The sibling wave-EL lane
+/// maps a declined NON-Option enum to `Ty::Unit`, which is not a scalar, so `to_mir` fails
+/// CLOSED on it ("param widening: trust-ir Unit vs built .."). `Ty::Bool` IS a scalar, so the
+/// fail-closed gate never fired — the Option-flag lane converted a fail-closed GAP into an ABI
+/// LIE. Every test below therefore asserts a CONTRAST, never a bare presence: the lying row and
+/// the three rows that must keep working sit in the same table.
+#[cfg(test)]
+mod option_flag_signature_guard_tests {
+    use trust_ir::Ty;
+
+    use super::{is_scalar_ty, opaque_lane_is_abi_lie};
+
+    /// The stripped production text of `lib.rs`, bounded at the first test section. Same helper,
+    /// same reason, as `nested_payload_lane_tests::production_code`: this file quotes its own code
+    /// in comments and lives inside `include_str!("lib.rs")`, so an un-stripped search would match
+    /// a COMMENT and pass with the production line deleted.
+    fn production_code() -> String {
+        super::nested_payload_lane_tests::production_code()
+    }
+
+    /// The source span of `lower_fn`, bounded by the `fn` that follows it — so every assertion
+    /// below is made about THAT function and cannot be satisfied elsewhere in a 30k-line file.
+    fn lower_fn_span() -> String {
+        let code = production_code();
+        super::nested_payload_lane_tests::fn_span(&code, "lower_fn", "lower_const_body").to_string()
+    }
+
+    // ---- the pure decision: all four rows, executable ------------------------------------
+
+    /// **THE TOOTH.** The scalar-spelled opaque lane in an ABI-visible position is a lie.
+    ///
+    /// `Ty::Bool` is the only spelling `map_ty`'s decline arm can produce that `to_mir` will
+    /// denote as a real rustc scalar, so this single row is the whole defect.
+    #[test]
+    fn a_scalar_spelled_opaque_lane_is_an_abi_lie() {
+        assert!(
+            opaque_lane_is_abi_lie(&Ty::Bool, true),
+            "an `Option<(u32,u32)>` the flag lane spells `Ty::Bool` must be REFUSED at a \
+             signature boundary: `to_mir` denotes a scalar without consulting the built type, \
+             so admitting it mints a bool-returning body for an Option-returning function",
+        );
+    }
+
+    /// **CORRECTED (#189) — the wave-EL `Ty::Unit` lane IS an ABI lie in signature position.**
+    ///
+    /// This test previously asserted the opposite, on the rationale that "`to_mir`'s Unit arm
+    /// already demands `built.is_unit()` and fails CLOSED — no soundness gain". That rationale is
+    /// true of the FLIP CONSUMER and says nothing about the EMITTED MODULE, and the emitted module
+    /// is what `validate_module` and every downstream reader see.
+    ///
+    /// Falsified by reproduction on `tests/ui/trust/thir_opaque_result_layout_no_cycle.rs`: the
+    /// signature is written from the UNREVEALED return type (`register_enum` declines an alias
+    /// field whose layout it cannot prove -> opaque lane -> `Ty::Unit`) while the body's `Ok(..)`
+    /// constructor sees the REVEALED type (different generic args, different `register_enum` key,
+    /// ADMITTED -> `Ty::Enum(1)`). The module shipped `functy.0 = (fatptr<str>) -> (())` over a
+    /// body whose `ret` carries `enum.1`, with `unsupported: []` and `spliced: true` — a
+    /// `ReturnTypeMismatch` the guard was declining to catch.
+    ///
+    /// The guard is consulted ONLY from `guard_sig_position_ty`, so VALUE positions keep the
+    /// collapse the wave-EL lanes depend on; only the interface stops lying.
+    #[test]
+    fn the_unit_opaque_lane_is_an_abi_lie_in_signature_position() {
+        assert!(
+            opaque_lane_is_abi_lie(&Ty::Unit, true),
+            "an opaque-lane enum collapsed to `Ty::Unit` in a SIGNATURE is a false statement \
+             about the interface: the body returns the revealed type while the signature claims \
+             unit (reproduced as ReturnTypeMismatch expected=\"()\" actual=\"enum.1\")",
+        );
+        // A type that legitimately maps to `Ty::Unit` without the opaque lane (a ZST,
+        // `PhantomData`) is NOT a lie — the lane flag is what distinguishes them.
+        assert!(
+            !opaque_lane_is_abi_lie(&Ty::Unit, false),
+            "a genuine unit/ZST mapping must stay admitted",
+        );
+    }
+
+    /// **WORKING PATH 2 — a REGISTERED `Option<u32>` is a real enum, not a lane.**
+    ///
+    /// `register_enum` ADMITS a scalar payload, so `map_ty` answers `Ty::Enum` and the opaque
+    /// conjunct is false. Both conjuncts are false here, so the row is asserted twice over —
+    /// once as the enum spelling, once with the lane flag cleared.
+    #[test]
+    fn a_registered_scalar_payload_option_is_never_refused() {
+        let registered = Ty::Enum(trust_ir::EnumId::new(0));
+        assert!(
+            !is_scalar_ty(&registered),
+            "a first-class `Ty::Enum` is not a scalar, so `to_mir` never respells it",
+        );
+        assert!(
+            !opaque_lane_is_abi_lie(&registered, false),
+            "`Option<u32>` registers as a real enum — the lane never applies and this guard \
+             must be silent, or every scalar-payload Option stops lowering",
+        );
+    }
+
+    /// **WORKING PATH 3 — the `opaque_lane_enum` conjunct carries the whole discrimination.**
+    ///
+    /// Without it the guard would reject every `-> bool` in the corpus. Asserted across the FULL
+    /// `is_scalar_ty` set, so a future author cannot delete the conjunct and keep one row green.
+    #[test]
+    fn a_real_scalar_is_never_refused() {
+        for real in [
+            Ty::Bool,
+            Ty::I8,
+            Ty::I16,
+            Ty::I32,
+            Ty::I64,
+            Ty::I128,
+            Ty::U8,
+            Ty::U16,
+            Ty::U32,
+            Ty::U64,
+            Ty::U128,
+            Ty::Isize,
+            Ty::Usize,
+            Ty::Char,
+        ] {
+            assert!(is_scalar_ty(&real), "{real:?} must be in the scalar set this guard keys on");
+            assert!(
+                !opaque_lane_is_abi_lie(&real, false),
+                "{real:?} is a REAL scalar, not an opaque lane — refusing it would reject \
+                 every predicate and arithmetic body in the corpus",
+            );
+        }
+    }
+
+    /// The non-scalar spellings a signature position can carry are all silent, so the guard
+    /// costs the `register_enum` probe on nothing but genuine scalars.
+    #[test]
+    fn no_non_scalar_spelling_reaches_the_probe() {
+        for quiet in [
+            // Trust (#189): `Ty::Unit` is NOT in this list any more, and its absence is the point.
+            // It used to sit here on the rationale that `to_mir`'s Unit arm fails closed on its
+            // own — true of the FLIP CONSUMER, and silent about the EMITTED MODULE, which is what
+            // #189 measured and fixed. `opaque_lane_is_abi_lie` now answers `true` for it, and
+            // `the_unit_opaque_lane_is_an_abi_lie_in_signature_position` is where that contract
+            // lives. Leaving it here asserted the retired contract and turned main red.
+            Ty::Ptr,
+            Ty::F32,
+            Ty::F64,
+            Ty::Struct(trust_ir::StructId(0)),
+            Ty::Enum(trust_ir::EnumId::new(0)),
+            Ty::FatPtr(trust_ir::FatPtrKind::Str),
+            Ty::Tuple(vec![Ty::U32, Ty::U32]),
+        ] {
+            assert!(
+                !opaque_lane_is_abi_lie(&quiet, true),
+                "{quiet:?} is not a scalar — `to_mir` cannot respell it, so the guard is silent \
+                 even when the type IS an opaque-lane enum",
+            );
+        }
+    }
+
+    // ---- the guard is actually WIRED, at BOTH signature positions -------------------------
+
+    /// **THE MISS EDGE.** A guard the signature construction does not call is a doc comment.
+    ///
+    /// Both ABI-visible positions are pinned, because the measured mismatch appeared in both and
+    /// a fix applied to only one is exactly as wrong as no fix. Needles are assembled at run time
+    /// (this test's source is inside `include_str!("lib.rs")`) and searched in the STRIPPED
+    /// production text bounded to `lower_fn`, so neither this test nor a prose comment can
+    /// satisfy them.
+    #[test]
+    fn both_signature_positions_are_guarded_in_lower_fn() {
+        let lane = lower_fn_span();
+        let call = format!("self.{}(", "guard_sig_position_ty");
+        assert_eq!(
+            lane.matches(call.as_str()).count(),
+            2,
+            "`lower_fn` must guard EXACTLY the two ABI-visible positions — the return and the \
+             declared-param loop. The measured lie appeared as both `ret:bool` and `arg1:bool`.",
+        );
+        assert!(
+            lane.contains(&format!("{}(fn_sig.output(), &out, \"ret\")", "guard_sig_position_ty")),
+            "the RETURN must be guarded with its own position name: this is the \
+             `shift_bvar_range() -> Option<(u32,u32)>` row that produced `_0: bool`",
+        );
+        assert!(
+            lane.contains(&format!("{}(*t, &mapped, &format!(\"arg", "guard_sig_position_ty")),
+            "every DECLARED param must be guarded inside the loop — an unused \
+             `Option<(u32,u32)>` param lied as `arg1:bool` with no body code at all",
+        );
+    }
+
+    /// The tag is part of the contract: the census is how the next reader learns a body stopped
+    /// lowering and WHY. A guard that fired under a generic tag would be indistinguishable from
+    /// the pre-existing `Ty(..)` decline classes it must be counted separately from.
+    #[test]
+    fn the_refusal_carries_its_own_named_tag() {
+        let code = production_code();
+        let tag = format!("\"Ty({} in signature)\"", "option-flag");
+        assert_eq!(
+            code.matches(tag.as_str()).count(),
+            1,
+            "exactly one site may mint the signature-boundary tag — the guard itself",
+        );
+    }
+
+    /// The `map_fn_ptr_ty` precedent this guard is modelled on must survive it. That guard is
+    /// STRICTER (it refuses every opaque-lane enum anywhere in a fn-pointer signature, `Ty::Unit`
+    /// included) because a placeholder hole in a spliced INDIRECT-call signature is unrecoverable
+    /// at the call site. Relaxing it to match the direct-call guard would reopen the ABI lie one
+    /// level of indirection away, where nothing downstream fails closed.
+    #[test]
+    fn the_indirect_call_boundary_keeps_its_stricter_guard() {
+        let code = production_code();
+        let lane = super::nested_payload_lane_tests::fn_span(
+            &code,
+            "map_fn_ptr_ty",
+            "lower_closure_fn_pointer",
+        );
+        assert_eq!(
+            lane.matches(&format!("self.{}(", "is_opaque_lane_enum")).count(),
+            2,
+            "`map_fn_ptr_ty` must keep refusing an opaque-lane enum in BOTH its input and \
+             return positions — the direct-call guard is deliberately weaker, not a replacement",
+        );
+    }
+}
+
+/// Trust (wave-ABI R2): the SIBLING SIGNATURE POSITIONS `0a53c47bca` missed.
+///
+/// That commit asserted `lower_fn` "is the single point where a type CROSSES into a signature".
+/// It is not. Three points in this file mint a `FuncTy`, and the commit guarded one:
+///
+///   * `lower_fn`          — guarded by `0a53c47bca` (both positions).
+///   * `lower_const_body`  — MISSED. It carried the identical pre-fix line ~20 lines below the
+///     patched one, and is literally the delimiter `lower_fn_span()` uses. Reproduced against
+///     the HEAD stage1 producer: `const C_LIE: Option<(u32,u32)>` and `const C_BOOL: bool`
+///     shared ONE interned `functy.0 = () -> (bool)`, both `lowered`+`spliced`, `unsupported:
+///     []` — the lie inside the published `.trust-ir.bin`. `lower_const_body` is byte-identical
+///     across `0a53c47bca`, so that pre-fix binary's const rows ARE the HEAD rows.
+///   * the pended fn-pointer `FuncTy`s flushed in `finish_body` — already covered, and strictly
+///     harder, by `map_fn_ptr_ty`'s own guard.
+///
+/// And one more OUTSIDE this file's `add_func_type` census: a bodyless DECLARATION's `returns`,
+/// which `crate_module::decl_ret` reads back from `CalleeRef::ret_ty` — the value `probe_ret_ty`
+/// supplies. That position declines rather than tags (see `probe_ret_ty`), because the tag would
+/// land on the caller.
+///
+/// Every test here is a CONTRAST or a COUNT, never a bare presence: the needles are assembled at
+/// run time and searched in the comment-STRIPPED production text bounded to one `fn`, so neither
+/// this module nor a prose comment can satisfy them.
+#[cfg(test)]
+mod option_flag_sibling_position_tests {
+    /// Same stripped-production helper as the sibling module, for the same reason.
+    fn production_code() -> String {
+        super::nested_payload_lane_tests::production_code()
+    }
+
+    /// **THE SIBLING — the whole point of this module.**
+    ///
+    /// `lower_const_body`'s return must be guarded by the SAME call, with the SAME position name,
+    /// as `lower_fn`'s. Asserted over that function's own span so a guard added anywhere else in
+    /// a 30k-line file cannot satisfy it, and paired with a negative on the exact pre-fix
+    /// one-liner so restoring it fails here rather than in a dump nobody runs.
+    #[test]
+    fn the_const_initializer_return_is_guarded_like_the_fn_return() {
+        let code = production_code();
+        let lane =
+            super::nested_payload_lane_tests::fn_span(&code, "lower_const_body", "finish_body");
+        let call = format!("self.{}(const_rty, &out, \"ret\")", "guard_sig_position_ty");
+        assert_eq!(
+            lane.matches(call.as_str()).count(),
+            1,
+            "`lower_const_body` mints a `FuncTy` from `map_ty(const_rty)` exactly as `lower_fn` \
+             mints one from `map_ty(fn_sig.output())`. Unguarded, `const C_LIE: \
+             Option<(u32,u32)>` is signed `() -> (bool)` — the same interned `FuncTy` a real \
+             `bool` const gets — and ships spliced into the published module.",
+        );
+        let pre_fix = format!("vec![self.{}(const_rty)]", "map_ty");
+        assert_eq!(
+            lane.matches(pre_fix.as_str()).count(),
+            0,
+            "the unguarded pre-fix one-liner must not come back: it IS the defect, and it \
+             survived `0a53c47bca` because that commit believed `lower_fn` was the only \
+             signature boundary",
+        );
+    }
+
+    /// **THE CENSUS.** Every `FuncTy` this file mints is accounted for — so a FOURTH signature
+    /// position cannot be added without this test failing and forcing the author to say which
+    /// guard covers it. This is the ratchet the previous lane lacked; without it, "the single
+    /// point where a type crosses into a signature" was a claim no test could contradict.
+    #[test]
+    fn every_func_type_this_file_mints_is_a_guarded_position() {
+        let code = production_code();
+        assert_eq!(
+            code.matches(&format!("module.{}(", "add_func_type")).count(),
+            3,
+            "exactly three sites mint a `FuncTy` here: `lower_fn`, `lower_const_body`, and the \
+             pended fn-pointer flush in `finish_body`. A fourth is a new ABI boundary and needs \
+             its own guard — name it, then update this count.",
+        );
+        assert_eq!(
+            code.matches(&format!("self.{}(", "guard_sig_position_ty")).count(),
+            3,
+            "and exactly three guarded positions answer them: `lower_fn`'s return, `lower_fn`'s \
+             declared-param loop, and `lower_const_body`'s return. (The fn-pointer flush is \
+             covered upstream by `map_fn_ptr_ty`, which is strictly stricter.)",
+        );
+    }
+
+    /// **THE THIRD BOUNDARY — a bodyless DECLARATION's `returns`.**
+    ///
+    /// `probe_ret_ty` is the last resort that types a call result, and `crate_module::decl_ret`
+    /// reads that type straight into a declaration's `FuncTy`. The transaction already there
+    /// cannot catch this class: `map_ty`'s decline arm is SILENT for it (measured — the probe
+    /// crate's `Option<(u32,u32)>` const lowered with `unsupported: []`), so the tag the
+    /// transaction watches for is never pushed. The decision must therefore be made explicitly.
+    #[test]
+    fn the_declaration_return_probe_refuses_the_scalar_spelled_lane() {
+        let code = production_code();
+        let lane =
+            super::nested_payload_lane_tests::fn_span(&code, "probe_ret_ty", "is_drop_free_zst");
+        let decision =
+            format!("{}(&mapped, self.{}(rty))", "opaque_lane_is_abi_lie", "is_opaque_lane_enum");
+        assert_eq!(
+            lane.matches(decision.as_str()).count(),
+            1,
+            "the declaration-return probe must run the SAME pure decision the signature guard \
+             runs — `decl_ret` puts its answer into a declaration `FuncTy`, which is as \
+             ABI-visible as a definition's",
+        );
+        let cheap_first = format!("if {}(&mapped) && ", "is_scalar_ty");
+        assert!(
+            lane.contains(cheap_first.as_str()),
+            "and with `guard_sig_position_ty`'s cheap-conjunct-first order, so a non-scalar \
+             call result never pays for the `register_enum` probe",
+        );
+    }
+
+    /// **DECLINE, NOT TAG — the one place the guard's own shape would be wrong.**
+    ///
+    /// A tag pushed inside `probe_ret_ty` lands on the CALLER: a clean body would stop lowering
+    /// merely for calling an `Option`-returning function. That is the exact regression this
+    /// function's doc comment records (41 clean bodies, first cut of #178). `None` is the
+    /// position's own documented fail-closed spelling.
+    #[test]
+    fn the_declaration_return_probe_never_tags_the_caller() {
+        let code = production_code();
+        let lane =
+            super::nested_payload_lane_tests::fn_span(&code, "probe_ret_ty", "is_drop_free_zst");
+        assert_eq!(
+            lane.matches(&format!("self.unsupported.{}(", "push")).count(),
+            0,
+            "`probe_ret_ty` must never push a tag — it runs on the CALLER's body, and a caller \
+             is not defective for calling a callee this lane cannot spell",
+        );
+        assert_eq!(
+            lane.matches("return None;").count(),
+            2,
+            "exactly two declines: the pre-existing tag transaction, and the ABI-lie refusal. \
+             Both land on `None` = the honest empty `returns` the declaration already means \
+             by it.",
+        );
+    }
+
+    /// **THE UNGUARDED SPELLING IS GONE FROM THE FILE, not just from one function.**
+    ///
+    /// The defect was one line duplicated across two functions; a fix asserted only at the site
+    /// it patched is exactly how the first one shipped incomplete. This searches the WHOLE
+    /// stripped production text for a `map_ty` result flowing into a `returns` vector without an
+    /// intervening guard binding.
+    #[test]
+    fn no_signature_returns_vector_is_built_straight_from_map_ty() {
+        let code = production_code();
+        for unguarded in [
+            format!("vec![self.{}(const_rty)]", "map_ty"),
+            format!("vec![self.{}(fn_sig.output())]", "map_ty"),
+        ] {
+            assert_eq!(
+                code.matches(unguarded.as_str()).count(),
+                0,
+                "`{unguarded}` puts an unexamined mapped type into a signature. Both spellings \
+                 existed; `0a53c47bca` removed one.",
             );
         }
     }

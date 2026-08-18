@@ -52,6 +52,7 @@ fn fn_with_ensures(ensures: &str) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

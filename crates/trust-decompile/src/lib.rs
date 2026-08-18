@@ -40,10 +40,11 @@ use trust_types::{
     BinaryCallingConvention, BinaryCoverageSummary, BinaryFactConfidence, BinaryFactEvidence,
     BinaryFactSubject, BinaryFunctionSignature, BinaryMemoryModel, BinaryOrigin, BinaryParameter,
     BinaryReturn, BinarySelectedImageIdentity, BinarySourceProvenanceDiagnostic,
-    BinarySourceProvenanceSummary, BinaryStorageFact, BinaryStorageLocation, BinarySymbol,
+    BinarySourceProvenanceSummary, BinaryStackBase, BinaryStorageFact, BinaryStorageLocation,
+    BinarySymbol,
     BinarySymbolKind, BinaryVerificationSummary, ConstValue,
     DecompileOptions as SharedDecompileOptions, DecompileTarget, DecompiledFunction,
-    DecompiledOutput, Endianness, MemoryAccessFact, ModelAssumption, Operand,
+    DecompiledOutput, Endianness, Formula, MemoryAccessFact, ModelAssumption, Operand,
     PreservedSymbolicFormula, ProofCertificateStatus, ReconstructionCandidateKind,
     ReconstructionSummary, ReconstructionValidationDirection,
     ReconstructionValidationDirectionRecord, ReconstructionValidationEvidence,
@@ -51,8 +52,8 @@ use trust_types::{
     RustReconstructionEligibility, RustReconstructionRejectionKind, Rvalue, SerializableVc,
     SolverDispatchRecord, SolverDispatchStatus, SolverQuerySemantics, SourceSpan, Statement,
     TargetValidationBlocker, Terminator, TrustLevel, Ty, UnOp, UnsupportedLedger,
-    UnsupportedRecord, ValidatedRustReconstruction, VerifiableFunction, VerificationCondition,
-    VerificationResult, stable_sha256_hex,
+    UnsupportedRecord, ValidatedRustReconstruction, VerifiableBody, VerifiableFunction,
+    VerificationCondition, VerificationResult, stable_sha256_hex,
 };
 use trust_wasm_bridge::{
     WasmConversion, WasmProofConsumerEvidence, WasmProofConsumerStatus, WasmSymbolicFormula,
@@ -3696,6 +3697,910 @@ fn function_source_provenance_assumptions(
     source_provenance_assumptions(lifted)
 }
 
+// ── Frame reconstruction ───────────────────────────────────────────────────
+//
+// A binary-lifted body writes the machine STACK POINTER as if it were data.
+// x86_64 `ret` lifts to `SP := SP + 8` (the architectural pop of the return
+// address); a prologue lifts to `SP := SP - k`. trust-cg's LIR has no
+// stack-pointer register — a frame is addressed by SLOT (`Opcode::StackAddr`)
+// and the teardown is implied by the return — so those assignments have no LIR
+// value to become, and `trust-cg-bridge` correctly REFUSES to invent one
+// ("symbolic operand requires target-semantic lowering; refusing to replace
+// `BvAdd(Var(\"SP\"), 8)` with an arbitrary integer"). That refusal is right
+// about the statement and wrong about the verdict: it demoted the whole
+// conversion to `translation_rejected`, when a lift-stage blocker is supposed to
+// stay `inspectable_rejected` "as long as the trust-cg lowering itself succeeds
+// structurally" (cea7b70c74).
+//
+// This pass recovers the frame fact the lift left implicit — where the stack
+// pointer ends up relative to entry — and removes the writes that only encoded
+// it. Nothing is dropped silently: each elided write becomes a
+// `BinaryStorageFact` on the function.
+//
+// SCOPE. The pass rewrites the copy that becomes `DecompiledFunction::lifted`.
+// `trust_lift::LiftedFunction::trust_ir_body` is NOT touched — `summarize_function`
+// takes it by shared reference — and that is the copy `trust-vcgen`'s
+// `generate_memory_model_vcs` reads, recovering the frame from the same SP
+// assignments via `latest_sp_assignment_in_block`. The stack-discipline VCs are
+// therefore unaffected. Keep it that way: if a caller ever routes the decompiled
+// body back into that lane, it must read the storage facts below instead of
+// re-deriving the frame from statements that are no longer there.
+//
+// SOUNDNESS. The elision is guarded by one condition: the stack-pointer local is
+// never READ anywhere in the body. Then every write to it is dead, so removing
+// them cannot change an observable — the recorded offsets are the entire
+// residual meaning, and they are kept. If the stack pointer IS read as data
+// (`mov rax, rsp`, an escaping frame address), the guard fails, nothing is
+// elided, and the bridge refuses exactly as it does today. The read scan is
+// CONSERVATIVE in the fail-closed direction: any statement or terminator shape
+// it cannot decompose counts as a read, so an unrecognised construct blocks the
+// elision rather than permitting it. It is also ALL-OR-NOTHING: one write whose
+// offset from entry-SP is not derivable, or that carries its own obligation
+// (`Rvalue::Unsupported`), abandons the whole function.
+
+/// The local holding the machine stack pointer.
+///
+/// `trust_lift::LocalLayout::to_local_decls` names it exactly this on every
+/// architecture it supports (AArch64 `sp_local` 32, x86_64 `sp_local` 17), so
+/// the NAME is the architecture-independent handle and no index is hardcoded.
+const STACK_POINTER_LOCAL_NAME: &str = "SP";
+
+/// The local holding the machine program counter. Named the same way on every
+/// architecture (`pc_local` 33 on AArch64, 18 on x86_64).
+const PROGRAM_COUNTER_LOCAL_NAME: &str = "PC";
+
+/// The index of the local the lift gave this machine-register name, if any.
+fn machine_register_local(body: &VerifiableBody, name: &str) -> Option<usize> {
+    body.locals.iter().find(|decl| decl.name.as_deref() == Some(name)).map(|decl| decl.index)
+}
+
+/// Is `local` READ anywhere in `body`?
+///
+/// Conservative in the fail-closed direction: a statement or terminator shape
+/// the scan cannot decompose answers `true`.
+fn local_is_read_anywhere(body: &VerifiableBody, local: usize) -> bool {
+    body.blocks.iter().any(|block| {
+        block.stmts.iter().any(|statement| statement_reads_local(statement, local))
+            || terminator_reads_local(&block.terminator, local)
+    })
+}
+
+/// Read a bitvector literal as a SIGNED machine value.
+///
+/// A `sub rsp, 32` may lift as either `BvSub(SP, 32)` or `BvAdd(SP, 2^64 - 32)`;
+/// the second is the same displacement written as an unsigned wrap, so the
+/// literal is interpreted in two's complement at its own width.
+fn bitvec_as_signed(value: i128, width: u32) -> Option<i64> {
+    if width == 0 || width > 64 {
+        return None;
+    }
+    let modulus = 1i128 << width;
+    let wrapped = value.rem_euclid(modulus);
+    let signed = if wrapped < modulus / 2 { wrapped } else { wrapped - modulus };
+    i64::try_from(signed).ok()
+}
+
+/// The displacement of `formula` from the ENTRY stack pointer, when it is one.
+///
+/// Recognises `SP`, and `SP ± literal` nested to any depth. Returns `None` for
+/// anything that mixes in another variable or a non-literal — that is not frame
+/// bookkeeping and must not be elided.
+///
+/// Deliberately a second implementation of `trust_lift`'s private
+/// `stack_relative_offset`, which answers the same question for memory-region
+/// classification. This one additionally reads the literal in two's complement
+/// (see `bitvec_as_signed`) and narrows to `i64`, because its answer is recorded
+/// as a `BinaryStorageLocation::Stack` offset rather than compared symbolically.
+/// If the two ever need to agree, promote one — do not let them drift.
+fn entry_sp_offset(formula: &Formula) -> Option<i64> {
+    match formula {
+        Formula::Var(name, _) if name == STACK_POINTER_LOCAL_NAME => Some(0),
+        Formula::SymVar(symbol, _) if symbol.as_str() == STACK_POINTER_LOCAL_NAME => Some(0),
+        Formula::BvAdd(lhs, rhs, _) => match (&**lhs, &**rhs) {
+            (_, Formula::BitVec { value, width }) => {
+                entry_sp_offset(lhs)?.checked_add(bitvec_as_signed(*value, *width)?)
+            }
+            (Formula::BitVec { value, width }, _) => {
+                entry_sp_offset(rhs)?.checked_add(bitvec_as_signed(*value, *width)?)
+            }
+            _ => None,
+        },
+        // Only `sp - literal`. `literal - sp` is a negation, not a displacement.
+        Formula::BvSub(lhs, rhs, _) => match &**rhs {
+            Formula::BitVec { value, width } => {
+                entry_sp_offset(lhs)?.checked_sub(bitvec_as_signed(*value, *width)?)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Does `operand` read `local`?
+fn operand_reads_local(operand: &Operand, local: usize) -> bool {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => place.local == local,
+        Operand::Constant(_) => false,
+        // A symbolic formula names machine registers and memory, never a body
+        // local — the lift materialises locals only through `Place`.
+        Operand::Symbolic(_) => false,
+        // A payload that could not be represented: assume it reads everything.
+        _ => true,
+    }
+}
+
+/// Does `rvalue` read `local`?
+fn rvalue_reads_local(rvalue: &Rvalue, local: usize) -> bool {
+    match rvalue {
+        Rvalue::Use(operand) | Rvalue::Repeat(operand, _) | Rvalue::Cast(operand, _) => {
+            operand_reads_local(operand, local)
+        }
+        Rvalue::UnaryOp(_, operand) => operand_reads_local(operand, local),
+        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+            operand_reads_local(lhs, local) || operand_reads_local(rhs, local)
+        }
+        Rvalue::PtrOffset { ptr, count } => {
+            operand_reads_local(ptr, local) || operand_reads_local(count, local)
+        }
+        Rvalue::Aggregate(_, operands) => {
+            operands.iter().any(|operand| operand_reads_local(operand, local))
+        }
+        Rvalue::Ref { place, .. }
+        | Rvalue::AddressOf(_, place)
+        | Rvalue::Discriminant(place)
+        | Rvalue::Len(place)
+        | Rvalue::CopyForDeref(place) => place.local == local,
+        // `Unsupported` and any variant added later: assume it reads everything.
+        _ => true,
+    }
+}
+
+/// Does `statement` read `local`?
+///
+/// A write THROUGH a projection (`*_l = …`) counts as a read of `_l`, because the
+/// pointer value is consumed. A whole-local write does not.
+fn statement_reads_local(statement: &Statement, local: usize) -> bool {
+    match statement {
+        Statement::Assign { place, rvalue, .. } => {
+            (place.local == local && !place.projections.is_empty())
+                || rvalue_reads_local(rvalue, local)
+        }
+        Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
+            place.local == local && !place.projections.is_empty()
+        }
+        // Storage markers bound a lifetime; they do not observe the value.
+        Statement::StorageLive(_) | Statement::StorageDead(_) => false,
+        Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => false,
+        // A retag and an explicit mention both observe the place.
+        Statement::Retag { place } | Statement::PlaceMention(place) => place.local == local,
+        Statement::Intrinsic { args, .. } => {
+            args.iter().any(|arg| operand_reads_local(arg, local))
+        }
+        Statement::CopyNonOverlapping { src, dst, count, .. } => {
+            operand_reads_local(src, local)
+                || operand_reads_local(dst, local)
+                || operand_reads_local(count, local)
+        }
+        // `Unsupported` and any variant added later: assume it reads everything.
+        _ => true,
+    }
+}
+
+/// Does `terminator` read `local`?
+fn terminator_reads_local(terminator: &Terminator, local: usize) -> bool {
+    match terminator {
+        Terminator::Goto(_) | Terminator::Unreachable | Terminator::Resume => false,
+        // The return place is `_0` and is read on the way out.
+        Terminator::Return => local == 0,
+        Terminator::SwitchInt { discr, .. } => operand_reads_local(discr, local),
+        Terminator::Assert { cond, .. } => operand_reads_local(cond, local),
+        Terminator::Drop { place, .. } => place.local == local,
+        Terminator::Call { args, dest, .. } => {
+            args.iter().any(|arg| operand_reads_local(arg, local))
+                || (dest.local == local && !dest.projections.is_empty())
+        }
+        // `Opaque` (inline asm and friends) and any variant added later: assume
+        // it reads everything.
+        _ => true,
+    }
+}
+
+/// Reconstruct the frame: elide dead stack-pointer bookkeeping and return the
+/// facts it encoded.
+///
+/// Returns an empty vector and leaves `body` untouched whenever the elision is
+/// not provably meaning-preserving; see the module note above for the exact
+/// conditions.
+fn reconstruct_frame(body: &mut VerifiableBody, function: &str) -> Vec<BinaryStorageFact> {
+    let Some(sp_local) = machine_register_local(body, STACK_POINTER_LOCAL_NAME) else {
+        return Vec::new();
+    };
+
+    // (1) Every write to the stack-pointer local must be a whole-local write of
+    //     a derivable entry-SP displacement. One that is not abandons the
+    //     function: a partial elision would leave a frame whose residual writes
+    //     no longer compose to the recorded offset.
+    let mut writes: Vec<(usize, usize, i64)> = Vec::new();
+    for (block_index, block) in body.blocks.iter().enumerate() {
+        for (statement_index, statement) in block.stmts.iter().enumerate() {
+            let Statement::Assign { place, rvalue, .. } = statement else { continue };
+            if place.local != sp_local {
+                continue;
+            }
+            if !place.projections.is_empty() {
+                return Vec::new();
+            }
+            let Rvalue::Use(Operand::Symbolic(formula)) = rvalue else {
+                return Vec::new();
+            };
+            let Some(offset) = entry_sp_offset(formula) else {
+                return Vec::new();
+            };
+            writes.push((block_index, statement_index, offset));
+        }
+    }
+    if writes.is_empty() {
+        return Vec::new();
+    }
+
+    // (2) The guard: the stack pointer must never be read. Then the writes are
+    //     dead and removing them preserves every observable.
+    if local_is_read_anywhere(body, sp_local) {
+        return Vec::new();
+    }
+
+    // (3) Remove them, latest first so the earlier indices stay valid.
+    for (block_index, statement_index, _) in writes.iter().rev() {
+        if let Some(block) = body.blocks.get_mut(*block_index) {
+            block.stmts.remove(*statement_index);
+        }
+    }
+
+    // (4) Keep what they meant.
+    writes
+        .into_iter()
+        .map(|(_, _, offset)| BinaryStorageFact {
+            subject: BinaryFactSubject::Register {
+                function: function.to_string(),
+                register: STACK_POINTER_LOCAL_NAME.to_string(),
+            },
+            location: BinaryStorageLocation::Stack {
+                base: BinaryStackBase::StackPointer,
+                offset,
+                size_bytes: None,
+            },
+            evidence: BinaryFactEvidence::StackUse,
+            confidence: BinaryFactConfidence::Inferred,
+            // `Partial`, and load-bearing. These facts roll up into the
+            // artifact's `storage_facts`, which `trust-vcgen`'s
+            // `generate_binary_abi_contradiction_vcs` reads — but it first
+            // filters on `proof_grade_storage_fact`, which demands
+            // `ProofGrade`. A displacement read off a lifted formula is
+            // DERIVED, not proof-grade, and must never mint an ABI
+            // contradiction obligation against a real ABI fact.
+            trust_level: TrustLevel::Partial,
+            ..Default::default()
+        })
+        .collect()
+}
+
+
+/// Does this terminator ALREADY carry the control transfer its block's program-
+/// counter writes encode?
+///
+/// A `ret`/`jmp`/`jcc`/`call` whose target the CFG builder resolved is fully
+/// described by the terminator; the PC assignment beside it is a second copy.
+/// An UNRESOLVED transfer is the case that matters: the CFG builder emits
+/// `Terminator::Opaque` and preserves the real successors precisely because it
+/// could not decide them, so there the PC formula is the only surviving record
+/// of the target and must not be touched. `Unreachable`/`Resume` are refused for
+/// the same reason — no successor edge to carry anything.
+fn terminator_carries_the_control_transfer(terminator: &Terminator) -> bool {
+    matches!(
+        terminator,
+        Terminator::Return
+            | Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Call { .. }
+    )
+}
+
+/// Remove program-counter writes the control-flow graph already encodes.
+///
+/// Returns how many were removed.
+///
+/// trust-cg's LIR has no program counter: control flow IS the CFG, and a `ret`
+/// is `Opcode::Return`. So a lifted `PC := PC + 3` (straight-line sequencing) or
+/// `PC := <return address loaded from the stack>` (a `ret`) has no LIR value to
+/// become, and the bridge refuses to invent one — the same refusal, and the same
+/// correct refusal, that `reconstruct_frame` answers for the stack pointer.
+///
+/// SOUNDNESS. Two conditions, both required:
+///   1. the program-counter local is never READ (same conservative scan), so
+///      every write to it is dead; and
+///   2. every block holding such a write ends in a terminator that already
+///      carries the transfer (see `terminator_carries_the_control_transfer`).
+///
+/// (1) alone is what makes removal meaning-preserving. (2) is what makes it
+/// LOSSLESS as a record: the terminator is where the elided information still
+/// lives, which is why nothing is emitted alongside — unlike the stack pointer,
+/// whose displacement had no other home and becomes a `BinaryStorageFact`. An
+/// unresolved indirect branch fails (2), keeps its PC write, and goes on being
+/// refused; `tests/binary_unresolved_indirect_branch_golden.json` is that case.
+fn elide_control_flow_program_counter_writes(body: &mut VerifiableBody) -> usize {
+    let Some(pc_local) = machine_register_local(body, PROGRAM_COUNTER_LOCAL_NAME) else {
+        return 0;
+    };
+
+    // (1) Candidates: whole-local writes of an obligation-free value. As in
+    //     `reconstruct_frame`, a write carrying its own `UnsupportedMir`
+    //     obligation must never be deleted, and one write that does not qualify
+    //     abandons the whole function.
+    let mut writes: Vec<(usize, usize)> = Vec::new();
+    for (block_index, block) in body.blocks.iter().enumerate() {
+        for (statement_index, statement) in block.stmts.iter().enumerate() {
+            let Statement::Assign { place, rvalue, .. } = statement else { continue };
+            if place.local != pc_local {
+                continue;
+            }
+            if !place.projections.is_empty() {
+                return 0;
+            }
+            if !matches!(
+                rvalue,
+                Rvalue::Use(Operand::Symbolic(_)) | Rvalue::Use(Operand::Constant(_))
+            ) {
+                return 0;
+            }
+            if !terminator_carries_the_control_transfer(&block.terminator) {
+                return 0;
+            }
+            writes.push((block_index, statement_index));
+        }
+    }
+    if writes.is_empty() {
+        return 0;
+    }
+
+    // (2) The guard.
+    if local_is_read_anywhere(body, pc_local) {
+        return 0;
+    }
+
+    for (block_index, statement_index) in writes.iter().rev() {
+        if let Some(block) = body.blocks.get_mut(*block_index) {
+            block.stmts.remove(*statement_index);
+        }
+    }
+    writes.len()
+}
+
+#[cfg(test)]
+mod frame_reconstruction_tests {
+    use super::*;
+    use trust_types::{BasicBlock, BlockId, LocalDecl, Place, Projection, Sort};
+
+    const SP: usize = 32; // AArch64 `LocalLayout::sp_local`.
+    const X0: usize = 1;
+
+    const PC: usize = 33; // AArch64 `LocalLayout::pc_local`.
+
+    fn pc_var() -> Formula {
+        Formula::Var(PROGRAM_COUNTER_LOCAL_NAME.to_string(), Sort::BitVec(64))
+    }
+
+    fn pc_assign(value: Formula) -> Statement {
+        Statement::Assign {
+            place: Place::local(PC),
+            rvalue: Rvalue::Use(Operand::Symbolic(value)),
+            span: SourceSpan::binary_address(0x1000),
+        }
+    }
+
+    /// A body carrying both machine bookkeeping locals.
+    fn machine_body(stmts: Vec<Statement>, terminator: Terminator) -> VerifiableBody {
+        let mut body = body_with(stmts, terminator);
+        body.locals.push(LocalDecl {
+            index: PC,
+            ty: Ty::Int { width: 64, signed: false },
+            name: Some(PROGRAM_COUNTER_LOCAL_NAME.to_string()),
+        });
+        body
+    }
+
+    /// The `trust_fixture_return` shape: `.byte 0x90` then `retq`. Every
+    /// statement is machine bookkeeping — straight-line PC sequencing, the
+    /// stack pop, and the return address loaded off the stack — so after both
+    /// passes the block is empty and the lowering has nothing left to refuse.
+    #[test]
+    fn a_nop_then_ret_reduces_to_nothing_but_its_terminator() {
+        let mut body = machine_body(
+            vec![
+                // NOP: PC := PC + 1
+                pc_assign(Formula::BvAdd(Box::new(pc_var()), Box::new(bv(1)), 64)),
+                // RET: SP := SP + 8
+                sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
+                // RET: PC := <return address loaded from the stack>
+                pc_assign(Formula::BvOr(
+                    Box::new(Formula::Var("MEM".to_string(), Sort::BitVec(64))),
+                    Box::new(bv(0)),
+                    64,
+                )),
+            ],
+            Terminator::Return,
+        );
+
+        let facts = reconstruct_frame(&mut body, "trust_fixture_return");
+        let elided_pc = elide_control_flow_program_counter_writes(&mut body);
+
+        assert_eq!(offsets(&facts), vec![8]);
+        assert_eq!(elided_pc, 2);
+        assert!(
+            body.blocks[0].stmts.is_empty(),
+            "nothing but bookkeeping was present: {:?}",
+            body.blocks[0].stmts
+        );
+    }
+
+
+    /// THE POINT OF THE PASS, measured against the real consumer.
+    ///
+    /// Before: `trust-cg-bridge` refused the `retq` body outright — "symbolic
+    /// operand requires target-semantic lowering; refusing to replace
+    /// `BvAdd(Var(\"SP\"), 8)` with an arbitrary integer" — and that refusal
+    /// demoted the whole conversion to `translation_rejected`. After: the
+    /// machine bookkeeping is gone, so the lowering succeeds STRUCTURALLY and
+    /// the artifact can be `inspectable_rejected` (still rejected, on its own
+    /// merits, via the conversion gate's blockers).
+    ///
+    /// The bridge's refusal was never wrong, and it is unchanged: LIR has no
+    /// `Undef` opcode, so inventing a value for a non-ground formula was the
+    /// only alternative and it would have been a different program. What
+    /// changed is that there is no longer anything un-lowerable to refuse.
+    #[test]
+    #[cfg(feature = "trust-cg")]
+    fn the_bridge_accepts_a_ret_body_that_it_refuses_before_the_passes() {
+        // `.byte 0x90` then `retq`, exactly as `trust_lift` emits it: the
+        // machine locals, `arg_count: 0`, `return_ty: Ty::Unit`.
+        let stmts = vec![
+            pc_assign(Formula::BvAdd(Box::new(pc_var()), Box::new(bv(1)), 64)),
+            sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
+            pc_assign(Formula::BvOr(
+                Box::new(Formula::Var("MEM".to_string(), Sort::BitVec(64))),
+                Box::new(bv(0)),
+                64,
+            )),
+        ];
+        let lifted = |body: VerifiableBody| VerifiableFunction {
+            name: "trust_fixture_return".to_string(),
+            def_path: "binary::trust_fixture_return".to_string(),
+            span: SourceSpan::binary_address(0x400000),
+            body,
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+
+        // BEFORE: the bridge refuses, and names a machine register in doing so.
+        let before = trust_cg_bridge::lower_binary_trust_ir_to_lir(&lifted(machine_body(
+            stmts.clone(),
+            Terminator::Return,
+        )));
+        let refusal = before.expect_err("the un-reconstructed body must still be refused");
+        let refusal = format!("{refusal:?}");
+        assert!(
+            refusal.contains("symbolic operand requires target-semantic lowering"),
+            "the refusal must be the symbolic-operand one; got {refusal}"
+        );
+
+        // AFTER: both passes run, and the same body lowers.
+        let mut body = machine_body(stmts, Terminator::Return);
+        let facts = reconstruct_frame(&mut body, "trust_fixture_return");
+        let elided_pc = elide_control_flow_program_counter_writes(&mut body);
+        assert_eq!(offsets(&facts), vec![8]);
+        assert_eq!(elided_pc, 2);
+
+        trust_cg_bridge::lower_binary_trust_ir_to_lir(&lifted(body))
+            .expect("after frame reconstruction the bridge must lower the body structurally");
+    }
+
+    /// THE GUARD THAT MATTERS. An UNRESOLVED indirect branch keeps its PC write:
+    /// `Terminator::Opaque` means the CFG builder could not decide the successor,
+    /// so the formula is the only record of where control goes.
+    #[test]
+    fn an_unresolved_indirect_branch_keeps_its_program_counter_write() {
+        let mut body = machine_body(
+            vec![pc_assign(Formula::Var("X0".to_string(), Sort::BitVec(64)))],
+            Terminator::Opaque {
+                kind: "unresolved-indirect-branch".to_string(),
+                targets: vec![],
+                span: SourceSpan::binary_address(0x1004),
+            },
+        );
+
+        assert_eq!(
+            elide_control_flow_program_counter_writes(&mut body),
+            0,
+            "an unresolved branch target must survive as the PC formula"
+        );
+        assert_eq!(body.blocks[0].stmts.len(), 1);
+    }
+
+    /// `Unreachable` and `Resume` carry no successor either, so they refuse too.
+    #[test]
+    fn only_terminators_that_carry_the_transfer_permit_the_elision() {
+        for permitted in [
+            Terminator::Return,
+            Terminator::Goto(BlockId(0)),
+            Terminator::SwitchInt {
+                discr: Operand::Constant(trust_types::ConstValue::Int(0)),
+                targets: vec![],
+                otherwise: BlockId(0),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::binary_address(0),
+            },
+        ] {
+            assert!(
+                terminator_carries_the_control_transfer(&permitted),
+                "{permitted:?} resolves its own successors"
+            );
+        }
+        for refused in [
+            Terminator::Unreachable,
+            Terminator::Resume,
+            Terminator::Opaque {
+                kind: "asm".to_string(),
+                targets: vec![],
+                span: SourceSpan::binary_address(0),
+            },
+        ] {
+            assert!(
+                !terminator_carries_the_control_transfer(&refused),
+                "{refused:?} does not carry a control transfer"
+            );
+        }
+    }
+
+    /// A read of the program counter blocks it, exactly as for the stack
+    /// pointer — `lea rax, [rip + k]` materialises the PC as data.
+    #[test]
+    fn a_program_counter_that_is_read_blocks_the_elision() {
+        let mut body = machine_body(
+            vec![
+                pc_assign(Formula::BvAdd(Box::new(pc_var()), Box::new(bv(4)), 64)),
+                Statement::Assign {
+                    place: Place::local(X0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(PC))),
+                    span: SourceSpan::binary_address(0x1004),
+                },
+            ],
+            Terminator::Return,
+        );
+
+        assert_eq!(elide_control_flow_program_counter_writes(&mut body), 0);
+        assert_eq!(body.blocks[0].stmts.len(), 2);
+    }
+
+    /// The two passes are independent: a body whose stack pointer escapes still
+    /// gets its redundant PC writes removed, and vice versa. Pinned so a future
+    /// refactor does not accidentally couple the two guards.
+    #[test]
+    fn the_two_passes_do_not_gate_each_other() {
+        let mut body = machine_body(
+            vec![
+                pc_assign(Formula::BvAdd(Box::new(pc_var()), Box::new(bv(1)), 64)),
+                sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
+                // `mov rax, rsp` — the stack pointer escapes, the PC does not.
+                Statement::Assign {
+                    place: Place::local(X0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(SP))),
+                    span: SourceSpan::binary_address(0x1008),
+                },
+            ],
+            Terminator::Return,
+        );
+
+        assert!(reconstruct_frame(&mut body, "sp_escapes").is_empty());
+        assert_eq!(elide_control_flow_program_counter_writes(&mut body), 1);
+        assert_eq!(
+            body.blocks[0].stmts.len(),
+            2,
+            "the SP write and its consumer must both remain: {:?}",
+            body.blocks[0].stmts
+        );
+    }
+
+    fn sp_var() -> Formula {
+        Formula::Var(STACK_POINTER_LOCAL_NAME.to_string(), Sort::BitVec(64))
+    }
+
+    fn bv(value: i128) -> Formula {
+        Formula::BitVec { value, width: 64 }
+    }
+
+    /// A body shaped like the lift's: an SP local named "SP" plus one GPR.
+    fn body_with(stmts: Vec<Statement>, terminator: Terminator) -> VerifiableBody {
+        VerifiableBody {
+            locals: vec![
+                LocalDecl { index: X0, ty: Ty::Int { width: 64, signed: false }, name: Some("X0".to_string()) },
+                LocalDecl {
+                    index: SP,
+                    ty: Ty::Int { width: 64, signed: false },
+                    name: Some(STACK_POINTER_LOCAL_NAME.to_string()),
+                },
+            ],
+            blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        }
+    }
+
+    fn sp_assign(value: Formula) -> Statement {
+        Statement::Assign {
+            place: Place::local(SP),
+            rvalue: Rvalue::Use(Operand::Symbolic(value)),
+            span: SourceSpan::binary_address(0x1000),
+        }
+    }
+
+    fn offsets(facts: &[BinaryStorageFact]) -> Vec<i64> {
+        facts
+            .iter()
+            .map(|fact| match &fact.location {
+                BinaryStorageLocation::Stack { offset, base, .. } => {
+                    assert_eq!(*base, BinaryStackBase::StackPointer);
+                    *offset
+                }
+                other => panic!("a frame fact must be a stack location; got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The shipped case: an x86_64 `ret` lifts to `SP := SP + 8` and nothing
+    /// reads SP. The write is dead, so it goes — and the displacement it encoded
+    /// survives as a fact.
+    #[test]
+    fn a_dead_stack_pointer_pop_is_elided_and_recorded() {
+        let mut body = body_with(
+            vec![sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64))],
+            Terminator::Return,
+        );
+
+        let facts = reconstruct_frame(&mut body, "trust_fixture_return");
+
+        assert!(body.blocks[0].stmts.is_empty(), "the dead SP write must be gone: {body:?}");
+        assert_eq!(offsets(&facts), vec![8]);
+        assert_eq!(
+            facts[0].subject,
+            BinaryFactSubject::Register {
+                function: "trust_fixture_return".to_string(),
+                register: "SP".to_string(),
+            }
+        );
+    }
+
+    /// THE GUARD. `mov rax, rsp` makes the stack pointer observable, so the
+    /// write is no longer dead and nothing may be removed — the bridge must go
+    /// on refusing.
+    #[test]
+    fn a_stack_pointer_that_is_read_blocks_every_elision() {
+        let mut body = body_with(
+            vec![
+                sp_assign(Formula::BvSub(Box::new(sp_var()), Box::new(bv(32)), 64)),
+                Statement::Assign {
+                    place: Place::local(X0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(SP))),
+                    span: SourceSpan::binary_address(0x1004),
+                },
+            ],
+            Terminator::Return,
+        );
+        let before = body.clone();
+
+        let facts = reconstruct_frame(&mut body, "reads_sp");
+
+        assert!(facts.is_empty(), "a read stack pointer must yield no frame fact");
+        assert_eq!(body.blocks[0].stmts.len(), before.blocks[0].stmts.len());
+    }
+
+    /// A read reached only through a TERMINATOR must block it too — the scan
+    /// covers both halves of a block.
+    #[test]
+    fn a_stack_pointer_read_by_a_terminator_blocks_the_elision() {
+        let mut body = body_with(
+            vec![sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64))],
+            Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(SP)),
+                targets: vec![],
+                otherwise: BlockId(0),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::binary_address(0x1004),
+            },
+        );
+
+        assert!(reconstruct_frame(&mut body, "switch_on_sp").is_empty());
+        assert_eq!(body.blocks[0].stmts.len(), 1);
+    }
+
+    /// A statement the scan cannot decompose counts as a read. `Unsupported` is
+    /// the standing instance, and it must fail CLOSED even though its declared
+    /// operands never mention SP.
+    #[test]
+    fn an_undecomposable_statement_counts_as_a_read() {
+        let mut body = body_with(
+            vec![
+                sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
+                Statement::Unsupported {
+                    kind: "InlineAsm".to_string(),
+                    detail: "opaque".to_string(),
+                    operands: vec![],
+                    span: SourceSpan::binary_address(0x1004),
+                },
+            ],
+            Terminator::Return,
+        );
+
+        assert!(
+            reconstruct_frame(&mut body, "opaque").is_empty(),
+            "an opaque statement must block the elision, not be assumed SP-free"
+        );
+        assert_eq!(body.blocks[0].stmts.len(), 2);
+    }
+
+    /// ALL-OR-NOTHING. One SP write whose displacement is not derivable
+    /// abandons the whole function: a partial elision would leave writes that no
+    /// longer compose to the recorded offset.
+    #[test]
+    fn one_underivable_write_abandons_the_whole_function() {
+        let mut body = body_with(
+            vec![
+                sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
+                // `sp := sp + x0` — a dynamic alloca, not a constant frame.
+                sp_assign(Formula::BvAdd(
+                    Box::new(sp_var()),
+                    Box::new(Formula::Var("X0".to_string(), Sort::BitVec(64))),
+                    64,
+                )),
+            ],
+            Terminator::Return,
+        );
+
+        assert!(reconstruct_frame(&mut body, "dynamic_frame").is_empty());
+        assert_eq!(body.blocks[0].stmts.len(), 2, "neither write may be removed");
+    }
+
+    /// An SP write carrying its own obligation (`Rvalue::Unsupported` mints an
+    /// `UnsupportedMir` VC) must never be deleted — that would delete the
+    /// obligation with it.
+    #[test]
+    fn an_obligation_bearing_write_is_never_deleted() {
+        let mut body = body_with(
+            vec![Statement::Assign {
+                place: Place::local(SP),
+                rvalue: Rvalue::Unsupported {
+                    kind: "NullaryOp".to_string(),
+                    detail: "unmodeled".to_string(),
+                    operands: vec![],
+                },
+                span: SourceSpan::binary_address(0x1000),
+            }],
+            Terminator::Return,
+        );
+
+        assert!(reconstruct_frame(&mut body, "obligation").is_empty());
+        assert_eq!(body.blocks[0].stmts.len(), 1);
+    }
+
+    /// A write THROUGH a projection (`*sp = …`) consumes the pointer value, so
+    /// it is not a whole-local write and stops the pass.
+    #[test]
+    fn a_projected_write_stops_the_pass() {
+        let mut body = body_with(
+            vec![Statement::Assign {
+                place: Place { local: SP, projections: vec![Projection::Deref] },
+                rvalue: Rvalue::Use(Operand::Symbolic(sp_var())),
+                span: SourceSpan::binary_address(0x1000),
+            }],
+            Terminator::Return,
+        );
+
+        assert!(reconstruct_frame(&mut body, "projected").is_empty());
+        assert_eq!(body.blocks[0].stmts.len(), 1);
+    }
+
+    /// A prologue's `sub rsp, 32` may lift EITHER as `BvSub(SP, 32)` or as
+    /// `BvAdd(SP, 2^64 - 32)`. Both are the same displacement and both must read
+    /// back as -32.
+    #[test]
+    fn a_negative_displacement_is_read_the_same_written_either_way() {
+        for value in [
+            Formula::BvSub(Box::new(sp_var()), Box::new(bv(32)), 64),
+            Formula::BvAdd(Box::new(sp_var()), Box::new(bv(-32)), 64),
+        ] {
+            let mut body = body_with(vec![sp_assign(value)], Terminator::Return);
+            assert_eq!(offsets(&reconstruct_frame(&mut body, "prologue")), vec![-32]);
+        }
+    }
+
+    /// Prologue and epilogue together: two writes, two facts, in order.
+    #[test]
+    fn a_prologue_and_its_epilogue_are_both_recorded() {
+        let mut body = body_with(
+            vec![
+                sp_assign(Formula::BvSub(Box::new(sp_var()), Box::new(bv(32)), 64)),
+                sp_assign(Formula::BvAdd(
+                    Box::new(Formula::BvSub(Box::new(sp_var()), Box::new(bv(32)), 64)),
+                    Box::new(bv(32)),
+                    64,
+                )),
+            ],
+            Terminator::Return,
+        );
+
+        assert_eq!(offsets(&reconstruct_frame(&mut body, "framed")), vec![-32, 0]);
+        assert!(body.blocks[0].stmts.is_empty());
+    }
+
+    /// A body with no stack-pointer local at all is left exactly as it was.
+    #[test]
+    fn a_body_without_a_stack_pointer_is_untouched() {
+        let mut body = VerifiableBody {
+            locals: vec![LocalDecl {
+                index: X0,
+                ty: Ty::Int { width: 64, signed: false },
+                name: Some("X0".to_string()),
+            }],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Nop],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        };
+
+        assert!(reconstruct_frame(&mut body, "no_sp").is_empty());
+        assert_eq!(body.blocks[0].stmts.len(), 1);
+    }
+
+    /// `Terminator::Return` reads `_0` and only `_0` — the SP local is not the
+    /// return place, so a return does not by itself block the elision. Pinned
+    /// because getting this backwards would silently disable the whole pass.
+    #[test]
+    fn a_return_reads_the_return_place_and_not_the_stack_pointer() {
+        assert!(terminator_reads_local(&Terminator::Return, 0));
+        assert!(!terminator_reads_local(&Terminator::Return, SP));
+    }
+
+    /// The displacement reader must reject anything that is not entry-SP plus a
+    /// constant, whatever it is made of.
+    #[test]
+    fn only_entry_sp_plus_a_constant_is_a_displacement() {
+        assert_eq!(entry_sp_offset(&sp_var()), Some(0));
+        // `32 - sp` is a negation of the stack pointer, not a displacement.
+        assert_eq!(
+            entry_sp_offset(&Formula::BvSub(Box::new(bv(32)), Box::new(sp_var()), 64)),
+            None
+        );
+        // A different register is not the stack pointer.
+        assert_eq!(entry_sp_offset(&Formula::Var("X0".to_string(), Sort::BitVec(64))), None);
+        // A bare constant has no stack-pointer base.
+        assert_eq!(entry_sp_offset(&bv(8)), None);
+        // Nesting is fine as long as every added term is a literal.
+        assert_eq!(
+            entry_sp_offset(&Formula::BvAdd(
+                Box::new(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
+                Box::new(bv(8)),
+                64,
+            )),
+            Some(16)
+        );
+    }
+}
+
 fn summarize_function(
     function: &LiftedFunction,
     arch: Option<LiftArch>,
@@ -3708,7 +4613,7 @@ fn summarize_function(
         Some(function.entry_point),
         function_span.clone(),
     ));
-    let (signature, abi_facts, storage_facts) = arch
+    let (signature, abi_facts, mut storage_facts) = arch
         .map(|arch| build_signature_facts(function, arch, origin.clone()))
         .unwrap_or_else(|| {
             (
@@ -3724,6 +4629,14 @@ fn summarize_function(
             )
         });
 
+    // Recover the frame before the body is handed on: the stack-pointer writes
+    // are bookkeeping trust-cg's LIR has no register for, and leaving them in
+    // makes a lift-stage blocker read as a lowering failure. See
+    // `reconstruct_frame`.
+    let mut body = function.trust_ir_body.clone();
+    storage_facts.extend(reconstruct_frame(&mut body, &function.name));
+    elide_control_flow_program_counter_writes(&mut body);
+
     DecompiledFunction {
         name: function.name.clone(),
         entry: function.entry_point,
@@ -3735,7 +4648,7 @@ fn summarize_function(
             name: function.name.clone(),
             def_path: function_def_path(function),
             span: function_span,
-            body: function.trust_ir_body.clone(),
+            body,
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -7774,7 +8687,7 @@ mod tests {
     fn aarch64_decompile_records_partial_boundary_in_unsupported_ledger() {
         let artifact = decompile_binary(
             &minimal_aarch64_elf_with_entry_instructions(&[
-                0xD5033B9F, // DMB ISH: modeled only as an ordering boundary.
+                0xD5033BBF, // DMB ISH: modeled only as an ordering boundary.
                 0xD65F03C0, // RET
             ]),
             DecompileOptions::default(),
@@ -7800,10 +8713,10 @@ mod tests {
             .expect("AArch64 DMB must be visible in the artifact unsupported ledger");
         assert!(record.feature.contains("AArch64 synchronization boundary"));
         assert_eq!(record.origin.as_ref().map(|origin| origin.instruction_address), Some(0x400000));
-        assert_eq!(record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033B9F));
+        assert_eq!(record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033BBF));
         assert_eq!(
             record.origin.as_ref().map(|origin| origin.instruction_bytes.as_slice()),
-            Some(&[0x9F, 0x3B, 0x03, 0xD5][..])
+            Some(&[0xBF, 0x3B, 0x03, 0xD5][..])
         );
         assert!(artifact.functions[0].unsupported.records.iter().any(|function_record| {
             function_record.stage == record.stage
@@ -7831,7 +8744,7 @@ mod tests {
                 && json_record["architecture"] == "aarch64"
                 && json_record["opcode"] == "Dmb"
                 && json_record["origin"]["instruction_address"] == 0x400000
-                && json_record["origin"]["encoding"].as_u64() == Some(0xD5033B9F)
+                && json_record["origin"]["encoding"].as_u64() == Some(0xD5033BBF)
         }));
     }
 
@@ -7953,7 +8866,7 @@ mod tests {
 
         let aarch64_artifact = decompile_binary(
             &minimal_aarch64_elf_with_entry_instructions(&[
-                0xD5033B9F, // DMB ISH: modeled only as an ordering boundary.
+                0xD5033BBF, // DMB ISH: modeled only as an ordering boundary.
                 0xD65F03C0, // RET
             ]),
             DecompileOptions::default(),
@@ -7974,9 +8887,9 @@ mod tests {
                 && record["origin"]["function_entry"] == 0x400000
                 && record["origin"]["instruction_address"] == 0x400000
                 && record["origin"]["instruction_size"] == 4
-                && record["origin"]["encoding"].as_u64() == Some(0xD5033B9F)
+                && record["origin"]["encoding"].as_u64() == Some(0xD5033BBF)
                 && record["origin"]["instruction_bytes"]
-                    == serde_json::json!([0x9F, 0x3B, 0x03, 0xD5])
+                    == serde_json::json!([0xBF, 0x3B, 0x03, 0xD5])
         }));
 
         let x86_64_artifact = decompile_binary(
@@ -9260,6 +10173,7 @@ mod tests {
                     }],
                     arg_count: 0,
                     return_ty: Ty::Unit,
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -9336,6 +10250,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -9381,6 +10296,7 @@ mod tests {
                     }],
                     arg_count: 0,
                     return_ty: Ty::Unit,
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -9452,6 +10368,7 @@ mod tests {
                     }],
                     arg_count: 0,
                     return_ty: Ty::Tuple(vec![Ty::i32(), Ty::i32()]),
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -9529,6 +10446,7 @@ mod tests {
                     ],
                     arg_count: 0,
                     return_ty: Ty::Unit,
+                    datatype_defs: Default::default(),
                 },
                 contracts: vec![],
                 preconditions: vec![],
@@ -14472,6 +15390,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -14504,6 +15423,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -14537,6 +15457,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: reference_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15158,6 +16079,7 @@ bb0(%0: bool):
                 blocks: vec![],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             ssa: None,
             annotations: vec![],

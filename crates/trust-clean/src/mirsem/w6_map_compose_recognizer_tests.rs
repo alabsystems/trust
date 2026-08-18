@@ -27,21 +27,52 @@ const AND_THEN: &str = "trust-mir-b0282c69c16082e4-e11fb07682484adc.json";
 /// predicate-filter shape (ref arg, second Bool switch, Drop plumbing, Resume).
 const FILTER: &str = "trust-mir-4fc5e5e1c0f8ba5c-a45a703cdd36ac11.json";
 
-/// A spec-free, arg_count-2 (env + untupled x) certified closure fact.
-fn closure_fact() -> CalleeFact {
-    CalleeFact { arg_count: 2, requires: Some(vec![]), param_names: vec![None, Some("x".into())] }
+/// A spec-free, arg-count-2 certified closure fact carrying the exact formal
+/// signature represented by the caller's already-typechecked MIR call edge.
+fn closure_fact(func: &VerifiableFunction) -> CalleeFact {
+    let (param_tys, return_ty) = func
+        .body
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            Terminator::Call { args, dest, .. } => {
+                let params = args
+                    .iter()
+                    .map(|arg| trust_vcgen::operand_ty(func, arg))
+                    .collect::<Option<Vec<_>>>()?;
+                let ret = crate::assignment_types::place_type(&func.body, dest)?;
+                Some((params, ret))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            (
+                Vec::new(),
+                trust_types::Ty::Unsupported {
+                    kind: "missing synthetic call signature".into(),
+                    detail: "test fact must fail closed".into(),
+                },
+            )
+        });
+    CalleeFact {
+        arg_count: 2,
+        param_tys,
+        return_ty,
+        requires: Some(vec![]),
+        param_names: vec![None, Some("x".into())],
+    }
 }
 
-fn registry(key: &str) -> BTreeMap<String, CalleeFact> {
+fn registry(func: &VerifiableFunction, key: &str) -> BTreeMap<String, CalleeFact> {
     let mut m = BTreeMap::new();
-    m.insert(key.to_string(), closure_fact());
+    m.insert(key.to_string(), closure_fact(func));
     m
 }
 
 #[test]
 fn recognizes_corpus_noncapturing_map() {
     let func = load_dump(MAP_NONCAP);
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     let shape = sem_adt_map_compose_of_discriminant_switch(&func, &callees)
         .expect("the non-capturing mono map must be recognized");
     assert_eq!(shape.call_variant, 1, "Some is variant 1");
@@ -58,7 +89,7 @@ fn recognizes_corpus_noncapturing_map() {
 #[test]
 fn recognizes_corpus_and_then() {
     let func = load_dump(AND_THEN);
-    let callees = registry("and_then_pos::{closure#0}");
+    let callees = registry(&func, "and_then_pos::{closure#0}");
     let shape = sem_adt_map_compose_of_discriminant_switch(&func, &callees)
         .expect("the mono and_then must be recognized");
     assert_eq!(shape.kind, super::ComposeReturn::AndThenFlat, "and_then is the flat mode");
@@ -73,7 +104,7 @@ fn recognizes_corpus_and_then() {
 #[test]
 fn and_then_exact_match_only_declines_suffix_decoy() {
     let func = load_dump(AND_THEN);
-    let callees = registry("inner::and_then_pos::{closure#0}"); // ONLY the decoy.
+    let callees = registry(&func, "inner::and_then_pos::{closure#0}"); // ONLY the decoy.
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a unique-suffix nested-module decoy must NOT resolve on the and_then lane"
@@ -97,7 +128,7 @@ fn and_then_drop_of_non_closure_place_declines() {
     if let Terminator::Drop { place, .. } = &mut block_mut(&mut func, 2).terminator {
         place.local = 1;
     }
-    let callees = registry("and_then_pos::{closure#0}");
+    let callees = registry(&func, "and_then_pos::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -122,7 +153,7 @@ fn and_then_extra_continuation_write_declines() {
         span: trust_types::SourceSpan::default(),
     };
     block_mut(&mut func, 4).stmts.push(some_rewrap);
-    let callees = registry("and_then_pos::{closure#0}");
+    let callees = registry(&func, "and_then_pos::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a stray `_0` write in the flat continuation must decline"
@@ -136,7 +167,7 @@ fn and_then_extra_continuation_write_declines() {
 #[test]
 fn recognizes_corpus_filter() {
     let func = load_dump(FILTER);
-    let callees = registry("filter_pos::{closure#0}");
+    let callees = registry(&func, "filter_pos::{closure#0}");
     let shape = sem_adt_filter_compose_of_discriminant_switch(&func, &callees)
         .expect("the mono filter must be recognized");
     assert_eq!(shape.some_variant, 1, "Some/keep is variant 1");
@@ -149,7 +180,7 @@ fn recognizes_corpus_filter() {
 #[test]
 fn filter_exact_match_only_declines_suffix_decoy() {
     let func = load_dump(FILTER);
-    let callees = registry("inner::filter_pos::{closure#0}");
+    let callees = registry(&func, "inner::filter_pos::{closure#0}");
     assert!(sem_adt_filter_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -158,7 +189,7 @@ fn filter_exact_match_only_declines_suffix_decoy() {
 #[test]
 fn map_recognizer_declines_filter_shape() {
     let func = load_dump(FILTER);
-    let callees = registry("filter_pos::{closure#0}");
+    let callees = registry(&func, "filter_pos::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "the map/and_then recognizer must not accept the filter shape"
@@ -184,7 +215,7 @@ fn filter_forged_reconstruct_off_substitute_local_declines() {
             }
         }
     }
-    let callees = registry("filter_pos::{closure#0}");
+    let callees = registry(&func, "filter_pos::{closure#0}");
     assert!(
         sem_adt_filter_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a reconstruct off a substitute local must decline"
@@ -199,7 +230,7 @@ fn filter_drop_of_non_payload_place_declines() {
     if let Terminator::Drop { place, .. } = &mut block_mut(&mut func, 4).terminator {
         place.local = 0;
     }
-    let callees = registry("filter_pos::{closure#0}");
+    let callees = registry(&func, "filter_pos::{closure#0}");
     assert!(sem_adt_filter_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -211,7 +242,7 @@ fn filter_drop_of_non_payload_place_declines() {
 fn filter_edge_into_resume_declines() {
     let mut func = load_dump(FILTER);
     block_mut(&mut func, 3).terminator = Terminator::Goto(trust_types::BlockId(8));
-    let callees = registry("filter_pos::{closure#0}");
+    let callees = registry(&func, "filter_pos::{closure#0}");
     assert!(
         sem_adt_filter_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a KEEP-arm edge into the Resume sink must decline"
@@ -226,6 +257,37 @@ fn filter_empty_registry_declines() {
     assert!(sem_adt_filter_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
+#[test]
+fn closure_composition_rejects_unsafe_call_signatures() {
+    let mut map = load_dump(MAP_NONCAP);
+    let map_callees = registry(&map, "map_add1::{closure#0}");
+    let map_call = map
+        .body
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Call { is_unsafe_sig, .. } => Some(is_unsafe_sig),
+            _ => None,
+        })
+        .expect("map closure call");
+    *map_call = true;
+    assert!(sem_adt_map_compose_of_discriminant_switch(&map, &map_callees).is_none());
+
+    let mut filter = load_dump(FILTER);
+    let filter_callees = registry(&filter, "filter_pos::{closure#0}");
+    let filter_call = filter
+        .body
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Call { is_unsafe_sig, .. } => Some(is_unsafe_sig),
+            _ => None,
+        })
+        .expect("filter closure call");
+    *filter_call = true;
+    assert!(sem_adt_filter_compose_of_discriminant_switch(&filter, &filter_callees).is_none());
+}
+
 /// THE MANDATORY adversarial gate: a registry containing ONLY a DIFFERENT
 /// nested-module closure `inner::map_add1::{closure#0}` whose def-path
 /// SUFFIX-matches the env's `map_add1::{closure#0}` must DECLINE — never
@@ -233,7 +295,7 @@ fn filter_empty_registry_declines() {
 #[test]
 fn exact_match_only_declines_suffix_decoy() {
     let func = load_dump(MAP_NONCAP);
-    let callees = registry("inner::map_add1::{closure#0}"); // ONLY the decoy.
+    let callees = registry(&func, "inner::map_add1::{closure#0}"); // ONLY the decoy.
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a unique-suffix nested-module decoy must NOT resolve on the closure lane"
@@ -244,8 +306,9 @@ fn exact_match_only_declines_suffix_decoy() {
 /// (suffix-admitting) production resolver would silently misresolve.
 #[test]
 fn exact_resolver_declines_where_suffix_resolver_matches() {
+    let func = load_dump(MAP_NONCAP);
     let mut callees = BTreeMap::new();
-    callees.insert("inner::map_add1::{closure#0}".to_string(), closure_fact());
+    callees.insert("inner::map_add1::{closure#0}".to_string(), closure_fact(&func));
     // The production resolver ADMITS the unique suffix (the unsound behavior).
     assert!(
         resolve_certified_callee(&callees, "map_add1::{closure#0}").is_some(),
@@ -258,7 +321,7 @@ fn exact_resolver_declines_where_suffix_resolver_matches() {
     );
     // Both agree on an EXACT hit.
     let mut exact = BTreeMap::new();
-    exact.insert("map_add1::{closure#0}".to_string(), closure_fact());
+    exact.insert("map_add1::{closure#0}".to_string(), closure_fact(&func));
     assert!(resolve_certified_callee_exact(&exact, "map_add1::{closure#0}").is_some());
 }
 
@@ -271,7 +334,7 @@ fn exact_resolver_declines_where_suffix_resolver_matches() {
 #[test]
 fn capturing_closure_admitted_when_certified() {
     let func = load_dump(MAP_CAP);
-    let callees = registry("map_cap::{closure#0}");
+    let callees = registry(&func, "map_cap::{closure#0}");
     let shape = sem_adt_map_compose_of_discriminant_switch(&func, &callees)
         .expect("a capturing FnOnce closure with a certified spec-free leaf is now admitted");
     // The env operand is the BARE closure-param `Var` (the captures live inside it).
@@ -292,7 +355,7 @@ fn empty_registry_declines() {
 #[test]
 fn requires_bearing_closure_declines() {
     let func = load_dump(MAP_NONCAP);
-    let mut fact = closure_fact();
+    let mut fact = closure_fact(&func);
     // A non-vacuous requires (a real declared precondition) is DEFERRED (increment 2).
     fact.requires = Some(vec![trust_types::Formula::Bool(true)]);
     let mut callees = BTreeMap::new();
@@ -303,7 +366,7 @@ fn requires_bearing_closure_declines() {
 #[test]
 fn unknown_requires_closure_declines() {
     let func = load_dump(MAP_NONCAP);
-    let mut fact = closure_fact();
+    let mut fact = closure_fact(&func);
     fact.requires = None; // an unparsed precondition — fail closed.
     let mut callees = BTreeMap::new();
     callees.insert("map_add1::{closure#0}".to_string(), fact);
@@ -313,7 +376,7 @@ fn unknown_requires_closure_declines() {
 #[test]
 fn wrong_arg_count_closure_declines() {
     let func = load_dump(MAP_NONCAP);
-    let mut fact = closure_fact();
+    let mut fact = closure_fact(&func);
     fact.arg_count = 1; // must be env + untupled x == 2.
     let mut callees = BTreeMap::new();
     callees.insert("map_add1::{closure#0}".to_string(), fact);
@@ -337,7 +400,7 @@ fn wrong_downcast_variant_declines() {
             }
         }
     }
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a TAG↔DOWNCAST mismatch must decline"
@@ -354,7 +417,7 @@ fn tuple_arity_two_declines() {
             elems.push(e0);
         }
     }
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -370,7 +433,7 @@ fn tuple_element_not_payload_declines() {
             }
         }
     }
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -381,7 +444,7 @@ fn drop_of_non_closure_place_declines() {
     if let Terminator::Drop { place, .. } = &mut block_mut(&mut func, 2).terminator {
         place.local = 1; // Drop(_1) — not the bare closure param.
     }
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "a Drop of anything but the bare closure param must decline"
@@ -400,7 +463,7 @@ fn env_field_projection_declines() {
             }
         }
     }
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -410,7 +473,7 @@ fn effectful_residue_statement_declines() {
     block_mut(&mut func, 4)
         .stmts
         .push(Statement::Deinit { place: trust_types::Place::local(5) });
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "an effectful non-Assign statement must not be treated as a storage marker"
@@ -444,7 +507,7 @@ fn payload_definition_after_tuple_use_declines() {
         })
         .expect("tuple assignment");
     stmts.insert(tuple_index + 1, payload);
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "the payload definition must precede the tuple use at the exact statement site"
@@ -456,7 +519,7 @@ fn duplicate_block_identity_declines() {
     let mut func = load_dump(MAP_NONCAP);
     let duplicate = func.body.blocks[1].clone();
     func.body.blocks.push(duplicate);
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
         "duplicate block identities must not hide an unvalidated block behind `find`"
@@ -473,7 +536,7 @@ fn non_exhaustive_switch_declines() {
     {
         *exhaustive_enum_unreachable = false;
     }
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());
 }
 
@@ -494,6 +557,6 @@ fn second_call_in_none_arm_declines() {
         is_foreign: false,
         is_unsafe_sig: false,
     };
-    let callees = registry("map_add1::{closure#0}");
+    let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());
 }

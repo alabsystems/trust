@@ -3624,10 +3624,14 @@ fn discriminant_base_formula(
     let local = body.locals.get(place.local)?;
     let name = local.name.clone()?;
     match place.projections.as_slice() {
-        [] if local.ty.num_variants().is_some() => Some(Formula::Var(name, trust_types::Sort::Int)),
+        // R0: `num_variants_in` is `num_variants` plus the body's own explicit
+        // datatype table, so a receiver spelled as a bare marker still grounds.
+        [] if local.ty.num_variants_in(&body.datatype_defs).is_some() => {
+            Some(Formula::Var(name, trust_types::Sort::Int))
+        }
         [Projection::Deref] => match &local.ty {
             Ty::Ref { mutable: false, inner }
-                if inner.num_variants().is_some()
+                if inner.num_variants_in(&body.datatype_defs).is_some()
                     && !crate::mirsem::deref_write_exists(body, place.local) =>
             {
                 Some(Formula::Var(name, trust_types::Sort::Int))
@@ -10469,6 +10473,7 @@ mod tests {
                 blocks,
                 arg_count: 1,
                 return_ty: Ty::Int { width: 64, signed: false },
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -10618,6 +10623,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -11289,7 +11295,7 @@ mod tests {
             name: "probe".into(),
             def_path: "crate::probe".into(),
             span: Default::default(),
-            body: VerifiableBody { locals, blocks: vec![], arg_count: 0, return_ty: Ty::Unit },
+            body: VerifiableBody { locals, blocks: vec![], arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -11848,6 +11854,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "f".into(),
@@ -11957,6 +11964,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "sq_nonneg".into(),
@@ -12110,6 +12118,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "prod".into(),
@@ -12243,6 +12252,7 @@ mod tests {
             }],
             arg_count: 3,
             return_ty: i32_ty,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "monop".into(),
@@ -12475,6 +12485,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: i(),
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "pick".into(),
@@ -12524,6 +12535,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -12573,6 +12585,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -12634,6 +12647,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -12693,6 +12707,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -12754,6 +12769,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -12942,6 +12958,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: result_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13011,6 +13028,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13046,6 +13064,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 0,
                 return_ty: tree_backref,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13092,6 +13111,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13156,6 +13176,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 0,
                 return_ty: orphan_backref,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13208,6 +13229,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 0,
                 return_ty: loop_full,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13497,6 +13519,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13558,6 +13581,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13616,6 +13640,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![Formula::Gt(
@@ -13661,6 +13686,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -14383,6 +14409,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: ret_ty,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: name.into(),
@@ -14854,6 +14881,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Int { width: 32, signed: true },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -14958,6 +14986,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         };
         // A NON-trivial postcondition over the deref'd return: `ret > 0`.
         let func = VerifiableFunction {
@@ -15123,6 +15152,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: u(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15737,6 +15767,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15887,6 +15918,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -15997,6 +16029,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -16756,6 +16789,21 @@ mod rustc_mir_three_way_differential {
             // trust-ir's bitwise AND, the REAL `trust_ir::inst::BinOp::And` this
             // hop runs through the genuine imported interpreter).
             TrustIrBinOp::And => TirBinOp::And,
+            // Trust: OR/XOR ANCHOR — variant-for-variant, the REAL
+            // `trust_ir::inst::BinOp::{Or, Xor}`.
+            TrustIrBinOp::Or => TirBinOp::Or,
+            TrustIrBinOp::Xor => TirBinOp::Xor,
+            // Trust: SHL ANCHOR — variant-for-variant, the REAL `trust_ir::inst::BinOp::Shl`.
+            TrustIrBinOp::Shl => TirBinOp::Shl,
+            // Trust (#53): the BOOLEAN CONNECTIVES — variant-for-variant onto the REAL
+            // `trust_ir::inst::BinOp::{BAnd,BOr,BXor}` (trust-ir 4b06918). This hop is
+            // what makes the anchor's BUILT `Bool.rec` minors checkable against the
+            // genuine imported interpreter: trust-ir evaluates them as
+            // `if (lhs != 0) && (rhs != 0) then 1 else 0`, so a disagreement between
+            // the two shows up HERE as a LEG-B mismatch rather than passing silently.
+            TrustIrBinOp::BAnd => TirBinOp::BAnd,
+            TrustIrBinOp::BOr => TirBinOp::BOr,
+            TrustIrBinOp::BXor => TirBinOp::BXor,
         }
     }
     fn map_unop(op: TrustIrUnOp) -> TirUnOp {
@@ -16818,10 +16866,23 @@ mod rustc_mir_three_way_differential {
             // i32-arithmetic M3 corpus (`witness_body_module`'s callers) never produces
             // one; reaching this arm is a harness-scope bug, not a value to interpret —
             // panic loudly (fail-closed) rather than fabricate a silent placeholder.
-            IrOperand::Field(..) | IrOperand::Index(..) | IrOperand::Len(_) => panic!(
-                "emit_operand: `Field`/`Index`/`Len` have no LEG-B trust-ir bytecode \
-                 interpretation (uninterpreted `idxElem`/`sliceLen` projections, \
-                 MODEL-ONLY) — the M3 i32-arithmetic corpus should never reach this arm"
+            // Trust: DELTA-2 — the pre-op/cast carriers join the SAME arm for the same
+            // reason: `bnotAt` is an uninterpreted opaque, and `castU`/`castS`, while
+            // exactly reducible in the KERNEL, have no LEG-B bytecode lowering here.
+            // They are call-argument carriers, never produced inside a straight-line
+            // body, so reaching this arm is a harness-scope bug — panic loudly rather
+            // than fabricate a placeholder value.
+            IrOperand::Field(..)
+            | IrOperand::Index(..)
+            | IrOperand::Len(_)
+            | IrOperand::PreOpNotAt(..)
+            | IrOperand::CastU(..)
+            | IrOperand::CastS(..)
+            | IrOperand::Discr(_) => panic!(
+                "emit_operand: `Field`/`Index`/`Len`/`PreOpNotAt`/`CastU`/`CastS`/`Discr` have no \
+                 LEG-B trust-ir bytecode interpretation (uninterpreted or call-arg-only \
+                 carriers, MODEL-ONLY) — the M3 i32-arithmetic corpus should never reach \
+                 this arm"
             ),
         }
     }
@@ -16984,6 +17045,300 @@ mod rustc_mir_three_way_differential {
             blocks.push(blk);
         }
         assemble(name, func.body.arg_count, &ty, blocks, cfg.entry)
+    }
+
+    /// Trust: SET_BIT M2 (2026-08-12) — THE NUMERIC VALUE DIFFERENTIAL for the
+    /// cell-post mutator model, the leg no kernel tier can supply (the arms carry
+    /// opaque `Int.lor`/`Int.land`/`bnot` heads that never reduce to numerals).
+    ///
+    /// LEG B: the M1 walk's model `IrCfg`, CLOSED at concrete (pre, bit, value) —
+    /// every slot a `Const`, so the single-type harness emits it faithfully at each
+    /// width's `TirTy` — executed in the REAL imported trust-ir interpreter.
+    /// MIRROR: the width-exact Rust computation of `set_bit`'s spec.
+    /// REAL-EXECUTION VALIDATION: the mirror itself is checked against native Rust
+    /// integer ops in-process for one unsigned and one signed width — the machine-
+    /// semantics leg for these pure integer ops (the trustc-compiled artifact row is
+    /// provenance ceremony over the SAME semantics and is deliberately not test-time).
+    ///
+    /// The three M1 forgeries are re-run at VALUES: each must disagree with the
+    /// mirror at its distinguishing sample — the numeric teeth the shape oracle
+    /// cannot have.
+    #[test]
+    fn m2_set_bit_cell_post_value_differential() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue, IrTerm};
+        let path = format!(
+            "{}/fixtures/census-rung2-2026-07-07/bit_field/<u8 as lib__BitField>__set_bit.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).expect("committed set_bit dump");
+        let func: trust_types::VerifiableFunction =
+            serde_json::from_slice(&bytes).expect("parse");
+        let open_cfg = crate::prove::divergence_guarded_rmw_mutator_ir_cfg(&func)
+            .expect("the M1 walk must mint");
+
+        let close = |cfg: &crate::trustir_anchor::IrCfg,
+                     p: i128,
+                     b: i128,
+                     v: i128|
+         -> crate::trustir_anchor::IrCfg {
+            let mut c = cfg.clone();
+            let sub = |op: &mut IrOperand| {
+                if let IrOperand::Var(i) = op {
+                    match *i {
+                        0 => *op = IrOperand::Const(p),
+                        1 => *op = IrOperand::Const(b),
+                        2 => *op = IrOperand::Const(v),
+                        _ => {}
+                    }
+                }
+            };
+            for blk in &mut c.blocks {
+                for st in &mut blk.stmts {
+                    match &mut st.rvalue {
+                        IrRvalue::Use(a) | IrRvalue::Un(_, a) => sub(a),
+                        IrRvalue::Bin(_, a, b2) | IrRvalue::Cmp(_, a, b2) => {
+                            sub(a);
+                            sub(b2);
+                        }
+                    }
+                }
+                if let IrTerm::Switch(cond, _, _) = &mut blk.term {
+                    sub(&mut cond.a);
+                    sub(&mut cond.b);
+                }
+            }
+            c
+        };
+        let emit_closed = |cfg: &crate::trustir_anchor::IrCfg, ty: &TirTy| -> TirModule {
+            let mut fresh =
+                FreshIds::past(0, cfg.blocks.iter().flat_map(|b| b.stmts.iter().map(|s| s.idx)));
+            let mut blocks = Vec::new();
+            for (i, wblk) in cfg.blocks.iter().enumerate() {
+                let mut blk = TirBlock::new(TirBlockId::new(i as u32));
+                for st in &wblk.stmts {
+                    emit_stmt(&mut blk, &mut fresh, ty, st);
+                }
+                emit_term(&mut blk, &mut fresh, ty, &wblk.term);
+                blocks.push(blk);
+            }
+            assemble("set_bit_cell_post", 0, ty, blocks, cfg.entry)
+        };
+        // The width-exact spec mirror, in the interpreter's sign-decode convention.
+        let mirror = |p: i128, b: i128, v: i128, width: u32, signed: bool| -> i128 {
+            let m = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+            let pu = (p as u128) & m;
+            let mask = if (b as u32) >= width { 0 } else { (1u128 << b) & m };
+            let post = if v != 0 { pu | mask } else { pu & !mask & m };
+            if signed && width < 128 && (post >> (width - 1)) & 1 == 1 {
+                (post as i128) - (1i128 << width)
+            } else if signed && width == 128 {
+                post as i128
+            } else {
+                post as i128
+            }
+        };
+        // THE MIRROR'S OWN REAL-EXECUTION VALIDATION — native Rust ops, one unsigned
+        // and one signed width.
+        for (p, b) in [(0u8, 0u32), (165, 3), (255, 7), (1, 0)] {
+            for v in [false, true] {
+                let mut c = p;
+                if v {
+                    c |= 1u8 << b;
+                } else {
+                    c &= !(1u8 << b);
+                }
+                assert_eq!(
+                    i128::from(c),
+                    mirror(i128::from(p), i128::from(b), i128::from(v), 8, false),
+                    "mirror must match NATIVE u8 semantics at ({p},{b},{v})"
+                );
+            }
+        }
+        for (p, b) in [(-1i64, 0u32), (-98765, 13), (i64::MAX, 62)] {
+            for v in [false, true] {
+                let mut c = p;
+                if v {
+                    c |= 1i64 << b;
+                } else {
+                    c &= !(1i64 << b);
+                }
+                assert_eq!(
+                    i128::from(c),
+                    mirror(i128::from(p), i128::from(b), i128::from(v), 64, true),
+                    "mirror must match NATIVE i64 semantics at ({p},{b},{v})"
+                );
+            }
+        }
+
+        // LEG B == MIRROR across the width family.
+        let widths: [(TirTy, u32, bool); 6] = [
+            (TirTy::U8, 8, false),
+            (TirTy::I8, 8, true),
+            (TirTy::U32, 32, false),
+            (TirTy::I64, 64, true),
+            (TirTy::U128, 128, false),
+            (TirTy::I128, 128, true),
+        ];
+        for (ty, width, signed) in &widths {
+            let samples: Vec<(i128, i128)> = vec![
+                (0, 0),
+                (1, 0),
+                (165, 3),
+                (
+                    if *signed { -1 } else { ((1u128 << (width - 1)) - 1) as i128 },
+                    i128::from(width - 1),
+                ),
+                (if *signed { -(1i128 << (width - 2)) } else { 5 }, i128::from(width / 2)),
+            ];
+            for (p, b) in samples {
+                for v in [0i128, 1] {
+                    let closed = close(&open_cfg, p, b, v);
+                    let module = emit_closed(&closed, ty);
+                    let got = leg_b_exec(&module, ty, &[]).unwrap_or_else(|e| {
+                        panic!("LEG B failed at {ty:?} ({p},{b},{v}): {e}")
+                    });
+                    let want = mirror(p, b, v, *width, *signed);
+                    assert_eq!(
+                        got, want,
+                        "LEG B (trust-ir interpreter) vs MIRROR at {ty:?} ({p},{b},{v})"
+                    );
+                }
+            }
+        }
+
+        // THE FORGERIES, AT VALUES — each disagrees with the mirror at its
+        // distinguishing sample (u8; p=165, b=3).
+        let run = |cfg: &crate::trustir_anchor::IrCfg, p: i128, b: i128, v: i128| -> i128 {
+            leg_b_exec(&emit_closed(&close(cfg, p, b, v), &TirTy::U8), &TirTy::U8, &[])
+                .expect("forgery module must still execute")
+        };
+        // F1 — polarity swap: at v=1 the forged model CLEARS instead of SETS.
+        let mut f1 = open_cfg.clone();
+        if let IrTerm::Switch(_, t, e) = &mut f1.blocks[0].term {
+            std::mem::swap(t, e);
+        }
+        assert_ne!(run(&f1, 165, 3, 1), mirror(165, 3, 1, 8, false), "F1 must diverge");
+        // F2 — dropped Not: at v=0 the forged model ANDs with the RAW mask.
+        let mut f2 = open_cfg.clone();
+        {
+            let blk = &mut f2.blocks[2];
+            let not_idx = blk
+                .stmts
+                .iter()
+                .position(|s| matches!(s.rvalue, IrRvalue::Un(_, _)))
+                .expect("else arm carries the Not");
+            let shl_slot = blk.stmts[not_idx - 1].idx;
+            blk.stmts.remove(not_idx);
+            if let IrRvalue::Bin(_, _, rhs) = &mut blk.stmts.last_mut().unwrap().rvalue {
+                *rhs = IrOperand::Var(shl_slot);
+            }
+        }
+        assert_ne!(run(&f2, 165, 3, 0), mirror(165, 3, 0, 8, false), "F2 must diverge");
+        // F3 — Or→And head swap: at v=1 the forged model MASKS instead of SETTING.
+        let mut f3 = open_cfg.clone();
+        if let IrRvalue::Bin(op, _, _) = &mut f3.blocks[1].stmts.last_mut().unwrap().rvalue {
+            *op = crate::trustir_anchor::TrustIrBinOp::And;
+        }
+        assert_ne!(run(&f3, 165, 3, 1), mirror(165, 3, 1, 8, false), "F3 must diverge");
+    }
+
+    /// Trust: W19 M3 — the LEG-B numeric differential for the STRAIGHT-LINE mutator
+    /// shapes (store / bitwise / checked-arith), the M2 pattern on the sibling walk's
+    /// hand-built fixtures. The checked mirror uses `checked_add(..).expect(..)` so an
+    /// accidentally overflowing sample PANICS instead of comparing two wrapped values
+    /// (the vacuous-pass trap); samples are constructed overflow-free by width, and
+    /// the overflow side belongs to the SAFETY story, not this value story.
+    #[test]
+    fn m3_straight_mutator_value_differential() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue, IrTerm};
+        let mint = |shape: &str| -> crate::trustir_anchor::IrCfg {
+            let f = crate::prove::straight_mutator_for_test(shape);
+            crate::prove::straight_line_mutator_ir_cfg(&f).expect("M3 fixture must mint")
+        };
+        let close = |cfg: &crate::trustir_anchor::IrCfg, p: i128, v: i128| {
+            let mut c = cfg.clone();
+            for blk in &mut c.blocks {
+                for st in &mut blk.stmts {
+                    let sub = |op: &mut IrOperand| {
+                        if let IrOperand::Var(i) = op {
+                            match *i {
+                                0 => *op = IrOperand::Const(p),
+                                1 => *op = IrOperand::Const(v),
+                                _ => {}
+                            }
+                        }
+                    };
+                    match &mut st.rvalue {
+                        IrRvalue::Use(a) | IrRvalue::Un(_, a) => sub(a),
+                        IrRvalue::Bin(_, a, b) | IrRvalue::Cmp(_, a, b) => {
+                            sub(a);
+                            sub(b);
+                        }
+                    }
+                }
+                if let IrTerm::Switch(..) = &blk.term {
+                    unreachable!("straight-line mutator models are 1-block");
+                }
+            }
+            c
+        };
+        let emit_closed = |cfg: &crate::trustir_anchor::IrCfg, ty: &TirTy| -> TirModule {
+            let mut fresh =
+                FreshIds::past(0, cfg.blocks.iter().flat_map(|b| b.stmts.iter().map(|s| s.idx)));
+            let mut blocks = Vec::new();
+            for (i, wblk) in cfg.blocks.iter().enumerate() {
+                let mut blk = TirBlock::new(TirBlockId::new(i as u32));
+                for st in &wblk.stmts {
+                    emit_stmt(&mut blk, &mut fresh, ty, st);
+                }
+                emit_term(&mut blk, &mut fresh, ty, &wblk.term);
+                blocks.push(blk);
+            }
+            assemble("m3_mutator", 0, ty, blocks, cfg.entry)
+        };
+        let mirror = |shape: &str, p: u64, v: u64, width: u32| -> i128 {
+            let m: u128 = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+            let (pu, vu) = (u128::from(p) & m, u128::from(v) & m);
+            let post = match shape {
+                "store" => vu,
+                "bitwise" => pu | vu,
+                "checked" => pu
+                    .checked_add(vu)
+                    .expect("M3 samples must be overflow-free — a wrapped mirror is vacuous"),
+                _ => unreachable!(),
+            } & m;
+            post as i128
+        };
+        let widths: [(TirTy, u32); 3] = [(TirTy::U8, 8), (TirTy::U32, 32), (TirTy::U64, 64)];
+        for shape in ["store", "bitwise", "checked"] {
+            let open_cfg = mint(shape);
+            for (ty, width) in &widths {
+                for (p, v) in [(0u64, 0u64), (7, 9), (100, 27), (1, 1)] {
+                    let got = leg_b_exec(&emit_closed(&close(&open_cfg, p as i128, v as i128), ty), ty, &[])
+                        .unwrap_or_else(|e| panic!("LEG B {shape}@{ty:?} ({p},{v}): {e}"));
+                    assert_eq!(
+                        got,
+                        mirror(shape, p, v, *width),
+                        "LEG B vs mirror: {shape}@{ty:?} ({p},{v})"
+                    );
+                }
+            }
+        }
+        // Forgeries at values (u32; p=7, v=9): the op swap and the dropped pre-read.
+        let mut f1 = mint("checked");
+        if let IrRvalue::Bin(op, _, _) = &mut f1.blocks[0].stmts[0].rvalue {
+            *op = crate::trustir_anchor::TrustIrBinOp::Sub;
+        }
+        let got = leg_b_exec(&emit_closed(&close(&f1, 7, 9), &TirTy::U32), &TirTy::U32, &[])
+            .expect("forged module executes");
+        assert_ne!(got, mirror("checked", 7, 9, 32), "Add->Sub swap must diverge");
+        let mut f2 = mint("bitwise");
+        if let IrRvalue::Bin(_, a, _) = &mut f2.blocks[0].stmts[0].rvalue {
+            *a = IrOperand::Const(0); // the pre-read dropped to zero — a store in disguise.
+        }
+        let got = leg_b_exec(&emit_closed(&close(&f2, 7, 9), &TirTy::U32), &TirTy::U32, &[])
+            .expect("forged module executes");
+        assert_ne!(got, mirror("bitwise", 7, 9, 32), "dropped pre-read must diverge");
     }
 
     /// HAND-BUILT LEG-B functions for `poly` (`a*b - a`) and `lin` (`a+b - b`) —
@@ -17923,6 +18278,7 @@ mod ptr_intrinsic_model {
             ],
             arg_count: 2,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         }
     }
 
@@ -18177,6 +18533,7 @@ mod ptr_intrinsic_model {
             }],
             arg_count: 1,
             return_ty: raw,
+            datatype_defs: Default::default(),
         };
         assert!(
             resolve_ptr_model(&body, 0).is_none(),
@@ -18249,6 +18606,7 @@ mod ptr_intrinsic_model {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
         // The mid pointer `e` at `0 + len` is a LEGAL one-past-end offset.
         assert_eq!(ptr_offset_bounds_open(&body, 4), Some(true));
@@ -18304,6 +18662,7 @@ mod ptr_intrinsic_model {
             ],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
         let model = resolve_ptr_model(&body, 4).expect("q resolves to a value model");
         assert_eq!(
@@ -18368,6 +18727,7 @@ mod ptr_intrinsic_model {
             ],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
         // The VALUE model still resolves — the index is `0 + k`.
         let model = resolve_ptr_model(&body, 4).expect("q resolves to a PtrModel");
@@ -18834,6 +19194,7 @@ mod ptr_intrinsic_model {
             }],
             arg_count: 2,
             return_ty: raw_slice,
+            datatype_defs: Default::default(),
         };
         let model = resolve_ptr_model(&body, 5).expect("value model still resolves");
         assert_eq!(model.provenance, PtrProvenance::SliceStart);
@@ -19534,6 +19895,7 @@ mod ptr_intrinsic_model {
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "set_x".into(),
@@ -19891,6 +20253,7 @@ mod ptr_intrinsic_model {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "bump".into(),
@@ -20447,44 +20810,46 @@ mod ptr_intrinsic_model {
         );
     }
 
-    /// FIXTURE FAIL-CLOSED CONTROL — the committed `bump` dump (the REAL rustc lowering)
-    /// declines today, because its `Ty::Adt` predates the `adt_kind` stamp (serde-default
-    /// `None` ⇒ G-STRUCT-KIND). This pins the honest state of the documented follow-up:
-    /// re-dumping under an `adt_kind`-carrying stage2 is what turns it into a live
-    /// positive control. Every OTHER gate is exercised by `synth_rmw`, which is
-    /// byte-shaped like this dump.
+    /// FIXTURE POSITIVE CONTROL (was the fail-closed control) — the REGENERATED
+    /// (2026-08-13) `bump` dump carries `adt_kind: Some(Struct)` from the stamping
+    /// stage2 and MINTS directly. The original 2026-07-24 dump predated the stamp
+    /// and this test pinned its fail-closed decline as "the honest state of the
+    /// documented follow-up"; the re-dump IS that follow-up landing, so the pin
+    /// flips to the live positive control it was always waiting to become. The
+    /// UNSTAMP control preserves the old test's direction: stripping the stamp
+    /// must decline (G-STRUCT-KIND — serde-default `None` cannot exclude a union).
     #[test]
-    fn field_rmw_committed_bump_fixture_declines_fail_closed() {
+    fn field_rmw_committed_bump_fixture_mints_stamped() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/fixtures/w19-setter-2026-07-24/dumps/",
-            "trust-mir-60072d01ccb95541-363fc8dd3ff99a32.json"
+            "trust-mir-65f641d42b78189-50aa91c7de3358a8.json"
         );
-        // The fixture is COMMITTED (1584ea3ec6); a missing file is a real regression, not
-        // a reason to skip — a silently-skipping test is not a control.
+        // The fixture is COMMITTED; a missing file is a real regression, not a
+        // reason to skip — a silently-skipping test is not a control.
         let raw = std::fs::read_to_string(path).expect("the committed bump dump is readable");
         let func: trust_types::VerifiableFunction =
             serde_json::from_str(&raw).expect("the committed bump dump deserializes");
         assert_eq!(func.name, "bump");
-        assert!(
-            super::sem_field_rmw_shape_of(&func).is_none(),
-            "the committed bump dump must decline fail-closed (adt_kind is absent ⇒ None)"
-        );
-        // ...and it declines for EXACTLY that reason: stamping the kind makes it mint.
-        let mut stamped = func;
-        if let trust_types::Ty::Ref { inner, .. } = &mut stamped.body.locals[1].ty
-            && let trust_types::Ty::Adt { adt_kind, .. } = inner.as_mut()
-        {
-            *adt_kind = Some(trust_types::AdtKind::Struct);
-        }
-        let rmw = super::sem_field_rmw_shape_of(&stamped)
-            .expect("the REAL rustc lowering mints once the adt_kind stamp is present");
+        let rmw = super::sem_field_rmw_shape_of(&func)
+            .expect("the REGENERATED stamped dump mints directly");
         assert_eq!(rmw.field_key, 0);
         assert_eq!(rmw.op, crate::mirsem::SemRmwOp::Add);
         assert_eq!(rmw.rhs, crate::mirsem::SemRmwRhs::Const(1));
         assert_eq!(
             crate::trustir_adt::check_field_rmw_refinement(&rmw),
             crate::trustir_anchor::RefinementVerdict::ProvenModulo3
+        );
+        // UNSTAMP control — the decline direction, preserved.
+        let mut unstamped = func;
+        if let trust_types::Ty::Ref { inner, .. } = &mut unstamped.body.locals[1].ty
+            && let trust_types::Ty::Adt { adt_kind, .. } = inner.as_mut()
+        {
+            *adt_kind = None;
+        }
+        assert!(
+            super::sem_field_rmw_shape_of(&unstamped).is_none(),
+            "stripping the adt_kind stamp must decline fail-closed (G-STRUCT-KIND)"
         );
     }
 
@@ -20624,6 +20989,7 @@ mod ptr_intrinsic_model {
                 }],
                 arg_count: 2,
                 return_ty: i128t(),
+                datatype_defs: Default::default(),
             };
             VerifiableFunction {
                 name: "bad".into(),
@@ -20744,8 +21110,8 @@ mod ptr_intrinsic_model {
 #[cfg(test)]
 mod record_inc3_tests {
     use trust_types::{
-        AggregateKind, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
-        Terminator, Ty, UnOp, VerifiableFunction,
+        BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableFunction,
     };
 
     use super::sem_struct_return_folded_shape_of;

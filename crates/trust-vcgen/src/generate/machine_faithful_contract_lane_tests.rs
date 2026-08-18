@@ -41,6 +41,7 @@ fn machine_fn(
             }],
             arg_count: 1,
             return_ty: int_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,

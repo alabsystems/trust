@@ -1,0 +1,4 @@
+ INFO rustc_mir_transform::trust_ir_flip trust-ir-flip: compiled from trust-ir, did=DEF_ID, asserts=0, lineage=LINEAGE, flipped_so_far=1
+ INFO rustc_mir_transform::trust_ir_flip trust-ir-flip: compiled from trust-ir, did=DEF_ID, asserts=1, lineage=LINEAGE, flipped_so_far=2
+ INFO rustc_mir_transform::trust_ir_flip trust-ir-flip: compiled from trust-ir, did=DEF_ID, asserts=1, lineage=LINEAGE, flipped_so_far=3
+ INFO rustc_mir_transform::trust_ir_flip trust-ir-flip: compiled from trust-ir, did=DEF_ID, asserts=2, lineage=LINEAGE, flipped_so_far=4

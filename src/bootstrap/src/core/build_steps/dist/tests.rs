@@ -15,10 +15,10 @@ fn compiler_dist_keeps_only_required_compiler_compatibility_alias() {
 }
 
 #[test]
-fn compiler_dist_uses_trust_only_secondary_tool_names() {
+fn compiler_dist_secondary_tool_names_keep_only_the_doctest_alias() {
     let target = TargetSelection::from_user("x86_64-unknown-linux-gnu");
 
-    assert_eq!(trustdoc_dist_bin_names(target), ["trustdoc".to_string()]);
+    assert_eq!(trustdoc_dist_bin_names(target), ["trustdoc".to_string(), "rustdoc".to_string()]);
     assert_eq!(
         rust_analyzer_proc_macro_dist_bin_names(target),
         ["trust-analyzer-proc-macro-srv".to_string()]

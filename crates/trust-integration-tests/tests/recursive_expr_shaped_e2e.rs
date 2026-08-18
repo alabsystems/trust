@@ -238,6 +238,7 @@ fn erebuild_func(post: Formula) -> VerifiableFunction {
         ],
         arg_count: 1,
         return_ty: e_dt(),
+        datatype_defs: Default::default(),
     };
     VerifiableFunction {
         name: "erebuild".to_string(),

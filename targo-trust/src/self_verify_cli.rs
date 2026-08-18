@@ -1721,6 +1721,36 @@ fn live_stage2_trustd_protocol_smoke(
     // resolved through the same helper. A daemon that never becomes ready is
     // still rejected; only the patience is longer when built as a test harness.
     let ready_timeout = crate::bounded_process::resolve_probe_deadline(TRUSTD_READY_TIMEOUT);
+
+    // Trust (#35): refuse a KNOWN-IMPOSSIBLE wait instead of polling out the
+    // deadline. `daemon_budget_is_acceptable` (trust-router coordinator) requires
+    // `client_budget != 0` as a hard conjunct, so where this process observes no
+    // memory budget NO daemon can ever be accepted — the loop below is guaranteed
+    // to run its full `resolve_probe_deadline(TRUSTD_READY_TIMEOUT)`, which is
+    // fifteen minutes, and then report "did not become closed IDENTITY/STATUS
+    // ready", a message that names neither the blocker nor anything actionable.
+    //
+    // Measured on a bare-metal cgroup-v2 Linux host: the daemon completes 148
+    // well-formed IDENTITY+STATUS exchanges in five seconds and is rejected every
+    // time, purely on this conjunct. The budget is 0 there because the visible
+    // cgroup root has no `memory.max` and `linux_visible_cgroup_limit_with` fails
+    // closed — deliberately; see task #36 Part B, which is the open question about
+    // whether that rule should have an authenticated-namespace exemption.
+    //
+    // This changes NO admission decision. It reports the same refusal the loop
+    // would have reached, in milliseconds, naming the cause.
+    if trust_router::memory_jobserver::machine_budget_bytes() == 0 {
+        return Err(concat!(
+            "exact stage2 trustd cannot become ready: this process observes a machine ",
+            "memory budget of 0, and daemon admission requires a non-zero client budget, ",
+            "so no daemon would ever be accepted. On cgroup-v2 Linux this means the ",
+            "visible cgroup root has no `memory.max` and the budget derivation failed ",
+            "closed (see task #36). Refusing immediately rather than polling for the ",
+            "full readiness deadline.",
+        )
+        .to_string());
+    }
+
     let deadline = Instant::now()
         .checked_add(ready_timeout)
         .ok_or_else(|| "trustd live-smoke readiness deadline overflowed".to_string())?;
@@ -7467,6 +7497,35 @@ mod tests {
         assert!(error.contains("non-symlink directory"), "{error}");
     }
 
+
+    /// Daemon-backed stage2 validation needs a non-zero machine memory budget:
+    /// `daemon_budget_is_acceptable` carries `client_budget != 0` as a hard
+    /// conjunct, so where the visible cgroup root has no `memory.max` — every
+    /// bare-metal cgroup-v2 Linux box — NO daemon can be adopted and the
+    /// pre-loop guard refuses immediately, naming the cause (task #35).
+    ///
+    /// The tests below used to just FAIL on that whole class of machine,
+    /// forever, with no path to green, which trains readers to ignore red.
+    /// They now assert the contract in BOTH directions, which is strictly more
+    /// than before: with no budget the call MUST refuse AND MUST name the
+    /// budget as the reason (a refusal for some other reason now fails), and
+    /// with a budget the original assertions run unchanged.
+    fn host_can_admit_a_daemon() -> bool {
+        trust_router::memory_jobserver::machine_budget_bytes() != 0
+    }
+
+    /// The exact refusal a budget-less host must produce. Kept in one place so
+    /// a change to the guard's wording fails loudly here instead of quietly
+    /// turning these into vacuous passes.
+    fn assert_refused_for_zero_budget(error: &str) {
+        assert!(
+            error.contains("machine memory budget of 0")
+                && error.contains("daemon admission requires a non-zero client budget"),
+            "a budget-less host must refuse for the BUDGET reason, not some other \
+             failure: {error}"
+        );
+    }
+
     #[test]
     fn stage2_identity_binds_file_objects_lengths_hashes_and_version_labels() {
         let root = test_repo_root("targo-trust-self-verify-stage2-identity");
@@ -7487,6 +7546,13 @@ mod tests {
             &unit_compiler_version_script("trustdoc", label, "test-host", "1.99.0-test"),
         );
         let _trustd = FakeTrustd::install(&root, label, "1.99.0-test");
+        if !host_can_admit_a_daemon() {
+            assert_refused_for_zero_budget(
+                &validate_stage2_toolchain(&root)
+                    .expect_err("a budget-less host cannot validate a daemon-backed stage2"),
+            );
+            return;
+        }
         let identity = validate_stage2_toolchain(&root).expect("valid stage2 identity");
         assert_eq!(identity.targo_version.commit, label);
         assert_eq!(identity.trustc_version.commit, label);
@@ -7558,6 +7624,13 @@ mod tests {
         )
         .expect("evidence manifest");
 
+        if !host_can_admit_a_daemon() {
+            assert_refused_for_zero_budget(
+                &build_stage_plan(&full_verifier_options(&root))
+                    .expect_err("a budget-less host cannot build a daemon-backed stage plan"),
+            );
+            return;
+        }
         let plan = build_stage_plan(&full_verifier_options(&root))
             .expect("full verifier plan with runtime closure");
         let (variable, expected) = native_runtime_environment(

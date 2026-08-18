@@ -93,6 +93,13 @@ fn stmt_references_local(stmt: &Statement, local: usize) -> bool {
         Statement::Unsupported { operands, .. } => {
             operands.iter().any(|op| operand_references_local(op, local))
         }
+        // All three operands are real uses; answering `false` here would hide a
+        // local's use from the resilience analysis.
+        Statement::CopyNonOverlapping { src, dst, count, .. } => {
+            operand_references_local(src, local)
+                || operand_references_local(dst, local)
+                || operand_references_local(count, local)
+        }
         Statement::StorageLive(l) | Statement::StorageDead(l) => *l == local,
         Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => false,
     }

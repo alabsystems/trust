@@ -1667,6 +1667,7 @@ impl Default for Options {
             incremental: None,
             untracked_state_hash: Default::default(),
             trust_solver_content_fingerprint: String::new(),
+            trust_verify_explicit_off: false,
             unstable_opts,
             prints: Vec::new(),
             cg: Default::default(),
@@ -2592,6 +2593,10 @@ impl TrustFrontendAuthoritySnapshot {
         // decides" to anything that inspects the field later.
         opts.unstable_opts.trust_ir_lower = Some(TrustIrLower::Off);
         opts.trust_solver_content_fingerprint.clear();
+        // A deauthorized-by-design frontend never claims the explicit
+        // `-Ztrust-verify=off` spelling: it announces its policy once at this
+        // boundary, not once per crate through the loud-when-off note.
+        opts.trust_verify_explicit_off = false;
     }
 }
 
@@ -2868,11 +2873,48 @@ pub fn evidence_inert_target_llvm_args_error(
     target: &TargetTuple,
     has_llvm_args: bool,
 ) -> Option<String> {
-    let exact_builtin = target.json_contents().is_none()
-        && rustc_target::spec::TARGETS.iter().any(|builtin| *builtin == target.tuple());
-    (has_llvm_args && !exact_builtin).then(|| {
+    (has_llvm_args && !target_is_exact_builtin(target)).then(|| {
         format!(
             "NoTrustEvidence compiler frontend rejects LLVM arguments from custom target `{}`: backend plugin/loading controls must come only from the linked compiler's exact built-in target table",
+            target.tuple(),
+        )
+    })
+}
+
+/// Whether `target` names an exact entry of the linked compiler's built-in
+/// target table, with no custom JSON overriding it.
+///
+/// This is the predicate that separates *compiler-owned* target options from
+/// *user-supplied* ones. A built-in spec's `llvm_args` were fixed at the time
+/// this compiler was built and are covered by whatever evidence covers the
+/// compiler itself; a custom JSON target's `llvm_args` are an input the invoker
+/// controls, and are outside the proof TCB.
+///
+/// Shared by every check that draws that line, so the checks cannot disagree
+/// about what "custom target" means. They previously did: the authenticated
+/// session check rejected any non-empty `llvm_args` while its own diagnostic
+/// said "custom-target", which made `wasm32-unknown-unknown` — a built-in target
+/// whose compiler-owned spec sets `-wasm-use-legacy-eh=false` — unbuildable in
+/// the verified lane, failing before crate resolution on `core` itself.
+pub fn target_is_exact_builtin(target: &TargetTuple) -> bool {
+    target.json_contents().is_none()
+        && rustc_target::spec::TARGETS.iter().any(|builtin| *builtin == target.tuple())
+}
+
+/// Reject LLVM arguments that an authenticated Trust session did not vouch for.
+///
+/// Same line as [`evidence_inert_target_llvm_args_error`]: a custom target's
+/// `llvm_args` can smuggle LLVM plugin loading into a session that claims a
+/// proof, so they are refused. A built-in target's compiler-owned `llvm_args`
+/// are retained, because refusing them rejects the compiler's own target table
+/// rather than anything the invoker supplied.
+pub fn authenticated_target_llvm_args_error(
+    target: &TargetTuple,
+    has_llvm_args: bool,
+) -> Option<String> {
+    (has_llvm_args && !target_is_exact_builtin(target)).then(|| {
+        format!(
+            "authenticated Trust verification rejects non-empty custom-target `llvm-args` for `{}`: LLVM plugin loading is outside the proof TCB",
             target.tuple(),
         )
     })
@@ -3471,6 +3513,7 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         incremental,
         untracked_state_hash: Default::default(),
         trust_solver_content_fingerprint: String::new(),
+        trust_verify_explicit_off: false,
         unstable_opts,
         prints,
         cg,

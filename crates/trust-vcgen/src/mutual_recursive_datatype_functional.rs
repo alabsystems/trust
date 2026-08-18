@@ -225,7 +225,7 @@ fn ref_fn_target<'a>(func: &VerifiableFunction, post: &'a Formula) -> Option<&'a
 fn ref_pseudo_post(func: &VerifiableFunction) -> Option<Formula> {
     let fuel = param_var(func, FUEL_LOCAL)?;
     let e = param_var(func, PAYLOAD_LOCAL)?;
-    let ret_sort = crate::sort_for_ty(peel_indirection(&func.body.return_ty));
+    let ret_sort = crate::sort_for_ty_in(func, peel_indirection(&func.body.return_ty));
     Some(Formula::Eq(
         Box::new(Formula::FnApp {
             func: func.name.clone(),
@@ -488,7 +488,8 @@ fn emit_cluster(
         if let [direct] = mo.base_direct.as_slice() {
             // Direct base return: quantify the payload parameter itself.
             let e_name = crate::place_to_var_name(func, &Place::local(PAYLOAD_LOCAL));
-            let e_sort = crate::sort_for_ty(peel_indirection(local_ty(func, PAYLOAD_LOCAL)?));
+            let e_sort =
+                crate::sort_for_ty_in(func, peel_indirection(local_ty(func, PAYLOAD_LOCAL)?));
             let formula = Formula::forall(&[(e_name.as_str(), e_sort)], direct.clone());
             vcs.push(mk(format!("{MUTUAL_BASE_PROPERTY_PREFIX}{name}"), formula));
             n_bases += 1;
@@ -530,7 +531,8 @@ fn emit_cluster(
         };
         if let [direct] = mo.base_direct.as_slice() {
             let e_name = crate::place_to_var_name(func, &Place::local(PAYLOAD_LOCAL));
-            let e_sort = crate::sort_for_ty(peel_indirection(local_ty(func, PAYLOAD_LOCAL)?));
+            let e_sort =
+                crate::sort_for_ty_in(func, peel_indirection(local_ty(func, PAYLOAD_LOCAL)?));
             let formula = Formula::forall(&[(e_name.as_str(), e_sort)], direct.clone());
             vcs.push(mk(format!("{MUTUAL_REF_BASE_PROPERTY_PREFIX}{name}"), formula));
             n_refbases += 1;
@@ -565,7 +567,9 @@ fn emit_cluster(
             .map(|i| {
                 Some((
                     crate::place_to_var_name(func, &Place::local(i)),
-                    crate::sort_for_ty(peel_indirection(local_ty(func, i)?)),
+                    // R0: a parameter is a definitional position — widen so the binder's
+                    // sort carries the constructor list `declare-datatype` is built from.
+                    crate::sort_for_ty_in(func, peel_indirection(local_ty(func, i)?)),
                 ))
             })
             .collect::<Option<Vec<_>>>()?;
@@ -780,7 +784,11 @@ fn mwalk(
                     let Some(fuel_ty) = local_ty(func, FUEL_LOCAL) else {
                         return false;
                     };
-                    let dt = peel_indirection(fuel_ty).clone();
+                    // R0: the matched local's own datatype is an OUTERMOST position and is
+                    // spelled bare under markers-everywhere. Inline definition first, then
+                    // this body's explicit table; an undefined marker is untouched and the
+                    // structural gate below still declines exactly as before.
+                    let dt = crate::resolved_ty(func, peel_indirection(fuel_ty)).into_owned();
                     let Some(((z_tag, z_ctor), (s_tag, s_ctor))) = nat_shape(&dt) else {
                         return false;
                     };
@@ -850,7 +858,11 @@ fn mwalk(
                     let Some(matched_ty) = local_ty(func, PAYLOAD_LOCAL) else {
                         return false;
                     };
-                    let dt = peel_indirection(matched_ty).clone();
+                    // R0: the matched local's own datatype is an OUTERMOST position and is
+                    // spelled bare under markers-everywhere. Inline definition first, then
+                    // this body's explicit table; an undefined marker is untouched and the
+                    // structural gate below still declines exactly as before.
+                    let dt = crate::resolved_ty(func, peel_indirection(matched_ty)).into_owned();
                     let Ty::Datatype { variants, .. } = &dt else {
                         return false;
                     };
@@ -951,7 +963,8 @@ fn mwalk(
                     // call's output.
                     let ih_name = format!("__ih{ih_counter}");
                     *ih_counter += 1;
-                    let ret_sort = crate::sort_for_ty(peel_indirection(&callee_fn.body.return_ty));
+                    let ret_sort =
+                        crate::sort_for_ty_in(callee_fn, peel_indirection(&callee_fn.body.return_ty));
                     let ih_var = Formula::var_owned(ih_name.clone(), ret_sort.clone());
                     state.binders.push((ih_name, ret_sort));
                     state.store.insert(dest.local, ih_var.clone());
@@ -975,7 +988,8 @@ fn mwalk(
                 WalkKind::Reference => {
                     // Definitional mode: the call IS the callee's application
                     // at the smaller fuel — `FnApp(callee, [k, arg])`, inline.
-                    let ret_sort = crate::sort_for_ty(peel_indirection(&callee_fn.body.return_ty));
+                    let ret_sort =
+                        crate::sort_for_ty_in(callee_fn, peel_indirection(&callee_fn.body.return_ty));
                     state.store.insert(
                         dest.local,
                         Formula::FnApp {
@@ -1301,6 +1315,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: e_dt(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: name.to_string(),
@@ -1887,6 +1902,7 @@ mod literal_cluster_tests {
             ],
             arg_count: 2,
             return_ty: t_dt(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: name.to_string(),

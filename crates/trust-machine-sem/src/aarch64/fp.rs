@@ -558,7 +558,7 @@ impl Aarch64Semantics {
         let fn_val = read_fp_operand(state, insn, 1, width)?;
         let fm_val = read_fp_operand(state, insn, 2, width)?;
         let cond = extract_condition(insn, 3)?;
-        let cond_formula = condition_to_formula(state, cond);
+        let cond_formula = condition_to_formula(state, cond)?;
 
         let result = Formula::Ite(Box::new(cond_formula), Box::new(fn_val), Box::new(fm_val));
 

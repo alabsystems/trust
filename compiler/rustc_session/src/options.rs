@@ -345,6 +345,14 @@ top_level_options!(
         /// verdicts may enable certified-check elision and therefore change MIR.
         trust_solver_content_fingerprint: String [TRACKED],
 
+        /// Trust (loud-when-off): set when `-Ztrust-verify=off` arrived as the
+        /// caller's own argv spelling on the canonical frontend — never by
+        /// embedded/doctest frontend deauthorization or by the inherited
+        /// `TRUST_NO_VERIFY=1` nested-process transport. Drives only the
+        /// once-per-crate "compiled WITHOUT Trust verification" note, so it is
+        /// untracked.
+        trust_verify_explicit_off: bool [UNTRACKED],
+
         unstable_opts: UnstableOptions [SUBSTRUCT] { TARGET_MODIFIER: UnstableOptions(UnstableOptionsTargetModifiers) },
         prints: Vec<PrintRequest> [UNTRACKED],
         cg: CodegenOptions [SUBSTRUCT] { TARGET_MODIFIER: CodegenOptions(CodegenOptionsTargetModifiers) },
@@ -951,6 +959,9 @@ mod desc {
     pub(crate) const parse_frame_pointer: &str = "one of `true`/`yes`/`on`, `false`/`no`/`off`, or (with -Zunstable-options) `non-leaf` or `always`";
     pub(crate) const parse_threads: &str = "a number or `sync`";
     pub(crate) const parse_time_passes_format: &str = "`text` (default) or `json`";
+    // Trust (F1): which producer supplies the trust-cg backend's per-function
+    // input. `mir` is the shipped path; `trust-ir` is the source-first one.
+    pub(crate) const parse_trust_cg_frontend: &str = "one of `mir` or `trust-ir`";
     // Trust: keep the compiler transport's finite verifier domains honest at
     // option-parsing time instead of silently coercing typos later in MIR.
     pub(crate) const parse_trust_cg_output_gate: &str =
@@ -1630,6 +1641,20 @@ pub mod parse {
     pub(crate) fn parse_trust_cg_output_gate(slot: &mut String, v: Option<&str>) -> bool {
         match v {
             Some(value @ ("allow-unknown" | "strict" | "off")) => {
+                *slot = value.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // Trust (F1): the trust-cg backend's per-function INPUT PRODUCER. A typo
+    // must fail here rather than silently leave the shipped MIR path selected,
+    // because the whole point of the option is to say which producer the
+    // emitted object came from.
+    pub(crate) fn parse_trust_cg_frontend(slot: &mut String, v: Option<&str>) -> bool {
+        match v {
+            Some(value @ ("mir" | "trust-ir")) => {
                 *slot = value.to_string();
                 true
             }
@@ -3237,6 +3262,33 @@ written to standard error output)"),
     // frontend-authority inventory is built from, so it lives at the
     // declaration and not in a second list somewhere else: a `-Ztrust-*` option
     // without one fails to compile (`trust_authority_classification`).
+    // Trust (F1): WHICH PRODUCER supplies the trust-cg backend's per-function
+    // input. This is a `-Z` option and not a cargo feature (the two earlier
+    // trust-ir probes were cargo features) for three reasons that all matter to
+    // the evidence:
+    //   * it is per-INVOCATION, so ONE compiler binary emits both paths and
+    //     "the default path is byte-identical" becomes a diff of two objects
+    //     from the same trustc rather than a claim about a differently-built
+    //     dylib;
+    //   * it is [TRACKED], so the choice enters the crate hash — an option that
+    //     changes which machine code is emitted must, or artifacts produced by
+    //     the two producers could be confused for each other on a warm cache;
+    //   * it lands in the TRUST_AUTHORITY inventory, the existing boundary for
+    //     "a caller changed which evidence this compilation produces".
+    // `trust-ir` is FAIL-CLOSED end to end: a mono-item the `trust_ir_of` query
+    // declines, or a Module the converter refuses, is a compile ERROR. It never
+    // falls back to the MIR path, because a silent fallback would make the flag
+    // worthless as evidence.
+    trust_cg_frontend: String = ("mir".to_string(), parse_trust_cg_frontend, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "which producer supplies the trust-cg backend's per-function input: `mir` (the default \
+         and the shipped path — rustc MIR -> VerifiableFunction -> LIR) or `trust-ir` (the \
+         source-first F1 path — THIR -> `trust_ir_of` -> trust_ir::Module -> LIR). `trust-ir` \
+         requires -Ztrust-ir-lower and fails the build on any item the producer or the converter \
+         declines -- it never falls back to the MIR path, so one unsupported item refuses the \
+         whole crate. It IS verified by the proven-output gate (the spec is derived from the \
+         trust-ir module rather than from MIR) and needs no gate relaxation: it emits under the \
+         default `strict`"),
     trust_cg_output_gate: String = ("strict".to_string(), parse_trust_cg_output_gate, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "set the trust-cg output-preservation gate: `strict` (the default) rejects an unknown \
@@ -3270,7 +3322,7 @@ written to standard error output)"),
     // driver option-domain validation).
     trust_sat_perturb: Option<String> = (None, parse_opt_string, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
-        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
+        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|payload-tramp) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
     // Trust: tri-state because no single static default is true of this option.
     // The direct frontend is not optional under verification, so an unset
     // request follows verification; only the explicit `-Ztrust-verify=off`

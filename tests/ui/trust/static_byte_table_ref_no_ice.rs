@@ -1,4 +1,9 @@
+//@ needs-trust-verify
+//@ compile-flags: -Ztrust-verify=on
+//@ compile-flags: -Ztrust-policy=advisory
 //@ dont-check-compiler-stderr
+//@ dont-require-annotations: NOTE
+//@ dont-require-annotations: WARN
 //@ check-pass
 //! Regression for the trust-mir-extract ICE "expected memory, got Static(..)"
 //! (`convert.rs` `array_ref_u8_const_bytes`): a `&[u8; N]` MIR constant may
@@ -10,8 +15,16 @@
 //! (`GlobalAlloc::Memory` let-else → `None`) instead of ICEing.
 //!
 //! Salvaged from the 2026-07-15 audit-agent patch, landed with this test.
-//! The guarded indexing keeps every Level-0 obligation provable, so the
-//! compile must simply pass — before the fix it ICE'd.
+//! VACUOUS until 2026-08: it shipped with no verify directives, and
+//! compiletest injects `-Ztrust-verify=off` into every managed compile
+//! (`TRUST_VANILLA_RUSTC_FLAG`), so the extractor never ran and the test
+//! stayed green against a compiler that still had the ICE. Verification must
+//! be ON for this pin to bite; `needs-trust-verify` makes the mode explicit.
+//!
+//! Advisory policy, not strict: `pair` computes `i + 1`, whose add-overflow
+//! obligation is genuinely refutable (`i == usize::MAX`), so strict Level-0
+//! verification rejects this crate even with the ICE fixed. The pin is that
+//! verification RUNS and the compile survives — before the fix it ICE'd.
 static DIGIT_TABLE: [u8; 8] = [48, 49, 50, 51, 52, 53, 54, 55];
 
 pub fn digit(i: usize) -> u8 {

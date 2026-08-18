@@ -4953,13 +4953,28 @@ pub enum ItemKind<'hir> {
         /// typeck results.
         fake_body: BodyId,
     },
-    /// Trust: a `clean { … }` PARSER ISLAND (two-language design E10). The
-    /// island body is Clean (Lean) source, carried as its SPAN only — no body
-    /// owner, nothing to resolve, typecheck, or codegen. The verify pass
-    /// recovers the text through the source map, parses it with the real
-    /// Clean parser, registers the declarations, and kernel-checks them;
-    /// a rejected island fails the build with a source-spanned diagnostic.
-    CleanIsland { content_span: Span },
+    /// Trust: a `clean { … }` PARSER ISLAND (two-language design E10, ruling
+    /// v7/D1). The island body is Clean (Lean) source — no body owner, nothing
+    /// for rustc to resolve, typecheck, or codegen. It was REALLY PARSED, by
+    /// the real Clean parser, during rustc's parse; a Clean syntax error was
+    /// already reported there.
+    ///
+    /// **The payload is syntax, never authority.** `decls` records what
+    /// `clean_parser` recognised, nothing more. The verify pass still
+    /// elaborates the island from `text`, registers the declarations in
+    /// authored order, and kernel-checks them; a rejected island fails the
+    /// build with a source-spanned diagnostic.
+    CleanIsland {
+        /// Span of the island body — the anchor Clean's island-relative
+        /// diagnostic offsets are remapped onto.
+        content_span: Span,
+        /// The island body text exactly as authored, captured at parse time
+        /// so the elaborator does not have to re-read the source map.
+        text: Symbol,
+        /// Top-level declarations recognised by the Clean parser, in source
+        /// order, with spans already in rustc coordinates.
+        decls: &'hir [ast::CleanIslandDecl],
+    },
     /// A type alias, e.g., `type Foo = Bar<u8>`.
     TyAlias(Ident, &'hir Generics<'hir>, &'hir Ty<'hir>),
     /// An enum definition, e.g., `enum Foo<A, B> { C<A>, D<B> }`.

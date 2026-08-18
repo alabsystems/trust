@@ -266,7 +266,7 @@ fn return_place_derived_leaf(name: &str) -> bool {
     if let Some((base, _)) = name.split_once('.') {
         return return_place_derived_leaf(base);
     }
-    ["_len", "_discr", "_value", "_sign"]
+    ["__len", "__discr", "__value", "__sign"]
         .into_iter()
         .any(|suffix| name.strip_suffix(suffix).is_some_and(return_place_derived_leaf))
 }
@@ -287,7 +287,7 @@ fn parameter_derived_leaf(
     if let Some((base, _)) = name.split_once('.') {
         return parameter_derived_leaf(base, parameters);
     }
-    ["_len", "_discr", "_value", "_sign"]
+    ["__len", "__discr", "__value", "__sign"]
         .into_iter()
         .any(|suffix| name.strip_suffix(suffix).is_some_and(|base| {
             parameter_derived_leaf(base, parameters)

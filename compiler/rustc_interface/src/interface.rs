@@ -715,12 +715,13 @@ fn run_compiler_after_backend_route_transition<R: Send>(
     // the exact in-memory TargetTuple bytes it parsed. Recheck the resulting
     // semantic target inside the authenticated session so an A -> B -> A file
     // mutation cannot smuggle LLVM plugin arguments between Cargo's reads.
-    if config.opts.unstable_opts.trust_verify_session.is_some()
-        && !target.options.llvm_args.is_empty()
-    {
-        early_dcx.early_fatal(
-            "authenticated Trust verification rejects non-empty custom-target `llvm-args`: LLVM plugin loading is outside the proof TCB",
-        );
+    if config.opts.unstable_opts.trust_verify_session.is_some() {
+        if let Some(error) = config::authenticated_target_llvm_args_error(
+            &config.opts.target_triple,
+            !target.options.llvm_args.is_empty(),
+        ) {
+            early_dcx.early_fatal(error);
+        }
     }
     let file_loader = config.file_loader.unwrap_or_else(|| Box::new(RealFileLoader));
     let path_mapping = config.opts.file_path_mapping();

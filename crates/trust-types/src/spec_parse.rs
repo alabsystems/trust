@@ -1093,8 +1093,8 @@ pub(crate) fn typed_quantifier_domain(
 /// Map a method call on a formula to the appropriate representation.
 ///
 /// Known methods:
-/// - `.len()` => `Var("<base>_len", Int)` (models collection length)
-/// - `.is_empty()` => `Eq(<base>_len, 0)` (models emptiness check)
+/// - `.len()` => `Var("<base>__len", Int)` (models collection length)
+/// - `.is_empty()` => `Eq(<base>__len, 0)` (models emptiness check)
 pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, SpecParseError> {
     let base_name = match &base {
         Formula::Var(name, _) => name.clone(),
@@ -1102,9 +1102,9 @@ pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, Sp
     };
 
     match method {
-        "len" => Ok(int_var(format!("{base_name}_len"))),
+        "len" => Ok(int_var(format!("{base_name}__len"))),
         "is_empty" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}_len"))),
+            Box::new(int_var(format!("{base_name}__len"))),
             Box::new(Formula::Int(0)),
         )),
         // Trust SAFE_API §3.4: the fixed capability accessor set. `.fd()` /
@@ -1115,7 +1115,7 @@ pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, Sp
         "fd" | "components" => Ok(int_var(base_name)),
         // Option-result reasoning for postconditions of `Option<T>`-returning
         // functions, e.g. `result.is_none() || result.unwrap() < n`. The
-        // discriminant `{base}_discr` (0 = None) and payload `{base}_value`
+        // discriminant `{base}__discr` (0 = None) and payload `{base}__value`
         // model the wrapper. The VC layer is responsible for linking these to the
         // actual return: until it does they are free variables, so such a
         // postcondition can only FAIL to prove, never vacuously prove
@@ -1124,67 +1124,67 @@ pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, Sp
         // SILENTLY DROPPING the entire contract (no VC emitted) — a
         // false-success hazard that this closes.
         "is_none" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}_discr"))),
+            Box::new(int_var(format!("{base_name}__discr"))),
             Box::new(Formula::Int(0)),
         )),
         "is_some" => Ok(Formula::Not(Box::new(Formula::Eq(
-            Box::new(int_var(format!("{base_name}_discr"))),
+            Box::new(int_var(format!("{base_name}__discr"))),
             Box::new(Formula::Int(0)),
         )))),
-        "unwrap" => Ok(int_var(format!("{base_name}_value"))),
+        "unwrap" => Ok(int_var(format!("{base_name}__value"))),
         // Result reasoning, mirroring the Option discriminant/value model above.
-        // We adopt the SAME convention as Option (`_discr == 0` = the "empty"
-        // variant): for a Result, `_discr == 0` models the `Err` variant and a
+        // We adopt the SAME convention as Option (`__discr == 0` = the "empty"
+        // variant): for a Result, `__discr == 0` models the `Err` variant and a
         // nonzero discriminant models `Ok`. This keeps `is_ok`/`is_err` the exact
-        // boolean duals of `is_some`/`is_none`, and reuses `{base}_value` (already
+        // boolean duals of `is_some`/`is_none`, and reuses `{base}__value` (already
         // the `unwrap` payload term) as the Ok payload — so `result.is_ok()` and
-        // `result.unwrap()` ground to the same `{base}_discr`/`{base}_value` pair.
+        // `result.unwrap()` ground to the same `{base}__discr`/`{base}__value` pair.
         //
         // SEMANTICS:
-        //   is_ok  => `{base}_discr != 0`   (the Result is the Ok variant)
-        //   is_err => `{base}_discr == 0`   (the Result is the Err variant)
+        //   is_ok  => `{base}__discr != 0`   (the Result is the Ok variant)
+        //   is_err => `{base}__discr == 0`   (the Result is the Err variant)
         // As with Option, the VC layer is responsible for linking these synthetic
         // terms to the actual return value; until it does they are free variables,
         // so such a postcondition can only FAIL to prove, never vacuously prove
         // (fail-closed). Previously these returned UnsupportedMethod, which
         // `parse_spec_expr` swallows to None — silently dropping the whole contract.
         "is_ok" => Ok(Formula::Not(Box::new(Formula::Eq(
-            Box::new(int_var(format!("{base_name}_discr"))),
+            Box::new(int_var(format!("{base_name}__discr"))),
             Box::new(Formula::Int(0)),
         )))),
         "is_err" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}_discr"))),
+            Box::new(int_var(format!("{base_name}__discr"))),
             Box::new(Formula::Int(0)),
         )),
         // Sign predicates on an integer/rational base (e.g. `c.is_positive()` for
         // the rational `c` extracted from an Ok payload). We model the trichotomy
-        // with ONE synthetic Int var `{base}_sign` that stands for the sign of the
+        // with ONE synthetic Int var `{base}__sign` that stands for the sign of the
         // base value (negative / zero / positive ↦ a value < 0 / == 0 / > 0).
         //
         // SEMANTICS:
-        //   is_negative => `{base}_sign < 0`
-        //   is_zero     => `{base}_sign == 0`
-        //   is_positive => `{base}_sign > 0`
-        // Because all three predicates refer to the SAME `{base}_sign` term, LIA
+        //   is_negative => `{base}__sign < 0`
+        //   is_zero     => `{base}__sign == 0`
+        //   is_positive => `{base}__sign > 0`
+        // Because all three predicates refer to the SAME `{base}__sign` term, LIA
         // automatically gives the trichotomy and the mutual exclusion: e.g.
-        // `!(c.is_positive())` (the negation of `{base}_sign > 0`, i.e.
-        // `{base}_sign <= 0`) is exactly "c is negative or zero". This is the EXACT
+        // `!(c.is_positive())` (the negation of `{base}__sign > 0`, i.e.
+        // `{base}__sign <= 0`) is exactly "c is negative or zero". This is the EXACT
         // boolean dual structure of the source `is_positive`/`is_negative`/`is_zero`
         // (each tests a distinct, mutually-exclusive, exhaustive branch of the sign).
-        // The `{base}_sign` term is a free variable until the VC layer links it to
+        // The `{base}__sign` term is a free variable until the VC layer links it to
         // the base's concrete value, so a sign postcondition can only FAIL to prove,
         // never vacuously prove (fail-closed). Previously these returned
         // UnsupportedMethod, silently dropping the contract.
         "is_negative" => Ok(Formula::Lt(
-            Box::new(int_var(format!("{base_name}_sign"))),
+            Box::new(int_var(format!("{base_name}__sign"))),
             Box::new(Formula::Int(0)),
         )),
         "is_zero" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}_sign"))),
+            Box::new(int_var(format!("{base_name}__sign"))),
             Box::new(Formula::Int(0)),
         )),
         "is_positive" => Ok(Formula::Gt(
-            Box::new(int_var(format!("{base_name}_sign"))),
+            Box::new(int_var(format!("{base_name}__sign"))),
             Box::new(Formula::Int(0)),
         )),
         _ => Err(SpecParseError::UnsupportedMethod { method: method.into() }),
@@ -1315,13 +1315,13 @@ fn resort_pred_arg(arg: Formula, sort: Sort) -> Formula {
 /// collide after contract lowering.
 ///
 /// Contract formulas currently use a compact compatibility encoding:
-/// `result` becomes `_0`, `old(x)` becomes `old_x`, modeled accessors mint
-/// leaves ending in `_len`, `_discr`, `_value`, or `_sign`, and MIR/VC lowering
-/// reserves double-underscore spellings for generated metadata (for example
-/// `s__slice_len` and `__trust_constparam_0_N`).  Those spellings are legal
-/// Rust identifiers, so admitting the same spelling as an ordinary binding
-/// would make the lowering non-injective and could collapse a false relation
-/// into reflexivity.  Keep this classification shared by every
+/// `result` becomes `_0`, `old(x)` becomes `old_x`, and modeled accessors and
+/// MIR/VC lowering mint their leaves inside the reserved double-underscore
+/// metadata family (`xs.len()` becomes `xs__len`; generated names such as
+/// `s__slice_len` and `__trust_constparam_0_N` live there too).  The remaining
+/// reserved spellings are legal Rust identifiers, so admitting one as an
+/// ordinary binding would make the lowering non-injective and could collapse a
+/// false relation into reflexivity.  Keep this classification shared by every
 /// source/query/extraction boundary until the formula vocabulary carries
 /// tagged provenance directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1330,8 +1330,6 @@ pub enum SourceContractSyntheticNameCollision {
     ReturnPlace,
     /// The compatibility pre-state spelling `old(<binding>)`.
     OldValue,
-    /// A modeled accessor/projection leaf.
-    Projection,
     /// A positional MIR local fallback such as `_1` or `_2`.
     PositionalPlace,
     /// A closed-vocabulary uninterpreted predicate symbol.
@@ -1362,10 +1360,11 @@ pub(crate) fn is_plain_source_binding_name(name: &str) -> bool {
 /// namespace.
 ///
 /// Trailing `*` is ignored because exact source environments spell a scalar
-/// reference binding `x` as `x*`.  Projection suffixes are deliberately
-/// rejected independent of a currently visible base: quantifier binders can
-/// introduce that base inside a clause, and chained accessors still end in one
-/// of the same four suffixes.
+/// reference binding `x` as `x*`.  Modeled accessor/projection leaves need no
+/// per-suffix reservation here: `map_method_call` mints them inside the `__`
+/// family (`xs__len`, `x__discr`, `x__value`, `x__sign`), which the
+/// `GeneratedMetadata` arm below reserves wholesale, so an ordinary binding
+/// such as `max_len` can never alias a minted projection.
 pub fn source_contract_synthetic_name_collision(
     name: &str,
 ) -> Option<SourceContractSyntheticNameCollision> {
@@ -1394,9 +1393,6 @@ pub fn source_contract_synthetic_name_collision(
     }
     if name.starts_with("old_") {
         return Some(SourceContractSyntheticNameCollision::OldValue);
-    }
-    if ["_len", "_discr", "_value", "_sign"].into_iter().any(|suffix| name.ends_with(suffix)) {
-        return Some(SourceContractSyntheticNameCollision::Projection);
     }
     None
 }
@@ -1607,33 +1603,33 @@ mod tests {
         // Regression: `is_none`/`unwrap` used to return UnsupportedMethod, which
         // `parse_spec_expr` swallowed to None — SILENTLY DROPPING the contract of
         // every Option-returning fn (no VC). They must now parse: discriminant
-        // `_0_discr` (0 = None) and payload `_0_value`.
+        // `_0__discr` (0 = None) and payload `_0__value`.
         let parsed = parse_spec_expr("result.is_none() || result.unwrap() < n")
             .expect("Option-result postcondition must parse (not silently drop)");
         let expected = Formula::Or(vec![
-            Formula::Eq(Box::new(var("_0_discr")), Box::new(int(0))),
-            Formula::Lt(Box::new(var("_0_value")), Box::new(var("n"))),
+            Formula::Eq(Box::new(var("_0__discr")), Box::new(int(0))),
+            Formula::Lt(Box::new(var("_0__value")), Box::new(var("n"))),
         ]);
         assert_eq!(parsed, expected);
         // is_some is the negation of the discriminant-is-zero test.
         assert_eq!(
             parse_spec_expr("result.is_some()"),
-            Some(Formula::Not(Box::new(Formula::Eq(Box::new(var("_0_discr")), Box::new(int(0))))))
+            Some(Formula::Not(Box::new(Formula::Eq(Box::new(var("_0__discr")), Box::new(int(0))))))
         );
     }
 
     #[test]
     fn parses_result_ok_err_postcondition() {
-        // Result reasoning mirrors Option: `_discr == 0` = Err, nonzero = Ok, with
-        // `{base}_value` as the Ok payload. These must parse (not silently drop the
+        // Result reasoning mirrors Option: `__discr == 0` = Err, nonzero = Ok, with
+        // `{base}__value` as the Ok payload. These must parse (not silently drop the
         // contract of a Result-returning fn). `result` maps to `_0`.
         assert_eq!(
             parse_spec_expr("result.is_ok()"),
-            Some(Formula::Not(Box::new(Formula::Eq(Box::new(var("_0_discr")), Box::new(int(0))))))
+            Some(Formula::Not(Box::new(Formula::Eq(Box::new(var("_0__discr")), Box::new(int(0))))))
         );
         assert_eq!(
             parse_spec_expr("result.is_err()"),
-            Some(Formula::Eq(Box::new(var("_0_discr")), Box::new(int(0))))
+            Some(Formula::Eq(Box::new(var("_0__discr")), Box::new(int(0))))
         );
         // `is_ok` is exactly the boolean dual of `is_err`.
         assert_eq!(parse_spec_expr("result.is_ok()"), parse_spec_expr("!(result.is_err())"));
@@ -1642,37 +1638,37 @@ mod tests {
     #[test]
     fn parses_sign_predicates() {
         // `is_positive`/`is_negative`/`is_zero` model ONE synthetic sign var
-        // `{base}_sign`; the trichotomy is then automatic LIA.
+        // `{base}__sign`; the trichotomy is then automatic LIA.
         assert_eq!(
             parse_spec_expr("c.is_positive()"),
-            Some(Formula::Gt(Box::new(var("c_sign")), Box::new(int(0))))
+            Some(Formula::Gt(Box::new(var("c__sign")), Box::new(int(0))))
         );
         assert_eq!(
             parse_spec_expr("c.is_negative()"),
-            Some(Formula::Lt(Box::new(var("c_sign")), Box::new(int(0))))
+            Some(Formula::Lt(Box::new(var("c__sign")), Box::new(int(0))))
         );
         assert_eq!(
             parse_spec_expr("c.is_zero()"),
-            Some(Formula::Eq(Box::new(var("c_sign")), Box::new(int(0))))
+            Some(Formula::Eq(Box::new(var("c__sign")), Box::new(int(0))))
         );
     }
 
     #[test]
     fn parses_chained_result_unwrap_sign() {
         // The exact checker idiom after lowering: the Ok payload extracted via
-        // `unwrap` (→ `{base}_value`) then sign-tested. `result.unwrap()` →
-        // `_0_value`, `.is_positive()` → `_0_value_sign > 0`. This is what
+        // `unwrap` (→ `{base}__value`) then sign-tested. `result.unwrap()` →
+        // `_0__value`, `.is_positive()` → `_0__value__sign > 0`. This is what
         // `!matches!(r, Ok(c) if c.is_positive())` lowers into (under the outer Not):
         // `!((result.is_ok()) && (result.unwrap().is_positive()))`.
         assert_eq!(
             parse_spec_expr("result.unwrap().is_positive()"),
-            Some(Formula::Gt(Box::new(var("_0_value_sign")), Box::new(int(0))))
+            Some(Formula::Gt(Box::new(var("_0__value__sign")), Box::new(int(0))))
         );
         let parsed = parse_spec_expr("!((result.is_ok()) && (result.unwrap().is_positive()))")
             .expect("the lowered check_farkas postcondition must parse");
         let expected = Formula::Not(Box::new(Formula::And(vec![
-            Formula::Not(Box::new(Formula::Eq(Box::new(var("_0_discr")), Box::new(int(0))))),
-            Formula::Gt(Box::new(var("_0_value_sign")), Box::new(int(0))),
+            Formula::Not(Box::new(Formula::Eq(Box::new(var("_0__discr")), Box::new(int(0))))),
+            Formula::Gt(Box::new(var("_0__value__sign")), Box::new(int(0))),
         ])));
         assert_eq!(parsed, expected);
     }
@@ -1689,10 +1685,10 @@ mod tests {
         )
         .expect("the lowered check_entailment postcondition must parse");
         let expected = Formula::Not(Box::new(Formula::And(vec![
-            Formula::Not(Box::new(Formula::Eq(Box::new(var("_0_discr")), Box::new(int(0))))),
+            Formula::Not(Box::new(Formula::Eq(Box::new(var("_0__discr")), Box::new(int(0))))),
             Formula::Gt(
-                Box::new(var("_0_value.__trust_ok_0")),
-                Box::new(var("_0_value.__trust_ok_1")),
+                Box::new(var("_0__value.__trust_ok_0")),
+                Box::new(var("_0__value.__trust_ok_1")),
             ),
         ])));
         assert_eq!(parsed, expected);
@@ -1751,23 +1747,28 @@ mod tests {
             source_contract_synthetic_name_collision("value__future_metadata"),
             Some(Collision::GeneratedMetadata)
         );
-        assert_eq!(source_contract_synthetic_name_collision("xs_len"), Some(Collision::Projection));
+        // Minted projection leaves live in the `__` family and stay reserved…
         assert_eq!(
-            source_contract_synthetic_name_collision("x_discr"),
-            Some(Collision::Projection)
+            source_contract_synthetic_name_collision("xs__len"),
+            Some(Collision::GeneratedMetadata)
         );
         assert_eq!(
-            source_contract_synthetic_name_collision("x_value"),
-            Some(Collision::Projection)
+            source_contract_synthetic_name_collision("x__discr"),
+            Some(Collision::GeneratedMetadata)
         );
         assert_eq!(
-            source_contract_synthetic_name_collision("x_value_sign"),
-            Some(Collision::Projection)
+            source_contract_synthetic_name_collision("x__value__sign"),
+            Some(Collision::GeneratedMetadata)
         );
-        assert_eq!(
-            source_contract_synthetic_name_collision("x_sign*"),
-            Some(Collision::Projection)
-        );
+        // …while the single-underscore spellings are ORDINARY user bindings:
+        // `xs.len()` mints `xs__len`, so a parameter `xs_len` (or `max_len`)
+        // cannot alias a projection and must not be rejected.
+        assert_eq!(source_contract_synthetic_name_collision("xs_len"), None);
+        assert_eq!(source_contract_synthetic_name_collision("max_len"), None);
+        assert_eq!(source_contract_synthetic_name_collision("x_discr"), None);
+        assert_eq!(source_contract_synthetic_name_collision("x_value"), None);
+        assert_eq!(source_contract_synthetic_name_collision("x_value_sign"), None);
+        assert_eq!(source_contract_synthetic_name_collision("x_sign*"), None);
         assert_eq!(source_contract_synthetic_name_collision("payload_length"), None);
         assert_eq!(source_contract_synthetic_name_collision("older_x"), None);
     }
@@ -1780,13 +1781,9 @@ mod tests {
             "_2",
             "priv_dropped",
             "s__slice_len",
+            "xs__len",
             "__trust_constparam_0_N",
             "old_x",
-            "xs_len",
-            "x_discr",
-            "x_value",
-            "x_sign",
-            "x_value_sign",
         ] {
             let native = parse_spec_expr_result(&format!("forall {name}: u64, true"));
             assert!(
@@ -1798,6 +1795,12 @@ mod tests {
                 matches!(compat, Err(SpecParseError::InvalidQuantifier { .. })),
                 "compat binder `{name}` must fail closed, got {compat:?}",
             );
+        }
+        // Projection-suffixed spellings are plain bindings now that minted
+        // leaves are namespaced (`xs.len()` -> `xs__len`); binders may use them.
+        for name in ["xs_len", "x_discr", "x_value", "x_sign", "x_value_sign", "max_len"] {
+            let native = parse_spec_expr_result(&format!("forall {name}: u64, true"));
+            assert!(native.is_ok(), "plain binder `{name}` must be admitted, got {native:?}");
         }
     }
 
@@ -2037,7 +2040,7 @@ mod tests {
         let formula = parse_spec_expr_result("arr.len() > 0").expect("should parse");
         match formula {
             Formula::Gt(lhs, rhs) => {
-                assert_eq!(*lhs, var("arr_len"));
+                assert_eq!(*lhs, var("arr__len"));
                 assert_eq!(*rhs, int(0));
             }
             other => panic!("expected Gt, got {other:?}"),
@@ -2049,7 +2052,7 @@ mod tests {
         let formula = parse_spec_expr_result("s.is_empty()").expect("should parse");
         match formula {
             Formula::Eq(lhs, rhs) => {
-                assert_eq!(*lhs, var("s_len"));
+                assert_eq!(*lhs, var("s__len"));
                 assert_eq!(*rhs, int(0));
             }
             other => panic!("expected Eq, got {other:?}"),

@@ -172,10 +172,14 @@ class BootstrapBuildLaunchTests(unittest.TestCase):
         }
         with patch.dict(os.environ, hostile, clear=True), patch.object(
             recreate_bootstrap, "add_homebrew_library_path"
+        ), patch.object(
+            recreate_bootstrap,
+            "seed_verification_off_switch",
+            return_value="flag",
         ), patch.object(recreate_bootstrap.subprocess, "run", side_effect=run):
             self.assertEqual(
                 recreate_bootstrap.run_xpy_build(
-                    Path("/checkout"), 2, None, [], seed_mode=seed_mode
+                    Path("/checkout"), "test-host", 2, None, [], seed_mode=seed_mode
                 ),
                 0,
             )

@@ -36,7 +36,17 @@ COMPILE_FLAGS = [
     "-Z", "trust-ir-lower", "-Z", "trust-verify=off",
     "--edition", "2021", "--crate-type", "lib",
     "-C", "link-dead-code=yes", "-C", "codegen-units=1",
-    "-C", "opt-level=0", "-C", "debuginfo=0",
+    # `-C debug-assertions=off` is NOT redundant with `-C opt-level=0`; it is
+    # the correction for it. rustc INFERS debug-assertions from the opt level
+    # when the flag is absent -- ON at 0, OFF above (re-measured 2026-08-13,
+    # rustc 1.97.1: `rustc -Copt-level=0` on a `#[cfg(debug_assertions)]
+    # compile_error!` crate errors; `-Copt-level=3` compiles). Without this
+    # flag the frontier is tallied over debug_assertions-ON bodies, which carry
+    # extra overflow/precondition assert arms and are therefore NOT the shapes
+    # the deployed, release-profile subject presents to the gate.
+    # SUSPECT BASELINE: any frontier histogram recorded before 2026-08-13 was
+    # produced without this flag.
+    "-C", "opt-level=0", "-C", "debug-assertions=off", "-C", "debuginfo=0",
     "--cap-lints", "allow", "--emit=obj",
 ]
 

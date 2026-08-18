@@ -664,6 +664,19 @@ fn validate_statement_references(
             }
             Ok(())
         }
+        // The modeled `copy_nonoverlapping` STATEMENT (rustc's `LowerIntrinsics`
+        // spelling) is a KNOWN carrier, not a malformed variant: admit it so the
+        // body reaches the VC lane, where `SepEngine::interpret_statement`
+        // (pattern 5) mints its bounds/overlap obligations. Rejecting it here
+        // collapses the whole body to an indistinguishable `MalformedTrustIr`
+        // BEFORE those obligations exist — the exact misread the 810baa6c4c
+        // revert records ("1 obligation NOT PROVED" that was a marker, not a
+        // memory-safety row). Same admission rationale as `Rvalue::PtrOffset`.
+        Statement::CopyNonOverlapping { src, dst, count, .. } => {
+            validate_operand_references(func, src)?;
+            validate_operand_references(func, dst)?;
+            validate_operand_references(func, count)
+        }
         Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => Ok(()),
         _ => Err(VcgenError::MalformedMir {
             function: func.name.clone(),
@@ -1178,9 +1191,12 @@ pub use generate::generate_full_assert_refutation_vcs;
 /// Prospective measurement-only raw-VC rehydration; this is not a compiler
 /// verdict/cache-hit authority path and must not replace fresh VC generation.
 pub use generate::discharge_captured_raw_body_with_context;
+// Bounded-model-checking refutation of a statically-sized array reduction whose
+// accumulator genuinely overflows (refutation-only; see `bmc_reduction`).
+pub use generate::generate_bounded_reduction_bmc_refutation_candidates;
 pub use generate::{
-    derive_float_result_range, generate_callsite_precondition_vcs,
-    generate_callsite_precondition_vcs_attributed,
+    derive_float_result_range, generate_callsite_l0_replay_candidates,
+    generate_callsite_precondition_vcs, generate_callsite_precondition_vcs_attributed,
     generate_full_assert_refutation_vcs_with_context, generate_vcs,
     generate_vcs_capturing_raw_body_with_context, generate_vcs_with_context,
     generate_vcs_with_discharge, generate_vcs_with_discharge_and_summaries,
@@ -2108,6 +2124,35 @@ pub(crate) fn sort_for_ty(ty: &Ty) -> Sort {
     }
 }
 
+/// R0: `ty` itself, unless it is a bare `Ty::Datatype { variants: [] }` marker
+/// that THIS function body's explicit out-of-band table defines.
+///
+/// The inline definition always wins; the table is consulted only for a marker
+/// that carries no structure at all, and only under that marker's own name.
+/// A marker the table does not define comes back untouched, so the caller
+/// declines exactly as it did before the table existed. Never a body-wide search
+/// for a same-name definitional occurrence — that design is fail-open and was
+/// withdrawn (see `trust_types::resolve_datatype_marker`).
+pub(crate) fn resolved_ty<'a>(
+    func: &'a VerifiableFunction,
+    ty: &'a Ty,
+) -> std::borrow::Cow<'a, Ty> {
+    trust_types::resolved_datatype(&func.body.datatype_defs, ty)
+}
+
+/// [`sort_for_ty`] at a DEFINITIONAL position — a local's, parameter's or return
+/// slot's own declared type, i.e. the places whose sort a `declare-datatype` is
+/// built from.
+///
+/// Only the OUTERMOST marker is widened. Datatype-typed FIELDS keep the by-name
+/// `Sort::Datatype { constructors: [] }` spelling that `datatype_sort_from_ty`
+/// deliberately cuts recursion with — that is the standard natively-recursive
+/// SMT-LIB encoding, and inlining there would both diverge from
+/// `collect_datatype_decls` and fail to terminate on a self-recursive type.
+pub(crate) fn sort_for_ty_in(func: &VerifiableFunction, ty: &Ty) -> Sort {
+    sort_for_ty(&resolved_ty(func, ty))
+}
+
 pub(crate) fn operand_sort(func: &VerifiableFunction, op: &Operand) -> Option<Sort> {
     match op {
         Operand::Copy(place) | Operand::Move(place) => place_sort(func, place),
@@ -2149,8 +2194,71 @@ pub(crate) fn place_sort(func: &VerifiableFunction, place: &Place) -> Option<Sor
         .or_else(|| place_ty(func, place).map(|ty| sort_for_ty(&ty)))
 }
 
+/// One projection step of `place_sort_from_declared_type`'s DECLARED-type walk,
+/// as a borrow.
+///
+/// Byte-identical to the logic it was factored out of; it became a function only
+/// so the walk can thread a `Cow`. R0 makes that necessary: a marker resolved
+/// through the body's out-of-band table is a freshly built `Ty` and therefore
+/// owned, while an inline definition must stay BORROWED from the function to
+/// keep the fat-ADT clone-free win this path was tuned for.
+fn declared_ty_step<'a>(
+    ty: &'a Ty,
+    proj: &'a Projection,
+    pending_variant: &mut Option<usize>,
+) -> Option<&'a Ty> {
+    match proj {
+        Projection::Downcast(v) => {
+            *pending_variant = Some(*v);
+            Some(ty)
+        }
+        Projection::Field(idx) => {
+            if let (Some(v), Ty::Adt { fields, .. }) = (*pending_variant, ty) {
+                *pending_variant = None;
+                let prefix = format!("__v{v}_");
+                fields
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(&prefix))
+                    .nth(*idx)
+                    .map(|(_, field_ty)| field_ty)
+            } else if let Ty::Datatype { variants, .. } = ty {
+                // Lever A: a `Field` after a `Downcast(v)` selects variant v's
+                // i-th field; a bare `Field` on a single-variant (struct-like)
+                // datatype selects variant 0's i-th field. A multi-variant
+                // datatype with no preceding downcast is ambiguous — fail closed
+                // (None), exactly as the `Ty::Adt` path does. Resolving the
+                // datatype field gives it a concrete `Sort::from_ty`-modeled
+                // sort, so `place_sort` no longer returns None and the place
+                // stops false-stamping `TrustSymbolicAggregateFieldSortMissing`.
+                let v = match pending_variant.take() {
+                    Some(v) => v,
+                    None if variants.len() == 1 => 0,
+                    None => return None,
+                };
+                variants.get(v).and_then(|(_, fs)| fs.get(*idx)).map(|(_, t)| t)
+            } else {
+                *pending_variant = None;
+                project_ty_ref(ty, proj)
+            }
+        }
+        _ => {
+            *pending_variant = None;
+            project_ty_ref(ty, proj)
+        }
+    }
+}
+
 fn place_sort_from_declared_type(func: &VerifiableFunction, place: &Place) -> Option<Sort> {
-    let base_ty = local_ty_ref(func, place.local)?;
+    use std::borrow::Cow;
+
+    // R0: the base local's declared type may be a BARE `Ty::Datatype` marker
+    // under markers-everywhere. Widen it through this body's explicit table
+    // before ANYTHING reads it — including the work meter below, which must
+    // charge the structure that will actually be materialized, not the 29-byte
+    // marker standing in for it. `resolved_ty` is the identity on every other
+    // shape and on a marker the table does not define.
+    let declared = resolved_ty(func, local_ty_ref(func, place.local)?);
+    let base_ty: &Ty = &declared;
     // Charge the BASE local's declared-type materialization ONCE per scope (every projected
     // subtree below is `<=` it). Degrade to the cheap `Sort::Int` on trip.
     if gen_work::charge_local_once(func.body.locals.as_ptr() as usize, place.local, |cap| {
@@ -2175,49 +2283,39 @@ fn place_sort_from_declared_type(func: &VerifiableFunction, place: &Place) -> Op
         return Some(cached);
     }
 
-    let mut ty = base_ty;
+    let mut ty: Cow<'_, Ty> = Cow::Borrowed(base_ty);
     let mut pending_variant: Option<usize> = None;
 
     for proj in &place.projections {
-        match proj {
-            Projection::Downcast(v) => {
-                pending_variant = Some(*v);
-            }
-            Projection::Field(idx) => {
-                if let (Some(v), Ty::Adt { fields, .. }) = (pending_variant, ty) {
-                    pending_variant = None;
-                    let prefix = format!("__v{v}_");
-                    ty = fields
-                        .iter()
-                        .filter(|(name, _)| name.starts_with(&prefix))
-                        .nth(*idx)
-                        .map(|(_, field_ty)| field_ty)?;
-                } else if let Ty::Datatype { variants, .. } = ty {
-                    // Lever A: a `Field` after a `Downcast(v)` selects variant v's
-                    // i-th field; a bare `Field` on a single-variant (struct-like)
-                    // datatype selects variant 0's i-th field. A multi-variant
-                    // datatype with no preceding downcast is ambiguous — fail closed
-                    // (None), exactly as the `Ty::Adt` path does. Resolving the
-                    // datatype field gives it a concrete `Sort::from_ty`-modeled
-                    // sort, so `place_sort` no longer returns None and the place
-                    // stops false-stamping `TrustSymbolicAggregateFieldSortMissing`.
-                    let v = match pending_variant.take() {
-                        Some(v) => v,
-                        None if variants.len() == 1 => 0,
-                        None => return None,
-                    };
-                    ty = variants.get(v).and_then(|(_, fs)| fs.get(*idx)).map(|(_, t)| t)?;
-                } else {
-                    pending_variant = None;
-                    ty = project_ty_ref(ty, proj)?;
-                }
-            }
-            _ => {
-                pending_variant = None;
-                ty = project_ty_ref(ty, proj)?;
-            }
+        // R0: a datatype reached PARTWAY down a projection chain (a recursive
+        // child, `((*_1) as Two).0 as Leaf`) is spelled bare too, so the table is
+        // consulted at every step, not just at the base. Resolution is SHALLOW —
+        // one level per step — which is exactly what a chain of steps needs and
+        // is why it terminates on a self-recursive type.
+        if let Some(resolved) = trust_types::resolve_datatype_marker(&func.body.datatype_defs, &ty)
+        {
+            ty = Cow::Owned(resolved);
         }
+        ty = match ty {
+            // Still borrowing the function's declared type — step by reference so
+            // the fat recursive root is never cloned.
+            Cow::Borrowed(t) => Cow::Borrowed(declared_ty_step(t, proj, &mut pending_variant)?),
+            // Owning a table-resolved definition, whose borrow cannot escape this
+            // frame: step against it and clone the (small) field result to re-own.
+            Cow::Owned(t) => {
+                Cow::Owned(declared_ty_step(&t, proj, &mut pending_variant)?.clone())
+            }
+        };
     }
+    // The place may land ON a datatype (a local or field whose own type is the
+    // cut point). Widen once more so the emitted `Sort` carries the constructor
+    // list a `declare-datatype` is built from rather than an empty by-name
+    // reference — and so the memo's node count below measures what was built.
+    let ty: Cow<'_, Ty> = match resolved_ty(func, &ty) {
+        Cow::Owned(resolved) => Cow::Owned(resolved),
+        Cow::Borrowed(_) => ty,
+    };
+    let ty: &Ty = &ty;
 
     // verifier-perf mid-generation work-bound: this is the OTHER O(datatype-size) hot
     // path the generation walk hammers — `sort_for_ty` builds a fresh `Sort` mirroring
@@ -2734,7 +2832,13 @@ pub(crate) fn place_ty(func: &VerifiableFunction, place: &Place) -> Option<Ty> {
     // OpaqueCast/Subslice steps, which are themselves 8k-capped — a bounded under-count, and the
     // meter is drop-only, so never a false PROVE.
     if gen_work::charge_local_once(func.body.locals.as_ptr() as usize, place.local, |cap| {
-        local_ty_ref(func, place.local).map_or(0, |t| gen_work_datatype_nodes(t, cap))
+        // R0: charge the RESOLVED declared type. A bare marker is 29 bytes and one
+        // node while the definition it stands for can be thousands, so metering the
+        // marker would silently defeat this budget on exactly the fat recursive
+        // roots it exists to bound. (Under-counting is drop-only and never a false
+        // PROVE — but it is the guard, so keep it honest.)
+        local_ty_ref(func, place.local)
+            .map_or(0, |t| gen_work_datatype_nodes(&resolved_ty(func, t), cap))
     }) {
         return Some(gen_work_degraded_leaf());
     }
@@ -2789,6 +2893,17 @@ pub(crate) fn place_ty_cow<'a>(
     // i-th `__v{v}_*` field instead.
     let mut pending_variant: Option<usize> = None;
     for proj in &place.projections {
+        // R0: widen a bare `Ty::Datatype { variants: [] }` marker through THIS
+        // body's explicit out-of-band table before the step reads it. Applied at
+        // every step, not just the base, because a datatype reached partway down
+        // a chain (a recursive child) is spelled bare too. Resolution is shallow
+        // — one level per step — so it terminates on a self-recursive type, and
+        // it is the identity on every other shape and on a marker the table does
+        // not define, so a place that already typed keeps its exact result.
+        if let Some(resolved) = trust_types::resolve_datatype_marker(&func.body.datatype_defs, &ty)
+        {
+            ty = Cow::Owned(resolved);
+        }
         match proj {
             Projection::Downcast(v) => {
                 // A downcast does not change the modeled type; it only records
@@ -4560,6 +4675,7 @@ mod f5_e2e_repro {
                 ],
                 arg_count: 2,
                 return_ty: Ty::f64_ty(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![pre.clone()],

@@ -10,7 +10,9 @@
 //! admission requires the exact fresh per-call-site bijection; both calls
 //! strictly decrease the authored unsigned measure. The negative revision
 //! keeps the same native surface but passes the entry measure unchanged, which
-//! must remain a visible unproved termination obligation.
+//! must remain a visible unproved termination obligation. (Post ay-0.9.0, the
+//! solver's refutation of the encoded VC carries no producer fidelity
+//! attestation and is demoted, so the row reads UNKNOWN rather than FAILED.)
 
 #[cfg(correct)]
 pub fn two_calls(n: u32) //[correct]~ NOTE Trust verification: 4 proved
@@ -23,8 +25,8 @@ pub fn two_calls(n: u32) //[correct]~ NOTE Trust verification: 4 proved
 }
 
 #[cfg(wrong_decrease)]
-pub fn no_descent(n: u32) //[wrong_decrease]~ NOTE Trust verification: 0 proved, 1 failed, 0 unknown
-//[wrong_decrease]~| NOTE [termination] FAILED
+pub fn no_descent(n: u32) //[wrong_decrease]~ NOTE Trust verification: 0 proved, 0 failed, 1 unknown
+//[wrong_decrease]~| NOTE [termination] UNKNOWN
 //[wrong_decrease]~| ERROR Trust strict verification failed for
     decreases n
 {

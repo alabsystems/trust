@@ -33,6 +33,13 @@ pub mod clean_ground;
 // therefore adversarial; semantic recognizers must prove that every assignment they
 // chase writes a value of the destination place's (projection-aware) type.
 pub(crate) mod assignment_types;
+// Trust: the std/core/alloc def-path spellings the recognizers pin, under BOTH
+// renderings the extractor has shipped. `safe_def_path_str` switched from the
+// visible re-export path to the definition-site path on 2026-07-13
+// (`bd2d6ed1fc`), so one item reaches older fixtures as `std::sync::Arc` and
+// newer ones as `alloc::sync::Arc`. See the module doc for why admitting both is
+// not a widening of what a pin admits.
+pub(crate) mod def_path_pins;
 // Trust: GOAL-ITEM #4 (FAITHFULNESS) — the MirSem semantic anchor pinned in Clean
 // + Lemma 1A (operand adequacy), proving the scalar-operand reflection ADEQUATE to
 // the MIR operational semantics. See docs/PLAN-clean-dependent-type-reflection.md §2/§0.

@@ -238,6 +238,7 @@ pub fn lower_function(f: &TsFunction) -> Result<VerifiableFunction, FragmentEsca
             blocks: lo.blocks,
             arg_count: f.params.len(),
             return_ty: f.ret.to_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

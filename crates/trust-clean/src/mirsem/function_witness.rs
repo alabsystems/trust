@@ -73,6 +73,32 @@ pub fn function_adequacy_witness_with_callees(
             if matches!(stmt, Statement::Assign { .. }) {
                 let (place, rvalue) = crate::assignment_types::assigned_rvalue(body, stmt)?;
                 if place.local == 0 && place.projections.is_empty() {
+                    // Trust (#55, 2026-08-15) — A TUPLE RETURN IS NOT MODELED BY A
+                    // SINGLE `Int`. FAIL CLOSED.
+                    //
+                    // Measured: `overflowing_add(a, b) -> (i32, bool)`, whose body
+                    // is the single statement `_0 := CheckedBinaryOp(Add, _1, _2)`,
+                    // was certified `fully_faithful` with
+                    //   SemReturn { stmts: [Bin(Add, Var 0, Var 1)], ret: Var 0 }
+                    // i.e. the denotation `a + b`. Two things are wrong with that:
+                    // the overflow FLAG is not modeled at all (and for
+                    // `overflowing_add` the flag IS the function), and `Bin(Add, ..)`
+                    // grounds to the UNBOUNDED `Int.add` rather than the wrapped
+                    // `.0`. At `a = i32::MAX, b = 1` the certificate denotes
+                    // 2147483648 while the function returns (-2147483648, true).
+                    //
+                    // The usual defence — "truncation is a separately-emitted safety
+                    // VC" (see `prove`'s `Shl` arm) — does NOT apply: measured,
+                    // `generate_vcs` emits ZERO VCs for this body, so
+                    // `function_safety_vcs_all_discharged` was passing VACUOUSLY.
+                    //
+                    // The value-field shape `_0 := Use(_t.0)` is a DIFFERENT thing
+                    // and stays supported by the arm below: there the returned local
+                    // genuinely is the scalar `op(a, b)`, and the return type is the
+                    // scalar, not the pair.
+                    if matches!(body.return_ty, trust_types::Ty::Tuple(_)) {
+                        return None;
+                    }
                     let return_use_site = Some((block.id, Some(statement_index)));
                     match rvalue {
                         // `_0 := Use(Move/Copy _t.0)` where `_t := CheckedBinaryOp(op,a,b)`
@@ -102,7 +128,31 @@ pub fn function_adequacy_witness_with_callees(
                                 }
                             }
                         }
-                        Rvalue::Use(op) => operands.push(op),
+                        Rvalue::Use(op) => {
+                            operands.push(op);
+                            // Trust: TRANSPARENT-UNWRAP leg (2026-08-18) — a
+                            // MULTI-HOP by-value field-chain return operand
+                            // (`_0 := Copy(_1.0.0)`, the extractor's transmute
+                            // spelling) never resolves via `sem_operand_of_mir`
+                            // (projections decline there), so collect its
+                            // resolved nested selector as an ALREADY-RESOLVED
+                            // Lemma-1A piece — the Len/Discriminant arms'
+                            // discipline — else the "at least one modeled piece"
+                            // gate spuriously rejects the whole body.
+                            if let Operand::Copy(p) | Operand::Move(p) = op {
+                                if p.projections.len() >= 2
+                                    && p.projections.iter().all(|pr| {
+                                        matches!(pr, trust_types::Projection::Field(_))
+                                    })
+                                {
+                                    if let Some(sem) =
+                                        sem_field_read_operand(body, op, &param_index)
+                                    {
+                                        extra_sem_operands.push(sem);
+                                    }
+                                }
+                            }
+                        }
                         Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                             rvalues.push((rvalue, return_use_site));
                             operands.push(a);
@@ -570,6 +620,18 @@ pub fn function_fully_faithful_witness_with_callees(
     func: &trust_types::VerifiableFunction,
     callees: &std::collections::BTreeMap<String, CalleeFact>,
 ) -> Option<FullFaithfulnessCertificate> {
+    // Trust: FAMILY-WIDE G8 (2026-08-17) — the MirSem composition's chokepoint:
+    // a `Cleanup` unwind target that can reach Return is a normally-returning
+    // path no Sem* recognizer's normal-edge walk models (the wrap-return audit's
+    // proven false-certificate channel, closed as a CLASS here rather than
+    // per-recognizer); duplicate block ids shadow every id-keyed gate. Terminal
+    // landing pads stay admitted — the panic path diverges, outside every
+    // partial-correctness claim. Zero corpus cost, measured 2026-08-17.
+    if crate::prove::body_has_live_cleanup_path(&func.body)
+        || !crate::prove::all_block_ids_unique(&func.body)
+    {
+        return None;
+    }
     // (a) The WHOLE-FUNCTION CONTRACT must certify modulo 3 (Lemmas 1A+1B+1C).
     //     Fail-closed on any uncertified contract piece or an unmodeled return.
     let contract = function_adequacy_witness_with_callees(func, callees)?;
@@ -599,4 +661,75 @@ pub fn function_fully_faithful_witness_with_callees(
     };
 
     Some(FullFaithfulnessCertificate { contract, safety })
+}
+
+
+#[cfg(test)]
+mod tuple_return_fail_closed_tests {
+    //! Trust (#55): a TUPLE return must not be certified by a single-`Int` model.
+
+    use super::*;
+
+    fn load(dir: &str, name: &str) -> Option<trust_types::VerifiableFunction> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+        for entry in std::fs::read_dir(&root).ok()?.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(func) = serde_json::from_str::<trust_types::VerifiableFunction>(&text) else {
+                continue;
+            };
+            if func.name == name {
+                return Some(func);
+            }
+        }
+        None
+    }
+
+    /// THE REGRESSION. `overflowing_add` was certified `fully_faithful` with the
+    /// denotation `a + b` — no overflow flag, and the UNBOUNDED `Int.add` rather
+    /// than the wrapped `.0`. At `a = i32::MAX, b = 1` that denotes 2147483648
+    /// while the function returns `(-2147483648, true)`.
+    ///
+    /// It must now DECLINE. Note the usual "truncation is a separate safety VC"
+    /// defence does not apply here: `generate_vcs` emits ZERO VCs for this body,
+    /// so the safety gate was passing vacuously.
+    #[test]
+    fn whole_tuple_checked_binop_return_declines() {
+        let func = load("fixtures/mass-harvest-2026-07-17/arith-guarded/dumps", "overflowing_add")
+            .expect("`overflowing_add` fixture must be present");
+        assert!(
+            matches!(func.body.return_ty, trust_types::Ty::Tuple(_)),
+            "the fixture must actually return a tuple, or this test proves nothing"
+        );
+        assert!(
+            function_fully_faithful_witness(&func).is_none(),
+            "a whole-tuple `_0 := CheckedBinaryOp(..)` return must FAIL CLOSED — a \
+             single-Int model omits the overflow flag and denotes the unbounded sum"
+        );
+    }
+
+    /// THE CONTROL. The value-field shape `_0 := Use(_t.0)` is a different thing
+    /// and must keep certifying: there the returned local genuinely IS the scalar
+    /// `op(a, b)` and the return type is that scalar, not the pair. Without this,
+    /// the gate above could be over-broad and nobody would notice.
+    #[test]
+    fn checked_binop_value_field_return_still_certifies() {
+        let mut checked = 0;
+        for name in ["bounded_add", "checked_sub", "inc_gt"] {
+            let Some(func) = load("fixtures/real-spec-corpus", name) else { continue };
+            if matches!(func.body.return_ty, trust_types::Ty::Tuple(_)) {
+                continue;
+            }
+            assert!(
+                function_fully_faithful_witness(&func).is_some(),
+                "{name}: the scalar value-field return must be UNAFFECTED by the \
+                 tuple gate"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no scalar checked-arith control found to verify against");
+    }
 }

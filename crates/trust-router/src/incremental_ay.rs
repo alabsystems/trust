@@ -358,8 +358,21 @@ impl CommonAssertion {
             commands.push(decl);
         }
 
-        // Emit the assertion.
-        commands.push(format!("(assert {})", smt2_export::formula_to_smt2(formula)));
+        // Emit the assertion. The conjunction spine is canonically flattened
+        // first (pure associativity via this module's own flatten/conjoin pair):
+        // ay 0.6+ makes strict Alethe surface rendering REQUIRED, and its
+        // `and_pos` printer fails on nested `(and A (and B C))` — "indexed
+        // conjunct is absent from its effective source" — publishing `unknown`
+        // for a formula it PROVED. Measured: charindices_slice_tail's
+        // slice-bounds VC is UNSAT and certifies (`trust_free=yes`) in the flat
+        // spelling, and publishes unknown in the nested one, on the same ay.
+        // Mirrors `in_process_ay_backend::flatten_conjunction_spine`; the real
+        // printer fix belongs in ay, but the flat input is logically identical
+        // and keeps every solver verdict backed by its own strict proof.
+        commands.push(format!(
+            "(assert {})",
+            smt2_export::formula_to_smt2(&conjoin_formulas(flatten_conjuncts(formula)))
+        ));
 
         CommonAssertion { label: label.into(), commands }
     }
@@ -1183,8 +1196,13 @@ impl IncrementalAYSession {
             send_command_until(proc, decl, deadline)?;
         }
 
-        // Assert the VC formula.
-        let assertion = format!("(assert {})", smt2_export::formula_to_smt2(&vc.formula));
+        // Assert the VC formula, conjunction spine flattened — see the
+        // common-assertion builder above for why (ay `and_pos` strict-export
+        // failure on nested conjunctions; flat input is logically identical).
+        let assertion = format!(
+            "(assert {})",
+            smt2_export::formula_to_smt2(&conjoin_formulas(flatten_conjuncts(&vc.formula)))
+        );
         send_command_until(proc, &assertion, deadline)?;
 
         // Check satisfiability.
@@ -2664,7 +2682,36 @@ pub fn violation_is_forced(formula: &Formula) -> bool {
 /// escalation, never to grant a proof).
 #[must_use]
 pub fn violation_is_modeling_gap_failclose(formula: &Formula) -> bool {
-    matches!(formula, Formula::Bool(true))
+    // The marker is not always the WHOLE formula. vcgen conjoins it with the
+    // reaching path condition, so a real modeling gap arrives as
+    // `And([Bool(true), Or([path1, path2])])` and a bare top-level match misses
+    // it — the gap then escalates itself into "the violation holds on every
+    // reaching execution", i.e. Trust ACCUSES CORRECT CODE.
+    //
+    // MEASURED on orca-config's `strip_inline_comment_and_trim`: the escalated
+    // VC has 26 atoms — i64/u32 range facts, boolean-domain facts, the char
+    // domain, `Eq(c, 35)` for the literal '#', and `Bool(true)` — and contains
+    // NO index term and NO length term whatsoever. There is nothing there that
+    // could express an out-of-bounds, yet it was reported as a guaranteed
+    // Level 0 safety violation.
+    //
+    // FAIL-CLOSED: this predicate is only ever consulted to WITHHOLD an
+    // escalation, never to grant a proof. Widening it can only DEMOTE a
+    // "guaranteed violation" back to a plain Failed obligation; the strict lane
+    // still rejects the build. It cannot produce a false PROVE.
+    contains_failclose_marker(formula)
+}
+
+/// Does a `Formula::Bool(true)` fail-close marker appear anywhere on the
+/// violation side? Structural recursion, because the marker is conjoined with
+/// the path condition rather than standing alone.
+fn contains_failclose_marker(formula: &Formula) -> bool {
+    match formula {
+        Formula::Bool(true) => true,
+        Formula::And(parts) | Formula::Or(parts) => parts.iter().any(contains_failclose_marker),
+        Formula::Not(inner) => contains_failclose_marker(inner),
+        _ => false,
+    }
 }
 
 /// Trust: an `UnboundedAllocation` is a GUARANTEED over-budget violation iff its
@@ -2862,9 +2909,23 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let directory = std::env::current_dir()
-                .expect("test current directory")
-                .join(format!(".trust-incremental-memory-test-{}-{nonce:x}", std::process::id()));
+            // Root under $HOME, NOT the checkout — the same correction applied to
+            // `memory_jobserver::TestDirectory` and `coordinator::TestFileLane`.
+            // The ledger rejects a token whose ANCESTOR chain is group/other
+            // writable, and under the common `umask 0002` every directory in a
+            // checked-out repo is 0775, so a fixture below `cwd` can never pass
+            // however private its own leaf is. Falls back to the temp dir when
+            // HOME is unset, which reproduces the failure loudly.
+            let base = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cache")
+                .join("trust-incremental-memory-tests");
+            std::fs::create_dir_all(&base).expect("create incremental-memory test root");
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+                .expect("make incremental-memory test root private");
+            let directory =
+                base.join(format!("{}-{nonce:x}", std::process::id()));
             std::fs::create_dir(&directory).expect("create private token fixture");
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
                 .expect("make token fixture private");
@@ -3214,6 +3275,11 @@ mod tests {
     #[test]
     fn active_reservation_exactly_matches_the_enforced_memory_argument() {
         let _env = crate::memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Supply the machine total, as this test already supplies the socket env.
+        // Without it `machine_budget_bytes()` is 0 wherever the visible cgroup
+        // root has no `memory.max`, and the reservation this test exists to
+        // compare is refused before it is ever made.
+        let _budget = crate::memory_jobserver::TestTotalMemory::set(1 << 30);
         let _socket = ScopedEnv::remove(crate::coordinator::SOCK_ENV);
         let _disable = ScopedEnv::remove(crate::coordinator::DISABLE_ENV);
         let _lane = TestTokenLane::new();

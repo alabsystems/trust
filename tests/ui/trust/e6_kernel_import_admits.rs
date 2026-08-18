@@ -3,6 +3,12 @@
 //@ check-fail
 //@ dont-require-annotations: WARN
 //@ normalize-stderr: "elapsed_ms=\d+" -> "elapsed_ms=$$TIME"
+//@ normalize-stderr: "sha256:[0-9a-f]{64}" -> "sha256:$$DIGEST"
+//@ normalize-stderr: "trust-mc@\d+\.\d+\.\d+" -> "trust-mc@$$ENGINE"
+// Digests are content addresses over the serialized bundle/request bytes —
+// they shift on EVERY lowering change on either side of a merge (measured
+// 2026-08-14: two consecutive digest-only re-pins in one day). Pin structure,
+// normalize the addresses.
 //! E6 kernel-import, end-to-end (two-language design §3.1, v3). A program
 //! function CALLED inside a spec clause is a DEFINITIONAL use: it is admissible
 //! only if the whole-crate facet analysis certifies it `Pure ∧ Total ∧
@@ -101,3 +107,39 @@ fn c_not_pure(x: u64, y: u64) -> u64
 { y }
 
 fn main() {}
+
+// EXPECTATION NOTE (2026-08-13, resolves the e6/e9 open question of
+// reports/red-suite-triage-2026-08-13.md): on `not_pure`, the pinned native
+// verifier status moved `Failed; failed=1` -> `Inconclusive; unknown=1`, and the
+// per-obligation refutation authority moved from the native lane
+// (`FAILED (trust-full-verifier); counterexample: verified_counterexample = true`)
+// to the in-process bridge
+// (`FAILED (ay-in-process); counterexample: _0 = 0, x = 18446744073709551615`).
+// That is an INTENDED fail-closed authority change, not a native-lane defect:
+// commit 91ce53b4e5 ("fix(semantics): fail closed on unattested refinement
+// edges") withdrew public refutation authority from the native typed-CHC lane
+// until the compiler emits a positive producer fidelity attestation
+// (`trust-trust-mc.typed-chc-obligation.encoding_fidelity=exact`, which it
+// "intentionally does not emit yet" — trust-bmc verifier_api,
+// `TrustMcChcRefutationAdmissibility::Unattested`). The native trust-mc runner
+// STILL refutes this obligation (see the retained "runner refuted obligation
+// ...; refusing to emit proof evidence" evidence line); its row is merely
+// demoted to Unknown — the demotion diagnostic ("refutation demoted to unknown:
+// the submitted ChcVc has no positive producer fidelity attestation ...") is
+// the row's 4th evidence diagnostic and is cut by the reporter's
+// 3-diagnostics-per-row limit. The refutation the build fails on is now carried
+// by ay-in-process WITH a concrete counterexample — strictly stronger evidence
+// than the old solver-level `verified_counterexample = true`, which the code
+// itself documents as refuting only the ENCODED VC. Every pinned error below
+// still fires; the L0 gate still fails closed on the refuted row.
+//
+// EXPECTATION NOTE (2026-08-14, digest re-pin after the 97-commit upstream
+// merge): the `bundle_digest`/`request_digest` values are content addresses —
+// sha256 over the serde bytes of the `NativeVerificationBundle` and each
+// native request (trust-router `native_trust_ir/index.rs`). The merge unioned
+// upstream's ir-bridge lowering work (9e83268acc..221e88f7d3, with the
+// trust-ir/trust-mc pin moves) with our lowering commits (1bf0cf45c5,
+// 8ca24d4d1b, d9997cbd0b, 06ad94aaad), so the serialized request bytes match
+// neither parent's blessing and all 13 digests moved. Every other stderr byte
+// is unchanged from the 175e5e4ed5 pin — same admissions, same TermRejected
+// term trees, same statuses — a digest-only re-pin, not a behavior change.

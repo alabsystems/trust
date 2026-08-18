@@ -180,7 +180,8 @@ fn rustdoc_sysroot_aliases_preserve_stage_policy() {
     );
     assert_eq!(
         rustdoc_sysroot_bins(bindir, 2, "rustdoc", "trustdoc"),
-        (bindir.join("trustdoc"), Vec::new())
+        // The stock alias stays: cargo doctests spawn `rustdoc` by name.
+        (bindir.join("trustdoc"), vec![bindir.join("rustdoc")])
     );
 }
 

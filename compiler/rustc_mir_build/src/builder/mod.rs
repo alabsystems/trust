@@ -89,6 +89,25 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
             // THIR of the parent function without a cycle.
             let thir = thir.borrow();
             let mir = build_mir(&thir);
+            // Trust (F1): WARM `trust_ir_of` FOR THE TRUST-CG TRUST-IR CODEGEN FRONTEND.
+            //
+            // `-Ztrust-cg-frontend=trust-ir` makes the backend consume `trust_ir_of` — but a
+            // codegen backend runs long after `check_unsafety` STEALS THIR, and the query's
+            // provider fails closed on a stolen `Thir` (`if thir.is_stolen() { return None }`).
+            // A consumer that first asked at codegen time would therefore see `None` for every
+            // body in the crate and read a compiler-lifecycle fact as a producer coverage
+            // result. Forcing the query HERE, where THIR is demonstrably still alive, is exactly
+            // the usage the query documents ("a query forced before unsafeck sees it intact");
+            // the backend then reads the memoized artifact.
+            //
+            // This is a CACHE WARM, not a second producer: the query IS the artifact, and its
+            // in-memory cache is what carries it across the phase boundary. It costs one extra
+            // lowering per body and is reachable only under the off-by-default flag. Warm-cache
+            // incremental replay does not reach it — but trust-cg refuses `-Cincremental`
+            // outright, so there is no lane where that silently matters.
+            if tcx.sess.trust_cg_frontend_is_trust_ir() {
+                let _ = tcx.trust_ir_of(def);
+            }
             // Trust: P1 — lower source (THIR) directly to trust-ir + differential gate vs MIR
             // (parallel to MIR). THIR is still fresh here, before unsafeck steals it. The freshly
             // built `mir` is passed by ref so the oracle builds the MIR-side trust-ir from it
@@ -186,6 +205,39 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                                  fully lower this body ({} unsupported shape(s)): {}",
                                 report.unsupported.len(),
                                 shapes.join("; ")
+                            ),
+                        );
+                    }
+                    // Trust (A2-D): under `-Ztrust-ir-lower=strict` a DISAGREEMENT is an ERROR,
+                    // not a logged verdict. This is a strictly different failure from the
+                    // unsupported-shape arm above: there the producer said "I cannot lower this"
+                    // and no trust-ir exists to ship; here it produced trust-ir and that trust-ir
+                    // means something OTHER than the MIR the rest of the compiler uses. Since
+                    // `-Ztrust-cg-frontend=trust-ir` emits objects FROM the THIR-derived side,
+                    // a disagreement is precisely the case where the emitted object would carry
+                    // behaviour the MIR path does not have — the one observation that must never
+                    // be a `debug!` event. `DiffMode::MirOracle` is the differential's own name
+                    // for "both modules were sample-interpreted and DISAGREED"; `NotRun` (a
+                    // coverage-only skip) and `Agreed` are untouched, so this arm cannot fire on
+                    // a body nobody compared.
+                    if tcx.sess.trust_ir_lower_strict()
+                        && report.mode == trust_thir_lower::differential::DiffMode::MirOracle
+                    {
+                        // Every `MirOracle` arm of `differential::compare` pushes a note that
+                        // names BOTH sides ("THIR ... vs MIR ...", "THIR returned X, MIR oracle
+                        // returned Y"); the last note is this body's divergence.
+                        let divergence = report
+                            .notes
+                            .last()
+                            .map(String::as_str)
+                            .unwrap_or("<differential reported no note>");
+                        tcx.dcx().span_err(
+                            tcx.def_span(def),
+                            format!(
+                                "-Ztrust-ir-lower=strict: THIR-derived trust-ir DISAGREES with \
+                                 the built MIR for this body after {} sampled input(s): \
+                                 {divergence}",
+                                report.samples_checked
                             ),
                         );
                     }
@@ -302,6 +354,29 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                         tally = ?derived_report.tally,
                         "trust-ir-lower: derived-MIR differential"
                     );
+                    // Trust (A2-D): the SECOND disagreement channel, same rule. `compare_derived`
+                    // re-derives MIR from the THIR-side trust-ir and compares it structurally
+                    // against the built MIR; `DerivedMismatch` means "both canonicalized and the
+                    // forms DIFFER" — a real divergence, as distinct from `DerivedUnsupported`
+                    // (comparator incapacity, never counted as agreement and never an error
+                    // here). It is a separate channel rather than a duplicate of the
+                    // interpretation differential: `compare_derived` reaches a verdict on exactly
+                    // the bodies sampled interpretation must skip, so on the measured corpus it
+                    // is the channel that actually fires (27 vs 1 over 2,000 ui files at HEAD).
+                    // `detail` names both sides in the form `built ... vs derived ...`.
+                    if tcx.sess.trust_ir_lower_strict()
+                        && derived_report.verdict
+                            == trust_thir_lower::mir_differential::DerivedVerdict::DerivedMismatch
+                    {
+                        tcx.dcx().span_err(
+                            tcx.def_span(def),
+                            format!(
+                                "-Ztrust-ir-lower=strict: MIR re-derived from the THIR-derived \
+                                 trust-ir DISAGREES with the built MIR for this body: {}",
+                                derived_report.detail
+                            ),
+                        );
+                    }
                     // Trust: P1 item 5 (the flip) — remember the trust-ir Module for bodies
                     // whose derived-MIR differential is green. `optimized_mir`
                     // (rustc_mir_transform::trust_ir_flip) re-derives MIR from it and consumes
@@ -318,6 +393,7 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                             def,
                             &lowered,
                             derived_report.markers_exact,
+                            derived_report.source_header_correspondence.as_ref(),
                         );
                     }
                     // Trust: P1 Phase-0 — hand the per-body result to the crate-level registry.

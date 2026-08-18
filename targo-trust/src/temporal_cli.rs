@@ -42,7 +42,7 @@ never evidence.
 /// Whether the crate ships the legacy, project-authored model harness. This is
 /// detected only so it can be rejected with a migration diagnostic: accepting
 /// verdict text from code under verification would let that code forge proof.
-pub(crate) fn crate_has_models(path: &str) -> bool {
+pub(crate) fn crate_has_retired_project_harness(path: &str) -> bool {
     Path::new(path).join("examples").join("trust_models.rs").is_file()
 }
 
@@ -344,7 +344,7 @@ fn temporal_gate_target(
     metadata_context: &[String],
 ) -> Result<TemporalGateTarget, String> {
     let path = root.to_string_lossy();
-    if crate_has_models(&path) {
+    if crate_has_retired_project_harness(&path) {
         Ok(TemporalGateTarget::Explicit)
     } else {
         resolved_temporal_gate_target(root, metadata_context)

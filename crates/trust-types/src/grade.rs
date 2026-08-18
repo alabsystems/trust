@@ -78,6 +78,31 @@ pub enum ProofValidation {
     /// No verification evidence yet (queued, skipped, or unattempted). (No
     /// legacy equivalent — legacy encoded absence out-of-band.)
     Pending,
+    /// The obligation was discharged by CITING a generic theorem the Clean
+    /// kernel checked ONCE, rather than by reconstructing and re-checking a
+    /// proof term for THIS instance.
+    ///
+    /// # Why this is not [`ProofValidation::KernelRechecked`]
+    ///
+    /// `KernelRechecked` asserts the kernel saw a term for the obligation in
+    /// hand. Here it did not: it saw a width-generic theorem, and the instance
+    /// is covered by instantiating it. That is a real and useful discharge —
+    /// the theorem is axiom-free and the instantiation is free — but the step
+    /// from "the theorem holds" to "this instance is an instance of it" is
+    /// carried by a CORRESPONDENCE that the kernel did not check.
+    ///
+    /// Conflating the two would be the exact false-verify shape this codebase
+    /// keeps finding: something that reads as PROVED at one seam and is not
+    /// re-checkable one layer down.
+    ///
+    /// # The residual is mandatory, not optional
+    ///
+    /// A citation is only honest if the unproved correspondence is NAMED. Build
+    /// this grade through [`GradeRecord::cited_kernel_theorem`], which forces an
+    /// [`AxiomClosure::Named`] residual; that closure caps the projection at
+    /// `Trusted` by the existing E8 rule, so this variant can never reach
+    /// `Certified` however it is constructed.
+    CitedKernelTheorem,
 }
 
 /// Axis 2 — the axiom closure the verdict depends on.
@@ -297,6 +322,33 @@ impl GradeRecord {
         }
     }
 
+    /// Discharged by CITING a generic, kernel-checked theorem rather than by
+    /// re-checking a term for this instance — see
+    /// [`ProofValidation::CitedKernelTheorem`].
+    ///
+    /// `theorem` names the cited theorem (e.g. `"G16Mul.blast_equals_ir"`) and
+    /// `residual` the correspondence the kernel did NOT check (e.g.
+    /// `"G16Mul.AyBlastAgrees"`). Both land in the axiom closure, so the
+    /// residual travels with the verdict instead of living in a comment, and
+    /// the E8 rule caps the result at `Trusted`.
+    ///
+    /// This constructor cannot produce `Certified`: the closure is non-empty by
+    /// construction.
+    #[must_use]
+    pub fn cited_kernel_theorem(theorem: &str, residual: &str) -> Self {
+        Self {
+            validation: ProofValidation::CitedKernelTheorem,
+            axiom_closure: AxiomClosure::Named(
+                [format!("cites:{theorem}"), format!("residual:{residual}")]
+                    .into_iter()
+                    .collect(),
+            ),
+            coverage: CoverageBound::Unbounded,
+            executability: Executability::Unrecorded,
+            reflection: ReflectionTier::Unrecorded,
+        }
+    }
+
     /// Discharged by a solver whose UNSAT result was not independently
     /// kernel-rechecked. Projects to `SmtBacked`.
     #[must_use]
@@ -432,6 +484,12 @@ impl GradeRecord {
                 // proof is real but rests on assumptions (or unknown ones).
                 AxiomClosure::Named(_) | AxiomClosure::Unrecorded => AssuranceLevel::Trusted,
             },
+            // A citation rests on an unchecked correspondence, so it projects to
+            // `Trusted` — never `Certified`, whatever the closure says. The
+            // closure is non-empty by construction anyway; this arm makes the
+            // ceiling independent of that, so a future constructor cannot raise
+            // it by accident.
+            ProofValidation::CitedKernelTheorem => AssuranceLevel::Trusted,
             ProofValidation::SolverValidated => AssuranceLevel::SmtBacked,
             ProofValidation::SoundAnalysis => AssuranceLevel::Sound,
             ProofValidation::TrustedVerdict => AssuranceLevel::Trusted,
@@ -708,3 +766,56 @@ mod tests {
         assert_eq!(refined.to_legacy(), baseline.to_legacy());
     }
 }
+
+#[cfg(test)]
+mod cited_kernel_theorem_tests {
+    use super::*;
+
+    /// The ceiling is the whole point: a citation must never read as
+    /// `Certified`, because the kernel never saw a term for the instance.
+    #[test]
+    fn citation_never_reaches_certified() {
+        let g = GradeRecord::cited_kernel_theorem("G16Mul.blast_equals_ir", "G16Mul.AyBlastAgrees");
+        assert_eq!(g.to_legacy(), AssuranceLevel::Trusted);
+        assert!(!g.is_certified(), "a cited theorem is not a per-instance kernel re-check");
+    }
+
+    /// The residual must travel WITH the verdict. If it could be dropped, the
+    /// grade would claim more than it has.
+    #[test]
+    fn residual_and_citation_are_recorded_in_the_closure() {
+        let g = GradeRecord::cited_kernel_theorem("G16Mul.blast_equals_ir", "G16Mul.AyBlastAgrees");
+        match &g.axiom_closure {
+            AxiomClosure::Named(names) => {
+                assert!(names.iter().any(|n| n.contains("G16Mul.blast_equals_ir")));
+                assert!(names.iter().any(|n| n.contains("G16Mul.AyBlastAgrees")));
+                assert!(names.iter().any(|n| n.starts_with("residual:")));
+            }
+            other => panic!("a citation must carry a NAMED closure; got {other:?}"),
+        }
+    }
+
+    /// Even with the closure forced empty, the variant still caps at `Trusted`.
+    /// This is the belt-and-braces the doc promises: the ceiling does not depend
+    /// on a constructor remembering to add the residual.
+    #[test]
+    fn citation_caps_at_trusted_even_with_empty_closure() {
+        let mut g =
+            GradeRecord::cited_kernel_theorem("G16Mul.blast_equals_ir", "G16Mul.AyBlastAgrees");
+        g.axiom_closure = AxiomClosure::Empty;
+        assert_eq!(
+            g.to_legacy(),
+            AssuranceLevel::Trusted,
+            "the citation ceiling must not depend on the closure being non-empty"
+        );
+    }
+
+    /// A genuine per-instance kernel re-check is still strictly stronger, so the
+    /// new variant did not disturb the existing top of the lattice.
+    #[test]
+    fn genuine_kernel_recheck_is_still_stronger() {
+        assert_eq!(GradeRecord::kernel_certified().to_legacy(), AssuranceLevel::Certified);
+        assert!(GradeRecord::kernel_certified().is_certified());
+    }
+}
+

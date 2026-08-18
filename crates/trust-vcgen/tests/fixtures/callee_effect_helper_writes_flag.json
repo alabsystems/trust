@@ -1,0 +1,119 @@
+{
+  "name": "set_flag",
+  "def_path": "p2::G::set_flag",
+  "span": {
+    "file": "p2.rs",
+    "line_start": 19,
+    "col_start": 4,
+    "line_end": 21,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "p2::G",
+                "fields": [
+                  [
+                    "storage",
+                    {
+                      "Adt": {
+                        "name": "p2::Storage",
+                        "fields": [
+                          [
+                            "flag",
+                            "Bool"
+                          ],
+                          [
+                            "other",
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 0
+                  },
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "p2.rs",
+                "line_start": 20,
+                "col_start": 8,
+                "line_end": 20,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

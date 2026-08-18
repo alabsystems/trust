@@ -1542,9 +1542,11 @@ fn canonical_default_admission_metadata() -> Vec<MetadataEntry> {
 /// route (`trust-router` `obligation_route_for_kind`), trust-mc ownership plus a
 /// `MirObligationKind::Assertion` lowering (`trust-bmc`), trust-mc
 /// formula-obligation status (`trust-mir-extract`), and native TrustIr
-/// routability (`rustc_mir_transform::trust_verify`). Every other `Custom`
-/// namespace is deliberately un-routable, and that exclusion is load-bearing:
-/// see [`TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE`].
+/// routability (`rustc_mir_transform::trust_verify`). The only other routable
+/// `Custom` namespace is [`TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE`],
+/// which is confined to the trust-vc certificate-import lane (see its doc);
+/// every remaining `Custom` namespace is deliberately un-routable, and that
+/// exclusion is load-bearing.
 pub const TRUST_VC_HARDENED_OBLIGATION_NAMESPACE: &str = "trust.vc.hardened";
 
 /// Compiler verification conditions with no nominal [`ObligationKind`].
@@ -1552,11 +1554,20 @@ pub const TRUST_VC_OBLIGATION_NAMESPACE: &str = "trust.vc";
 
 /// Allocation-capacity obligations (`count >= ceiling`).
 ///
-/// This namespace exists so the obligation is NOT natively routable. A
-/// `VcKind::UnboundedAllocation` is not a panic-freedom / arithmetic-overflow
-/// property, and the native whole-function CHC proof does not model it; mapping
-/// it into a routable kind false-proved unbounded allocations. Widening the
-/// privileged-namespace test to cover this namespace reopens that P0.
+/// This namespace is routable ONLY to the trust-vc certificate-import lane —
+/// the BoundsCheck precedent: the compiler constructs a MIR-memory proof unit
+/// whose predicate is the negated guard-conjoined capacity VC itself, and
+/// TrustVcTrustEngine discharges it with a replayable certificate at import
+/// time. Routing there is dispatch, never proof: acceptance still requires the
+/// validated proof unit plus the replayed certificate, per obligation,
+/// fail-closed.
+///
+/// It must NEVER be routed to the whole-function CHC or any other kind whose
+/// proof does not encode `count >= ceiling`. A `VcKind::UnboundedAllocation`
+/// is not a panic-freedom / arithmetic-overflow property, and the native
+/// whole-function CHC proof does not model it; mapping it into such a routable
+/// kind false-proved unbounded allocations (a P0). Widening the
+/// privileged-hardened-namespace test to cover this namespace reopens that P0.
 pub const TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE: &str =
     "trust.vc.unbounded_allocation";
 
@@ -9386,10 +9397,11 @@ mod tests {
 
     /// `ObligationKind::Custom.namespace` is authority-bearing, not decorative:
     /// `trust.vc.hardened` alone buys a full-verifier route, trust-mc ownership
-    /// plus an `Assertion` MIR lowering, and native TrustIr routability, while
-    /// every other namespace is deliberately unroutable (the
-    /// `trust.vc.unbounded_allocation` P0). It is therefore admitted from a
-    /// pinned list instead of accepted as producer free text.
+    /// plus an `Assertion` MIR lowering, and native TrustIr routability;
+    /// `trust.vc.unbounded_allocation` buys exactly one route — the trust-vc
+    /// certificate-import lane (never the whole-function CHC, the recorded P0);
+    /// every other namespace is deliberately unroutable. It is therefore
+    /// admitted from a pinned list instead of accepted as producer free text.
     #[test]
     fn custom_obligation_namespace_is_sealed_to_the_pinned_vocabulary() {
         for namespace in ADMITTED_OBLIGATION_NAMESPACES {

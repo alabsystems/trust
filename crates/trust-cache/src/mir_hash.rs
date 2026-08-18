@@ -512,6 +512,7 @@ mod tests {
             }],
             arg_count,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         }
     }
 
@@ -525,6 +526,7 @@ mod tests {
             }],
             arg_count,
             return_ty,
+            datatype_defs: Default::default(),
         }
     }
 

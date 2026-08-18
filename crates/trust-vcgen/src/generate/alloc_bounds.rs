@@ -109,7 +109,7 @@ pub(super) fn alloc_element_byte_size(
     args: &[Operand],
 ) -> Option<i128> {
     // AUTHORITATIVE: the exact `tcx.layout_of` element size the extractor carried in a
-    // trailing `::<__trust_elem_bytes_N>` token — sizes EVERY concrete element (incl. a
+    // trailing `::<__trust_elem_bytes@N>` token — sizes EVERY concrete element (incl. a
     // named struct/enum the turbofish spelling cannot size).
     let raw = parse_elem_bytes_token(callee).or_else(|| match display {
         // Fallbacks (older callees / robustness): the from_elem element operand, or the
@@ -130,12 +130,19 @@ pub(super) fn alloc_element_byte_size(
     raw.filter(|&s| s > 1)
 }
 
-/// Parse the `__trust_elem_bytes_N` element-size token the extractor appends to a
-/// bulk-allocation sink callee (`…::with_capacity::<__trust_elem_bytes_4096>`).
+/// Parse the TRAILING `::<__trust_elem_bytes@N>` element-size token the
+/// extractor appends to a bulk-allocation sink callee
+/// (`…::with_capacity::<__trust_elem_bytes@4096>`). Delegates to the ONE
+/// shared grammar (`trust_types::parse_trailing_elem_bytes_token`, also used
+/// by trust-ir-bridge's `vec_alloc_elem_bytes_token`): the non-identifier `@`
+/// spelling plus the trailing-position requirement mean a user-spellable
+/// lookalike (`Vec::<__trust_elem_bytes_1>::with_capacity` — a legal
+/// type/param name that survives in the rendered path exactly when the
+/// extractor omits the real token) can never feed the OOM ceiling a forged
+/// stride (batch-6 adversarial review D1; the old loose substring parse here
+/// accepted it).
 pub(super) fn parse_elem_bytes_token(callee: &str) -> Option<i128> {
-    let after = callee.rsplit_once("__trust_elem_bytes_")?.1;
-    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    trust_types::parse_trailing_elem_bytes_token(callee)
 }
 
 /// Recognize a std bulk heap-allocation / grow call by its `safe_def_path_str`
@@ -164,8 +171,8 @@ pub(crate) fn method_tail(callee: &str) -> &str {
     // SOUNDNESS (P0 false proof, 2026-06-17 hunt-15 Class A): strip ALL trailing
     // balanced turbofish groups, not just one. A FREE-FUNCTION bulk-alloc sink rendered
     // with the hunt-11 byte-size token carries TWO trailing turbofishes —
-    // `std::vec::from_elem::<u8>::<__trust_elem_bytes_1>` (element type AND byte token),
-    // likewise `collect::<Vec<u8>>::<__trust_elem_bytes_N>`. Stripping only the outer one
+    // `std::vec::from_elem::<u8>::<__trust_elem_bytes@1>` (element type AND byte token),
+    // likewise `collect::<Vec<u8>>::<__trust_elem_bytes@N>`. Stripping only the outer one
     // left `from_elem::<u8>`, whose last `::` segment is `<u8>` (not `from_elem`), so
     // `bulk_alloc_call`/`is_collect_sink` returned None and `vec![x; n]` / `(0..n).collect()`
     // emitted NO UnboundedAllocation obligation at all — a capacity-overflow then sailed

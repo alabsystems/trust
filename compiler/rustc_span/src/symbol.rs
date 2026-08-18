@@ -2442,7 +2442,90 @@ symbols! {
         ztso,
         // tidy-alphabetical-end
     }
+
+    // ======================================================================
+    // trust: THE INDEX-STABLE TAIL. READ THIS BEFORE ADDING A SYMBOL.
+    // ======================================================================
+    //
+    // Entries here are interned AFTER everything above -- after `Keywords`,
+    // after `Symbols`, after the generated `0`..`9` / `A`..`Z` / `a`..`z`
+    // prefill, and after the `env!()`-valued symbols. Adding one therefore
+    // renumbers NOTHING. Entries in `Symbols` above are NOT index-stable: an
+    // insertion anywhere in that list, INCLUDING AT ITS END, shifts the digit,
+    // letter and env symbols that follow it.
+    //
+    // WHY THIS EXISTS -- the failure it prevents, measured 2026-08-16:
+    //
+    //   `rustc_metadata` encodes a predefined symbol as its raw u32 index
+    //   (`SYMBOL_PREDEFINED`, `rmeta/encoder.rs::encode_symbol_or_byte_symbol`)
+    //   and decodes it the same way. An `.rmeta` on disk is therefore only
+    //   readable by a compiler whose index -> string map is IDENTICAL to the
+    //   one that wrote it. Upstream rustc never notices, because upstream
+    //   rebuilds std with the compiler. This repo does not: measurement lanes
+    //   rebuild the DRIVER ALONE and point it at a FROZEN prebuilt stage1 std,
+    //   with CFG_VERSION/CFG_VER_HASH deliberately set to the std's build rev
+    //   so rustc's own version guard admits it. Renumbering here does not mean
+    //   "recompile something", it means the frozen std stops loading.
+    //
+    //   What it looks like when you get it wrong: every crate resolution fails
+    //   with E0463 `can't find crate for 'std'`, and
+    //   `RUSTC_LOG=rustc_metadata=info` shows `Rejecting via crate name` from
+    //   `locator.rs::crate_matches` -- because the crate NAME in the header is
+    //   itself a predefined symbol, so it decodes to the wrong string. It is
+    //   not a missing sysroot, not a triple mismatch, and not a stale lockfile.
+    //   Commit 4c72c18351 inserted two symbols in the middle of `Symbols` and
+    //   cost three lanes their measurements (one of them a 40-minute driver
+    //   build) before the cause was found.
+    //
+    // SO: if you are adding a symbol and this tree's stage1 std is frozen, add
+    // it HERE. Alphabetical order is a `Symbols` convention only; this section
+    // is chronological on purpose, and nothing sorts or bisects it. If you must
+    // add to `Symbols` (e.g. taking an upstream import wholesale), you are
+    // choosing to rebuild std -- the compile-time assertions below will stop
+    // you first, and they are the intended place to record that decision.
+    AppendOnly {
+        // 4c72c18351, static_str_write_fmt: `core::fmt::Arguments::from_str`
+        // and the `core::fmt::Write` trait, both looked up as diagnostic items.
+        FmtArgumentsFromStr,
+        FmtWrite,
+    }
 }
+
+// ==========================================================================
+// trust: THE FROZEN PREINTERNED-INDEX ABI.
+// ==========================================================================
+//
+// `SYMBOL_DIGITS_BASE` is the number of entries in `Keywords` + `Symbols`
+// above, so pinning it pins the index of EVERY symbol an already-built
+// `.rmeta` can name. It is checked at COMPILE time, on every driver build, so
+// a mid-list insertion is a build error in `rustc_span` -- near the bottom of
+// the graph, long before the expensive crates -- rather than an E0463 after a
+// forty-minute driver build. See the `AppendOnly` block above for the full
+// failure mode.
+//
+// The value is not arbitrary: it is the table the frozen stage1 std in
+// `build/<host>/stage1` was compiled with, verified end-to-end by building an
+// unpatched driver from this source and having it compile against that std.
+//
+// If you are DELIBERATELY renumbering (an upstream import, or a tree whose std
+// is going to be rebuilt anyway), update these numbers in the same commit and
+// say so in the message -- and expect every sealed driver and every `.rmeta`
+// built before the change to stop interoperating with every one built after.
+const _: () = assert!(
+    SYMBOL_DIGITS_BASE == 2318,
+    "preinterned symbol indices moved: the Keywords/Symbols lists gained or lost an entry. \
+     Already-built .rmeta -- the frozen stage1 std -- encodes predefined symbols BY INDEX, \
+     so it will stop loading, with E0463 and `Rejecting via crate name` in the metadata log. \
+     Add new symbols to the AppendOnly section instead: it is interned last and renumbers nothing."
+);
+// These two are implied by the assertion above, but spelling them out means a
+// future change to the macro's prefill order (digits before letters, extra
+// prefill classes, ...) is also caught here rather than at crate-load time.
+const _: () = assert!(SYMBOL_UPPERCASE_LETTERS_BASE == SYMBOL_DIGITS_BASE + 10);
+const _: () = assert!(SYMBOL_LOWERCASE_LETTERS_BASE == SYMBOL_UPPERCASE_LETTERS_BASE + 26);
+// The env-derived symbols are interned after the letters and before the
+// `AppendOnly` tail; pinning `env_CFG_RELEASE` pins that boundary too.
+const _: () = assert!(sym::env_CFG_RELEASE.as_u32() == SYMBOL_LOWERCASE_LETTERS_BASE + 26);
 
 /// Symbols for crates that are part of the stable standard library: `std`, `core`, `alloc`, and
 /// `proc_macro`.
@@ -2720,7 +2803,9 @@ impl Symbol {
         })
     }
 
-    pub fn as_u32(self) -> u32 {
+    // `const` so the frozen preinterned-index assertions at the end of the
+    // `symbols!` invocation can be checked at compile time.
+    pub const fn as_u32(self) -> u32 {
         self.0.as_u32()
     }
 

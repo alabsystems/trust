@@ -66,6 +66,7 @@ fn func_with_locals(name: &str, locals: Vec<LocalDecl>, return_ty: Ty) -> Verifi
             }],
             arg_count: 0,
             return_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

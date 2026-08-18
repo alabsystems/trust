@@ -609,15 +609,247 @@ pub fn flip_safety_verdicts_with_module(
     (out, FlipReport { decisions })
 }
 
+/// The OBLIGATION-ENUMERATION difference between the two independent producers,
+/// keyed by `(kind, span)` and deliberately NOT by formula.
+///
+/// Trust (#57, 2026-08-17) — THE MISSING-OBLIGATION ALARM. This repo runs two
+/// independent safety-obligation producers over every function, and until now it
+/// compared them only to decide WHICH set to dispatch, discarding the comparison
+/// itself. That threw away the one signal no downstream layer can reconstruct: an
+/// obligation that is never emitted produces SILENCE, and silence is
+/// indistinguishable from success at every layer below, including the Clean kernel
+/// — a kernel can only re-check propositions it is handed.
+///
+/// The two directions are NOT symmetric, and conflating them would bury the signal:
+///
+///  * `native_only` is the ALARM. The dispatched set on this path is trust-vcgen's,
+///    so an obligation only the trust-ir spine derived is one that NOTHING checks.
+///  * `vcgen_only` is over-approximation on the dispatched side, not silence. It
+///    means the spine has a coverage gap; trust-vcgen's obligation is still
+///    dispatched and still checked. Worth reporting, never worth failing on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObligationKey {
+    /// The canonical obligation class — see [`obligation_class`].
+    pub class: String,
+    /// Where the obligation lives. Carried structurally rather than pre-rendered
+    /// because the compiler turns a `native_only` entry into a user-visible
+    /// fail-closed finding, and a finding without a span cannot carry its fix.
+    pub location: SourceSpan,
+}
+
+impl ObligationKey {
+    /// The user-visible message for the fail-closed finding the COMPILER raises
+    /// when this obligation reaches nobody.
+    ///
+    /// It lives here, not in `trust_verify.rs`, for a boring but decisive reason:
+    /// no cargo sweep reaches `compiler/**`, so a test next to the caller would
+    /// compile and never run. The caller is left as a six-line adapter with no
+    /// untested logic in it.
+    ///
+    /// Follows principle 10 / v7-D3 — a refusal must carry the fix, with options.
+    /// The finding does NOT say a violation exists; it says nobody looked, and the
+    /// two ways to resolve that are genuinely different pieces of work.
+    #[must_use]
+    pub fn unchecked_finding_message(&self) -> String {
+        format!(
+            "[spine:unchecked-obligation] the trust-ir spine derived a `{}` obligation here \
+             that trust-vcgen neither emitted nor discharged, so nothing verifies it \
+             (fail-closed — an obligation that is never emitted is silent, and silence reads \
+             as success). Resolve by either (a) teaching trust-vcgen to emit it, if the \
+             obligation is real, or (b) making the spine agree it does not exist, as the \
+             shared `trust_types::static_truth::assert_failure_is_known_false` fold does for \
+             constant divisors. Do NOT suppress this row: the two producers disagreeing \
+             about which obligations exist IS the signal.",
+            self.class,
+        )
+    }
+}
+
+impl std::fmt::Display for ObligationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}@{}:{}:{}",
+            self.class, self.location.file, self.location.line_start, self.location.col_start
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObligationSetDiff {
+    /// Obligations the trust-ir spine derived that trust-vcgen never emitted,
+    /// sorted. THE ALARM DIRECTION.
+    pub native_only: Vec<ObligationKey>,
+    /// Obligations trust-vcgen emitted that the trust-ir spine did not derive.
+    /// A spine coverage gap; these are dispatched and checked regardless.
+    pub vcgen_only: Vec<ObligationKey>,
+}
+
+impl ObligationSetDiff {
+    /// True when the two producers enumerate exactly the same obligations. Note
+    /// this says nothing about their FORMULAS agreeing — that is a separate and
+    /// deliberately weaker question, see [`vc_dispatch_multiset_eq`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.native_only.is_empty() && self.vcgen_only.is_empty()
+    }
+}
+
+
+
+/// The CANONICAL CLASS of an obligation kind — what the two producers must agree
+/// on for them to be talking about the same obligation.
+///
+/// Trust (#57): the naive key `format!("{:?}", vc.kind)` is WRONG here, and it was
+/// wrong in a way that manufactured false alarms rather than hiding real ones. Two
+/// measured causes, both confirmed against the corpus:
+///
+///  * **Spelling.** The two producers disagree on the NAME of the bounds
+///    obligation: the trust-ir spine emits `SliceBoundsCheck` where trust-vcgen
+///    emits `IndexOutOfBounds`, at a byte-identical span. Four corpus rows paired
+///    exactly like that, one in each direction. They are already treated as one
+///    class everywhere else in the tree (`matches!(vc.kind, VcKind::IndexOutOfBounds
+///    | VcKind::SliceBoundsCheck)`).
+///  * **Payload.** `ArithmeticOverflow` carries `operand_tys` inside the kind, and
+///    the two producers derive those independently (a measured case has native
+///    reporting `(i32, i64)` for one `Add`). Operand types are a detail OF the
+///    obligation, not its identity: at one span there is one `Add` to check.
+///
+/// So the class is the discriminant plus, for arithmetic, the operator — and
+/// nothing else. Everything finer belongs to the formula, which is deliberately
+/// out of scope for this comparison.
+fn obligation_class(kind: &VcKind) -> String {
+    match kind {
+        VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck => "BoundsCheck".to_string(),
+        VcKind::ArithmeticOverflow { op, .. } => format!("ArithmeticOverflow({op:?})"),
+        // Trust (#57): trust-vcgen's UNSAFE-MODEL findings get their own class, and
+        // it is not pedantry — it is the difference between a coverage gap and a
+        // category error. These say "Trust has no model for this unsafe operation"
+        // (`[unsafe] missing SAFETY comment`, `[unsafe:sep:deref] alignment check
+        // for *offset_62`, allocation validity). They are NOT L0 obligations derived
+        // from program semantics, so the trust-ir spine does not derive them and
+        // never should. Counting them as spine coverage gap overstated that gap by
+        // roughly half (119 of 236).
+        VcKind::Assertion { message } if message.starts_with("[unsafe") => {
+            "Assertion(unsafe-model)".to_string()
+        }
+        other => {
+            let rendered = format!("{other:?}");
+            let head = rendered
+                .split_once(" {")
+                .map_or(rendered.as_str(), |(h, _)| h)
+                .split_once('(')
+                .map_or_else(
+                    || rendered.split_once(" {").map_or(rendered.as_str(), |(h, _)| h),
+                    |(h, _)| h,
+                );
+            head.to_string()
+        }
+    }
+}
+
+/// The `(kind, span)` key set of a VC list — the obligation ENUMERATION, with the
+/// formula deliberately excluded.
+///
+/// A SET (not multiset), matching the historical comparison: trust-vcgen emits the
+/// co-located div/rem statement `DivByZero` VC twice where native has it once, and
+/// that duplication is not a disagreement about WHICH obligations exist.
+fn l0_obligation_key_set(
+    vcs: &[VerificationCondition],
+) -> std::collections::BTreeMap<(String, SpanKey), SourceSpan> {
+    vcs.iter()
+        .map(|vc| {
+            ((obligation_class(&vc.kind), span_key(&vc.location)), vc.location.clone())
+        })
+        .collect()
+}
+
+/// The obligation-enumeration difference between the trust-ir-native set and
+/// trust-vcgen's L0 set.
+///
+/// Keyed by `(kind, span)` and NOT by formula, and that choice is load-bearing
+/// rather than incidental: native may legitimately carry a sounder, canonicalized
+/// formula for the same obligation (slice-length-canonicalized bounds is the
+/// standing example). An alarm keyed on the formula would fire on every one of
+/// those benign differences, burying the real signal — and, once anything acts on
+/// it, would reject valid Rust, which is a release gate.
+#[must_use]
+pub fn l0_obligation_set_diff(
+    native: &[VerificationCondition],
+    vcgen_l0: &[VerificationCondition],
+) -> ObligationSetDiff {
+    l0_obligation_set_diff_with_discharged(native, vcgen_l0, std::iter::empty())
+}
+
+/// The obligation-enumeration difference, counting trust-vcgen's STATICALLY
+/// DISCHARGED obligations as present.
+///
+/// Trust (#57): this is not a refinement, it is a correctness requirement, and
+/// omitting it was the third measured false-alarm source. `generate_vcs_with_
+/// discharge_and_summaries` returns TWO sets — the VCs it emits for solving, and
+/// the ones it PROVED at generation time. A discharged obligation is checked, and
+/// checked more strongly than a dispatched one; treating it as absent reports
+/// "nothing checks this" about an obligation trust-vcgen actually proved. Measured:
+/// three corpus rows (`bounded_add`, `inc_gt`, `helper`) where native derived an
+/// `ArithmeticOverflow(Add)` that trust-vcgen emitted zero VCs for — and had
+/// discharged.
+#[must_use]
+pub fn l0_obligation_set_diff_with_discharged<'a, I>(
+    native: &[VerificationCondition],
+    vcgen_l0: &[VerificationCondition],
+    discharged: I,
+) -> ObligationSetDiff
+where
+    I: IntoIterator<Item = &'a VerificationCondition>,
+{
+    let native_keys = l0_obligation_key_set(native);
+    let vcgen_keys = l0_obligation_key_set(vcgen_l0);
+    let to_key = |(class, _): &(String, SpanKey), span: &SourceSpan| ObligationKey {
+        class: class.clone(),
+        location: span.clone(),
+    };
+    // The discharged set enters ONE side only, and deliberately so. It answers
+    // "is this obligation checked?", which is the `native_only` question; it does
+    // not answer "did the spine derive this?", which is the `vcgen_only` one.
+    // Folding it into both would manufacture spine-coverage-gap entries for every
+    // obligation trust-vcgen proved statically — noise in the direction that was
+    // already the benign one.
+    let mut checked_by_vcgen: std::collections::BTreeSet<(String, SpanKey)> =
+        vcgen_keys.keys().cloned().collect();
+    checked_by_vcgen.extend(
+        discharged.into_iter().map(|vc| (obligation_class(&vc.kind), span_key(&vc.location))),
+    );
+    ObligationSetDiff {
+        native_only: native_keys
+            .iter()
+            .filter(|(k, _)| !checked_by_vcgen.contains(*k))
+            .map(|(k, span)| to_key(k, span))
+            .collect(),
+        vcgen_only: vcgen_keys
+            .iter()
+            .filter(|(k, _)| !native_keys.contains_key(*k))
+            .map(|(k, span)| to_key(k, span))
+            .collect(),
+    }
+}
+
 /// Outcome of [`generate_native_or_flip_safety_vcs`], for the compiler's debug log.
 #[derive(Debug, Clone)]
 pub enum NativeGenOutcome {
     /// trust-ir GENERATED the dispatched L0 safety VC set (validated `==`
     /// trust-vcgen). The `usize` is how many L0 safety VCs the spine generated.
     NativeGenerated(usize),
-    /// Native generation declined or did not reproduce the L0 set exactly; the
-    /// verdict-flip ran over trust-vcgen's VCs instead (`FlipReport` attached).
+    /// Native generation declined, or it reproduced trust-vcgen's obligation
+    /// ENUMERATION exactly but with a different formula; the verdict-flip ran over
+    /// trust-vcgen's VCs instead (`FlipReport` attached). Benign: nothing is
+    /// unchecked, because the dispatched set enumerates the same obligations.
     FlippedFallback(FlipReport),
+    /// Trust (#57): the two producers DISAGREE about which obligations exist. The
+    /// verdict-flip still ran over trust-vcgen's VCs — dispatch behaviour is
+    /// byte-identical to `FlippedFallback` — but the disagreement is now reported
+    /// instead of discarded. A non-empty `diff.native_only` means the dispatched
+    /// set is SILENT about an obligation a second independent producer derived.
+    Disagreed { diff: ObligationSetDiff, report: FlipReport },
 }
 
 /// THE obligation-birth cutover entry point. Prefer trust-ir-NATIVE generation: if
@@ -639,6 +871,21 @@ pub fn generate_native_or_flip_safety_vcs(
     func: &VerifiableFunction,
     vcgen_vcs: Vec<VerificationCondition>,
 ) -> (Vec<VerificationCondition>, NativeGenOutcome) {
+    generate_native_or_flip_safety_vcs_with_discharged(func, vcgen_vcs, std::iter::empty())
+}
+
+/// [`generate_native_or_flip_safety_vcs`], told which obligations trust-vcgen
+/// STATICALLY DISCHARGED. Dispatch behaviour is byte-identical; the discharged set
+/// only ever makes the reported disagreement SMALLER, never larger, because it can
+/// only add keys to trust-vcgen's side.
+pub fn generate_native_or_flip_safety_vcs_with_discharged<'a, I>(
+    func: &VerifiableFunction,
+    vcgen_vcs: Vec<VerificationCondition>,
+    discharged: I,
+) -> (Vec<VerificationCondition>, NativeGenOutcome)
+where
+    I: IntoIterator<Item = &'a VerificationCondition>,
+{
     if let Some(native) = crate::lower::generate_native_safety_vcs(func) {
         let (vcgen_l0, vcgen_rest): (Vec<_>, Vec<_>) =
             vcgen_vcs.iter().cloned().partition(|vc| is_l0_safety(vc));
@@ -652,7 +899,18 @@ pub fn generate_native_or_flip_safety_vcs(
         // alone does not establish verdict equivalence, and previous universal dispatch
         // both admitted stale guard facts and lost loop facts. Any future cutover must be
         // an explicit, dependency-tracked API backed by the full soundness gates.
-        let _ = (native, vcgen_l0, vcgen_rest);
+        //
+        // Trust (#57, 2026-08-17) — but the COMPARISON is no longer discarded. Dispatch
+        // is unchanged (we still fall back, and we still never dispatch a mismatched
+        // native set — the soundness argument above depends on exactly that); what
+        // changes is that a disagreement about WHICH obligations exist is now reported
+        // rather than dropped on the floor.
+        let _ = vcgen_rest;
+        let diff = l0_obligation_set_diff_with_discharged(&native, &vcgen_l0, discharged);
+        if !diff.is_empty() {
+            let (flipped, report) = flip_safety_verdicts_to_spine(func, vcgen_vcs);
+            return (flipped, NativeGenOutcome::Disagreed { diff, report });
+        }
     }
     let (flipped, report) = flip_safety_verdicts_to_spine(func, vcgen_vcs);
     (flipped, NativeGenOutcome::FlippedFallback(report))
@@ -683,10 +941,11 @@ fn native_l0_set_matches_vcgen(
     native: &[VerificationCondition],
     vcgen_l0: &[VerificationCondition],
 ) -> bool {
-    let key_set = |vcs: &[VerificationCondition]| -> std::collections::HashSet<(String, SpanKey)> {
-        vcs.iter().map(|vc| (format!("{:?}", vc.kind), span_key(&vc.location))).collect()
-    };
-    key_set(native) == key_set(vcgen_l0)
+    // Trust (#57): delegates to the PRODUCTION diff rather than re-transcribing the
+    // keying. Two hand-maintained copies of the same key function are exactly the
+    // pair that drifts, and a drift here would be invisible — the test helper would
+    // keep passing while the production alarm keyed on something else.
+    l0_obligation_set_diff(native, vcgen_l0).is_empty()
 }
 
 /// Multiset equality of two VC sets by their DISPATCHED IDENTITY — `kind`, source
@@ -1127,6 +1386,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1271,6 +1531,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts,
             preconditions: vec![],
@@ -3113,6 +3374,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -3353,6 +3615,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -3422,13 +3685,19 @@ mod tests {
     /// `Postcondition` VC SPINE-SOURCED (formula) on the LIVE-path VC set.
     ///
     /// The live formula is
-    /// `(and (and (>= n 0) (<= n 4294967295)) (and true true (and (= _0 c) (not (>= _0 0)))))`:
+    /// `(and (and (>= n 0) (<= n 4294967295))
+    ///       (and true true
+    ///            (and (= _6 i) (= _5 (< _6 n))
+    ///                 (and (not (< _6 n))
+    ///                      (and (= _0 c) (not (>= _0 0)))))))` modulo SSA tokens:
     ///   * the env conjunct is the parameter `n`'s u32 type range ONLY — the loop
     ///     variables `c`/`i` widen to TOP (`[i128::MIN,i128::MAX]`) over the back-edge
     ///     and are FILTERED OUT by `interval_domain_to_formula`, so they contribute no
     ///     conjunct (the widening's observable env effect is "the loop vars drop out");
     ///   * the two `true`s are the return block's and the loop-header predecessor's
     ///     semantic guards, both JOIN-WEAKENED to `Bool(true)` on the back-edge revisit;
+    ///   * `_6 = i` and `_5 = (_6 < n)` are the predecessor definitions made
+    ///     relevant by the exact false loop-exit edge `not (_6 < n)`;
     ///   * `Eq(_0, c)` is the return-pin (`_0 = c`) and `Not(Ge(_0,0))` the negated
     ///     postcondition.
     /// The spine reconstructs every piece byte-for-byte WITHOUT running the fixpoint
@@ -3455,13 +3724,14 @@ mod tests {
         // And it is exactly the env-wrapped, weakened-guard, return-pinned shape.
         // The LIVE formula carries trust-vcgen's S2c statement-granular SSA version
         // tokens (`c#s0_1_s3_0`); modulo those tokens it is the param-env +
-        // weakened-guard + return-pin shape.
+        // weakened-guard + exact edge + return-pin shape.
         assert_eq!(
             strip_version_tokens_in_formula(&posts[0].formula).to_smtlib(),
             "(and (and (>= n 0) (<= n 4294967295)) \
-             (and true true (and (= _0 c) (not (>= _0 0)))))",
+             (and true true (and (= _6 i) (= _5 (< _6 n)) \
+             (and (not (< _6 n)) (and (= _0 c) (not (>= _0 0)))))))",
             "the live count postcondition formula must be the param-env + weakened-guard \
-             + return-pin shape (loop vars widen to TOP and drop out)"
+             + exact exit edge + return-pin shape (loop vars widen to TOP and drop out)"
         );
 
         let before = solver_vcs.clone();
@@ -3522,5 +3792,324 @@ mod tests {
              — i.e. the widened loop vars contribute NOTHING. live={:?} spine={:?}",
             live_env, spine_env
         );
+    }
+}
+
+/// Trust (#57, 2026-08-17) — THE MISSING-OBLIGATION RATCHET.
+///
+/// This repo runs two independent safety-obligation producers over every function
+/// and, until now, compared them only to decide WHICH set to dispatch — discarding
+/// the comparison itself (`let _ = (native, vcgen_l0, vcgen_rest);`). That threw
+/// away the one signal no downstream layer can reconstruct: an obligation that is
+/// never emitted produces SILENCE, and silence is indistinguishable from success
+/// everywhere below, including the Clean kernel, which can only re-check
+/// propositions it is handed.
+///
+/// This test runs the real production entry point over the real trust-vcgen
+/// pipeline across every committed dump, and pins the result.
+///
+/// **It is a RATCHET, not a zero-gate, and that is a measured decision rather than
+/// a concession.** The population is not zero, but every survivor is one known,
+/// benign class — see the assertions. What must never happen is a NEW class of
+/// obligation appearing that trust-vcgen neither emits nor discharges; that is the
+/// silent hole, and this test goes red the moment one shows up.
+///
+/// Getting to this state took correcting three false-alarm sources, each measured
+/// against the corpus rather than reasoned about (the naive comparison reported 44):
+///
+///  1. **Kind spelling** — the spine says `SliceBoundsCheck` where trust-vcgen says
+///     `IndexOutOfBounds`, at byte-identical spans. 4 rows, paired one-for-one in
+///     both directions. Fixed by [`obligation_class`].
+///  2. **Kind payload** — `ArithmeticOverflow` carries `operand_tys`, derived
+///     independently by each producer. Fixed by the same function.
+///  3. **Discharged obligations** — trust-vcgen returns emitted AND statically
+///     PROVED sets; treating the proved ones as absent claimed "nothing checks
+///     this" about obligations it had discharged. 3 rows (`bounded_add`, `inc_gt`,
+///     `helper`). Fixed by [`l0_obligation_set_diff_with_discharged`].
+#[cfg(test)]
+mod missing_obligation_ratchet {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// ZERO. Not a ceiling, not a whitelist — every obligation the trust-ir spine
+    /// derives is one trust-vcgen either dispatches or has already proved.
+    ///
+    /// This started as a ratchet at 31 with a `{DivisionByZero, RemainderByZero}`
+    /// allowance, because the spine emitted a trivially-true divisor VC where
+    /// trust-vcgen folded the obligation away. That allowance is gone: the spine
+    /// now applies the SAME fold, from the SAME definition
+    /// (`trust_types::static_truth::assert_failure_is_known_false`), so there is
+    /// nothing left to whitelist. Anything appearing here is an obligation one
+    /// producer derived and nothing checks.
+
+    /// The spine's measured coverage gap. Bounds the OPPOSITE failure from the
+    /// zero-gate: an over-aggressive fold that stops the spine deriving
+    /// obligations trust-vcgen still emits.
+    ///
+    /// SPINE-DERIVABLE ONLY. `Assertion(unsafe-model)` rows are excluded and
+    /// counted separately: they say "Trust has no model for this unsafe
+    /// operation", which the spine does not derive and never should. Including
+    /// them read as a 236-row gap when the real one is 139.
+    ///
+    /// Diagnosed sub-classes, for whoever closes them. The common thread is that
+    /// the spine's generator walks `Terminator::Assert` and NOTHING ELSE, while
+    /// trust-vcgen also derives obligations from place projections and from panic
+    /// calls:
+    ///  * `BoundsCheck` (38) — from a `ConstantIndex` / `Index` PLACE PROJECTION
+    ///    with no assert anywhere in the body. `core::slice::<impl [i32]>::first`
+    ///    is the clean example: its entire body is `PtrMetadata`, a `Ge` compare, a
+    ///    `SwitchInt`, and `&(*_1)[0]` — no `Assert` terminator exists to walk.
+    ///  * `Assertion` (22) — user `assert!`/`assert_eq!`, which lower to a PANIC
+    ///    CALL rather than an assert terminator (all 22 span
+    ///    `core/src/macros/mod.rs`, from byteorder's
+    ///    `assert_eq!(dst.len() * 8, src.len())`). trust-vcgen recovers these in
+    ///    `generate/panic_calls.rs`; the spine has no counterpart.
+    ///  * `ArithmeticOverflow(Add)` (37) — concentrated in probe fixtures.
+    ///
+    /// Lowering this is progress; raising it means coverage was retired. Note the
+    /// asymmetry with the zero-gate above: ADDING spine derivation is the risky
+    /// direction now, because anything the spine derives that trust-vcgen does not
+    /// lands in `native_only` and fail-closes the compiler.
+    const VCGEN_ONLY_CEILING: usize = 139;
+
+    fn dump_dirs(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else { return };
+        let mut has_json = false;
+        let mut subdirs = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                subdirs.push(path);
+            } else if path.extension().and_then(|x| x.to_str()) == Some("json") {
+                has_json = true;
+            }
+        }
+        if has_json {
+            out.push(root.to_path_buf());
+        }
+        for sub in subdirs {
+            dump_dirs(&sub, out);
+        }
+    }
+
+    fn vcgen_vcs_for(
+        func: &VerifiableFunction,
+    ) -> (Vec<VerificationCondition>, Vec<VerificationCondition>) {
+        use trust_vcgen::SummaryDatabase;
+        let summaries = SummaryDatabase::new();
+        let (solver_vcs, discharged) =
+            trust_vcgen::generate_vcs_with_discharge_and_summaries(func, &summaries);
+        (
+            trust_vcgen::filter_vcs_by_level(solver_vcs, trust_types::ProofLevel::L1Functional),
+            discharged.into_iter().map(|(vc, _)| vc).collect(),
+        )
+    }
+
+    #[test]
+    fn no_obligation_is_derived_by_the_spine_and_checked_by_nobody() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-clean/fixtures");
+        let mut dirs = Vec::new();
+        dump_dirs(&root, &mut dirs);
+        assert!(!dirs.is_empty(), "the fixture corpora must be found, or this measures nothing");
+
+        let mut functions = 0usize;
+        let mut native_only: Vec<String> = Vec::new();
+        let mut vcgen_only_total = 0usize;
+        let mut unsafe_model_total = 0usize;
+
+        for dir in &dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
+                functions += 1;
+                let (vcgen, discharged) = vcgen_vcs_for(&func);
+                let (_dispatched, outcome) = generate_native_or_flip_safety_vcs_with_discharged(
+                    &func,
+                    vcgen,
+                    discharged.iter(),
+                );
+                if let NativeGenOutcome::Disagreed { diff, .. } = outcome {
+                    for k in &diff.vcgen_only {
+                        if k.class == "Assertion(unsafe-model)" {
+                            unsafe_model_total += 1;
+                        } else {
+                            vcgen_only_total += 1;
+                        }
+                    }
+                    native_only
+                        .extend(diff.native_only.iter().map(|k| format!("{} :: {k}", func.def_path)));
+                }
+            }
+        }
+
+        assert!(functions > 2_000, "expected the full corpus, saw {functions} functions");
+
+        // THE GATE, at zero. Each row here is an obligation the trust-ir spine
+        // derived that trust-vcgen neither dispatched nor discharged — a
+        // proposition nothing in the pipeline verifies. Whitelisting a row is not
+        // a fix; either the spine should not be deriving it (make the two
+        // producers agree, as the div/rem fold did) or trust-vcgen has a hole.
+        assert!(
+            native_only.is_empty(),
+            "UNCHECKED OBLIGATION(S): the trust-ir spine derived {} obligation(s) that \
+             trust-vcgen neither emitted nor discharged. Each is a proposition nothing \
+             verifies — an obligation that is never emitted produces silence, and silence \
+             is indistinguishable from success everywhere downstream:\n  {}",
+            native_only.len(),
+            native_only.join("\n  "),
+        );
+
+        // THE OTHER DIRECTION, and it needs its own bound. The zero-gate above only
+        // catches the spine deriving TOO MUCH. A fold that is too AGGRESSIVE fails
+        // the opposite way: the spine stops deriving an obligation trust-vcgen still
+        // emits, which lands in `vcgen_only` and would sail past the gate above.
+        //
+        // That is not a soundness hole — trust-vcgen's obligation is still
+        // dispatched and still checked — but it silently retires cross-check
+        // coverage, and cross-checking is the entire value of running two
+        // producers. Pinning a ceiling here means the div/rem fold cannot quietly
+        // grow into obligations it was never meant to cover.
+        assert!(
+            vcgen_only_total <= VCGEN_ONLY_CEILING,
+            "the spine's coverage gap GREW to {vcgen_only_total} (ceiling \
+             {VCGEN_ONLY_CEILING}). Nothing is unchecked — trust-vcgen still dispatches \
+             these — but the spine stopped cross-checking obligations it used to, which \
+             is how an over-aggressive fold hides.",
+        );
+
+        eprintln!(
+            "alarm: {functions} functions, native_only=0, vcgen_only={vcgen_only_total} \
+             (spine-derivable coverage gap, ceiling {VCGEN_ONLY_CEILING}), \
+             unsafe_model={unsafe_model_total} (not a gap — never spine-derived)"
+        );
+    }
+}
+
+/// Trust (#57) — the ratchet's negative controls. A gate that cannot go red is not
+/// a gate, so these drive the diff directly rather than through the corpus.
+#[cfg(test)]
+mod missing_obligation_alarm_controls {
+    use super::*;
+
+    fn vc(kind: VcKind, line: u32) -> VerificationCondition {
+        VerificationCondition {
+            kind,
+            function: trust_types::Symbol::intern("ctrl"),
+            location: trust_types::SourceSpan {
+                file: "CTRL.rs".to_string(),
+                line_start: line,
+                col_start: 1,
+                line_end: line,
+                col_end: 2,
+            },
+            // The formula is deliberately irrelevant to this comparison — that is
+            // the whole point of keying on `(class, span)`. A `Bool(true)` here
+            // would silently pass even if the diff DID look at formulas, so use a
+            // distinguishable one.
+            formula: trust_types::Formula::Bool(false),
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+
+    fn render(keys: &[ObligationKey]) -> Vec<String> {
+        keys.iter().map(ToString::to_string).collect()
+    }
+
+    fn add_overflow_kind() -> VcKind {
+        VcKind::ArithmeticOverflow {
+            op: trust_types::BinOp::Add,
+            operand_tys: (
+                trust_types::Ty::Int { width: 32, signed: false },
+                trust_types::Ty::Int { width: 32, signed: false },
+            ),
+        }
+    }
+
+    /// POSITIVE CONTROL — an obligation only the spine derives, of a class the
+    /// ratchet does not whitelist, IS reported. This is the failure the whole
+    /// mechanism exists to catch.
+    #[test]
+    fn spine_only_obligation_is_reported() {
+        let native = vec![vc(add_overflow_kind(), 10)];
+        let diff = l0_obligation_set_diff(&native, &[]);
+        assert_eq!(render(&diff.native_only), vec!["ArithmeticOverflow(Add)@CTRL.rs:10:1"]);
+        assert!(diff.vcgen_only.is_empty());
+        assert!(!diff.is_empty(), "a spine-only obligation must NOT read as agreement");
+    }
+
+    /// The compiler renders each `native_only` entry into a fail-closed finding
+    /// with THIS message. Pinned here because the caller lives in `compiler/**`,
+    /// which no cargo sweep reaches.
+    #[test]
+    fn unchecked_finding_message_names_the_class_and_both_fixes() {
+        let key = ObligationKey {
+            class: "BoundsCheck".to_string(),
+            location: trust_types::SourceSpan {
+                file: "CTRL.rs".to_string(),
+                line_start: 7,
+                col_start: 1,
+                line_end: 7,
+                col_end: 2,
+            },
+        };
+        let msg = key.unchecked_finding_message();
+        assert!(msg.contains("BoundsCheck"), "the finding must name the obligation class");
+        assert!(
+            msg.contains("neither emitted nor discharged"),
+            "the finding must say WHY nothing checked it, not merely that something is wrong"
+        );
+        // v7-D3: a refusal carries the fix, with OPTIONS. Both must be present —
+        // "unsupported, good luck" is a defect.
+        assert!(msg.contains("(a) teaching trust-vcgen to emit it"), "fix (a) missing");
+        assert!(msg.contains("(b) making the spine agree"), "fix (b) missing");
+    }
+
+    /// NEGATIVE CONTROL — a DISCHARGED obligation is checked, and must not be
+    /// reported. Without this the alarm claims "nothing verifies this" about
+    /// something trust-vcgen proved.
+    #[test]
+    fn discharged_obligation_is_not_reported() {
+        let native = vec![vc(add_overflow_kind(), 10)];
+        let discharged = vec![vc(add_overflow_kind(), 10)];
+        let diff = l0_obligation_set_diff_with_discharged(&native, &[], discharged.iter());
+        assert!(diff.is_empty(), "a discharged obligation is checked: {diff:?}");
+    }
+
+    /// NEGATIVE CONTROL — the two producers' different SPELLINGS of the bounds
+    /// obligation are the same obligation. Four corpus rows depend on this.
+    #[test]
+    fn bounds_kind_spelling_is_not_a_disagreement() {
+        let native = vec![vc(VcKind::SliceBoundsCheck, 20)];
+        let vcgen = vec![vc(VcKind::IndexOutOfBounds, 20)];
+        let diff = l0_obligation_set_diff(&native, &vcgen);
+        assert!(diff.is_empty(), "SliceBoundsCheck vs IndexOutOfBounds at one span: {diff:?}");
+    }
+
+    /// NEGATIVE CONTROL — but a bounds obligation at a DIFFERENT span is a
+    /// different obligation, so aliasing the kind must not alias the span too.
+    #[test]
+    fn bounds_alias_does_not_collapse_distinct_spans() {
+        let native = vec![vc(VcKind::SliceBoundsCheck, 20)];
+        let vcgen = vec![vc(VcKind::IndexOutOfBounds, 21)];
+        let diff = l0_obligation_set_diff(&native, &vcgen);
+        assert_eq!(render(&diff.native_only), vec!["BoundsCheck@CTRL.rs:20:1"]);
+        assert_eq!(render(&diff.vcgen_only), vec!["BoundsCheck@CTRL.rs:21:1"]);
+    }
+
+    /// NEGATIVE CONTROL — the spine MISSING an obligation trust-vcgen emits is a
+    /// coverage gap, not silence: it lands in `vcgen_only`, never in the alarm
+    /// direction. Conflating the two would bury the real signal in 250 rows.
+    #[test]
+    fn spine_coverage_gap_is_the_other_direction() {
+        let vcgen = vec![vc(VcKind::DivisionByZero, 30)];
+        let diff = l0_obligation_set_diff(&[], &vcgen);
+        assert!(diff.native_only.is_empty(), "a spine gap is not an unchecked obligation");
+        assert_eq!(render(&diff.vcgen_only), vec!["DivisionByZero@CTRL.rs:30:1"]);
     }
 }

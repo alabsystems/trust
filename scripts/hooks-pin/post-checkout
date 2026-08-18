@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Advisory: announce submodule pin drift after a branch switch.
+# Never blocks, never mutates. Shared body with scripts/hooks/.
+#
+# argv: <prev_head> <new_head> <branch_flag>. branch_flag is 0 for a file
+# checkout (`git checkout -- path`), which cannot move a gitlink in a way worth
+# a paragraph of stderr, so only branch switches are reported.
+[ "${3:-0}" = "1" ] || exit 0
+
+NOTICE="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/_submodule_drift_notice.sh"
+[ -f "$NOTICE" ] || exit 0
+exec bash "$NOTICE"

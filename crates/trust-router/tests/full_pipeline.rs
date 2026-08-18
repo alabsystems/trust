@@ -47,6 +47,7 @@ fn division_function() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -107,6 +108,7 @@ fn bounded_checked_mul_function() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![
@@ -165,6 +167,7 @@ fn recursive_countdown_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

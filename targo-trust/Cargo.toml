@@ -6,6 +6,8 @@
 # Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 [patch.crates-io]
+# See the root manifest: memchr is first-party (crates/trust-memchr).
+memchr = { path = "../crates/trust-memchr" }
 rustc-hash = { path = "../first-party/ty/crates/tla-hash-fx" }
 rustc_version = { path = "../vendor/rustc_version_0_4_1" }
 

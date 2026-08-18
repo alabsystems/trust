@@ -31,11 +31,13 @@ sed -n \
   -e '/^contains_tool_error()/,/^}/p' \
   -e '/^contains_trust_counterexample_verdict()/,/^}/p' \
   -e '/^contains_trust_incompleteness_verdict()/,/^}/p' \
+  -e '/^contains_incomplete_static_accept()/,/^}/p' \
   -e '/^classify_verdict()/,/^}/p' \
   "$script" >"$work/fns.sh"
 
 for required in contains_tool_error contains_trust_counterexample_verdict \
-  contains_trust_incompleteness_verdict classify_verdict; do
+  contains_trust_incompleteness_verdict contains_incomplete_static_accept \
+  classify_verdict; do
   grep -q "^$required()" "$work/fns.sh" || {
     printf 'classify_verdict_test: %s not found — did the gate rename it?\n' "$required" >&2
     exit 2
@@ -58,6 +60,26 @@ check() {
 }
 
 check 'clean compile' 0 '' proved
+
+# EXIT 0 IS NOT PROOF (2026-08-04, task #37). Policy B's default exits 0 while
+# RETAINING runtime checks for undischarged obligations; the two shift-reduction
+# mutants rode that to a `proved` row and a false "SURVIVING MUTANT" headline.
+# rc=0 is `proved` only when every report summary is all-zero except proved.
+check 'exit 0, all obligations static' 0 \
+  'note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)' proved
+check 'exit 0, runtime-checked row' 0 \
+  'note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked out of 2 obligation(s)' runtime-checked
+check 'exit 0, unknown row' 0 \
+  'note: Trust verification: 1 proved, 0 failed, 1 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)' runtime-checked
+check 'exit 0, timed-out row' 0 \
+  'note: Trust verification: 3 proved, 0 failed, 0 unknown, 1 timed out, 0 runtime-checked out of 4 obligation(s)' runtime-checked
+# Zero-obligation acceptance fixtures emit no headline at all — still proved.
+check 'exit 0, no report (acceptance fixture)' 0 \
+  'warning: unused variable' proved
+# Two functions, second one degrades — any non-all-zero summary demotes.
+check 'exit 0, second fn runtime-checked' 0 \
+  'note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+note: Trust verification: 0 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked out of 1 obligation(s)' runtime-checked
 
 # A REFUTATION: the verifier exhibited a violated obligation. Only these count as
 # "caught" on the mutant lane.

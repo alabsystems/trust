@@ -672,6 +672,33 @@ mod tests {
                 Sha256::digest(fs::read(&executable).expect("installed fake trustd"))
             ),
         };
+        // `daemon_matches_bound_identity` can NEVER return true where the machine
+        // memory budget is 0 — `daemon_budget_is_acceptable` carries
+        // `client_budget != 0` as a hard conjunct, and the visible cgroup root has
+        // no `memory.max` on every bare-metal cgroup-v2 Linux box. Measured under
+        // #35: the fake daemon completes 148 well-formed IDENTITY+STATUS exchanges
+        // in five seconds and is rejected every time, on that conjunct alone.
+        //
+        // Assert that in BOTH directions instead of failing forever here. With no
+        // budget the exchange must still WORK and the refusal must be the budget
+        // one — which is a real assertion, not a skip: it would catch the daemon
+        // failing to answer at all.
+        if trust_router::memory_jobserver::machine_budget_bytes() == 0 {
+            let probe_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < probe_deadline {
+                assert!(
+                    !trust_router::coordinator::daemon_matches_bound_identity(
+                        &socket,
+                        &executable,
+                        &expected,
+                    ),
+                    "a zero-budget host must never admit a daemon — admission would mean the \
+                     non-zero-client-budget conjunct had been bypassed"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while !trust_router::coordinator::daemon_matches_bound_identity(
             &socket,

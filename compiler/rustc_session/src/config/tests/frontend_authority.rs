@@ -6,9 +6,12 @@ use std::thread;
 use super::{
     AutoDiff, BACKEND_AFTER_EVIDENCE_INERT, CG_OPTIONS, CodegenOptions, CompilerBackendRoute,
     CompilerBackendRouteState, EVIDENCE_INERT_AFTER_BACKEND, EVIDENCE_INERT_PROCESS_REUSE,
-    LEGACY_TRUST_SEMANTIC_ENV_VARS, Options, TrustAuthorityClass, TrustFrontendAuthoritySnapshot,
+    LEGACY_TRUST_SEMANTIC_ENV_VARS, Options, TargetTuple, TrustAuthorityClass,
+    TrustFrontendAuthoritySnapshot,
     TrustVerify, UNTRACKED_TRUST_CODEGEN_ENV_PREFIXES, UnstableOptions, Z_OPTIONS,
-    enter_compiler_backend_route_with_state, evidence_inert_llvm_control,
+    authenticated_target_llvm_args_error, enter_compiler_backend_route_with_state,
+    evidence_inert_llvm_control, evidence_inert_target_llvm_args_error,
+    target_is_exact_builtin,
     forbidden_no_official_evidence_environment_key, forbidden_trust_environment_key,
     is_legacy_trust_semantic_env_with_windows_semantics,
     is_untracked_trust_codegen_env_with_windows_semantics,
@@ -122,6 +125,7 @@ fn mutate_trust_control(opts: &mut UnstableOptions, field: &str) {
     use super::{TrustDump, TrustPolicy, TrustWitness};
     match field {
         "codegen_backend" => opts.codegen_backend = Some("llvm".to_string()),
+        "trust_cg_frontend" => opts.trust_cg_frontend = "trust-ir".to_string(),
         "trust_cg_output_gate" => opts.trust_cg_output_gate = "allow-unknown".to_string(),
         "trust_certified_test_monitors" => opts.trust_certified_test_monitors = true,
         "trust_dump" => {
@@ -371,3 +375,44 @@ fn windows_environment_case_folding_cannot_bypass_rejection() {
     ));
 }
 
+
+#[test]
+fn builtin_target_llvm_args_survive_the_authenticated_lane() {
+    // Regression: the authenticated-session check rejected ANY non-empty
+    // `llvm_args` while its diagnostic said "custom-target". Built-in wasm
+    // targets carry a compiler-owned `-wasm-use-legacy-eh=false`, so every wasm
+    // target was unbuildable under `targo trust build` — it failed before crate
+    // resolution, on `core` itself. iOS and Android passed only because their
+    // specs happen to carry no `llvm_args` at all.
+    //
+    // Rejecting a built-in target's own options rejects the linked compiler's
+    // target table, not anything the invoker supplied, so it cannot be what the
+    // proof TCB is protecting.
+    let wasm = TargetTuple::from_tuple("wasm32-unknown-unknown");
+    assert!(target_is_exact_builtin(&wasm));
+    assert_eq!(authenticated_target_llvm_args_error(&wasm, true), None);
+    assert_eq!(evidence_inert_target_llvm_args_error(&wasm, true), None);
+}
+
+#[test]
+fn custom_target_llvm_args_are_still_refused_in_the_authenticated_lane() {
+    // The actual threat the check exists for: a JSON target the invoker wrote
+    // can smuggle LLVM plugin loading into a session that claims a proof.
+    let custom = TargetTuple::TargetJson {
+        path_for_rustdoc: std::path::PathBuf::new(),
+        tuple: "my-evil-target".to_string(),
+        contents: "{}".to_string(),
+    };
+    assert!(!target_is_exact_builtin(&custom));
+    let err = authenticated_target_llvm_args_error(&custom, true)
+        .expect("a custom target with llvm_args must be refused");
+    assert!(err.contains("my-evil-target"), "the diagnostic must name the target: {err}");
+    assert!(evidence_inert_target_llvm_args_error(&custom, true).is_some());
+}
+
+#[test]
+fn no_llvm_args_is_never_an_error_either_way() {
+    let wasm = TargetTuple::from_tuple("wasm32-unknown-unknown");
+    assert_eq!(authenticated_target_llvm_args_error(&wasm, false), None);
+    assert_eq!(evidence_inert_target_llvm_args_error(&wasm, false), None);
+}

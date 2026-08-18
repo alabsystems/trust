@@ -1,6 +1,7 @@
 use super::{
-    bootstrap_disables_default_trust_verification, cargo_target_rustflags_env,
-    effective_codegen_units, effective_debuginfo_level, rustflags_contain_trust_verifier_control,
+    Rustflags, TRUST_BOOTSTRAP_NO_VERIFY_FLAG, apply_bootstrap_trust_verification_default,
+    bootstrap_disables_default_trust_verification, effective_codegen_units,
+    effective_debuginfo_level, flags_env, rustflags_contain_trust_verifier_control,
     rustflags_request_bootstrap_verification, trust_cg_codegen_flags, trust_cg_codegen_is_active,
 };
 use crate::core::config::DebuginfoLevel;
@@ -42,11 +43,67 @@ fn bootstrap_allows_only_the_exact_off_switch() {
     assert!(rustflags_request_bootstrap_verification("-Z trust-policy=advisory"));
 }
 
-#[test]
-fn bootstrap_no_verify_uses_target_specific_rustflags_env() {
-    let target = TargetSelection::from_user("aarch64-apple-darwin");
+/// Reproduce `Cargo::from`'s composition: bootstrap's own flags, then the
+/// verification default, then the env pair Cargo is handed.
+fn bootstrap_rustflags_env(
+    build_compiler_stage: u32,
+    bootstrap_flags: &[&str],
+) -> (String, String) {
+    let mut rustflags = Rustflags::new(TargetSelection::from_user("aarch64-apple-darwin"));
+    for flag in bootstrap_flags {
+        rustflags.arg(flag);
+    }
+    apply_bootstrap_trust_verification_default(&mut rustflags, build_compiler_stage);
+    let (var, value) = flags_env("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", &rustflags.0);
+    (var.to_string(), value)
+}
 
-    assert_eq!(cargo_target_rustflags_env(target), "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS");
+/// The regression this pins: Cargo honours exactly ONE rustflags source, so the
+/// off-switch has to be in the same payload as bootstrap's other flags. Deliver
+/// it through `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` instead and Cargo drops it on
+/// the floor, silently verifying the whole third-party dependency graph.
+#[test]
+fn bootstrap_off_switch_rides_the_same_lane_as_bootstrap_s_other_flags() {
+    // `-Wrust_2018_idioms` is unconditional in bootstrap, so the competing
+    // `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` lane always exists in practice.
+    let (var, value) = bootstrap_rustflags_env(1, &["-Wrust_2018_idioms", "-Wunused_lifetimes"]);
+
+    assert!(matches!(var.as_str(), "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS"), "{var}");
+    assert!(value.contains(TRUST_BOOTSTRAP_NO_VERIFY_FLAG), "{var}={value:?}");
+    assert!(value.contains("-Wrust_2018_idioms"), "{var}={value:?}");
+}
+
+#[test]
+fn bootstrap_off_switch_survives_when_bootstrap_has_no_other_flags() {
+    let (var, value) = bootstrap_rustflags_env(1, &[]);
+
+    assert_eq!(var, "RUSTFLAGS");
+    assert_eq!(value, TRUST_BOOTSTRAP_NO_VERIFY_FLAG);
+}
+
+#[test]
+fn stage0_units_keep_the_seed_default() {
+    let (_, value) = bootstrap_rustflags_env(0, &["-Wrust_2018_idioms"]);
+
+    assert!(!value.contains("trust-verify"), "{value:?}");
+}
+
+#[test]
+fn an_explicit_off_switch_is_not_duplicated() {
+    let (_, value) = bootstrap_rustflags_env(1, &["-Ztrust-verify=off"]);
+
+    assert_eq!(value.matches(TRUST_BOOTSTRAP_NO_VERIFY_FLAG).count(), 1, "{value:?}");
+}
+
+/// A deliberate developer control keeps ownership of the verifier surface: the
+/// default must not append a second, later-winning `-Z` on top of it.
+#[test]
+fn a_deliberate_verifier_control_suppresses_the_default() {
+    let mut rustflags = Rustflags::new(TargetSelection::from_user("aarch64-apple-darwin"));
+    rustflags.arg("-Ztrust-verify-output=json");
+    apply_bootstrap_trust_verification_default(&mut rustflags, 1);
+
+    assert!(!rustflags.0.contains(TRUST_BOOTSTRAP_NO_VERIFY_FLAG), "{:?}", rustflags.0);
 }
 
 #[test]

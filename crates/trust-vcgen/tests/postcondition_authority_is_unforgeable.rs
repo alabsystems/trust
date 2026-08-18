@@ -47,6 +47,7 @@ fn caller() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: Vec::new(),
         preconditions: Vec::new(),

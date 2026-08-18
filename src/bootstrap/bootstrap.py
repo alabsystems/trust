@@ -1290,7 +1290,37 @@ def trust_verifier_controls(value, encoded=False):
 
 
 def stage0_z_help(rustc, env):
-    """`rustc -Z help` output for the concrete Stage0 driver, or None."""
+    """`rustc -Z help` output for the concrete Stage0 driver, or None.
+
+    `None` means ONLY "the probe could not run" — the driver could not be
+    executed at all. It does NOT mean "the driver has no Trust surface"; that is
+    a positive answer and is returned as text, even when the driver delivers it
+    by exiting non-zero.
+
+    That distinction is this function's contract, stated in
+    `stage0_trust_surface_available`, whose docstring calls collapsing the two
+    "a FAIL-OPEN, and an expensive one". This function used to collapse them: a
+    non-zero exit returned `None`. A STABLE rustc answers `-Z help` by rejecting
+    it outright --
+
+        $ rustc -Z help; echo $?
+        error: the option `Z` is only accepted on the nightly compiler
+        1
+
+    -- which is a DEFINITIVE "no Trust surface here", not an unanswerable probe.
+    Reading it as unanswerable made the caller's fail-closed branch fire on every
+    machine whose stage0 is a stock stable rustc (the common case), planting
+    `TRUST_NO_VERIFY=1` in the bootstrap driver's environment. That variable then
+    leaks to compiletest and every stage1 `trustc` the ui suite spawns, where the
+    driver applies it as a post-parse override that BEATS each test's explicit
+    `-Ztrust-verify=on`. Measured consequence: the whole tests/ui/trust suite ran
+    with verification silently OFF -- 145 of 304 failing, 127 of them "an expected
+    failure signal was not produced" (monitors not aborting, expected errors not
+    emitted). See reports/red-145-root-cause-2026-08-08.md.
+
+    Only OSError/TimeoutExpired -- the genuinely unanswerable cases the
+    fail-closed branch was written for -- may report unavailability.
+    """
     try:
         result = subprocess.run(
             [rustc, "-Z", "help"],
@@ -1303,8 +1333,9 @@ def stage0_z_help(rustc, env):
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    if result.returncode != 0:
-        return None
+    # A non-zero exit is an ANSWER, not a failure to ask: the merged output
+    # carries the driver's own words, and the two spelling detectors below
+    # correctly find no Trust flag in them.
     return result.stdout
 
 
@@ -1317,6 +1348,17 @@ def rustc_supports_trust_bootstrap_no_verify(rustc, env):
         re.match(r"^\s*-Z\s+trust-verify(?:=|\s|$)", line)
         for line in help_text.splitlines()
     )
+
+
+def stage0_trust_surface_available(rustc, env):
+    """Whether the capability probe could answer AT ALL.
+
+    Separated from the two spelling detectors because `None` from
+    `stage0_z_help` means "I could not ask", which is NOT the same fact as
+    "asked, and this driver has no Trust off-switch". Collapsing the two is a
+    FAIL-OPEN, and an expensive one: see the caller.
+    """
+    return stage0_z_help(rustc, env) is not None
 
 
 def rustc_advertises_retired_no_verify(rustc, env):
@@ -1354,6 +1396,36 @@ def apply_trust_bootstrap_compiler_policy(rustc, env):
     if not rustc_supports_trust_bootstrap_no_verify(rustc, env):
         if rustc_advertises_retired_no_verify(rustc, env):
             env["TRUST_NO_VERIFY"] = "1"
+            return False
+        if not stage0_trust_surface_available(rustc, env):
+            # FAIL CLOSED. An unanswerable probe used to fall through here to
+            # "stock upstream, nothing to disable", which is the wrong default
+            # in the wrong direction: if the driver IS a batteries-on Trust
+            # seed, applying no policy verifies the ENTIRE third-party
+            # bootstrap dependency tree and aborts the build. Measured
+            # 2026-08-04: a `--stage 2` run whose probe did not answer spent
+            # 1:18:20 and 582,226 log lines inside "Building bootstrap" before
+            # dying on `memchr` with 694 verification errors, having never
+            # reached a single compiler step. The probe is a subprocess with a
+            # 10s timeout against a binary x.py may be extracting concurrently,
+            # so "could not ask" is a real, transient, load-dependent state —
+            # not a hypothetical.
+            #
+            # The env transport is the safe fallback precisely because it
+            # cannot abort anything: `TRUST_NO_VERIFY` is read before option
+            # parsing by every Trust vintage, and a stock upstream rustc
+            # ignores an unknown environment variable. Appending an argv
+            # spelling here could not be safe — the two spellings abort each
+            # other's vintage with `unknown unstable option`.
+            eprint(
+                "warning: could not probe the Stage0 driver's Trust flag surface "
+                "({}); assuming a batteries-on Trust seed and disabling "
+                "verification for the bootstrap build via TRUST_NO_VERIFY=1. "
+                "Bootstrap establishes compiler lineage and is deliberately not "
+                "a self-proving session, so this is safe for a stock driver "
+                "too.".format(rustc)
+            )
+            env["TRUST_NO_VERIFY"] = "1"
         return False
 
     flag_sources = (
@@ -1387,6 +1459,10 @@ def apply_trust_bootstrap_compiler_policy(rustc, env):
                 "\x1f" if encoded_flags else "",
                 TRUST_BOOTSTRAP_NO_VERIFY_FLAG,
             )
+    # The off-switch above is bootstrap's announced, recorded policy; quiet a
+    # note-capable seed's once-per-crate vanilla note (diagnostic-only, and
+    # older seeds ignore the variable).
+    env["TRUST_VANILLA_ANNOUNCED"] = "1"
     return True
 
 

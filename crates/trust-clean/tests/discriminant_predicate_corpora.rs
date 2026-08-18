@@ -1,5 +1,9 @@
 // Production-pipeline regression coverage for the general discriminant-predicate
 // lane. These are real rustc MIR dumps, not hand-authored recognizer examples.
+// The checked-in rows now traverse the TrustIR model lane: the chain recognizer
+// delegates to the same vetted MirSem discriminant-base gate, while the kernel
+// checker validates the resulting witness. Keep the split explicit so a future
+// fallback does not look like equivalent coverage.
 //
 // The two versioned corpora intentionally cover different dimensions:
 // - enum-discr-predicates: non-Option/Result enums and both direct/Not forms;
@@ -19,7 +23,7 @@ fn prove_fixture_dumps(fixture: &str) -> ProveScorecard {
     prove_dump_dir(&dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
 }
 
-fn assert_all_mirsem_fully_faithful(fixture: &str, expected_total: usize) {
+fn assert_all_trustir_fully_faithful(fixture: &str, expected_total: usize) {
     let sc = prove_fixture_dumps(fixture);
 
     assert_eq!(sc.total, expected_total, "every checked-in {fixture} dump must deserialize");
@@ -30,21 +34,21 @@ fn assert_all_mirsem_fully_faithful(fixture: &str, expected_total: usize) {
         sc.rejections
     );
     assert_eq!(
-        sc.fully_faithful_via_trustir, 0,
-        "{fixture} is a MirSem discriminant-predicate lane, not a trust-ir shape lane"
+        sc.fully_faithful_via_trustir, expected_total,
+        "every {fixture} certificate must traverse the intended TrustIR model lane"
     );
     assert_eq!(
-        sc.fully_faithful_mirsem_fallback, expected_total,
-        "every {fixture} certificate must traverse the intended MirSem lane"
+        sc.fully_faithful_mirsem_fallback, 0,
+        "{fixture} has a TrustIR discriminant-predicate lane and must not fall back to MirSem"
     );
 }
 
 #[test]
 fn general_enum_discriminant_predicates_are_fully_faithful() {
-    assert_all_mirsem_fully_faithful("enum-discr-predicates-2026-07-16", 9);
+    assert_all_trustir_fully_faithful("enum-discr-predicates-2026-07-16", 9);
 }
 
 #[test]
 fn option_result_discriminants_are_payload_type_agnostic() {
-    assert_all_mirsem_fully_faithful("optres-discr-innertypes-2026-07-16", 11);
+    assert_all_trustir_fully_faithful("optres-discr-innertypes-2026-07-16", 11);
 }

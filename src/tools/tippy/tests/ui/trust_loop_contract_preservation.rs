@@ -9,10 +9,19 @@
 #![allow(dead_code)]
 
 fn contract_blocks_while_let_rewrite(mut values: std::vec::IntoIter<u8>) {
+    // The invariant deliberately names `seen`, not the `while let` binding:
+    // since the fail-closed name-resolution change ("a dropped hypothesis
+    // fails closed, not refutes"), a pattern binding is not in scope for the
+    // loop's own invariant — `invariant value <= u8::MAX` is now a hard
+    // compile error ("source-contract variable `value` is not in scope").
+    // The property under test is unchanged: a contracted `while let` must
+    // not be rewritten by `while_let_on_iterator`.
+    let mut seen: u16 = 0;
     while let Some(value) = values.next()
-        invariant value <= u8::MAX
+        invariant seen <= 256
     {
         let _ = value;
+        seen += 1;
     }
 }
 

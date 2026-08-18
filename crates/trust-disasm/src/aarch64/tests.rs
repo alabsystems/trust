@@ -499,18 +499,18 @@ fn test_brk_1() {
 
 #[test]
 fn test_dmb_ish() {
-    // DMB ISH = 0xD5033BBF (CRm=0b1011=ISH|Full, op2=100=DMB... wait)
-    // Actually: DMB ISH = D5033B9F  (CRm=0b1011, op2=101)
-    // Let me encode correctly:
-    // System: 1101010100 L=0 op0=00 op1=011 CRn=0011 CRm=1011 op2=100 Rt=11111
-    // bits: 1101010100_0_00_011_0011_1011_101_11111 = D503 3BAF... hmm
-    // DMB ISH: D5033B9F from ARM ref
-    // CRm=1011 (0xB), op2=101 (5)
-    // Hmm, let me use the canonical: DMB ISH = 0xd5033b9f
-    let enc = 0xD5_03_3B_9F;
+    // ASSEMBLER-DERIVED (`clang --target=aarch64-none-elf` + `objdump -d`):
+    //   dmb ish = d5033bbf (op2=101)   dsb ish = d5033b9f (op2=100)
+    //
+    // This test used to assert `Opcode::Dmb` for d5033b9f, which is DSB ISH.
+    // Its own comment shows the hand-derivation collapsing: it opens with the
+    // correct `DMB ISH = 0xD5033BBF`, then talks itself into "the canonical
+    // 0xd5033b9f" and records `op2 = bits[7:5] = 100 => DMB`. bits[7:5] of
+    // 0x9F really is 100 — but 100 is DSB. The decoder's op2 table was then
+    // built to satisfy this test, so every DSB in a binary decoded as the
+    // strictly weaker DMB and every real DMB failed to decode at all.
+    let enc = 0xD5_03_3B_BF;
     let insn = decode(enc);
-    // D5033B9F = 1101_0101_0000_0011_0011_1011_1001_1111
-    // op2 = bits[7:5] = 100 => DMB (not DSB which is op2=001)
     assert_eq!(insn.opcode, Opcode::Dmb);
     assert!(matches!(
         insn.operand(0),
@@ -520,10 +520,13 @@ fn test_dmb_ish() {
 
 #[test]
 fn test_dmb_named_load_store_barrier_options_preserve_scope_and_kind() {
+    // ASSEMBLER-DERIVED. All three cases used to carry DSB encodings (op2=100)
+    // while asserting `Opcode::Dmb`: d503399f/d5033a9f/d5033f9f are
+    // `dsb ishld`/`dsb ishst`/`dsb sy`.
     let cases = [
-        (0xD5_03_39_9F, BarrierDomain::Ish, BarrierType::Ld), // DMB ISHLD
-        (0xD5_03_3A_9F, BarrierDomain::Ish, BarrierType::St), // DMB ISHST
-        (0xD5_03_3F_9F, BarrierDomain::Sy, BarrierType::Full), // DMB SY
+        (0xD5_03_39_BF, BarrierDomain::Ish, BarrierType::Ld), // dmb ishld
+        (0xD5_03_3A_BF, BarrierDomain::Ish, BarrierType::St), // dmb ishst
+        (0xD5_03_3F_BF, BarrierDomain::Sy, BarrierType::Full), // dmb sy
     ];
 
     for (enc, expected_domain, expected_kind) in cases {
@@ -540,10 +543,15 @@ fn test_dmb_named_load_store_barrier_options_preserve_scope_and_kind() {
 #[test]
 fn test_numeric_or_reserved_barrier_options_fail_closed() {
     let d = Aarch64Decoder::new();
+    // ASSEMBLER-DERIVED: `dmb #0` = d50330bf, `dsb #4` = d503349f (objdump
+    // renders it by its alias `pssbb`), `isb #0` = d50330df. The first two used
+    // to be d503309f (which is `dsb #0`, not `dmb #0`) and d503343f (op2=001,
+    // which is not a barrier at all and now fails closed as UnknownEncoding
+    // rather than as an unsupported OPTION).
     let cases: &[(u32, u64, u8)] = &[
-        (0xD5_03_30_9F, 0x4000, 0x0), // DMB #0: no named LD/ST/full option
-        (0xD5_03_34_3F, 0x4004, 0x4), // DSB #4: no named LD/ST/full option
-        (0xD5_03_30_DF, 0x4008, 0x0), // ISB #0: only ISB SY is in boundary
+        (0xD5_03_30_BF, 0x4000, 0x0), // dmb #0: no named LD/ST/full option
+        (0xD5_03_34_9F, 0x4004, 0x4), // dsb #4: no named LD/ST/full option
+        (0xD5_03_30_DF, 0x4008, 0x0), // isb #0: only ISB SY is in boundary
     ];
 
     for &(enc, addr, option) in cases {
@@ -921,11 +929,19 @@ fn test_adrp() {
 
 #[test]
 fn test_dsb_sy() {
-    // DSB SY = D5033F9F
-    // CRm=0b1111 (SY domain + full), op2=001 (DSB)
-    let enc = 0xD5_03_3F_3F;
+    // ASSEMBLER-DERIVED: `dsb sy` = d5033f9f (CRm=1111 = SY|full, op2=100).
+    //
+    // The comment above this test always said `DSB SY = D5033F9F`; the code
+    // then used d5033f3f, whose op2 is 001 — not a barrier at all. That bogus
+    // value is what put the spurious `0b001 => Dsb` arm in the decoder's op2
+    // table, which in turn left 0b100 free to be mislabelled DMB.
+    let enc = 0xD5_03_3F_9F;
     let insn = decode(enc);
     assert_eq!(insn.opcode, Opcode::Dsb);
+    assert!(matches!(
+        insn.operand(0),
+        Some(Operand::Barrier { domain: BarrierDomain::Sy, kind: BarrierType::Full })
+    ));
 }
 
 #[test]
@@ -1061,4 +1077,197 @@ fn test_fdiv_s() {
     let enc = 0x1E_22_18_20;
     let insn = decode(enc);
     assert_eq!(insn.opcode, Opcode::Fdiv);
+}
+
+// ==========================================================================
+// THE DECODER GUARD: a reserved encoding is an ERROR, never a plausible
+// instruction
+// ==========================================================================
+//
+// WHY. Every soundness hole found in this decoder so far had the same shape:
+// a word the architecture does not define (or defines as something else)
+// decoded into a REAL, WELL-FORMED instruction, which downstream consumers
+// then modeled with complete confidence. Nothing looked broken at any layer.
+//
+//   * `decode_load_store_pair` tested `is_64 = opc == 0b10`, so LDPSW decoded
+//     as a 32-bit LDP whose semantics ZERO-extend — architecturally the exact
+//     opposite of LDPSW's sign-extension — and the two words derived an
+//     IDENTICAL machine digest. `opc = 0b11` likewise became a 32-bit LDP.
+//   * `decode_bitmask_immediate` overflowed `1u64 << 64` and returned `#0` for
+//     every rotated 64-bit logical immediate, and returned `0` rather than a
+//     refusal for two UNDEFINED encodings.
+//   * the register-offset `option` field mapped its four reserved values onto
+//     LSL; two of them (001, 101) then produced a shape byte-identical to a
+//     genuine `ldr [xn, xm, lsl #s]`.
+//
+// A refusal is the floor. Approximating a reserved encoding as a real
+// instruction is a claim about hardware behaviour that nobody checked.
+//
+// GROUND TRUTH. Every word below was rendered by `objdump -d` on a `.word`
+// directive assembled by `clang --target=aarch64-apple-darwin`; none is
+// hand-encoded. The rendering is quoted per row.
+
+/// Decode without unwrapping, for the rows that must NOT decode.
+fn try_decode(encoding: u32) -> Result<crate::instruction::Instruction, crate::error::DisasmError> {
+    let d = Aarch64Decoder::new();
+    d.decode(&encoding.to_le_bytes(), 0)
+}
+
+/// A RESERVED or UNDEFINED encoding must be refused, not turned into a
+/// plausible instruction.
+///
+/// The two families whose silent approximation was a live soundness hole are
+/// included as explicit regression rows.
+#[test]
+fn reserved_encodings_are_refused_not_approximated() {
+    // (word, what it is, what it USED to decode as)
+    let rows: &[(u32, &str, &str)] = &[
+        // --- load/store pair (the LDPSW family) ---
+        (
+            0xE940_0440,
+            "load/store pair opc=0b11,L=1 (objdump: `ldtp x0, x1, [x2]`, FEAT_LSUI)",
+            "a 32-bit LDP with W registers",
+        ),
+        (
+            0x6900_0440,
+            "load/store pair opc=0b01,L=0 (objdump: `stgp x0, x1, [x2]`, FEAT_MTE)",
+            "a 32-bit STP with W registers",
+        ),
+        // --- bitmask immediate (the rotated-logical-immediate family) ---
+        (
+            0xB240_FC00,
+            "ORR (immediate) with an all-ones element, S == levels (objdump: `<unknown>`)",
+            "an immediate of #0",
+        ),
+        (
+            0xB200_FC00,
+            "ORR (immediate) with no encoded element size, len < 1 (objdump: `<unknown>`)",
+            "an immediate of #0",
+        ),
+        // --- load/store register offset: all four reserved `option` values ---
+        (0xB862_1820, "LDR register-offset option=0b000 (objdump: `<unknown>`)", "LSL"),
+        (0xB862_3820, "LDR register-offset option=0b001 (objdump: `<unknown>`)", "LSL"),
+        (0xB862_9820, "LDR register-offset option=0b100 (objdump: `<unknown>`)", "LSL"),
+        (0xB862_B820, "LDR register-offset option=0b101 (objdump: `<unknown>`)", "LSL"),
+        // --- control: a word that was never mistaken for anything ---
+        (0x0000_0000, "the all-zero word (objdump: `udf #0x0`)", "nothing"),
+    ];
+
+    for (word, what, used_to_be) in rows {
+        match try_decode(*word) {
+            Err(_) => {}
+            Ok(insn) => panic!(
+                "{word:#010x} is {what}, and the decoder produced a real instruction \
+                 ({:?}, operands {:?}) instead of refusing it. It used to decode as \
+                 {used_to_be}; a reserved word that models as a genuine instruction is \
+                 indistinguishable from that instruction to every consumer downstream.",
+                insn.opcode,
+                insn.operands().collect::<Vec<_>>()
+            ),
+        }
+    }
+}
+
+/// The refusal for a genuinely UNALLOCATED word is `UnallocatedEncoding`.
+///
+/// Kept separate from the refusal table above because the taxonomy is a claim
+/// in its own right: `UnallocatedEncoding` says the CPU does not define this
+/// word. Words the CPU DOES execute but this decoder declines to approximate
+/// (LDTR/STTR, FCMPE) carry `UnmodeledAarch64Instruction` instead, and saying
+/// "unallocated" about one of those would be a false statement about hardware.
+/// Only the rows `objdump` renders `<unknown>` are asserted here.
+#[test]
+fn unallocated_words_are_reported_as_unallocated() {
+    for word in [0xB240_FC00u32, 0xB200_FC00, 0xB862_1820, 0xB862_3820, 0xB862_9820, 0xB862_B820] {
+        assert!(
+            matches!(try_decode(word), Err(crate::error::DisasmError::UnallocatedEncoding { .. })),
+            "{word:#010x} renders `<unknown>` under objdump, so its refusal must be \
+             UnallocatedEncoding; got {:?}",
+            try_decode(word)
+        );
+    }
+}
+
+/// LDPSW is a DISTINCT instruction from a 32-bit LDP, and decodes as one.
+///
+/// REGRESSION ROW. `is_64 = opc == 0b10` put `opc=0b01` on the 32-bit path, so
+/// `ldpsw x0, x1, [x2]` decoded as `Opcode::Ldp` with W registers. Its
+/// semantics then ZERO-extended two 4-byte elements where the architecture
+/// SIGN-extends them, and the two words produced the identical machine digest
+/// `688eb3d22526d94a` — no spec could tell them apart.
+///
+/// Both halves are asserted: the opcode, and the REGISTER WIDTH. Checking only
+/// that it decodes would have passed the entire time.
+#[test]
+fn ldpsw_is_not_a_32_bit_ldp() {
+    // Assembler-derived: `ldp w0,w1,[x2]` / `ldpsw x0,x1,[x2]` / `ldp x0,x1,[x2]`.
+    let ldp_w = decode(0x2940_0440);
+    let ldpsw = decode(0x6940_0440);
+    let ldp_x = decode(0xA940_0440);
+
+    assert_eq!(ldp_w.opcode, Opcode::Ldp, "0x29400440 is `ldp w0,w1,[x2]`");
+    assert_eq!(
+        ldpsw.opcode,
+        Opcode::Ldpsw,
+        "0x69400440 is `ldpsw x0,x1,[x2]` — decoding it as {:?} makes a \
+         SIGN-extending load model as a zero-extending one",
+        ldpsw.opcode
+    );
+    assert_eq!(ldp_x.opcode, Opcode::Ldp, "0xa9400440 is `ldp x0,x1,[x2]`");
+
+    let dst_width = |insn: &crate::instruction::Instruction| match insn.operand(0) {
+        Some(Operand::Reg(r)) => r.width,
+        other => panic!("expected a register destination, got {other:?}"),
+    };
+    assert_eq!(dst_width(&ldp_w), 32, "`ldp w0,w1` targets W registers");
+    assert_eq!(
+        dst_width(&ldpsw),
+        64,
+        "LDPSW targets X registers — a 32-bit destination is the 32-bit-LDP \
+         misdecode, which is what made the two words indistinguishable"
+    );
+    assert_eq!(dst_width(&ldp_x), 64, "`ldp x0,x1` targets X registers");
+
+    // The whole point: the three words must not collapse into one decode.
+    assert_ne!(
+        (ldp_w.opcode, dst_width(&ldp_w)),
+        (ldpsw.opcode, dst_width(&ldpsw)),
+        "`ldp w0,w1,[x2]` and `ldpsw x0,x1,[x2]` decode identically"
+    );
+}
+
+/// A 64-bit logical immediate with a NON-ZERO ROTATE decodes to its value.
+///
+/// REGRESSION ROW for the second family. `1u64 << (s + 1)` and `1u64 << esize`
+/// both overflow at `esize == 64` — that is EVERY 64-bit logical immediate with
+/// `r != 0`. Release builds (how `trustc` ships) silently yielded `#0`, so
+/// `eor x0,x0,#0x8000000000000000` was modeled as the IDENTITY.
+///
+/// This asserts the VALUE. A test that only checked decoding succeeded would
+/// have passed throughout: the decoder never errored, it returned zero.
+#[test]
+fn rotated_logical_immediates_reach_their_architectural_value() {
+    // Assembler-derived words, with the immediate objdump printed for each.
+    let rows: &[(u32, u64, &str)] = &[
+        (0xD241_0000, 0x8000_0000_0000_0000, "eor x0,x0,#0x8000000000000000"),
+        (0x9260_7C00, 0xFFFF_FFFF_0000_0000, "and x0,x0,#0xffffffff00000000"),
+        (0xB27F_0000, 0x0000_0000_0000_0002, "orr x0,x0,#2"),
+        (0xB240_0000, 0x0000_0000_0000_0001, "orr x0,x0,#1"),
+    ];
+    for (word, want, asm) in rows {
+        let insn = decode(*word);
+        let got = insn
+            .operands()
+            .find_map(|op| match op {
+                Operand::Imm(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{asm}: no immediate operand in {insn:?}"));
+        assert_eq!(
+            got, *want,
+            "{asm} ({word:#010x}): decoded #{got:#x}, the architecture says #{want:#x} \
+             (a zero here is the `1u64 << 64` overflow silently returning 0, which \
+             models the instruction as the identity)"
+        );
+    }
 }

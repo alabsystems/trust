@@ -1,0 +1,10 @@
+error: `proofs/ay` holds a hand-encoded solver query that nothing in this build reads
+  |
+  = note: `proofs/ay/kt1_clamp_bound.smt2` is a self-contained query: an `(assert ...)` and a `(check-sat)`, and 2 more like it sit here
+  = note: `proofs/ay/verify.sh` discharges them by running `ay`, which nothing in this build produces — so no `cargo build`, no `cargo test` and no `trustc` run reads either the query or its verdict
+  = help: state the property on the item instead — a `#[trust::requires]`/`#[trust::ensures]` clause, an invariant, or a `clean { .. }` island — so trust-vc and trust-wp build the query from the MIR that ships and trust-mc discharges it in the build
+  = help: if the stack cannot express the property, that gap is the thing to report against trust-mc, trust-vc or trust-wp; a hand-written query states the property a second time, over a model of the code rather than the code, and the two copies drift apart with nothing watching
+  = note: `-D clippy::trust-hand-encoded-solver-query` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(clippy::trust_hand_encoded_solver_query)]`
+
+error: could not compile `trust_hand_encoded_solver_query` (bin "trust_hand_encoded_solver_query") due to 1 previous error

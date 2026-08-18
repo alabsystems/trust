@@ -397,6 +397,7 @@ set -euo pipefail
 printf '%s 0.1.0\n' "$(basename "$0")"
 SH
   chmod +x "$bin/targo-trust"
+  cp "$bin/targo-trust" "$bin/trustd"
 
   cat >"$bin/trustdoc" <<'SH'
 #!/usr/bin/env bash

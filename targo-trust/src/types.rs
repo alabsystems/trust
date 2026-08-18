@@ -894,13 +894,19 @@ pub(crate) fn compact_vc_tag_requires_typed_kind(kind: &str) -> bool {
             | "overflow:add"
             | "overflow:sub"
             | "overflow:mul"
+            | "overflow:div"
+            | "overflow:rem"
             | "arithmetic_overflow"
             | "arithmetic_overflow:add"
             | "arithmetic_overflow:sub"
             | "arithmetic_overflow:mul"
+            | "arithmetic_overflow:div"
+            | "arithmetic_overflow:rem"
             | "arithmetic_overflow_add"
             | "arithmetic_overflow_sub"
             | "arithmetic_overflow_mul"
+            | "arithmetic_overflow_div"
+            | "arithmetic_overflow_rem"
             | "shift"
             | "shift:left"
             | "shift:right"
@@ -1788,6 +1794,10 @@ mod subsumption_tests {
                 op: BinOp::Mul,
                 operand_tys: (u32_ty.clone(), u32_ty.clone()),
             }),
+            "overflow:div" | "arithmetic_overflow_div" => Some(VcKind::ArithmeticOverflow {
+                op: BinOp::Div,
+                operand_tys: (u32_ty.clone(), u32_ty.clone()),
+            }),
             "shift:left" | "shift_overflow_shl" => Some(VcKind::ShiftOverflow {
                 op: BinOp::Shl,
                 operand_ty: u32_ty.clone(),
@@ -2136,6 +2146,90 @@ mod subsumption_tests {
             results[1].backend
         );
         assert!(results[1].reason.as_deref().unwrap_or_default().contains("SUBSUMPTION"));
+    }
+
+    /// PARITY: the AGGREGATE report spelling (`arithmetic_overflow_<op>`) is a lossy
+    /// compact tag that `transport_tag()` never emits — it renders `overflow:<op>` —
+    /// so a row carrying the aggregate spelling can never satisfy the exact typed
+    /// cross-check and is authority-UNSAFE, whether or not it carries a payload.
+    /// `add`/`sub`/`mul` were already listed in `compact_vc_tag_requires_typed_kind`
+    /// and therefore already failed closed here; `div`/`rem` were NOT listed, so an
+    /// UNTYPED aggregate div row could carry subsumption authority that an identical
+    /// add row could not. That asymmetry is the gap this pins shut: Div must fail
+    /// closed EXACTLY as Add does. The live transport path is covered by
+    /// `transport_spelled_div_overflow_sibling_subsumes_its_twin`.
+    #[test]
+    fn aggregate_spelled_arithmetic_siblings_fail_closed_identically_for_div_and_add() {
+        for (kind, detail, marker) in [
+            ("arithmetic_overflow_div", "arithmetic overflow (Div)", "Overflow(Div)"),
+            ("arithmetic_overflow_add", "arithmetic overflow (Add)", "Overflow(Add)"),
+        ] {
+            let s = span(419, 22, 32);
+            let mut results = vec![
+                result("f", kind, detail, VerificationOutcome::Proved, Some(s.clone())),
+                overflow_twin("f", marker, s.clone()),
+            ];
+            subsume_hardened_panic_twins(&mut results);
+            assert!(
+                matches!(results[1].outcome, VerificationOutcome::Unknown),
+                "aggregate-spelled `{kind}` must not carry subsumption authority; got {:?}",
+                results[1].outcome
+            );
+        }
+    }
+
+    /// REGRESSION (a3d `cell_index_1d`, lib.rs:419:22-32). A Div sibling arriving
+    /// over the TRANSPORT carries whatever `VcKind::transport_tag()` produced.
+    /// That used to collapse `Div`/`Rem` onto the OP-LESS `"overflow"`, which
+    /// `direct_panic_sibling_family` refuses by design (an op-less tag must never
+    /// discharge an op-specific twin). So a PROVED div-overflow sibling was not
+    /// recognized as a sibling at all and its twin stayed UNKNOWN forever, with
+    /// no diagnostic — the twin simply never found its partner.
+    #[test]
+    fn transport_spelled_div_overflow_sibling_subsumes_its_twin() {
+        let s = span(419, 22, 32);
+        let mut results = vec![
+            result(
+                "f",
+                "overflow:div",
+                "arithmetic overflow (Div)",
+                VerificationOutcome::Proved,
+                Some(s.clone()),
+            ),
+            overflow_twin("f", "Overflow(Div)", s.clone()),
+        ];
+        subsume_hardened_panic_twins(&mut results);
+        assert!(
+            matches!(results[1].outcome, VerificationOutcome::Proved),
+            "transport-spelled Div sibling must subsume its same-span twin; got {:?} ({:?})",
+            results[1].outcome,
+            results[1].reason
+        );
+        assert!(results[1].backend.starts_with("subsumed:"));
+    }
+
+    /// Naming `Div` must NOT weaken cross-op isolation: a proved sibling of a
+    /// DIFFERENT arithmetic op at a byte-identical span must still never discharge
+    /// a Div twin. (Macro expansions do collapse distinct asserts onto one span.)
+    #[test]
+    fn div_twin_is_not_subsumed_by_a_proved_add_sibling_at_the_same_span() {
+        let s = span(419, 22, 32);
+        let mut results = vec![
+            result(
+                "f",
+                "overflow:add",
+                "arithmetic overflow (Add)",
+                VerificationOutcome::Proved,
+                Some(s.clone()),
+            ),
+            overflow_twin("f", "Overflow(Div)", s.clone()),
+        ];
+        subsume_hardened_panic_twins(&mut results);
+        assert!(
+            matches!(results[1].outcome, VerificationOutcome::Unknown),
+            "an Add sibling must NEVER discharge a Div twin; got {:?}",
+            results[1].outcome
+        );
     }
 
     #[test]

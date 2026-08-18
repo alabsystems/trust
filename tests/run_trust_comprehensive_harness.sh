@@ -131,6 +131,7 @@ fast.ledger-expirations|fast|ledger|true|2026-07-25|python3 scripts/check_ledger
 fast.pr-gate|fast|drift|true|2026-07-25|bash scripts/pr_gate.sh
 fast.pin-coherence|fast|supply-chain|true|2026-07-25|bash scripts/check_pin_coherence.sh
 fast.bridge-pin|fast|supply-chain|true|never|bash scripts/check_bridge_pin.sh --check
+scoped.compiler-check|all|supply-chain|true|never|bash scripts/check_compiler_targets_build.sh
 fast.tcb-panic-freedom|fast|soundness|true|2026-07-25|bash scripts/check_tcb_panic_freedom.sh
 fast.tcb-document-exhaustiveness|fast|soundness|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml -p trust-integration-tests --test tcb_document_exhaustiveness --locked
 fast.tcb-direct-trust-vc-certificate-boundary|fast|soundness|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml -p trust-vc-bridge --features trust-build direct_mir_memory_admission_binds_the_alethe_certificate_but_never_rechecks_it --locked

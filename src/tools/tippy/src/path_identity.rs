@@ -5,8 +5,26 @@
 //! guarded operation, and reject results after detectable mutation. The
 //! operation still opens resources by pathname, so a raced process can perform
 //! side effects before the post-check rejects its result.
-//! Conservatively recording ancestor contents also means unrelated direct-entry
-//! churn in a shared writable ancestor can reject an otherwise valid result.
+//!
+//! # What an ancestor directory is checked FOR
+//!
+//! The selected toolchain directory is held to its exact metadata: anything
+//! that moves there moved the toolchain out from under the run. Its ANCESTORS
+//! are held only to their AUTHORITY — identity (`device`/`inode`, or the
+//! Windows volume/file id) plus the permission bits that decide who may
+//! rewrite the chain (`mode`/`uid`/`gid`, or the Windows file attributes).
+//!
+//! That distinction is the whole point. The threat an ancestor check exists to
+//! catch is a directory in the chain being REPLACED or REDIRECTED so the same
+//! pathname resolves somewhere else; that necessarily changes its identity, and
+//! a widened `mode` is caught for the same reason. What it must NOT catch is
+//! ordinary churn — `len`, `mtime` and `ctime` on a directory move whenever ANY
+//! unrelated entry is created or removed inside it, and the chain reaches all
+//! the way to `/`. Comparing those made every guarded run a hostage to the
+//! busiest shared directory on the machine: a file appearing in the user's home
+//! directory, from any unrelated process, aborted an in-flight compile with
+//! "changed identity or contents" — a failure with no relation to toolchain
+//! integrity, and no action the user could take except "hold the machine still".
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -159,6 +177,76 @@ impl PathSnapshot {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = other;
+            false
+        }
+    }
+
+    /// Whether the LATER snapshot `other` of an ANCESTOR directory carries a
+    /// metadata-tamper signature relative to `self`: its change time advanced
+    /// while its modification time did not. On a directory the two move
+    /// TOGETHER for entry churn (create/remove touches contents), but a
+    /// RENAME — the redirect-and-restore race, where the ancestor is moved
+    /// aside, a substitute serves pathname resolution, and the original is
+    /// put back before revalidation — touches metadata only: ctime advances,
+    /// mtime stands still. So this ordering-aware test is what lets the chain
+    /// tolerate churn without tolerating the race
+    /// (`compiler_guard_rejects_ancestor_redirect_restore_after_raced_child_runs`
+    /// pins the race; `ancestor_churn_tests` pin the tolerance).
+    ///
+    /// Honest residual, matching the module's own "detectable mutation"
+    /// framing: an attacker who can BOTH rename the ancestor AND write inside
+    /// it can advance mtime to mask the signature — but writing inside every
+    /// chain ancestor is same-uid authority, at which point the toolchain
+    /// binaries themselves are writable and no directory guard can matter.
+    pub(crate) fn metadata_tampered_since(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            let ctime_advanced = (other.changed_seconds, other.changed_nanoseconds)
+                > (self.changed_seconds, self.changed_nanoseconds);
+            let mtime_advanced = (other.modified_seconds, other.modified_nanoseconds)
+                > (self.modified_seconds, self.modified_nanoseconds);
+            ctime_advanced && !mtime_advanced
+        }
+        #[cfg(windows)]
+        {
+            match (self.change_time, other.change_time) {
+                (Some(before), Some(after)) => {
+                    after > before && other.last_write_time <= self.last_write_time
+                }
+                // Without a change-time reading there is no signature to
+                // examine; identity + attributes remain the authority checks.
+                _ => false,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
+    /// Whether two snapshots of an ANCESTOR directory carry the same authority
+    /// over the chain: the same directory object, with the same permission
+    /// bits. Deliberately blind to `len`/`mtime` (and `links`, which counts
+    /// subdirectories) — see the module docs: those move on unrelated entry
+    /// churn, while a replaced or redirected directory cannot keep its
+    /// identity, and a widened `mode`/changed owner cannot hide here. The
+    /// rename-shaped `ctime` movement is NOT ignored — see
+    /// [`Self::metadata_tampered_since`], which callers pair with this.
+    pub(crate) fn same_directory_authority(&self, other: &Self) -> bool {
+        if !self.same_file(other) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            self.mode == other.mode && self.uid == other.uid && self.gid == other.gid
+        }
+        #[cfg(windows)]
+        {
+            self.file_attributes == other.file_attributes
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             false
         }
     }
@@ -472,10 +560,37 @@ pub(crate) struct AuthenticatedDirectoryChain {
     _selected_handles: DirectoryChainGuard,
 }
 
+/// What a directory in the chain is trusted for, and therefore how strictly it
+/// is re-checked. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryRole {
+    /// The selected toolchain directory itself: exact metadata, no slack. A
+    /// changed `mtime` here means the toolchain moved mid-run.
+    Selected,
+    /// A directory the selected one merely lives under (up to `/`): checked for
+    /// authority only, because its content churn is other people's business.
+    Ancestor,
+}
+
 #[derive(Debug)]
 struct AuthenticatedDirectory {
     path: PathBuf,
     snapshot: PathSnapshot,
+    role: DirectoryRole,
+}
+
+impl AuthenticatedDirectory {
+    /// Whether `observed` still authenticates this directory, at the strictness
+    /// its role demands.
+    fn still_authentic(&self, observed: &PathSnapshot) -> bool {
+        match self.role {
+            DirectoryRole::Selected => &self.snapshot == observed,
+            DirectoryRole::Ancestor => {
+                self.snapshot.same_directory_authority(observed)
+                    && !self.snapshot.metadata_tampered_since(observed)
+            }
+        }
+    }
 }
 
 impl AuthenticatedDirectoryChain {
@@ -502,7 +617,7 @@ impl AuthenticatedDirectoryChain {
         }
 
         let paths = launch_and_canonical_ancestors(root, &canonical);
-        let (directories, selected_handles) = capture_directory_chain(&paths)?;
+        let (directories, selected_handles) = capture_directory_chain(&paths, root, &canonical)?;
         let chain = Self {
             root: root.to_owned(),
             canonical_root: canonical,
@@ -519,8 +634,8 @@ impl AuthenticatedDirectoryChain {
         self.confirm_canonical_root()?;
         let mut handles = Vec::with_capacity(self.directories.len());
         for expected in &self.directories {
-            let (snapshot, handle) = checked_directory(&expected.path)?;
-            if snapshot != expected.snapshot {
+            let (snapshot, handle) = checked_directory(&expected.path, expected.role)?;
+            if !expected.still_authentic(&snapshot) {
                 return Err(format!(
                     "selected Trust toolchain directory ancestor `{}` changed identity or contents",
                     expected.path.display()
@@ -567,7 +682,7 @@ impl AuthenticatedDirectoryChain {
                 )
             })?;
             let opened_snapshot = checked_directory_snapshot(&expected.path, &opened, Some(handle))?;
-            if opened_snapshot != expected.snapshot {
+            if !expected.still_authentic(&opened_snapshot) {
                 return Err(format!(
                     "selected Trust toolchain directory ancestor `{}` changed while it was opened",
                     expected.path.display()
@@ -588,7 +703,7 @@ impl AuthenticatedDirectoryChain {
                 )
             })?;
             let path_snapshot = checked_directory_snapshot(&expected.path, &path_metadata, Some(&path_handle))?;
-            if !expected.snapshot.same_path_metadata(&after_snapshot) || expected.snapshot != path_snapshot {
+            if !expected.still_authentic(&after_snapshot) || !expected.still_authentic(&path_snapshot) {
                 return Err(format!(
                     "selected Trust toolchain directory ancestor `{}` changed while process identity was checked",
                     expected.path.display()
@@ -630,21 +745,34 @@ fn launch_and_canonical_ancestors(launch: &Path, canonical: &Path) -> Vec<PathBu
     paths
 }
 
-fn capture_directory_chain(paths: &[PathBuf]) -> Result<(Vec<AuthenticatedDirectory>, DirectoryChainGuard), String> {
+fn capture_directory_chain(
+    paths: &[PathBuf],
+    root: &Path,
+    canonical_root: &Path,
+) -> Result<(Vec<AuthenticatedDirectory>, DirectoryChainGuard), String> {
     let mut directories = Vec::with_capacity(paths.len());
     let mut handles = Vec::with_capacity(paths.len());
     for path in paths {
-        let (snapshot, handle) = checked_directory(path)?;
+        // Both spellings of the selected directory are the selected directory;
+        // on unix `capture` has already proven them equal, but Windows reaches
+        // here with a canonical form that may differ from the launch path.
+        let role = if path == root || path == canonical_root {
+            DirectoryRole::Selected
+        } else {
+            DirectoryRole::Ancestor
+        };
+        let (snapshot, handle) = checked_directory(path, role)?;
         directories.push(AuthenticatedDirectory {
             path: path.clone(),
             snapshot,
+            role,
         });
         handles.push(handle);
     }
     Ok((directories, DirectoryChainGuard { handles }))
 }
 
-fn checked_directory(path: &Path) -> Result<(PathSnapshot, fs::File), String> {
+fn checked_directory(path: &Path, role: DirectoryRole) -> Result<(PathSnapshot, fs::File), String> {
     let before = fs::symlink_metadata(path).map_err(|error| {
         format!(
             "selected Trust toolchain directory ancestor `{}` is unavailable: {error}",
@@ -675,9 +803,28 @@ fn checked_directory(path: &Path) -> Result<(PathSnapshot, fs::File), String> {
         )
     })?;
     let path_snapshot = checked_directory_snapshot(path, &path_metadata, Some(&path_handle))?;
-    if !before_snapshot.same_path_metadata(&snapshot)
-        || !snapshot.same_path_metadata(&after_snapshot)
-        || snapshot != path_snapshot
+    // The three re-reads above bracket the open. For the SELECTED directory
+    // they must agree exactly; for an ancestor they need only agree on
+    // authority, or an unrelated entry appearing between two `stat`s
+    // microseconds apart would fail the capture (the very race that made this
+    // guard fire on `$HOME`).
+    // The rename-shaped tamper signature applies here exactly as it does in
+    // `still_authentic`: `left` is always the EARLIER reading.
+    let agrees = |left: &PathSnapshot, right: &PathSnapshot| match role {
+        DirectoryRole::Selected => left.same_path_metadata(right),
+        DirectoryRole::Ancestor => {
+            left.same_directory_authority(right) && !left.metadata_tampered_since(right)
+        }
+    };
+    let identical = |left: &PathSnapshot, right: &PathSnapshot| match role {
+        DirectoryRole::Selected => left == right,
+        DirectoryRole::Ancestor => {
+            left.same_directory_authority(right) && !left.metadata_tampered_since(right)
+        }
+    };
+    if !agrees(&before_snapshot, &snapshot)
+        || !agrees(&snapshot, &after_snapshot)
+        || !identical(&snapshot, &path_snapshot)
     {
         return Err(format!(
             "selected Trust toolchain directory ancestor `{}` changed while its identity was captured",
@@ -844,5 +991,138 @@ mod windows_tests {
         assert!(!windows_file_attributes_are_plain(
             FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_REPARSE_POINT
         ));
+    }
+}
+
+/// THE ANCESTOR-CHURN CONTRACT. A guarded run must survive an unrelated file
+/// appearing in a directory it merely lives under, and must still refuse a
+/// toolchain that actually moved. Both halves are pinned here because relaxing
+/// the first is only safe while the second still holds.
+#[cfg(all(test, unix))]
+mod ancestor_churn_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, fs};
+
+    use super::AuthenticatedDirectoryChain;
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    /// `<temp>/<unique>/ancestor/selected` — a private two-level chain, so the
+    /// "ancestor" this test mutates is one this test owns. Canonicalized
+    /// because `capture` refuses a path that traverses a symlink, and macOS
+    /// hands out `/var/folders/...` behind one.
+    fn fixture(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let temp = env::temp_dir().canonicalize().unwrap_or_else(|_| env::temp_dir());
+        let root = temp.join(format!(
+            "tippy-ancestor-churn-{label}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("ancestor").join("selected")).expect("create fixture chain");
+        root
+    }
+
+    /// THE BUG THIS FIXES: a file appearing in a directory the toolchain merely
+    /// lives under used to abort the run with "changed identity or contents".
+    /// On a real machine that ancestor chain reaches `$HOME` and `/`, so any
+    /// unrelated process could kill an in-flight compile.
+    #[test]
+    fn unrelated_entry_churn_in_an_ancestor_keeps_the_chain_authentic() {
+        let root = fixture("churn");
+        let ancestor = root.join("ancestor");
+        let selected = ancestor.join("selected");
+        let chain = AuthenticatedDirectoryChain::capture(&selected).expect("capture chain");
+
+        // Exactly what an unrelated process does: create, then remove, an entry
+        // in a shared ancestor. Both move the directory's len/mtime/ctime.
+        fs::write(ancestor.join("unrelated.tmp"), b"noise").expect("write unrelated entry");
+        chain.revalidate().expect("ancestor entry churn must not break authentication");
+        fs::remove_file(ancestor.join("unrelated.tmp")).expect("remove unrelated entry");
+        chain.revalidate().expect("removing an unrelated entry must not break it either");
+
+        // A whole unrelated subdirectory also bumps the ancestor's link count.
+        fs::create_dir(ancestor.join("unrelated-dir")).expect("create unrelated subdir");
+        chain
+            .revalidate()
+            .expect("an unrelated subdirectory must not break authentication");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// THE HALF THAT MUST NOT RELAX: the selected toolchain directory is still
+    /// held to its exact metadata, so a binary appearing beside the compiler
+    /// mid-run is still caught.
+    #[test]
+    fn content_change_in_the_selected_directory_is_still_rejected() {
+        let root = fixture("selected");
+        let selected = root.join("ancestor").join("selected");
+        let chain = AuthenticatedDirectoryChain::capture(&selected).expect("capture chain");
+
+        fs::write(selected.join("planted"), b"tamper").expect("write into selected directory");
+        let verdict = chain.revalidate();
+        assert!(
+            verdict.is_err(),
+            "a changed selected toolchain directory must still be refused",
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// THE RACE THAT MUST STAY CAUGHT: renaming an ancestor aside and putting
+    /// it back restores identity and permissions, but the rename leaves a
+    /// metadata-only trail — ctime advances, mtime does not — and that
+    /// signature is rejected. This is the redirect-and-restore scenario the
+    /// compiler-fixture test pins end to end
+    /// (`compiler_guard_rejects_ancestor_redirect_restore_after_raced_child_runs`);
+    /// pinned here too so the property survives without the heavier fixture.
+    #[test]
+    fn a_renamed_and_restored_ancestor_is_still_rejected() {
+        let root = fixture("redirect");
+        let ancestor = root.join("ancestor");
+        let parked = root.join("ancestor-parked");
+        let selected = ancestor.join("selected");
+        let chain = AuthenticatedDirectoryChain::capture(&selected).expect("capture chain");
+
+        fs::rename(&ancestor, &parked).expect("rename ancestor aside");
+        fs::rename(&parked, &ancestor).expect("restore ancestor");
+
+        assert!(
+            chain.revalidate().is_err(),
+            "a redirect-and-restore must be refused even though identity is back",
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// AUTHORITY IS STILL CHECKED: identity is not the only thing that matters
+    /// about an ancestor — widening its permissions changes who may rewrite the
+    /// chain, and that must still be refused.
+    #[test]
+    fn a_widened_ancestor_permission_is_still_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fixture("perm");
+        let ancestor = root.join("ancestor");
+        let selected = ancestor.join("selected");
+        let chain = AuthenticatedDirectoryChain::capture(&selected).expect("capture chain");
+
+        let original = fs::metadata(&ancestor).expect("ancestor metadata").permissions();
+        let mut widened = original.clone();
+        widened.set_mode(0o777);
+        fs::set_permissions(&ancestor, widened).expect("widen ancestor permissions");
+
+        let verdict = chain.revalidate();
+        let _ = fs::set_permissions(&ancestor, original);
+        assert!(
+            verdict.is_err(),
+            "a world-writable ancestor is a changed authority and must be refused",
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

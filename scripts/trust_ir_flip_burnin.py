@@ -104,6 +104,14 @@ COMPILE_FLAGS = [
     "-C", "link-dead-code=yes",    # eager mono-item collection: private bodies reach codegen
     "-C", "codegen-units=1",       # one object, deterministic layout
     "-C", "opt-level=0",           # flip session gate: O0
+    # NOT redundant with the line above -- it is the correction for it. rustc
+    # infers debug-assertions from the opt level when the flag is absent: ON at
+    # 0, OFF above (re-measured 2026-08-13, rustc 1.97.1). A burn-in run without
+    # this flag exercises debug_assertions-ON bodies, i.e. extra assert arms
+    # that the release-profile subject does not have.
+    # SUSPECT BASELINE: burn-in inventories recorded before 2026-08-13 predate
+    # this flag.
+    "-C", "debug-assertions=off",  # flip session gate: release-shaped bodies
     "-C", "debuginfo=0",           # flip session gate: no debuginfo
     "--cap-lints", "allow",
     "--emit=obj",

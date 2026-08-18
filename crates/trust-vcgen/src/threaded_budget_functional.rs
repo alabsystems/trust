@@ -204,7 +204,9 @@ fn ref_fn_target<'a>(func: &VerifiableFunction, post: &'a Formula) -> Option<&'a
 fn ref_pseudo_post(func: &VerifiableFunction) -> Option<Formula> {
     let fuel = crate::recursive_datatype_functional::param_var(func, FUEL_LOCAL)?;
     let e = crate::recursive_datatype_functional::param_var(func, PAYLOAD_LOCAL)?;
-    let ret_sort = crate::sort_for_ty(peel_indirection(&func.body.return_ty));
+    // R0: the return slot is a definitional position — widen so the emitted sort
+    // carries the constructor list a `declare-datatype` is built from.
+    let ret_sort = crate::sort_for_ty_in(func, peel_indirection(&func.body.return_ty));
     Some(Formula::Eq(
         Box::new(Formula::FnApp {
             func: func.name.clone(),
@@ -288,9 +290,15 @@ fn emit_cluster(
 
     // The result-pair datatype: every member returns the SAME single-ctor
     // pair; its field datatypes are checked after the walk pins fuel/payload.
-    let res_dt = peel_indirection(&members[0].body.return_ty).clone();
+    // R0: a return slot is an OUTERMOST nominal position, so under
+    // markers-everywhere it is spelled bare. Resolve through each function's OWN
+    // table, on BOTH sides of the comparison — resolving only one side would make
+    // two spellings of one type compare unequal, which is the very asymmetry this
+    // campaign removes.
+    let res_dt =
+        crate::resolved_ty(&members[0], peel_indirection(&members[0].body.return_ty)).into_owned();
     for f in members {
-        if peel_indirection(&f.body.return_ty) != &res_dt {
+        if *crate::resolved_ty(f, peel_indirection(&f.body.return_ty)) != res_dt {
             return None;
         }
     }
@@ -334,7 +342,7 @@ fn emit_cluster(
             if names.contains(&func.name.as_str())
                 || !is_marker_safe_segment(&func.name)
                 || func.body.arg_count != 2
-                || peel_indirection(&func.body.return_ty) != &res_dt
+                || *crate::resolved_ty(func, peel_indirection(&func.body.return_ty)) != res_dt
             {
                 return None;
             }
@@ -508,7 +516,7 @@ fn emit_cluster(
             .map(|i| {
                 Some((
                     crate::place_to_var_name(func, &Place::local(i)),
-                    crate::sort_for_ty(peel_indirection(local_ty(func, i)?)),
+                    crate::sort_for_ty_in(func, peel_indirection(local_ty(func, i)?)),
                 ))
             })
             .collect::<Option<Vec<_>>>()?;
@@ -648,7 +656,8 @@ fn twalk(
                 return false;
             };
             let post = &cx.posts[cx.member_idx];
-            let res_dt = peel_indirection(&func.body.return_ty);
+            // R0: outermost position — widen through this body's explicit table.
+            let res_dt = &*crate::resolved_ty(func, peel_indirection(&func.body.return_ty));
             let Ty::Datatype { variants: res_variants, .. } = res_dt else {
                 return false;
             };
@@ -749,7 +758,11 @@ fn twalk(
                     let Some(fuel_ty) = local_ty(func, FUEL_LOCAL) else {
                         return false;
                     };
-                    let dt = peel_indirection(fuel_ty).clone();
+                    // R0: the matched local's own datatype is an OUTERMOST position and is
+                    // spelled bare under markers-everywhere. Inline definition first, then
+                    // this body's explicit table; an undefined marker is untouched and the
+                    // structural gate below still declines exactly as before.
+                    let dt = crate::resolved_ty(func, peel_indirection(fuel_ty)).into_owned();
                     let Some(((z_tag, z_ctor), (s_tag, s_ctor))) = nat_shape(&dt) else {
                         return false;
                     };
@@ -809,7 +822,11 @@ fn twalk(
                     let Some(matched_ty) = local_ty(func, PAYLOAD_LOCAL) else {
                         return false;
                     };
-                    let dt = peel_indirection(matched_ty).clone();
+                    // R0: the matched local's own datatype is an OUTERMOST position and is
+                    // spelled bare under markers-everywhere. Inline definition first, then
+                    // this body's explicit table; an undefined marker is untouched and the
+                    // structural gate below still declines exactly as before.
+                    let dt = crate::resolved_ty(func, peel_indirection(matched_ty)).into_owned();
                     let Ty::Datatype { variants, .. } = &dt else {
                         return false;
                     };
@@ -880,7 +897,7 @@ fn twalk(
             let Some(fuel_arg) = resolve_operand(func, &state, &args[0]) else {
                 return false;
             };
-            let res_dt = peel_indirection(&func.body.return_ty);
+            let res_dt = &*crate::resolved_ty(func, peel_indirection(&func.body.return_ty));
             // THREADING gate.
             let fuel_ok = match arm.call_values.last() {
                 None => fuel_arg.var_name() == Some(k_name.as_str()),
@@ -1305,6 +1322,7 @@ pub mod fixtures {
             ],
             arg_count: 2,
             return_ty: res_dt(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: name.to_string(),

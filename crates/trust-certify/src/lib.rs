@@ -118,6 +118,7 @@ pub mod body_bound_ensures;
 /// each declaration (registration IS the kernel gate), and report failures
 /// with island-relative byte offsets for source-accurate Rust diagnostics.
 pub mod clean_island;
+pub mod clean_island_batch;
 
 /// Trust: the kernel half of the zero-authority frontend firewall. The only
 /// route by which material from an untrusted frontend (TrustJS/TrustPy/
@@ -701,6 +702,15 @@ fn certify_with_identity_uncached(
         return Some(evidence);
     }
 
+    // Unsigned BV MULTIPLY no-overflow under dominating per-factor bounds (the
+    // guarded two-variable product `if a < 1000 && b < 1000 { a * b }`): the
+    // hardware bvudiv-recovery mul-overflow idiom over raw exact-width operand
+    // reads, discharged through the kernel by bounding the true product
+    // (`a·b ≤ Ba·Bb ≤ UMAX` ⟹ the recovery mismatch is unsatisfiable).
+    if let Some(evidence) = certify_unsigned_bv_mul_no_overflow(&conjuncts, identity) {
+        return Some(evidence);
+    }
+
     // Pure unsigned-BV ORDER contradiction (the guarded-index in-bounds
     // re-assert `if idx < K { a[idx] }`): the whole pool is unsigned order atoms
     // over one index — range facts `0 ≤u idx ≤u uMAX`, the dominating path guard
@@ -803,10 +813,59 @@ fn certify_with_identity_uncached(
         return Some(evidence);
     }
 
+    // The generic linear-Int fragment path (atom collection, interval / chain /
+    // Farkas refutation, then the full ay-solve + zero-trust reconstruction).
+    // Extracted verbatim so a LAST-RESORT lane can run after it without
+    // restructuring its internal `return None`s; every earlier lane keeps its
+    // exact previous position, so no certificate this producer already minted
+    // changes shape or bytes.
+    if let Some(evidence) = certify_linear_int_fragment(&conjuncts, identity) {
+        return Some(evidence);
+    }
+
+    // LAST: purely PROPOSITIONAL closure of a negated conjunction whose every
+    // leaf is present in the pool (`P₁ ∧ … ∧ Pₙ ∧ ¬(P₁ ∧ … ∧ Pₙ)`) — the exact
+    // shape a multi-atom or `Bool`-sorted `#[ensures]` clause produces, and one
+    // the linear-Int fragment above structurally cannot reach because
+    // `collect_supported_atoms` drops the `Not(And(..))` conjunct that carries
+    // the contradiction. Runs over the UNFILTERED conjunct view
+    // ([`NormalizedConjuncts::propositional_view`]) so `Bool`-sorted conjuncts,
+    // which `view()` drops as spent reifications, are still visible.
+    let propositional = normalized.propositional_view();
+    if let Some(evidence) = certify_propositional_closure_contradiction(&propositional, identity) {
+        return Some(evidence);
+    }
+
+    // LAST-RESORT: `Ite`-DEFINITION CASE SPLIT. A violation carrying
+    // `Eq(v, Ite(c, t, e))` conjuncts — the shape `wrapping_call_assert_model`
+    // grounds every `wrapping_{add,sub}` into — is invisible to EVERY lane
+    // above: `collect_term_vars` has no `Ite` arm, so `collect_supported_atoms`
+    // drops the whole conjunct and the surviving pool is nothing but type-range
+    // facts. Split each `Ite` definition into its (guard, value) branches, take
+    // the `Or.rec` case tree, and refute each leaf with the linear-Int Farkas
+    // engine. Placed after every other lane so no certificate this producer
+    // already mints changes shape or bytes.
+    if let Some(evidence) = certify_ite_case_split_contradiction(&conjuncts, identity) {
+        return Some(evidence);
+    }
+
+    None
+}
+
+/// The generic linear-integer fragment certificate path: keep the conjuncts
+/// inside the supported linear-Int atom fragment, try the interval / transitive
+/// chain / Farkas refutations, and otherwise drive ay end to end and reconstruct
+/// its refutation under a zero-trust budget. Split out of
+/// [`certify_with_identity_uncached`] with NO behavioural change so a later lane
+/// can run when this one declines.
+fn certify_linear_int_fragment(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
     // Keep only the conjuncts that lie in the supported linear-Int fragment; the
     // contradiction a real bounds/guard VC carries lives in this subset, wrapped
     // in reified `Bool = (x < y)` conjuncts we soundly drop.
-    let (atoms, var_names) = collect_supported_atoms(&conjuncts);
+    let (atoms, var_names) = collect_supported_atoms(conjuncts);
     if atoms.is_empty() {
         return None;
     }
@@ -826,6 +885,7 @@ fn certify_with_identity_uncached(
     if let Some(term) = single_var_interval_refutation(&atoms, &hyps)
         .or_else(|| transitive_chain_refutation(&atoms, &hyps))
         .or_else(|| multi_var_farkas_refutation(&atoms, &hyps))
+        .or_else(|| shifted_single_var_interval_refutation(&atoms, &hyps))
     {
         if let Some(evidence) = finish_certificate(&hyps, &term, &var_names, identity) {
             return Some(evidence);
@@ -941,7 +1001,7 @@ fn certify_with_identity_uncached(
 /// [`refute_via_var_cycle`] Var-Var restriction, which declined byte drift
 /// that bought NO coverage; [`retain_new_atoms`] serves the same purpose
 /// here, preventing the no-new-coverage churn of a bare second pass.
-const NORMALIZATION_STEPS: [fn(&[&Formula]) -> Vec<Formula>; 14] = [
+const NORMALIZATION_STEPS: [fn(&[&Formula]) -> Vec<Formula>; 15] = [
     // Trust #540: unfold asserted Bool reifications (`_b ⟺ inner; assert(_b)`)
     // into their entailed inner atoms, so a discharge whose contradiction hides
     // behind an asserted Bool (div-by-zero `assert(divisor != 0)` etc.) becomes
@@ -986,6 +1046,16 @@ const NORMALIZATION_STEPS: [fn(&[&Formula]) -> Vec<Formula>; 14] = [
     // propagation above are invisible to the first pass at table position 7-8.
     modulo_range_bounds_late,
     division_range_bounds_late,
+    // SECOND pass of the reification unfold (new-atoms-only): a spent TRUE
+    // reification (`Eq(_b, inner)` + asserted `_b`) that lives INSIDE the
+    // disjuncts of an `Or` is surfaced into the pool only by
+    // `extract_disjunction_common_conjuncts` (position 9), which pass 1 at
+    // position 0 ran too early to see — the waveform_scale_div div-overflow VC
+    // shape, whose Or-common `_6 ⟺ (d = 0)` + `_6` entails the `Eq(d, 0)` that
+    // meets the guard `Not(Eq(d, 0))` directly. Same modus-ponens soundness as
+    // pass 1: every emitted atom is entailed by present pool conjuncts, so a
+    // satisfiable obligation stays satisfiable (fail-closed).
+    unfold_asserted_bool_reifications_late,
 ];
 
 /// Owned result of [`normalize_violation`]: `base` borrows the violation's own
@@ -1007,6 +1077,22 @@ impl NormalizedConjuncts<'_> {
             .chain(self.pool.iter())
             .filter(|c| !is_bool_reification_conjunct(c))
             .collect()
+    }
+
+    /// The conjunct view WITHOUT the spent-Bool-reification filter, for the
+    /// propositional-closure lane. [`view`](Self::view) drops every conjunct
+    /// mentioning a `Bool`-sorted variable at top level, because the linear-Int
+    /// fragment cannot use them and [`unfold_asserted_bool_reifications`] has
+    /// already extracted their entailed Int content. A `Bool`-valued
+    /// `#[ensures]` clause (`ensures !self.f`) puts its ENTIRE contradiction in
+    /// exactly those conjuncts, so the propositional lane needs them back.
+    ///
+    /// Adding conjuncts is the safe direction for a refutation: every entry is
+    /// a base conjunct of the violation or an entailed atom derived by
+    /// [`NORMALIZATION_STEPS`], so a satisfiable obligation stays satisfiable
+    /// and still fails closed.
+    fn propositional_view(&self) -> Vec<&Formula> {
+        self.base.iter().copied().chain(self.pool.iter()).collect()
     }
 }
 
@@ -1591,6 +1677,15 @@ fn modulo_range_bounds_late(conjuncts: &[&Formula]) -> Vec<Formula> {
 /// Second pass of [`division_range_bounds`] — see [`modulo_range_bounds_late`].
 fn division_range_bounds_late(conjuncts: &[&Formula]) -> Vec<Formula> {
     retain_new_atoms(conjuncts, division_range_bounds(conjuncts))
+}
+
+/// Second pass of [`unfold_asserted_bool_reifications`], after
+/// `extract_disjunction_common_conjuncts` has surfaced Or-common reification
+/// definitions/assertions into the pool — see the [`NORMALIZATION_STEPS`]
+/// entry for the motivating VC shape. New-atoms-only ([`retain_new_atoms`]):
+/// pools where pass 1 already extracted everything are byte-identical.
+fn unfold_asserted_bool_reifications_late(conjuncts: &[&Formula]) -> Vec<Formula> {
+    retain_new_atoms(conjuncts, unfold_asserted_bool_reifications(conjuncts))
 }
 
 fn membership_interval_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
@@ -2505,6 +2600,188 @@ fn push_hyp(hyps: &mut Vec<Hyp>, smt: String, prop: Expr) -> FVarId {
 }
 
 // ---------------------------------------------------------------------------
+// Propositional closure of a negated conjunction (multi-atom / Bool `ensures`).
+// ---------------------------------------------------------------------------
+
+/// Max leaves of a negated conjunction this lane will close over. Bounds the
+/// certificate size and the kernel term depth; a wider clause fails closed.
+const PROP_CLOSURE_MAX_LEAVES: usize = 32;
+
+/// Max flattened conjuncts the lane inspects. Bounds the quadratic
+/// presence scan on pathological pools; a larger pool fails closed.
+const PROP_CLOSURE_MAX_POOL: usize = 512;
+
+/// Name prefix of the opaque `Int` indicator standing for one abstracted
+/// propositional atom. Chosen to be a simple SMT symbol so
+/// [`encoded_var_name`] passes it through unchanged.
+const PROP_INDICATOR_PREFIX: &str = "trust_prop_";
+
+/// A `Bool`-sorted leaf a propositional literal can be built from.
+fn is_bool_var_leaf(f: &Formula) -> bool {
+    matches!(f, Formula::Var(_, Sort::Bool) | Formula::SymVar(_, Sort::Bool))
+}
+
+/// Canonical propositional form of a conjunct: rewrite a `Bool`-sorted equality
+/// against a literal into the equivalent literal — `Eq(x, true) ⇝ x` and
+/// `Eq(x, false) ⇝ ¬x` (either operand order). Everything else is returned
+/// unchanged.
+///
+/// SOUNDNESS: `Formula::Eq` lowers to SMT `(= a b)`, which at `Bool` sort IS
+/// boolean equivalence, so both rewrites are EQUIVALENCES — not weakenings and
+/// not assumptions. Applying the same function to the pool and to the leaves is
+/// what makes the syntactic presence check below meaningful across the two
+/// spellings the vcgen emits for the same fact (`self.f = false` in the
+/// post-state vs `¬self.f` inside the negated clause).
+fn propositional_form(f: &Formula) -> Formula {
+    if let Formula::Eq(a, b) = f {
+        let atom_and_value = match (a.as_ref(), b.as_ref()) {
+            (x, Formula::Bool(v)) if is_bool_var_leaf(x) => Some((x, *v)),
+            (Formula::Bool(v), x) if is_bool_var_leaf(x) => Some((x, *v)),
+            _ => None,
+        };
+        if let Some((atom, value)) = atom_and_value {
+            return if value { atom.clone() } else { Formula::Not(Box::new(atom.clone())) };
+        }
+    }
+    f.clone()
+}
+
+/// Refute `P₁ ∧ … ∧ Pₙ ∧ ¬(P₁ ∧ … ∧ Pₙ)`: a negated conjunction EVERY leaf of
+/// which is already present, verbatim, in the obligation's own conjunct pool.
+///
+/// This is the shape a multi-atom (`a == 0 && b == 0`) or `Bool`-sorted
+/// (`!self.f`) `#[ensures]` clause produces. The postcondition violation is
+/// `post-state facts ∧ ¬clause`; when the body establishes the clause literally,
+/// each of its conjuncts appears as a post-state fact and the whole clause
+/// appears negated. The linear-Int fragment cannot reach it: `normalize_atom`
+/// has no `And`/`Or`/`Bool` arm, so `collect_supported_atoms` DROPS the
+/// `Not(And(..))` conjunct that carries the contradiction and the surviving
+/// residue is satisfiable.
+///
+/// ENCODING. Each distinct leaf atom is abstracted to a fresh opaque `Int`
+/// indicator pinned to `1`, keeping the whole proof inside the `Int` fragment
+/// [`build_env`] and [`proof_axiom_closure_is_clean`] already audit — no new
+/// sort, no widened axiom allowlist. The abstraction runs in the SAFE
+/// direction: any model of the concrete conjuncts induces an indicator
+/// assignment satisfying the abstract ones (`Aⱼ := 1` iff the model satisfies
+/// `Pⱼ`), so abstract-UNSAT ⇒ concrete-UNSAT. The atom → indicator map is a
+/// BIJECTION on distinct atoms by construction (structural dedup, positional
+/// index), which is what makes that model transfer well defined: merging two
+/// distinct atoms would add an unsound "they agree" constraint, and splitting
+/// equivalent ones only makes refutation harder.
+///
+/// MUTANT SAFETY is structural, not statistical: the lane fires only when every
+/// leaf is present, and a body that FAILS its clause never emits the leaf
+/// (`self.b = 1` under `ensures self.b == 0` yields `Eq(b,1)`, never `Eq(b,0)`),
+/// so the lane declines and the row keeps its refutation. A pool with no
+/// `Not(..)` conjunct at all — notably the source-clause catalog marker's
+/// non-semantic `Bool(false)` placeholder — never matches.
+fn certify_propositional_closure_contradiction(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    let mut flat: Vec<&Formula> = Vec::new();
+    for &c in conjuncts {
+        collect_conjuncts(c, &mut flat);
+    }
+    if flat.is_empty() || flat.len() > PROP_CLOSURE_MAX_POOL {
+        return None;
+    }
+
+    // The pool in canonical propositional form. `collect_conjuncts` itself only
+    // flattens `And` and eliminates double negation — both equivalences — so
+    // every entry is still entailed by the violation.
+    let pool: Vec<Formula> = flat.iter().map(|c| propositional_form(c)).collect();
+
+    for candidate in &pool {
+        let Formula::Not(inner) = candidate else { continue };
+        // `collect_conjuncts` is equivalence-preserving on the negated body, so
+        // `And(leaves) ≡ inner` and `candidate ≡ ¬And(leaves)`.
+        let mut leaf_refs: Vec<&Formula> = Vec::new();
+        collect_conjuncts(inner, &mut leaf_refs);
+        if leaf_refs.is_empty() || leaf_refs.len() > PROP_CLOSURE_MAX_LEAVES {
+            continue;
+        }
+        let leaves: Vec<Formula> = leaf_refs.iter().map(|q| propositional_form(q)).collect();
+        // THE GATE: every leaf must be present in the pool.
+        if !leaves.iter().all(|q| pool.iter().any(|h| h == q)) {
+            continue;
+        }
+        if let Some(evidence) = propositional_closure_certificate(&leaves, identity) {
+            return Some(evidence);
+        }
+    }
+    None
+}
+
+/// Build and kernel-check the refutation for a matched propositional closure:
+/// hypotheses `Aⱼ = 1` for each distinct leaf atom, the violation hypothesis
+/// `¬(A₁ = 1 ∧ … ∧ Aₙ = 1)`, and the term `h_v (And.intro …) : False`.
+/// Handed to [`finish_certificate`], which independently re-runs the ay UNSAT
+/// gate, the full clean-kernel `check_type(term, False)` + axiom-closure audit,
+/// and the serialize/deserialize round-trip re-check.
+fn propositional_closure_certificate(
+    leaves: &[Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    // Injective atom → indicator index (structural dedup, positional index).
+    let mut distinct: Vec<&Formula> = Vec::new();
+    let mut index_of: Vec<usize> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let idx = match distinct.iter().position(|d| *d == leaf) {
+            Some(i) => i,
+            None => {
+                distinct.push(leaf);
+                distinct.len() - 1
+            }
+        };
+        index_of.push(idx);
+    }
+    let names: Vec<String> =
+        (0..distinct.len()).map(|i| format!("{PROP_INDICATOR_PREFIX}{i}")).collect();
+
+    let one = int_literal_to_kernel(1)?;
+    let mut hyps: Vec<Hyp> = Vec::new();
+    let mut atom_prop: Vec<Expr> = Vec::with_capacity(names.len());
+    let mut atom_fvar: Vec<FVarId> = Vec::with_capacity(names.len());
+    for name in &names {
+        let encoded = encoded_var_name(name);
+        let prop = eq_int(Expr::const_(Name::from_string(&encoded), vec![]), one.clone());
+        let fvar = push_hyp(&mut hyps, format!("(= {encoded} 1)"), prop.clone());
+        atom_prop.push(prop);
+        atom_fvar.push(fvar);
+    }
+
+    // The negated conjunction, in LEAF order (a repeated leaf reuses its
+    // indicator and its hypothesis), right-nested to match `And`/`And.intro`.
+    let leaf_smt: Vec<String> = index_of
+        .iter()
+        .map(|&i| format!("(= {} 1)", encoded_var_name(&names[i])))
+        .collect();
+    let (conj_prop, conj_proof) = index_of
+        .iter()
+        .map(|&i| (atom_prop[i].clone(), Expr::fvar(atom_fvar[i])))
+        .rev()
+        .reduce(|(acc_prop, acc_proof), (prop, proof)| {
+            (
+                const_app("And", [prop.clone(), acc_prop.clone()]),
+                const_app("And.intro", [prop, acc_prop, proof, acc_proof]),
+            )
+        })?;
+
+    let conj_smt = if leaf_smt.len() == 1 {
+        leaf_smt[0].clone()
+    } else {
+        format!("(and {})", leaf_smt.join(" "))
+    };
+    let v_fvar = push_hyp(&mut hyps, format!("(not {conj_smt})"), const_app("Not", [conj_prop]));
+    let term = Expr::app(Expr::fvar(v_fvar), conj_proof);
+
+    let var_names: BTreeSet<String> = names.into_iter().collect();
+    finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+// ---------------------------------------------------------------------------
 // Closed-constant arithmetic contradictions (shift-amount / cast-range checks).
 // ---------------------------------------------------------------------------
 
@@ -2812,6 +3089,29 @@ fn atom_var_bound(atom: &Atom<'_>, hyp: Expr) -> Option<VarBound> {
     }
 }
 
+/// Shift a linear `x ± δ` endpoint back onto `x` so a single-variable interval
+/// refutation can use it, exactly as [`build_order_edge`] already does for the
+/// chain lane. Used only by the LAST-RUNG shifted variant so no certificate
+/// this producer already mints changes bytes.
+fn shifted_atom_var_bound(a: &Formula, b: &Formula, strict: bool, hyp: Expr) -> Option<VarBound> {
+    let var_expr = |v: &str| Expr::const_(Name::from_string(&encoded_var_name(v)), vec![]);
+    // `(x+δ) R k`  →  `x R (k-δ)`  (upper bound on x).
+    if let (Some((v, delta)), Some(k)) = (linear_var_offset(a), int_literal_value(b)) {
+        let kk = k.checked_sub(delta)?;
+        let (x, kk_e) = (var_expr(&v), int_literal_to_kernel(kk)?);
+        let shifted = shift_hyp(strict, &x, &kk_e, delta, hyp)?;
+        return Some(VarBound { is_upper: true, strict, value: kk, var: v, hyp: shifted });
+    }
+    // `k R (x+δ)`  →  `(k-δ) R x`  (lower bound on x).
+    if let (Some(k), Some((v, delta))) = (int_literal_value(a), linear_var_offset(b)) {
+        let kk = k.checked_sub(delta)?;
+        let (x, kk_e) = (var_expr(&v), int_literal_to_kernel(kk)?);
+        let shifted = shift_hyp(strict, &kk_e, &x, delta, hyp)?;
+        return Some(VarBound { is_upper: false, strict, value: kk, var: v, hyp: shifted });
+    }
+    None
+}
+
 /// Refute a single-variable interval contradiction: a lower bound `L ?≤ x` and an
 /// upper bound `x ?≤ U` on the SAME variable whose constants conflict. Chains
 /// them through the variable with the matching transitivity lemma to obtain the
@@ -2823,6 +3123,13 @@ fn single_var_interval_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Ex
         .zip(hyps)
         .filter_map(|(atom, hyp)| atom_var_bound(atom, Expr::fvar(hyp.fvar)))
         .collect();
+    first_conflicting_interval(&bounds)
+}
+
+/// The shared search both interval rungs run: the FIRST lower/upper pair on the
+/// same variable whose constants conflict, closed by [`build_interval_refutation`]
+/// (which returns `None` — fail closed — unless they genuinely conflict).
+fn first_conflicting_interval(bounds: &[VarBound]) -> Option<Expr> {
     for lower in bounds.iter().filter(|b| !b.is_upper) {
         for upper in bounds.iter().filter(|b| b.is_upper) {
             if lower.var != upper.var {
@@ -2834,6 +3141,54 @@ fn single_var_interval_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Ex
         }
     }
     None
+}
+
+/// Same single-variable interval refutation as [`single_var_interval_refutation`],
+/// but admitting endpoints of the form `x ± δ` (shifted back onto `x` through the
+/// existing `Int.<R>_of_add_<R>_add_right` cancellation lemma). This closes the
+/// unsigned-subtraction underflow goal `Lt(Sub(x, c), 0)` against a DIRECTLY
+/// present lower bound `Ge(x, b)` with `b ≥ c` — a two-atom contradiction the
+/// capped augmented-edge DFS in [`refute_via_chain_edges`] cannot reach once the
+/// surrounding VC carries more than 48 order edges. Runs LAST so every pool the
+/// earlier rungs already close keeps its exact certificate bytes.
+///
+/// # What certifying these rows actually causes — read before widening this further
+///
+/// A certificate here is not merely a report change. `KernelCertified` feeds
+/// `elide_kernel_certified_checks` (rustc_mir_transform/src/trust_verify.rs), which
+/// for `ArithmeticOverflow{Add|Sub|Mul}` rewrites the origin block's
+/// `TerminatorKind::Assert` to a `Goto`, PHYSICALLY DELETING the runtime check —
+/// and it does so whenever `overflow_checks()` is on, not only under
+/// `-Ztrust-policy=certify`. For the countdown fixtures that means the three
+/// `offset -= 4/2/1` checks, retained under today's default policy, are dropped.
+///
+/// Their safety then rests on the conjunct `Ge(offset, b)` that
+/// `trust_vcgen::generate::induction` emits from a hand-written countdown trip
+/// analysis. The kernel checks the IMPLICATION from that hypothesis; it does not
+/// check the hypothesis. Stated plainly so nobody has to rediscover it: that
+/// analysis is a TCB member, and this rung makes its loop-site fact load-bearing
+/// for elision on three rows where previously only its per-decrement result facts
+/// were. The component is not newly trusted — those result facts are already
+/// conjuncts of all 14 obligations, including the 11 that certify and elide today —
+/// but the blast radius is larger, and that is the honest cost of this change.
+///
+/// So: do not widen this rung to shapes whose supporting bound comes from a
+/// DIFFERENT unverified analysis without pricing that separately. The cheap failure
+/// mode is a rung that certifies more by leaning harder on facts nothing checks.
+fn shifted_single_var_interval_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr> {
+    let bounds: Vec<VarBound> = atoms
+        .iter()
+        .zip(hyps)
+        .filter_map(|(atom, hyp)| {
+            let (a, b, strict) = match atom {
+                Atom::Lt(a, b) => (*a, *b, true),
+                Atom::Le(a, b) => (*a, *b, false),
+            };
+            atom_var_bound(atom, Expr::fvar(hyp.fvar))
+                .or_else(|| shifted_atom_var_bound(a, b, strict, Expr::fvar(hyp.fvar)))
+        })
+        .collect();
+    first_conflicting_interval(&bounds)
 }
 
 /// Build a `False` term from conflicting `lower : L ?≤ x` and `upper : x ?≤ U`.
@@ -2879,6 +3234,14 @@ enum ChainNode {
     /// `a >= b`). Carries the lifted `a-b` bounds derived from the guard (`b ≤ a ⟹
     /// 0 ≤ a-b`) and from `a`'s upper bound with `0 ≤ b` (`a-b ≤ a`).
     Diff(String, String),
+    /// A product of two variables: `x * y` (a guarded two-variable NONLINEAR
+    /// multiplication overflow term, e.g. `x * y` under dominating guards
+    /// `x ≤ Kx`, `y ≤ Ky`). Carries the lifted interval-product bounds
+    /// `0 ≤ x·y ≤ Kx·Ky` built by [`augment_with_product_lifts`] from the
+    /// per-factor guard bounds and non-negativities — a BOUNDED-product fact,
+    /// not general NIA (symbolic exponents / mixed-sign products stay outside
+    /// the fragment and fail closed).
+    Product(String, String),
 }
 
 /// One directed order edge `from R to` (`from ≤ to` or `from < to`) carrying its
@@ -2901,12 +3264,17 @@ fn chain_node(f: &Formula) -> Option<ChainNode> {
         Formula::Int(n) => Some(ChainNode::Lit(*n)),
         Formula::UInt(n) if *n <= i128::MAX as u128 => Some(ChainNode::Lit(*n as i128)),
         // `x * c` — a positive-scaled variable (guarded multiplication overflow).
+        // `x * y` of two Int variables — a Product node (guarded two-variable
+        // nonlinear multiplication overflow); anything else (literal×literal,
+        // var×compound) stays outside the chain fragment (fail-closed).
         Formula::Mul(a, b) => {
-            let (c, var) = linear_mul_operands(a, b)?;
-            if c <= 0 {
-                return None;
+            if let Some((c, var)) = linear_mul_operands(a, b) {
+                if c <= 0 {
+                    return None;
+                }
+                return Some(ChainNode::Scaled(int_var_name(var)?, c));
             }
-            Some(ChainNode::Scaled(int_var_name(var)?, c))
+            Some(ChainNode::Product(int_var_name(a)?, int_var_name(b)?))
         }
         // `a + (-x)` is the MIR lowering of the difference `a - x`: route it to a
         // Diff node (not Sum) so guarded-subtraction obligations whose `a-b` lowers
@@ -3323,12 +3691,185 @@ fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
     out
 }
 
+/// Lift guard bounds onto the two-variable PRODUCT nodes (`x*y`) that appear —
+/// the nonlinear analogue of [`augment_with_additive_lifts`], restricted to the
+/// BOUNDED-product (interval-product) fact a guarded multiplication needs:
+///
+/// * UPPER (`x*y ≤ Kx·Ky`, edge `Product(x,y) → Lit(Kx·Ky)`): from the
+///   non-strict per-factor bounds `x ≤ Kx`, `y ≤ Ky` (strict guards already
+///   carry their integer-tightened `≤` twins alongside — [`build_order_edges`])
+///   plus the non-negativity `0 ≤ y` and the LITERAL checks `Kx ≥ 0`, `Ky ≥ 0`.
+///   Kernel composition ([`product_upper_lift`]):
+///     step1 = `Int.mul_le_mul_of_nonneg_right x Kx y hx hy0 : x·y ≤ Kx·y`;
+///     step2 = `Int.mul_le_mul_of_nonneg_right y Ky Kx hy hKx0 : y·Kx ≤ Ky·Kx`,
+///       reoriented to `Kx·y ≤ Kx·Ky` by two `Int.mul_comm` + `Eq.subst`
+///       transports (the neg_mul_neg_bridge pattern);
+///     composed with `Int.le_trans`. `Kx·Ky` folds to the edge literal by
+///   kernel def-eq exactly as [`mul_lift`] already relies on; the i128
+///   `checked_mul` declines on overflow (fail-closed).
+/// * LOWER (`0 ≤ x*y`, edge `Lit(0) → Product(x,y)`): `Int.mul_nonneg x y
+///   hx0 hy0` from the present non-negativities `0 ≤ x`, `0 ≤ y`.
+///
+/// SOUNDNESS: every lifted edge is a composed kernel proof term whose premises
+/// are REAL present hypotheses (guard-bound edges) or constructed literal
+/// witnesses (`Int.NonNeg.mk` for `0 ≤ Kx`, checked in Rust first), re-verified
+/// end-to-end by the clean kernel; the lift itself never decides anything. An
+/// unguarded or wide-guarded product (the mutant's `x,y < 100000` on u32) gets
+/// an edge to `Lit(Kx·Ky)` whose literal EXCEEDS the violation threshold, so no
+/// conflicting chain exists and the obligation fails closed — the lift uses
+/// the actual bound magnitudes, never the mere existence of a guard.
+fn augment_with_product_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
+    let mut products: BTreeSet<(String, String)> = BTreeSet::new();
+    for edge in edges {
+        for node in [&edge.from, &edge.to] {
+            if let ChainNode::Product(x, y) = node {
+                products.insert((x.clone(), y.clone()));
+            }
+        }
+    }
+    if products.is_empty() {
+        return edges.to_vec();
+    }
+    // Tightest non-strict upper bound per variable (min B — same discipline as
+    // the additive lift) and the EXACT `0 ≤ v` witnesses. The non-negativity
+    // premises of `Int.mul_nonneg` / `mul_le_mul_of_nonneg_right` need the
+    // literal-zero form, which is exactly the unsigned type-range conjunct the
+    // BV→Int synthesizer emits; a stronger lower bound (`5 ≤ v`) is NOT
+    // weakened here — absent the exact form the lift declines (fail-closed).
+    let mut upper: std::collections::BTreeMap<String, (i128, Expr)> = Default::default();
+    let mut nonneg: std::collections::BTreeMap<String, Expr> = Default::default();
+    for edge in edges {
+        if edge.strict {
+            continue;
+        }
+        match (&edge.from, &edge.to) {
+            (ChainNode::Var(v), ChainNode::Lit(b)) => {
+                let e = upper.entry(v.clone()).or_insert((*b, edge.hyp.clone()));
+                if *b < e.0 {
+                    *e = (*b, edge.hyp.clone());
+                }
+            }
+            (ChainNode::Lit(0), ChainNode::Var(v)) => {
+                nonneg.entry(v.clone()).or_insert_with(|| edge.hyp.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut out = edges.to_vec();
+    for (x, y) in &products {
+        if let (Some((kx, hx)), Some((ky, hy)), Some(hy0)) =
+            (upper.get(x), upper.get(y), nonneg.get(y))
+        {
+            if let Some(edge) = product_upper_lift(x, y, *kx, *ky, hx, hy, hy0) {
+                out.push(edge);
+            }
+        }
+        if let (Some(hx0), Some(hy0)) = (nonneg.get(x), nonneg.get(y)) {
+            if let Some(edge) = product_nonneg_lift(x, y, hx0, hy0) {
+                out.push(edge);
+            }
+        }
+    }
+    out
+}
+
+/// Build the UPPER lifted edge `Product(x,y) → Lit(Kx·Ky)` — see
+/// [`augment_with_product_lifts`] for the lemma chain and soundness argument.
+/// `hx : x ≤ Kx`, `hy : y ≤ Ky`, `hy0 : 0 ≤ y`; declines (fail-closed) on a
+/// negative bound, a `0 ≤ Kx` witness outside `u64`, or i128 product overflow.
+fn product_upper_lift(
+    x: &str,
+    y: &str,
+    kx: i128,
+    ky: i128,
+    hx: &Expr,
+    hy: &Expr,
+    hy0: &Expr,
+) -> Option<OrderEdge> {
+    if kx < 0 || ky < 0 {
+        return None;
+    }
+    let product = kx.checked_mul(ky)?;
+    let xe = chain_var_expr(x);
+    let ye = chain_var_expr(y);
+    let kxe = int_literal_to_kernel(kx)?;
+    let kye = int_literal_to_kernel(ky)?;
+    // `@Int.NonNeg.mk Kx : Int.le 0 Kx` (def-eq) — the literal non-negativity
+    // witness for the second `mul_le_mul_of_nonneg_right` application.
+    let hkx0 = nonneg_mk(u64::try_from(kx).ok()?);
+    // step1 : x·y ≤ Kx·y   (a := x, b := Kx, c := y).
+    let step1 = const_app(
+        "Int.mul_le_mul_of_nonneg_right",
+        [xe.clone(), kxe.clone(), ye.clone(), hx.clone(), hy0.clone()],
+    );
+    // step2 : y·Kx ≤ Ky·Kx (a := y, b := Ky, c := Kx).
+    let step2 = const_app(
+        "Int.mul_le_mul_of_nonneg_right",
+        [ye.clone(), kye.clone(), kxe.clone(), hy.clone(), hkx0],
+    );
+    let m_ykx = int_mul_expr(ye.clone(), kxe.clone());
+    let m_kxy = int_mul_expr(kxe.clone(), ye.clone());
+    let m_kykx = int_mul_expr(kye.clone(), kxe.clone());
+    let m_kxky = int_mul_expr(kxe.clone(), kye.clone());
+    // Reorient step2 to `Kx·y ≤ Kx·Ky` by transporting BOTH operands through
+    // `Int.mul_comm` (`Eq.subst` with an order motive each time — the same
+    // transport pattern as trust-clean's neg_mul_neg_bridge):
+    //   comm1 : y·Kx = Kx·y   rewrites the LEFT operand;
+    //   comm2 : Ky·Kx = Kx·Ky rewrites the RIGHT operand.
+    let comm1 = const_app("Int.mul_comm", [ye.clone(), kxe.clone()]);
+    let motive1 = Expr::lam(
+        BinderInfo::Default,
+        int_ty(),
+        const_app("Int.le", [Expr::bvar(0), m_kykx.clone()]),
+    );
+    let s2a = eq_subst_int(motive1, m_ykx, m_kxy.clone(), comm1, step2);
+    let comm2 = const_app("Int.mul_comm", [kye.clone(), kxe.clone()]);
+    let motive2 = Expr::lam(
+        BinderInfo::Default,
+        int_ty(),
+        const_app("Int.le", [m_kxy.clone(), Expr::bvar(0)]),
+    );
+    let s2b = eq_subst_int(motive2, m_kykx, m_kxky.clone(), comm2, s2a);
+    // x·y ≤ Kx·y ≤ Kx·Ky, composed with le_trans. The `from` operand uses the
+    // HMul spelling ([`hmul_int`]) so it matches the violation atom's rendered
+    // term ([`term_to_kernel`] on `Mul(x,y)`); def-eq bridges it to the bare
+    // `Int.mul` the lemma statements carry (same reliance as [`mul_lift`]).
+    let xy = hmul_int(xe, ye);
+    let hyp = const_app("Int.le_trans", [xy.clone(), m_kxy, m_kxky, step1, s2b]);
+    Some(OrderEdge {
+        from: ChainNode::Product(x.to_string(), y.to_string()),
+        to: ChainNode::Lit(product),
+        from_expr: xy,
+        to_expr: int_literal_to_kernel(product)?,
+        strict: false,
+        hyp,
+    })
+}
+
+/// Build the LOWER lifted edge `Lit(0) → Product(x,y)` via
+/// `Int.mul_nonneg x y hx0 hy0 : 0 ≤ x·y`, from the present non-negativities
+/// `hx0 : 0 ≤ x`, `hy0 : 0 ≤ y`. Closes the underflow disjunct `x·y < 0`.
+fn product_nonneg_lift(x: &str, y: &str, hx0: &Expr, hy0: &Expr) -> Option<OrderEdge> {
+    let xe = chain_var_expr(x);
+    let ye = chain_var_expr(y);
+    let hyp = const_app("Int.mul_nonneg", [xe.clone(), ye.clone(), hx0.clone(), hy0.clone()]);
+    Some(OrderEdge {
+        from: ChainNode::Lit(0),
+        to: ChainNode::Product(x.to_string(), y.to_string()),
+        from_expr: int_literal_to_kernel(0)?,
+        to_expr: hmul_int(xe, ye),
+        strict: false,
+        hyp,
+    })
+}
+
 /// Search a set of order edges for a transitive chain `L R … R U` between
 /// conflicting literals and return its kernel `False` refutation, or `None`.
 fn refute_via_chain_edges(edges: &[OrderEdge]) -> Option<Expr> {
     let edges = augment_with_multiplicative_lifts(edges);
     let edges = augment_with_additive_lifts(&edges);
     let edges = augment_with_subtractive_lifts(&edges);
+    let edges = augment_with_product_lifts(&edges);
     let edges = edges.as_slice();
     // Bound the DFS: a handful of order atoms is typical, and the `visited` set
     // already caps each path at the node count, but cap the edge set so a
@@ -3725,17 +4266,31 @@ fn closed_constant_refutation(conjuncts: &[&Formula]) -> Option<(Vec<Hyp>, Expr)
     None
 }
 
-/// Shared tail for the closed-constant path: confirm ay refutes the asserted
-/// hypothesis, re-check the kernel term proves `False`, serialize, round-trip
-/// re-check, and emit the lineage-bound `CleanCic`. Mirrors the tails of
-/// [`certify_with_identity`] / [`certify_direct_disequality_contradiction`] but
-/// over an empty free-variable set (the obligation is closed).
+/// Shared tail for the closed-constant path: cross-check with ay, re-check the
+/// kernel term proves `False`, serialize, round-trip re-check, and emit the
+/// lineage-bound `CleanCic`. Mirrors the tails of [`certify_with_identity`] /
+/// [`certify_direct_disequality_contradiction`] but over an empty free-variable
+/// set (the obligation is closed).
+///
+/// [`AyCrossCheck::Advisory`], and ONLY here. [`closed_constant_refutation`] is a
+/// pure function of the obligation's own conjuncts: `hyps` are those conjuncts
+/// rendered by the shared encoders, `term` is built from the closed-atom lemmas,
+/// and the emitted payload is exactly `serialize(term)` + `serialize(ctx(hyps))`.
+/// No ay artifact reaches the certificate — unlike [`certify_linear_int_fragment`]
+/// step 5, where the term IS `attempt_kernel_reconstruction_with_budget`'s
+/// rebuild of ay's own refutation and an ay `Unsat` is therefore a precondition
+/// for a term existing at all. Here `kernel_checks_false` +
+/// `proof_axiom_closure_is_clean` + `payload_roundtrip_rechecks` are the entire
+/// soundness argument, so an ay that merely ABSTAINS must not delete evidence it
+/// never produced. (Live instance: ay withdraws a computed UNSAT whose Alethe
+/// proof contains a `hole` step, which arrives here as `Unknown`.) An ay that
+/// DISAGREES — `Sat` — still declines, in this mode as in every other.
 fn finish_closed_certificate(
     hyps: &[Hyp],
     term: &Expr,
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
-    finish_certificate(hyps, term, &BTreeSet::new(), identity)
+    finish_certificate_with(hyps, term, &BTreeSet::new(), identity, AyCrossCheck::Advisory)
 }
 
 // ---------------------------------------------------------------------------
@@ -3821,6 +4376,28 @@ enum DisjunctRefutation<'a> {
     /// An order atom contradicting the conjunctive context (`_3 < 8` vs `_3 ≥ 8`)
     /// — close the transitive chain over `context ∧ this`.
     ChainAtom { a: &'a Formula, b: &'a Formula, strict: bool },
+    /// An `And`-disjunct whose OWN flattened conjunct set carries a syntactic
+    /// contradiction (the waveform_scale_div signed-div-overflow VC1 family:
+    /// branch-local `Eq(n, MIN)` vs `Not(Eq(n, MIN))`). The branch hypothesis
+    /// is the WEAKENED two-conjunct projection `And(P, Q)` of the authored
+    /// disjunct — see [`parse_and_disjunct_internal_pair`] for why asserting
+    /// the weakening is sound — and the branch closes by real kernel steps:
+    /// `And.left`/`And.right` projections plus either the direct application
+    /// of the negation ([`InternalPairKind::EqNeg`]) or an `Eq` transport into
+    /// a closed false literal equality ([`InternalPairKind::EqEq`]).
+    /// `var` is the pair's shared Int variable NAME, so the certificate
+    /// declares it even when no context atom mentions it.
+    InternalAndPair { var: String, left: Expr, right: Expr, kind: InternalPairKind },
+}
+
+/// How an [`DisjunctRefutation::InternalAndPair`]'s two projected conjuncts
+/// contradict each other.
+enum InternalPairKind {
+    /// `left : Eq t c`, `right : Not (Eq t c)` — `False` by `right left`.
+    EqNeg,
+    /// `left : Eq v a`, `right : Eq v b` with literals `a ≠ b` — derive
+    /// `Eq a b` (`Eq.symm` + `Eq.trans`) and close via [`refute_false_eq`].
+    EqEq { v: Expr, a: i128, b: i128 },
 }
 
 /// A disjunct of a disjunctive violation: its kernel prop (for the `Or` / branch
@@ -3849,6 +4426,28 @@ fn refute_disjunct(d: &Disjunct<'_>, context: &[OrderEdge], h: Expr) -> Option<E
             let mut edges = context.to_vec();
             edges.extend(own);
             refute_via_chain_edges(&edges)
+        }
+        DisjunctRefutation::InternalAndPair { var: _, left, right, kind } => {
+            // `h : And left right`; project both halves with the explicit-arg
+            // `And.left`/`And.right` (real kernel constants, re-checked like
+            // every other step — never a syntactic shortcut).
+            let hl = const_app("And.left", [left.clone(), right.clone(), h.clone()]);
+            let hr = const_app("And.right", [left.clone(), right.clone(), h]);
+            match kind {
+                // `hr : Not P` is `P → False`; apply it to `hl : P`.
+                InternalPairKind::EqNeg => Some(Expr::app(hr, hl)),
+                // `hl : Eq v a`, `hr : Eq v b` ⟹ `Eq a b` (symm + trans), a
+                // closed FALSE literal equality (`a ≠ b` checked at parse
+                // time), closed by the existing equality refutation.
+                InternalPairKind::EqEq { v, a, b } => {
+                    let ak = int_literal_to_kernel(*a)?;
+                    let bk = int_literal_to_kernel(*b)?;
+                    // symm : Eq a v ; trans (Eq a v) (Eq v b) : Eq a b.
+                    let symm = eq_symm_int(v.clone(), ak.clone(), hl);
+                    let eq_ab = eq_trans_int(ak, v.clone(), bk, symm, hr);
+                    refute_false_eq(*a, *b, eq_ab)
+                }
+            }
         }
     }
 }
@@ -3962,6 +4561,11 @@ fn parse_disjunct(di: &Formula) -> Option<Disjunct<'_>> {
             });
         }
     }
+    // An `And`-disjunct carrying its own internal syntactic contradiction
+    // (branch-local `Eq`/`Not(Eq)` or conflicting literal equalities).
+    if matches!(di, Formula::And(_)) {
+        return parse_and_disjunct_internal_pair(di);
+    }
     // Otherwise a single order atom refuted against the context.
     let atoms = normalize_atom(di)?;
     let [atom] = atoms.as_slice() else { return None };
@@ -3974,6 +4578,108 @@ fn parse_disjunct(di: &Formula) -> Option<Disjunct<'_>> {
         smt: linear_atom_smt(atom)?,
         refutation: DisjunctRefutation::ChainAtom { a, b, strict },
     })
+}
+
+/// Parse an `And`-disjunct whose OWN (recursively flattened, per-disjunct
+/// reification-unfolded) conjunct set contains a syntactic contradicting pair:
+///
+///  * `Eq(t, c)` and `Not(Eq(t, c))` — same Int variable `t`, same literal `c`
+///    (the waveform_scale_div VC1 shape: branch-local `n = i32::MIN` against
+///    the sibling branch guard `n ≠ i32::MIN`), or
+///  * `Eq(v, a)` and `Eq(v, b)` with literals `a ≠ b`.
+///
+/// The returned [`Disjunct`] carries the WEAKENED two-conjunct projection
+/// `And(P, Q)` as its prop/SMT, not the full authored disjunct. SOUNDNESS of
+/// the weakening: each pair member is ENTAILED by the disjunct — it is either
+/// literally one of its flattened conjuncts (`And`-projection) or the
+/// modus-ponens unfold of an asserted Bool reification the disjunct carries
+/// ([`unfold_asserted_bool_reifications`]'s argument) — so `Dᵢ ⟹ And(P, Q)`,
+/// and by `Or`-monotonicity the violation entails the weakened disjunction the
+/// certificate's hypothesis asserts. Refuting the weakened system therefore
+/// refutes the violation a fortiori — the SAME direction as the top-level
+/// conjunct dropping [`collect_supported_atoms`] documents. A disjunct with no
+/// such pair (the mutant's genuinely-satisfiable branch) returns `None` and
+/// the whole disjunctive certification declines (fail-closed); the ay UNSAT
+/// cross-check and clean-kernel re-check in `finish_certificate` remain the
+/// backstops behind the syntactic pair test.
+///
+/// Pair selection is DETERMINISTIC (first `Eq`/`Not(Eq)` pair in flattened
+/// order, then first conflicting `Eq`/`Eq` pair), so the consumer-side
+/// regeneration ([`recheck_cleancic`]) rebuilds the identical certificate.
+fn parse_and_disjunct_internal_pair(di: &Formula) -> Option<Disjunct<'_>> {
+    let mut flat: Vec<&Formula> = Vec::new();
+    collect_conjuncts(di, &mut flat);
+    // Per-disjunct reification unfold: `_b ⟺ inner` + asserted `_b`/`Not(_b)`
+    // INSIDE this branch entails `inner`/`Not(inner)` for this branch.
+    let unfolded = unfold_asserted_bool_reifications(&flat);
+    let pool: Vec<&Formula> = flat.iter().copied().chain(unfolded.iter()).collect();
+
+    // Canonical `(var, literal)` reading of an `Eq` between an Int variable and
+    // an Int literal (either operand order).
+    let var_lit_eq = |f: &Formula| -> Option<(String, i128)> {
+        let Formula::Eq(a, b) = f else { return None };
+        match (int_var_name(a), int_literal_value(b), int_literal_value(a), int_var_name(b)) {
+            (Some(v), Some(c), _, _) => Some((v, c)),
+            (_, _, Some(c), Some(v)) => Some((v, c)),
+            _ => None,
+        }
+    };
+
+    // The kernel/SMT renderings shared by both pair kinds.
+    let build = |v: &str, c: i128, kind_b: Option<i128>| -> Option<Disjunct<'static>> {
+        let ve = Expr::const_(Name::from_string(&encoded_var_name(v)), vec![]);
+        let ce = int_literal_to_kernel(c)?;
+        let p = eq_int(ve.clone(), ce.clone());
+        let smt_v = encoded_var_name(v);
+        let smt_c = int_literal_to_smt(c)?;
+        let (q, smt_q, kind) = match kind_b {
+            // `Eq(v, c)` against `Not(Eq(v, c))`.
+            None => (
+                not_prop(p.clone()),
+                format!("(not (= {smt_v} {smt_c}))"),
+                InternalPairKind::EqNeg,
+            ),
+            // `Eq(v, c)` against `Eq(v, b)`, `b ≠ c` — checked by the caller.
+            Some(b) => (
+                eq_int(ve.clone(), int_literal_to_kernel(b)?),
+                format!("(= {smt_v} {})", int_literal_to_smt(b)?),
+                InternalPairKind::EqEq { v: ve.clone(), a: c, b },
+            ),
+        };
+        Some(Disjunct {
+            prop: const_app("And", [p.clone(), q.clone()]),
+            smt: format!("(and (= {smt_v} {smt_c}) {smt_q})"),
+            refutation: DisjunctRefutation::InternalAndPair {
+                var: v.to_string(),
+                left: p,
+                right: q,
+                kind,
+            },
+        })
+    };
+
+    // (i) `Eq(t, c)` with a matching `Not(Eq(t, c))` anywhere in the pool.
+    for &f in &pool {
+        let Some((v, c)) = var_lit_eq(f) else { continue };
+        let has_neg = pool.iter().any(|&g| {
+            matches!(g, Formula::Not(inner)
+                if var_lit_eq(inner).is_some_and(|(nv, nc)| nv == v && nc == c))
+        });
+        if has_neg {
+            return build(&v, c, None);
+        }
+    }
+    // (ii) `Eq(v, a)` with a conflicting `Eq(v, b)`, `a ≠ b`.
+    for &f in &pool {
+        let Some((v, a)) = var_lit_eq(f) else { continue };
+        let conflicting = pool
+            .iter()
+            .find_map(|&g| var_lit_eq(g).filter(|(gv, gc)| *gv == v && *gc != a).map(|(_, gc)| gc));
+        if let Some(b) = conflicting {
+            return build(&v, a, Some(b));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5446,6 +6152,131 @@ fn certify_unsigned_bv_div_sum_no_overflow(
     certify_with_identity(&synth, identity)
 }
 
+/// Direct kernel discharge of the UNSIGNED-BV MULTIPLY no-overflow obligation —
+/// the hardware bvudiv-recovery idiom trust-vcgen's
+/// `v2_unsigned_bv_overflow_formula` emits for `a * b`:
+///
+/// ```text
+///   Not(Eq(a, 0))  ∧  Not(Eq(BvUDiv(BvMul(a, b, w), a, w), b))
+/// ```
+///
+/// over FRESH `w`-bit operand vars, with the dominating guard bounds
+/// (`BvULt(a, K, w)` / `BvULe`) conjoined by
+/// `v2_bv_mul_dominating_guard_constraints`. The guarded two-variable product
+/// fixture (`if a < 1000 && b < 1000 { a * b }` on u32) is the canonical case.
+///
+/// SOUNDNESS — model-mapping lift, fail-closed (the
+/// [`certify_unsigned_bv_div_sum_no_overflow`] posture, with ONE Rust-side
+/// meta-step). Operands must be RAW exact-width `Var` reads (matched
+/// structurally below — any derived operand: extract/extend/mask/arithmetic
+/// simply fails the match and declines, the
+/// [`certify_unsigned_bv_order_contradiction`] whitelist rule), so a model's
+/// unsigned read-back of each operand is exact. Take any BV model of the
+/// violation, with unsigned operand values `cx, cy`:
+///  * `cx ≤ Bx`, `cy ≤ By` from the present `BvULe`/`BvULt` guard bounds
+///    ([`bv_unsigned_upper_bound`] — raw var vs exact-width literal only), and
+///    `0 ≤ cx, cy` since unsigned values are non-negative;
+///  * if the TRUE product `cx·cy ≤ UMAX` (= `2^w - 1`), the `w`-bit `bvmul` is
+///    exact and, for `cx ≠ 0`, Euclidean division recovers
+///    `bvudiv(cx·cy, cx) = cy` — contradicting the asserted mismatch. So every
+///    violation model has `cx·cy > UMAX`.
+/// Therefore `p := cx·cy` witnesses the synthesized LINEAR system
+/// `0 ≤ p ∧ p ≤ Bx·By ∧ p > UMAX` (`p ≤ Bx·By` is product monotonicity on
+/// non-negatives — the Rust-side meta-step, mirroring the div_sum recognizer's
+/// `⌊Ux/c⌋` division-monotonicity step; `Bx·By` folds via `checked_mul`). We
+/// REQUIRE `Bx·By ≤ UMAX`, so the synthesized system is UNSAT and the existing
+/// single-variable interval pipeline proves it in the kernel
+/// (`UMAX < p ≤ Bx·By` → closed false `UMAX < Bx·By` → `Int.lt_irrefl`), with
+/// `finish_certificate`'s ay UNSAT cross-check and clean-kernel re-check as
+/// backstops. A genuinely-overflowing product — the mutant's widened bound
+/// `Bx = By = 99999` on u32, where `99999² > u32::MAX` — fails the
+/// `checked_mul ≤ UMAX` gate and declines: the discharge uses the ACTUAL bound
+/// magnitudes, never the mere presence of a guard. The certificate is
+/// lineage-bound to the ORIGINAL obligation `identity`.
+fn certify_unsigned_bv_mul_no_overflow(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    // Match the mismatch conjunct `Not(Eq(BvUDiv(BvMul(a,b,w), a, w), b))` (either
+    // Eq operand order) with `a`, `b` RAW exact-width Var reads and one shared
+    // width; then require the companion `Not(Eq(a, 0))` guard for the SAME `a`.
+    let mut target: Option<(String, String, u32)> = None;
+    for &c in conjuncts {
+        let Formula::Not(inner) = c else { continue };
+        let Formula::Eq(lhs, rhs) = inner.as_ref() else { continue };
+        // One side is the recovery `BvUDiv(BvMul(a,b,w), a, w)`, the other the raw `b`.
+        let (recovered, b_side) = match (lhs.as_ref(), rhs.as_ref()) {
+            (r @ Formula::BvUDiv(..), other) => (r, other),
+            (other, r @ Formula::BvUDiv(..)) => (r, other),
+            _ => continue,
+        };
+        let Formula::BvUDiv(prod, div_by, w) = recovered else { continue };
+        if *w == 0 || *w > 126 {
+            // Width gate: `2^w - 1` must be a representable positive i128 for the
+            // exact UMAX comparison below (every real rustc overflow width is ≤ 128;
+            // the 128-bit case exceeds the i128 threshold carrier — fail closed).
+            continue;
+        }
+        let Formula::BvMul(ma, mb, mul_w) = prod.as_ref() else { continue };
+        if mul_w != w {
+            continue;
+        }
+        // RAW exact-width Var operands only; the divisor must be the SAME `a` read.
+        let (Some((a_name, aw)), Some((b_name, bw))) =
+            (bv_order_operand_var(ma), bv_order_operand_var(mb))
+        else {
+            continue;
+        };
+        if aw != *w || bw != *w || !is_exact_bv_var(div_by, &a_name, *w) {
+            continue;
+        }
+        if !is_exact_bv_var(b_side, &b_name, *w) {
+            continue;
+        }
+        // The companion non-zero guard `Not(Eq(a, 0))` (either operand order),
+        // over the SAME raw read. Without it the idiom is not the vcgen shape
+        // (and the `a = 0` case needs no discharge anyway — decline regardless).
+        let has_nonzero = conjuncts.iter().any(|&g| {
+            let Formula::Not(ginner) = g else { return false };
+            let Formula::Eq(ga, gb) = ginner.as_ref() else { return false };
+            (is_exact_bv_var(ga, &a_name, *w)
+                && exact_unsigned_bv_literal(gb, *w) == Some(0))
+                || (is_exact_bv_var(gb, &a_name, *w)
+                    && exact_unsigned_bv_literal(ga, *w) == Some(0))
+        });
+        if has_nonzero {
+            target = Some((a_name, b_name, *w));
+            break;
+        }
+    }
+    let (a_name, b_name, w) = target?;
+
+    // Present per-factor unsigned upper bounds (raw var vs exact-width literal
+    // only). A factor with no known bound may reach UMAX, so the product may
+    // overflow — fail closed.
+    let bx = bv_unsigned_upper_bound(conjuncts, &a_name, w)?;
+    let by = bv_unsigned_upper_bound(conjuncts, &b_name, w)?;
+    let umax = (1i128 << w) - 1;
+    // THE decisive gate (what keeps the mutant red): the bound product must fit
+    // the type — checked in i128, declining on arithmetic overflow too.
+    let prod = bx.checked_mul(by)?;
+    if bx < 0 || by < 0 || prod > umax {
+        return None;
+    }
+
+    // Synthesized LINEAR carrier system over one fresh Int var (see the lift
+    // argument above): `0 ≤ p ∧ p ≤ Bx·By ∧ p > UMAX` — UNSAT by construction
+    // here (`Bx·By ≤ UMAX`), closed by the interval pipeline in the kernel.
+    let carrier = format!("__cert_bvmul_p_{a_name}");
+    let p = || Formula::Var(carrier.clone(), Sort::Int);
+    let i = Formula::Int;
+    let ge = |a: Formula, b: Formula| Formula::Ge(Box::new(a), Box::new(b));
+    let le = |a: Formula, b: Formula| Formula::Le(Box::new(a), Box::new(b));
+    let gt = |a: Formula, b: Formula| Formula::Gt(Box::new(a), Box::new(b));
+    let synth = Formula::And(vec![ge(p(), i(0)), le(p(), i(prod)), gt(p(), i(umax))]);
+    certify_with_identity(&synth, identity)
+}
+
 /// The `(name, width)` of a `BitVec`-sorted variable leaf (`Var`/`SymVar`), or
 /// `None` for anything else — the raw-read operand test of the unsigned-BV
 /// order-contradiction recognizer's whitelist.
@@ -6288,9 +7119,17 @@ fn build_disjunctive_certificate(
     let mut disjunct_smts: Vec<String> = Vec::new();
     for di in disjuncts {
         let disjunct = parse_disjunct(di)?;
-        if let DisjunctRefutation::ChainAtom { a, b, .. } = &disjunct.refutation {
-            collect_formula_int_vars(a, var_names);
-            collect_formula_int_vars(b, var_names);
+        match &disjunct.refutation {
+            DisjunctRefutation::ChainAtom { a, b, .. } => {
+                collect_formula_int_vars(a, var_names);
+                collect_formula_int_vars(b, var_names);
+            }
+            // The internal-pair variable must be declared even when no context
+            // atom bounds it (its contradiction is branch-local).
+            DisjunctRefutation::InternalAndPair { var, .. } => {
+                var_names.insert(var.clone());
+            }
+            _ => {}
         }
         disjunct_smts.push(disjunct.smt.clone());
         parsed.push(disjunct);
@@ -6306,6 +7145,16 @@ fn build_disjunctive_certificate(
         name: format!("h_{}", hyps.len()),
     });
 
+    // STRICT (`Required`) ay cross-check.
+    //
+    // An earlier revision of this fix relaxed the lane to `Advisory`, on the
+    // reading that ay could not decide the or-of-conjunctions this lane emits.
+    // That reading was WRONG and is recorded here so it is not repeated: ay
+    // refutes the query in ~26ms. What produced the abstention was this crate
+    // DEMANDING a proof artifact it never reads (see the note in
+    // `finish_certificate_with`). With the demand dropped, the strongest gate is
+    // also the correct one, so the lane keeps `Required`: an ay abstention here
+    // would now be real evidence and must decline.
     finish_certificate(hyps, &term, var_names, identity)
 }
 
@@ -7187,6 +8036,713 @@ fn multi_var_farkas_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr>
     refute_false_atom(&atom, refuted)
 }
 
+// ===========================================================================
+// `Ite`-definition case split (the wrapping-arithmetic fragment).
+//
+// `trust_vcgen::generate::assert_refutation::wrapping_call_assert_model` grounds
+// every `wrapping_{add,sub}` as a faithful modular reduction
+//
+//     Eq(dest, Ite(cond, wrapped, raw))
+//
+// so a chained wrapping invariant (`head.wrapping_add(n).wrapping_sub(n) ==
+// head`) reaches this crate as a conjunction of `Ite` DEFINITIONS plus type
+// ranges plus a goal disequality. Every lane above is structurally blind to it:
+// [`collect_term_vars`] has no `Ite` arm, so [`collect_supported_atoms`] drops
+// each defining conjunct wholesale and the surviving pool is nothing but
+// trivially-satisfiable range facts.
+//
+// THE SPLIT. Over a DECIDABLE integer condition `c`, the definition entails
+//
+//     (c ∧ v ≤ t ∧ t ≤ v) ∨ (¬c ∧ v ≤ e ∧ e ≤ v)
+//
+// — case analysis on `c`, plus `Eq` as two `≤`. Nested `Ite`s flatten into one
+// n-way disjunction over guard CONJUNCTIONS. A goal disequality `a ≠ b` splits
+// the same way, by ℤ trichotomy (`a < b ∨ b < a`), exactly as
+// [`certify_split_disequality_contradiction`] already does. The certificate is a
+// nested `Or.rec` case tree whose every leaf is a linear-integer contradiction
+// closed by a Farkas witness ([`compact_nonneg_sum_refutation`]); a branch
+// hypothesis is an `And` chain projected with the real `And.left`/`And.right`
+// kernel constants, never a syntactic shortcut.
+//
+// INTEGRALITY. Strictness is discharged ONCE, when an atom is built: over ℤ,
+// `a < b ⟺ b − a − 1 ≥ 0`. The Farkas rows are non-strict `0 ≤ L`, so without
+// this step the rational relaxation of a leaf like `_4 = head ∧ _4 < head` is
+// satisfiable and NOTHING closes. Every variable in the accepted fragment is
+// `Sort::Int`, so the step is sound by construction.
+//
+// SOUNDNESS. Every hypothesis this lane asserts is a logical CONSEQUENCE of the
+// obligation's own conjuncts — the case split of a present `Ite` definition, the
+// trichotomy split of a present disequality, or a present order atom — and
+// conjuncts outside the fragment are DROPPED, which only weakens the system.
+// Weakening is the safe direction for a refutation: a SATISFIABLE violation
+// stays satisfiable, so ay answers `Sat` (or no Farkas witness exists at some
+// leaf) and the certificate is declined. The emitted term is fully re-checked by
+// the clean kernel in [`finish_certificate`], and again over the serialized
+// payload, so a bug in the tree builder can only FAIL to certify.
+// ===========================================================================
+
+/// Structural budget for the case tree. Every bound is checked before any
+/// solver or kernel work, so a pathological violation is declined cheaply.
+const ITE_SPLIT_MAX_SPLITS: usize = 8;
+const ITE_SPLIT_MAX_BRANCHES: usize = 4;
+const ITE_SPLIT_MAX_LEAVES: usize = 64;
+const ITE_SPLIT_MAX_ITE_DEPTH: usize = 4;
+const ITE_SPLIT_MAX_ATOMS: usize = 256;
+const ITE_SPLIT_MAX_LEAF_ATOMS: usize = 64;
+
+/// Cap on the expanded Farkas fold sequence of a single leaf.
+/// [`find_farkas_multipliers`] already bounds `Σλ` at 200; this keeps a leaf's
+/// term small enough that the whole case tree stays inside the proof codec's
+/// node ceiling.
+const COMPACT_SUM_MAX_STEPS: usize = 24;
+
+/// Parse a linear-Int TERM into its [`LinForm`], `Sub`/`Neg` aware.
+///
+/// Deliberately SEPARATE from [`formula_linform`]: that one feeds the
+/// pre-existing Farkas lane, and widening it would change the rows — and hence
+/// the certificate bytes — of every persisted certificate in that family, for no
+/// added coverage. See the [`refute_via_var_cycle`] precedent on declining byte
+/// drift that buys nothing.
+fn ite_split_linform(f: &Formula) -> Option<LinForm> {
+    match f {
+        Formula::Var(name, Sort::Int) => {
+            let mut l = LinForm::constant(0);
+            l.add_term(name, 1)?;
+            Some(l)
+        }
+        Formula::SymVar(sym, Sort::Int) => {
+            let mut l = LinForm::constant(0);
+            l.add_term(sym.as_str(), 1)?;
+            Some(l)
+        }
+        Formula::Int(n) => Some(LinForm::constant(*n)),
+        Formula::UInt(n) if *n <= i128::MAX as u128 => Some(LinForm::constant(*n as i128)),
+        Formula::Add(a, b) => ite_split_linform(a)?.add(&ite_split_linform(b)?),
+        Formula::Sub(a, b) => ite_split_linform(a)?.sub(&ite_split_linform(b)?),
+        Formula::Neg(a) => LinForm::constant(0).sub(&ite_split_linform(a)?),
+        Formula::Mul(a, b) => {
+            let (coeff, var) = linear_mul_operands(a, b)?;
+            let name = int_var_name(var)?;
+            let mut l = LinForm::constant(0);
+            l.add_term(&name, coeff)?;
+            Some(l)
+        }
+        _ => None,
+    }
+}
+
+/// The canonical [`Part`] list of a [`LinForm`]: one monomial per variable in
+/// name order, then the constant. Matches [`part_key_cmp`]'s ordering exactly,
+/// so [`fold_parts`] and [`add_canon_parts`] accept the result directly.
+fn linform_to_parts(l: &LinForm) -> Vec<Part> {
+    let mut parts: Vec<Part> = l
+        .terms
+        .iter()
+        .map(|(name, coeff)| Part { key: PartKey::Var(name.clone()), coeff: *coeff })
+        .collect();
+    if l.c != 0 || parts.is_empty() {
+        parts.push(Part { key: PartKey::Const, coeff: l.c });
+    }
+    parts
+}
+
+/// The `Formula` mirror of one canonical [`Part`]. A coefficient-1 variable is
+/// still spelled `Mul(1, v)` so the formula's SMT rendering and the kernel's
+/// [`part_expr`] describe the SAME term.
+fn part_to_formula(p: &Part) -> Formula {
+    match &p.key {
+        PartKey::Var(name) => Formula::Mul(
+            Box::new(Formula::Int(p.coeff)),
+            Box::new(Formula::Var(name.clone(), Sort::Int)),
+        ),
+        PartKey::Const => Formula::Int(p.coeff),
+    }
+}
+
+/// The `Formula` mirror of [`fold_parts`] — same right-nested association, same
+/// part order — so the SMT assertion and the kernel proposition of an atom are
+/// two renderings of one term.
+fn parts_to_formula(parts: &[Part]) -> Option<Formula> {
+    let mut iter = parts.iter().rev();
+    let mut acc = part_to_formula(iter.next()?);
+    for p in iter {
+        acc = Formula::Add(Box::new(part_to_formula(p)), Box::new(acc));
+    }
+    Some(acc)
+}
+
+/// The [`LinForm`] `L` for which `f` (optionally NEGATED) says exactly `0 ≤ L`.
+/// Integer strictness is folded in here — see the INTEGRALITY note above.
+fn ite_split_order_nonneg(f: &Formula, negated: bool) -> Option<LinForm> {
+    // `(lo, hi, strict)` reads as `lo ≤ hi` (or `lo < hi`).
+    let (lo, hi, strict) = match (f, negated) {
+        (Formula::Le(a, b), false) => (a.as_ref(), b.as_ref(), false),
+        (Formula::Lt(a, b), false) => (a.as_ref(), b.as_ref(), true),
+        (Formula::Ge(a, b), false) => (b.as_ref(), a.as_ref(), false),
+        (Formula::Gt(a, b), false) => (b.as_ref(), a.as_ref(), true),
+        // ¬(a ≤ b) = b < a ; ¬(a < b) = b ≤ a ; ¬(a ≥ b) = a < b ; ¬(a > b) = a ≤ b
+        (Formula::Le(a, b), true) => (b.as_ref(), a.as_ref(), true),
+        (Formula::Lt(a, b), true) => (b.as_ref(), a.as_ref(), false),
+        (Formula::Ge(a, b), true) => (a.as_ref(), b.as_ref(), true),
+        (Formula::Gt(a, b), true) => (a.as_ref(), b.as_ref(), false),
+        (Formula::Not(inner), _) => return ite_split_order_nonneg(inner, !negated),
+        _ => return None,
+    };
+    let mut l = ite_split_linform(hi)?.sub(&ite_split_linform(lo)?)?;
+    if strict {
+        l.c = l.c.checked_sub(1)?;
+    }
+    Some(l)
+}
+
+/// Flatten a (possibly nested) `Ite` VALUE into its `(guard conjunction, value)`
+/// branches; a non-`Ite` term is the single unguarded branch. The branch list is
+/// exhaustive and mutually exclusive by construction, so the disjunction of the
+/// branches is entailed by the definition it came from.
+fn flatten_ite_branches(f: &Formula, depth: usize) -> Option<Vec<(Vec<LinForm>, LinForm)>> {
+    if depth > ITE_SPLIT_MAX_ITE_DEPTH {
+        return None;
+    }
+    match f {
+        Formula::Ite(cond, then_f, else_f) => {
+            let positive = ite_split_order_nonneg(cond, false)?;
+            let negative = ite_split_order_nonneg(cond, true)?;
+            let mut out: Vec<(Vec<LinForm>, LinForm)> = Vec::new();
+            for (guards, value) in flatten_ite_branches(then_f, depth + 1)? {
+                let mut all = vec![positive.clone()];
+                all.extend(guards);
+                out.push((all, value));
+            }
+            for (guards, value) in flatten_ite_branches(else_f, depth + 1)? {
+                let mut all = vec![negative.clone()];
+                all.extend(guards);
+                out.push((all, value));
+            }
+            if out.len() > ITE_SPLIT_MAX_BRANCHES {
+                return None;
+            }
+            Some(out)
+        }
+        other => Some(vec![(Vec::new(), ite_split_linform(other)?)]),
+    }
+}
+
+/// Right-nested `And p1 (And p2 (… pn))`; a single prop is itself.
+fn build_and_prop(props: &[Expr]) -> Option<Expr> {
+    match props {
+        [] => None,
+        [only] => Some(only.clone()),
+        [first, rest @ ..] => Some(const_app("And", [first.clone(), build_and_prop(rest)?])),
+    }
+}
+
+/// SMT rendering matching [`build_and_prop`]. SMT `and` is n-ary, but a single
+/// conjunct is emitted bare so the assertion stays well-formed.
+fn build_and_smt(smts: &[String]) -> Option<String> {
+    match smts {
+        [] => None,
+        [only] => Some(only.clone()),
+        many => Some(format!("(and {})", many.join(" "))),
+    }
+}
+
+/// Refute a set of canonical `0 ≤ Lᵢ` hypotheses whose non-negative-integer
+/// Farkas combination is a NEGATIVE constant, in a proof shape whose size is
+/// LINEAR in the witness.
+///
+/// The mathematics is [`multi_var_farkas_refutation`]'s — a witness `λ ≥ 0` from
+/// [`find_farkas_multipliers`], folded with the real `Int.add_le_add_*` /
+/// `Int.le_trans` kernel lemmas — with two shape changes that matter only for
+/// size:
+///
+/// * every row is ALREADY canonical (the caller builds atoms from [`LinForm`]s),
+///   so no per-row `NormTerm` normalization proof is needed at all; and
+/// * the running sum is renormalized at EVERY step, so each equality proof stays
+///   local to one two-list [`add_canon_parts`] merge instead of being nested
+///   inside the next step's `Eq.subst` motives.
+///
+/// The generic normalizer's single end-of-fold `NormTerm` costs ~2.3× per added
+/// row (measured: a five-row leaf of the 4-op wrapping chain is ~250 KB of proof
+/// term), and a 32-leaf case tree of those blows the proof codec's 2 000 000-node
+/// ceiling. Same kernel constants, same full re-check in [`finish_certificate`].
+///
+/// Fail-closed: a satisfiable leaf has no witness, and the final canonical form
+/// must be a single NEGATIVE constant or nothing is emitted.
+fn compact_nonneg_sum_refutation(
+    rows: &[LinForm],
+    parts: &[Vec<Part>],
+    proofs: &[Expr],
+) -> Option<Expr> {
+    if rows.len() != proofs.len() || rows.len() != parts.len() || rows.is_empty() {
+        return None;
+    }
+    let mult = find_farkas_multipliers(rows)?;
+
+    // Expand the witness into the fold sequence (a multiplier of `m` repeats the
+    // row `m` times, exactly as the generic lane does — no scaling `Int.mul`).
+    let mut sequence: Vec<usize> = Vec::new();
+    for index in farkas_fold_order(rows, &mult) {
+        let m = mult.get(index).copied().unwrap_or(0);
+        if m <= 0 {
+            continue;
+        }
+        let repeats = usize::try_from(m).ok()?;
+        if sequence.len().checked_add(repeats)? > COMPACT_SUM_MAX_STEPS {
+            return None;
+        }
+        for _ in 0..repeats {
+            sequence.push(index);
+        }
+    }
+    if sequence.is_empty() {
+        return None;
+    }
+
+    let zero = int_literal_to_kernel(0)?;
+    // `λ t : Int => 0 ≤ t`, the transport motive used at every step.
+    let nonneg_motive =
+        || Expr::lam(BinderInfo::Default, int_ty(), le_int(zero.clone(), Expr::bvar(0)));
+
+    let mut accumulated: Option<(Vec<Part>, Expr, Expr)> = None;
+    for &index in &sequence {
+        let row_parts = &parts[index];
+        let row_expr = fold_parts(row_parts);
+        accumulated = Some(match accumulated {
+            None => (row_parts.clone(), row_expr, proofs[index].clone()),
+            Some((acc_parts, acc_expr, acc_proof)) => {
+                // `0 ≤ Lᵢ` and `0 ≤ ACC` give `0 ≤ Lᵢ + ACC` …
+                let summed = add_le_add(
+                    zero.clone(),
+                    row_expr.clone(),
+                    proofs[index].clone(),
+                    zero.clone(),
+                    acc_expr.clone(),
+                    acc_proof,
+                );
+                // … then renormalize `Lᵢ + ACC` back to canonical form.
+                let (merged, merge_proof) = add_canon_parts(row_parts, &acc_parts)?;
+                let merged_expr = fold_parts(&merged);
+                let transported = eq_subst_int(
+                    nonneg_motive(),
+                    int_add_expr(row_expr, acc_expr),
+                    merged_expr.clone(),
+                    merge_proof,
+                    summed,
+                );
+                (merged, merged_expr, transported)
+            }
+        });
+    }
+
+    let (final_parts, _, proof) = accumulated?;
+    let [part] = final_parts.as_slice() else { return None };
+    if !matches!(part.key, PartKey::Const) || part.coeff >= 0 {
+        return None;
+    }
+    refute_false_atom(&ClosedOrderAtom { a: 0, b: part.coeff, is_lt: false }, proof)
+}
+
+/// Order in which the Farkas contributions are folded into the running sum.
+///
+/// The fold's proof is dominated by the SIZE of the intermediate canonical
+/// forms — every merge and transport carries them in full — so a fold that keeps
+/// the running part count small is materially cheaper than one that accumulates
+/// every variable before cancelling. `find_farkas_multipliers` returns the rows
+/// in input order, which is arbitrary with respect to cancellation. Greedy:
+/// start from the narrowest row, then repeatedly add whichever remaining row
+/// leaves the fewest variables. Ties keep input order, so the result is
+/// deterministic and the consumer regenerates identical bytes.
+fn farkas_fold_order(rows: &[LinForm], mult: &[i128]) -> Vec<usize> {
+    let used: Vec<usize> =
+        (0..rows.len()).filter(|&i| mult.get(i).copied().unwrap_or(0) > 0).collect();
+    if used.len() < 3 {
+        return (0..rows.len()).collect();
+    }
+    let mut remaining = used.clone();
+    let mut sequence: Vec<usize> = Vec::with_capacity(remaining.len());
+    let seed_pos = remaining
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, i)| (rows[**i].terms.len(), **i))
+        .map(|(pos, _)| pos)
+        .unwrap_or(0);
+    let seed = remaining.remove(seed_pos);
+    let mut accumulated = rows[seed].clone();
+    sequence.push(seed);
+    while !remaining.is_empty() {
+        let mut best: Option<(usize, usize, LinForm)> = None;
+        for (pos, &i) in remaining.iter().enumerate() {
+            let Some(next) = accumulated.add(&rows[i]) else { continue };
+            let width = next.terms.len();
+            if best.as_ref().is_none_or(|(seen, _, _)| width < *seen) {
+                best = Some((width, pos, next));
+            }
+        }
+        let Some((_, pos, next)) = best else {
+            return (0..rows.len()).collect();
+        };
+        accumulated = next;
+        sequence.push(remaining.remove(pos));
+    }
+    // Zero-multiplier rows are skipped by the caller; keep them in front so the
+    // emitted order is a total permutation of `0..rows.len()`.
+    let mut order: Vec<usize> = (0..rows.len()).filter(|i| !used.contains(i)).collect();
+    order.extend(sequence);
+    order
+}
+
+/// One branch hypothesis recorded along a path through the case tree.
+struct CasePathEntry {
+    split: usize,
+    branch: usize,
+    /// Number of binders enclosing this hypothesis' own binder, so its de Bruijn
+    /// index at a leaf of total depth `D` is `D - 1 - binder_pos`.
+    binder_pos: usize,
+}
+
+/// The parsed case-split plan for one violation: an interned pool of canonical
+/// `0 ≤ L` atoms, the atoms that hold unconditionally, and the splits.
+struct IteCaseSplitPlan {
+    /// Linear form of each interned atom (`0 ≤ form`), used for interning and
+    /// as the Farkas row.
+    atom_forms: Vec<LinForm>,
+    /// Canonical part list of each atom — the kernel side of the same term.
+    atom_parts: Vec<Vec<Part>>,
+    /// Kernel proposition `0 ≤ fold_parts(parts)` of each atom.
+    atom_props: Vec<Expr>,
+    /// SMT-LIB2 assertion of each atom.
+    atom_smts: Vec<String>,
+    /// Atom ids holding unconditionally (one hypothesis each).
+    context: Vec<usize>,
+    /// Per split, per branch, the atom ids that hold in that branch.
+    splits: Vec<Vec<Vec<usize>>>,
+    var_names: BTreeSet<String>,
+}
+
+impl IteCaseSplitPlan {
+    /// Intern the canonical atom `0 ≤ l`, returning its id.
+    fn push_atom(&mut self, l: LinForm) -> Option<usize> {
+        if let Some(pos) = self.atom_forms.iter().position(|existing| *existing == l) {
+            return Some(pos);
+        }
+        if self.atom_forms.len() >= ITE_SPLIT_MAX_ATOMS {
+            return None;
+        }
+        let parts = linform_to_parts(&l);
+        let formula = parts_to_formula(&parts)?;
+        let zero = Formula::Int(0);
+        // The SMT assertion and the kernel proposition must describe the same
+        // term; both are built from `parts`, and `parts_to_formula` mirrors
+        // `fold_parts` exactly.
+        let smt = linear_atom_smt(&Atom::Le(&zero, &formula))?;
+        let prop = le_int(int_literal_to_kernel(0)?, fold_parts(&parts));
+        collect_formula_int_vars(&formula, &mut self.var_names);
+        self.atom_forms.push(l);
+        self.atom_parts.push(parts);
+        self.atom_props.push(prop);
+        self.atom_smts.push(smt);
+        Some(self.atom_forms.len() - 1)
+    }
+
+    fn push_context(&mut self, id: usize) {
+        if !self.context.contains(&id) {
+            self.context.push(id);
+        }
+    }
+
+    /// Classify the conjunct pool into context atoms and splits. Conjuncts
+    /// outside the fragment are DROPPED (sound weakening); `None` when the
+    /// result carries no `Ite` definition at all, in which case this lane adds
+    /// nothing over the ones that already ran.
+    fn build(conjuncts: &[&Formula]) -> Option<Self> {
+        let mut plan = IteCaseSplitPlan {
+            atom_forms: Vec::new(),
+            atom_parts: Vec::new(),
+            atom_props: Vec::new(),
+            atom_smts: Vec::new(),
+            context: Vec::new(),
+            splits: Vec::new(),
+            var_names: BTreeSet::new(),
+        };
+        let mut ite_definitions = 0usize;
+        let mut leaves: usize = 1;
+
+        for &conjunct in conjuncts {
+            if let Formula::Eq(a, b) = conjunct {
+                // (1) An `Ite` DEFINITION `Eq(v, Ite(..))`, either operand order.
+                let definition: Option<(&Formula, &Formula)> = match (a.as_ref(), b.as_ref()) {
+                    (Formula::Ite(..), Formula::Ite(..)) => None,
+                    (ite @ Formula::Ite(..), subject) => Some((ite, subject)),
+                    (subject, ite @ Formula::Ite(..)) => Some((ite, subject)),
+                    _ => None,
+                };
+                if let Some((ite, subject)) = definition {
+                    // An unparseable `Ite` definition is simply dropped.
+                    if let Some(branches) = plan.parse_ite_definition(subject, ite) {
+                        leaves = leaves.checked_mul(branches.len())?;
+                        plan.splits.push(branches);
+                        ite_definitions += 1;
+                    }
+                    continue;
+                }
+                // (2) An ordinary equality contributes both order directions.
+                if let (Some(la), Some(lb)) = (ite_split_linform(a), ite_split_linform(b))
+                    && let (Some(forward), Some(backward)) = (lb.sub(&la), la.sub(&lb))
+                    && let (Some(first), Some(second)) =
+                        (plan.push_atom(forward), plan.push_atom(backward))
+                {
+                    plan.push_context(first);
+                    plan.push_context(second);
+                }
+                continue;
+            }
+            // (3) A goal DISEQUALITY splits by ℤ trichotomy.
+            if let Formula::Not(inner) = conjunct
+                && let Formula::Eq(a, b) = inner.as_ref()
+            {
+                if let Some(branches) = plan.parse_disequality(a, b) {
+                    leaves = leaves.checked_mul(branches.len())?;
+                    plan.splits.push(branches);
+                }
+                continue;
+            }
+            // (4) A plain order atom joins the shared context.
+            if let Some(l) = ite_split_order_nonneg(conjunct, false)
+                && let Some(id) = plan.push_atom(l)
+            {
+                plan.push_context(id);
+            }
+        }
+
+        if ite_definitions == 0
+            || plan.splits.len() > ITE_SPLIT_MAX_SPLITS
+            || leaves > ITE_SPLIT_MAX_LEAVES
+        {
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// `subject = Ite(..)` → one branch per `(guards, value)` pair, each holding
+    /// its guards plus the two order directions of `subject = value`.
+    fn parse_ite_definition(
+        &mut self,
+        subject: &Formula,
+        ite: &Formula,
+    ) -> Option<Vec<Vec<usize>>> {
+        let subject_form = ite_split_linform(subject)?;
+        let branches = flatten_ite_branches(ite, 0)?;
+        if branches.len() < 2 {
+            return None;
+        }
+        let mut out: Vec<Vec<usize>> = Vec::with_capacity(branches.len());
+        for (guards, value) in branches {
+            let mut ids: Vec<usize> = Vec::with_capacity(guards.len() + 2);
+            for guard in guards {
+                ids.push(self.push_atom(guard)?);
+            }
+            ids.push(self.push_atom(value.sub(&subject_form)?)?);
+            ids.push(self.push_atom(subject_form.sub(&value)?)?);
+            out.push(ids);
+        }
+        Some(out)
+    }
+
+    /// `a ≠ b` → `a < b ∨ b < a` (ℤ trichotomy), each branch a single atom.
+    fn parse_disequality(&mut self, a: &Formula, b: &Formula) -> Option<Vec<Vec<usize>>> {
+        let la = ite_split_linform(a)?;
+        let lb = ite_split_linform(b)?;
+        let mut below = lb.sub(&la)?;
+        below.c = below.c.checked_sub(1)?;
+        let mut above = la.sub(&lb)?;
+        above.c = above.c.checked_sub(1)?;
+        Some(vec![vec![self.push_atom(below)?], vec![self.push_atom(above)?]])
+    }
+
+    fn certify(&self, identity: &ObligationIdentity) -> Option<trust_ir::ProofEvidence> {
+        let mut hyps: Vec<Hyp> = Vec::with_capacity(self.context.len() + self.splits.len());
+        for &id in &self.context {
+            let fvar = FVarId::new(HYP_FVAR_BASE + hyps.len() as u64);
+            hyps.push(Hyp {
+                smt: self.atom_smts[id].clone(),
+                prop: self.atom_props[id].clone(),
+                fvar,
+                name: format!("h_{}", hyps.len()),
+            });
+        }
+
+        let mut split_props: Vec<Vec<Expr>> = Vec::with_capacity(self.splits.len());
+        let mut split_fvars: Vec<FVarId> = Vec::with_capacity(self.splits.len());
+        for split in &self.splits {
+            let mut branch_props: Vec<Expr> = Vec::with_capacity(split.len());
+            let mut branch_smts: Vec<String> = Vec::with_capacity(split.len());
+            for branch in split {
+                let props: Vec<Expr> =
+                    branch.iter().map(|&id| self.atom_props[id].clone()).collect();
+                let smts: Vec<String> =
+                    branch.iter().map(|&id| self.atom_smts[id].clone()).collect();
+                branch_props.push(build_and_prop(&props)?);
+                branch_smts.push(build_and_smt(&smts)?);
+            }
+            let fvar = FVarId::new(HYP_FVAR_BASE + hyps.len() as u64);
+            hyps.push(Hyp {
+                smt: format!("(or {})", branch_smts.join(" ")),
+                prop: build_or_prop(&branch_props)?,
+                fvar,
+                name: format!("h_{}", hyps.len()),
+            });
+            split_props.push(branch_props);
+            split_fvars.push(fvar);
+        }
+
+        let mut path: Vec<CasePathEntry> = Vec::new();
+        let term = self.build_case_tree(0, 0, &mut path, &split_props, &split_fvars)?;
+        finish_certificate(&hyps, &term, &self.var_names, identity)
+    }
+
+    /// Case tree from split `si` down; `depth` counts the enclosing binders.
+    fn build_case_tree(
+        &self,
+        si: usize,
+        depth: usize,
+        path: &mut Vec<CasePathEntry>,
+        split_props: &[Vec<Expr>],
+        split_fvars: &[FVarId],
+    ) -> Option<Expr> {
+        // EARLY CLOSE: a prefix that is already contradictory does not need the
+        // remaining splits. Sound in the only direction that matters — the leaf
+        // proof uses a SUBSET of the hypotheses a full path would offer.
+        if let Some(term) = self.refute_leaf(depth, path) {
+            return Some(term);
+        }
+        if si == self.splits.len() {
+            return None;
+        }
+        self.build_or_chain(
+            si,
+            0,
+            depth,
+            Expr::fvar(split_fvars[si]),
+            path,
+            split_props,
+            split_fvars,
+        )
+    }
+
+    /// Right-nested `Or.rec` over the branches of split `si`, mirroring
+    /// [`build_disjunctive_false`]: each `inl`/`inr` lambda adds exactly one
+    /// binder, so a branch hypothesis' binder position is known exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn build_or_chain(
+        &self,
+        si: usize,
+        j: usize,
+        depth: usize,
+        h: Expr,
+        path: &mut Vec<CasePathEntry>,
+        split_props: &[Vec<Expr>],
+        split_fvars: &[FVarId],
+    ) -> Option<Expr> {
+        let branch_props = &split_props[si];
+        let count = branch_props.len();
+        if j + 1 >= count {
+            // `h` is the LAST branch's hypothesis, bound one binder ago.
+            path.push(CasePathEntry { split: si, branch: j, binder_pos: depth.checked_sub(1)? });
+            let built = self.build_case_tree(si + 1, depth, path, split_props, split_fvars);
+            path.pop();
+            return built;
+        }
+        let first = branch_props[j].clone();
+        let rest = build_or_prop(&branch_props[j + 1..])?;
+        let or_ty = const_app("Or", [first.clone(), rest.clone()]);
+        let motive = Expr::lam(BinderInfo::Default, or_ty, false_expr());
+
+        path.push(CasePathEntry { split: si, branch: j, binder_pos: depth });
+        let inl_body = self.build_case_tree(si + 1, depth + 1, path, split_props, split_fvars);
+        path.pop();
+        let inl = Expr::lam(BinderInfo::Default, first.clone(), inl_body?);
+
+        let inr_body = self.build_or_chain(
+            si,
+            j + 1,
+            depth + 1,
+            Expr::bvar(0),
+            path,
+            split_props,
+            split_fvars,
+        )?;
+        let inr = Expr::lam(BinderInfo::Default, rest.clone(), inr_body);
+        Some(const_app("Or.rec", [first, rest, motive, inl, inr, h]))
+    }
+
+    /// One leaf: the shared context atoms (proved by their local-context fvars)
+    /// plus every atom this path's branch hypotheses carry (projected out of
+    /// their `And` chains), handed to the Farkas refutation.
+    fn refute_leaf(&self, depth: usize, path: &[CasePathEntry]) -> Option<Expr> {
+        let mut rows: Vec<LinForm> = Vec::new();
+        let mut parts: Vec<Vec<Part>> = Vec::new();
+        let mut proofs: Vec<Expr> = Vec::new();
+        let mut push = |plan: &Self, id: usize, proof: Expr| {
+            rows.push(plan.atom_forms[id].clone());
+            parts.push(plan.atom_parts[id].clone());
+            proofs.push(proof);
+        };
+        for (index, &id) in self.context.iter().enumerate() {
+            push(self, id, Expr::fvar(FVarId::new(HYP_FVAR_BASE + index as u64)));
+        }
+        for entry in path {
+            let branch = &self.splits[entry.split][entry.branch];
+            let props: Vec<Expr> = branch.iter().map(|&id| self.atom_props[id].clone()).collect();
+            let index = depth.checked_sub(1)?.checked_sub(entry.binder_pos)?;
+            let mut carrier = Expr::bvar(u32::try_from(index).ok()?);
+            for (k, &id) in branch.iter().enumerate() {
+                if k + 1 == branch.len() {
+                    push(self, id, carrier.clone());
+                    break;
+                }
+                let rest = build_and_prop(&props[k + 1..])?;
+                push(
+                    self,
+                    id,
+                    const_app("And.left", [props[k].clone(), rest.clone(), carrier.clone()]),
+                );
+                carrier = const_app("And.right", [props[k].clone(), rest, carrier]);
+            }
+        }
+        if rows.len() > ITE_SPLIT_MAX_LEAF_ATOMS {
+            return None;
+        }
+        compact_nonneg_sum_refutation(&rows, &parts, &proofs)
+    }
+}
+
+/// See the section banner: split every `Ite` DEFINITION (and the goal
+/// disequality) into its cases and refute each leaf of the `Or.rec` tree.
+fn certify_ite_case_split_contradiction(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    IteCaseSplitPlan::build(conjuncts)?.certify(identity)
+}
+
+/// What an ay answer is allowed to decide about a certificate.
+///
+/// The tail below runs TWO independent refutations of the same hypotheses: ay's,
+/// and the clean CIC kernel's. Which of them is load-bearing depends on where
+/// the kernel `term` came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AyCrossCheck {
+    /// Default for every lane. A non-`Unsat` ay answer declines the certificate.
+    Required,
+    /// ONLY for lanes whose `term` is derived STRUCTURALLY from the obligation's
+    /// own conjuncts and carries no ay artifact (today: the closed-constant path,
+    /// [`closed_constant_refutation`]). There the kernel re-check IS the whole
+    /// soundness argument, so ay ABSTAINING (`Unknown`, a withdrawn verdict, a
+    /// lapsed deadline, a solver error) must not veto evidence it did not
+    /// produce. ay DISAGREEING (`Sat`) still declines — see below.
+    Advisory,
+}
+
 /// Shared certificate tail: confirm ay refutes the asserted hypotheses, re-check
 /// the kernel term proves `False` under an environment with the given free Int
 /// variables, serialize, round-trip re-check, and emit the lineage-bound
@@ -7198,10 +8754,41 @@ fn finish_certificate(
     var_names: &BTreeSet<String>,
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    finish_certificate_with(hyps, term, var_names, identity, AyCrossCheck::Required)
+}
+
+/// [`finish_certificate`] with the ay cross-check's authority made explicit.
+/// Callers that do not name it get [`AyCrossCheck::Required`].
+fn finish_certificate_with(
+    hyps: &[Hyp],
+    term: &Expr,
+    var_names: &BTreeSet<String>,
+    identity: &ObligationIdentity,
+    cross_check: AyCrossCheck,
+) -> Option<trust_ir::ProofEvidence> {
     let env = build_env(var_names)?;
 
     // Defense in depth: ay must independently refute the asserted hypotheses.
-    let mut backend = AyProofBackend::new_with_proofs(AyLogic::QfLia);
+    // VERDICT ONLY — deliberately NOT `new_with_proofs`.
+    //
+    // This gate matches `AyProofResult::Unsat { .. }` and discards the proof: it
+    // wants ay's independent VERDICT as defence in depth behind the kernel, not
+    // an ay proof artifact.
+    //
+    // Demanding the artifact is not free. ay documents `set_produce_proofs` as
+    // an AUTHORITY DEMAND — "if strict validation of the requested artifact
+    // fails, an otherwise computed UNSAT must remain `unknown`"
+    // (ay-dpll/src/api/solving/proofs.rs). MEASURED on the per-branch
+    // or-of-conjunctions this lane emits: ay answers `unsat` in ~26ms with proof
+    // production OFF and `unknown` with it ON. The verdict was correct and was
+    // being withheld only because the unwanted artifact could not be validated,
+    // which under `Required` declined every per-branch certificate.
+    //
+    // ay's own CLI does not make this demand for a synthesized default proof
+    // either — it budgets reconstruction as best-effort
+    // (`should_budget_synthesized_proof`, ay/src/run.rs). Dropping it here asks
+    // ay the question this gate actually has.
+    let mut backend = AyProofBackend::new_default(AyLogic::QfLia);
     for name in var_names {
         backend.add_raw_declaration(&format!("(declare-fun {} () Int)", encoded_var_name(name)));
     }
@@ -7218,7 +8805,21 @@ fn finish_certificate(
         backend.check_sat()
     } {
         Ok(AyProofResult::Unsat { .. }) => {}
-        _ => return None,
+        // ay DISAGREES: it produced a model of the very hypotheses the kernel is
+        // about to prove `False` from. One of the two encoders is then wrong, and
+        // which one is unknown — so decline in EVERY mode. Disagreement is never
+        // waved through; only abstention is.
+        Ok(AyProofResult::Sat) => return None,
+        // ay ABSTAINS: `Unknown` (incl. a computed UNSAT withdrawn by its own
+        // strict certification), a lapsed `AY_DIRECT_SOLVE_TIMEOUT_MS` deadline, a
+        // solver error, or a future `#[non_exhaustive]` variant. This is not
+        // evidence against the certificate, and on an [`AyCrossCheck::Advisory`]
+        // lane it is not evidence the certificate ever rested on.
+        _ => {
+            if cross_check == AyCrossCheck::Required {
+                return None;
+            }
+        }
     }
 
     let ctx = build_ctx(hyps);
@@ -7312,11 +8913,20 @@ fn term_to_kernel(f: &Formula) -> Option<Expr> {
         // Linear sum term: ay reconstructs Farkas over `(+ ..)` zero-trust and
         // its translate_term emits the HAdd form, so we mirror it (left-folded).
         Formula::Add(a, b) => Some(hadd_int(term_to_kernel(a)?, term_to_kernel(b)?)),
-        // Linear mul-by-constant: only literal×var / var×literal (var×var is
-        // nonlinear → None). Emit variable-first to match ay's normalization.
+        // Linear mul-by-constant: literal×var / var×literal, emitted
+        // variable-first to match ay's normalization. var×var — the guarded
+        // two-variable product [`ChainNode::Product`] supports — renders as the
+        // HMul of the two variable consts, operand order preserved; any other
+        // `Mul` (var×compound) stays outside the fragment (fail-closed).
         Formula::Mul(a, b) => {
-            let (lit, var) = linear_mul_operands(a, b)?;
-            Some(hmul_int(term_to_kernel(var)?, int_literal_to_kernel(lit)?))
+            if let Some((lit, var)) = linear_mul_operands(a, b) {
+                return Some(hmul_int(term_to_kernel(var)?, int_literal_to_kernel(lit)?));
+            }
+            let (x, y) = (int_var_name(a)?, int_var_name(b)?);
+            Some(hmul_int(
+                Expr::const_(Name::from_string(&encoded_var_name(&x)), vec![]),
+                Expr::const_(Name::from_string(&encoded_var_name(&y)), vec![]),
+            ))
         }
         _ => None,
     }
@@ -7331,8 +8941,15 @@ fn term_to_smt(f: &Formula) -> Option<String> {
         Formula::UInt(n) if *n <= u64::MAX as u128 => Some(n.to_string()),
         Formula::Add(a, b) => Some(format!("(+ {} {})", term_to_smt(a)?, term_to_smt(b)?)),
         Formula::Mul(a, b) => {
-            let (lit, var) = linear_mul_operands(a, b)?;
-            Some(format!("(* {} {})", term_to_smt(var)?, int_literal_to_smt(lit)?))
+            if let Some((lit, var)) = linear_mul_operands(a, b) {
+                return Some(format!("(* {} {})", term_to_smt(var)?, int_literal_to_smt(lit)?));
+            }
+            // var×var product (mirrors [`term_to_kernel`]'s Product arm). The
+            // ay cross-check sees the genuine nonlinear atom — if ay cannot
+            // refute the asserted set it returns non-UNSAT and the certificate
+            // is declined (fail-closed), never approximated.
+            let (x, y) = (int_var_name(a)?, int_var_name(b)?);
+            Some(format!("(* {} {})", encoded_var_name(&x), encoded_var_name(&y)))
         }
         _ => None,
     }
@@ -7404,7 +9021,12 @@ fn collect_term_vars(f: &Formula, out: &mut BTreeSet<String>) -> bool {
         Formula::Neg(a) => collect_term_vars(a, out),
         Formula::Mul(a, b) => match linear_mul_operands(a, b) {
             Some((lit, var)) => int_literal_to_kernel(lit).is_some() && collect_term_vars(var, out),
-            None => false,
+            // var×var product: supported iff BOTH operands are Int variables
+            // (the [`ChainNode::Product`] fragment); var×compound stays out.
+            None => match (int_var_name(a), int_var_name(b)) {
+                (Some(_), Some(_)) => collect_term_vars(a, out) && collect_term_vars(b, out),
+                _ => false,
+            },
         },
         _ => false,
     }
@@ -8563,19 +10185,47 @@ mod tests {
 
     #[test]
     fn fails_closed_on_nonlinear_var_times_var() {
-        // var×var is nonlinear (NIA); the linear bridge must fail closed,
-        // never fabricate a Certified.
+        // HISTORY: this pin originally asserted that ANY var×var violation
+        // declines (the term was wholly outside the linear fragment). With
+        // [`ChainNode::Product`] landed, a var×var product is a supported
+        // TERM, so the genuinely-UNSAT same-term contradiction below now
+        // certifies — real coverage, kernel-rechecked. The pin's soundness
+        // content is retained in its strongest form: a SATISFIABLE nonlinear
+        // system must still fail closed — the lane must never fabricate a
+        // Certified for NIA it cannot kernel-refute.
         let xy = || {
             Formula::Mul(
                 Box::new(Formula::Var("x".to_string(), Sort::Int)),
                 Box::new(Formula::Var("y".to_string(), Sort::Int)),
             )
         };
-        let viol = Formula::And(vec![
+        // SAT: x = 1, y = -1 gives x·y = -1 ∈ (-10, 0) — must decline.
+        let sat = Formula::And(vec![
+            Formula::Lt(Box::new(xy()), Box::new(Formula::Int(0))),
+            Formula::Lt(Box::new(Formula::Int(-10)), Box::new(xy())),
+        ]);
+        assert!(
+            certify_violation(&sat).is_none(),
+            "a satisfiable nonlinear var*var system must fail closed"
+        );
+        // UNSAT: `x·y < 0 ∧ 0 < x·y` bounds ONE term both ways — closed by the
+        // Product-node chain cycle and independently re-checked by the kernel.
+        let unsat = Formula::And(vec![
             Formula::Lt(Box::new(xy()), Box::new(Formula::Int(0))),
             Formula::Lt(Box::new(Formula::Int(0)), Box::new(xy())),
         ]);
-        assert!(certify_violation(&viol).is_none(), "nonlinear var*var must fail closed");
+        let evidence =
+            certify_violation(&unsat).expect("same-term var*var contradiction must certify");
+        let trust_ir::ProofEvidence::CleanCic { term, context, .. } = evidence else {
+            panic!("expected CleanCic evidence");
+        };
+        let mut vars = BTreeSet::new();
+        vars.insert("x".to_string());
+        vars.insert("y".to_string());
+        assert!(
+            payload_roundtrip_rechecks(&vars, &term, &context),
+            "var*var contradiction payload must re-check to False via the clean kernel"
+        );
     }
 
     #[test]
@@ -9005,6 +10655,190 @@ mod tests {
         assert!(certify_violation(&cast).is_some(), "cast range check must certify");
         assert_formula_certificate_pairs(&shift);
         assert_formula_certificate_pairs(&cast);
+    }
+
+    /// The real 32-bit shift-amount violation `2 < 0 ∨ 2 ≥ 32` under its
+    /// `i64::MIN ≤ 2 ≤ i64::MAX` range block — the shape
+    /// [`certifies_closed_constant_shift_and_cast_range_checks`] pins, reused by
+    /// the falsification tests below.
+    fn shift32_violation() -> Formula {
+        let two = || Formula::Int(2);
+        Formula::And(vec![
+            Formula::And(vec![
+                Formula::Le(Box::new(Formula::Int(i64::MIN as i128)), Box::new(two())),
+                Formula::Le(Box::new(two()), Box::new(Formula::Int(i64::MAX as i128))),
+            ]),
+            Formula::Or(vec![
+                Formula::Lt(Box::new(two()), Box::new(Formula::Int(0))),
+                Formula::Ge(Box::new(two()), Box::new(Formula::Int(32))),
+            ]),
+        ])
+    }
+
+    /// FALSIFY-ONCE for [`AyCrossCheck::Advisory`].
+    ///
+    /// The closed-constant lane no longer lets an ABSTAINING ay veto a
+    /// certificate ay never produced, so the clean CIC kernel is now the ONLY
+    /// thing standing between a planted term and a `Certified` verdict. This
+    /// plants three forgeries against the genuine `2 < 0 ∨ 32 ≤ 2` hypothesis and
+    /// watches the kernel reject each — with ay removed from the question
+    /// entirely (`kernel_checks_false` takes no solver input), so the rejection
+    /// cannot be miscredited to the gate that was relaxed.
+    #[test]
+    fn advisory_ay_cross_check_leaves_the_kernel_rejecting_forged_closed_certificates() {
+        let violation = shift32_violation();
+        let normalized = normalize_violation(&violation).expect("supported violation");
+        let conjuncts = normalized.view();
+        let (hyps, honest) =
+            closed_constant_refutation(&conjuncts).expect("the closed-constant shift shape");
+        let identity = ObligationIdentity::from_violation(&violation).expect("identity");
+        let no_vars = BTreeSet::new();
+        let env = build_env(&no_vars).expect("constructive arithmetic env");
+        let ctx = build_ctx(&hyps);
+        let h = Expr::fvar(hyps[0].fvar);
+
+        // NON-VACUITY: the honest term is exactly what the production lane emits,
+        // so this test cannot drift into checking a term nobody ships.
+        assert_eq!(
+            serialize_term(&honest).expect("serialize"),
+            match certify_closed_constant_contradiction(&conjuncts, &identity)
+                .expect("production lane must certify")
+            {
+                ProofEvidence::CleanCic { term, .. } => term,
+                other => panic!("expected CleanCic, got {other:?}"),
+            },
+            "the test's honest term must be the production lane's term"
+        );
+
+        // STATE A (control): the honest certificate kernel-checks and the relaxed
+        // lane emits it.
+        assert!(
+            kernel_checks_false(&env, ctx.clone(), &honest, &no_vars),
+            "control: the kernel accepts the honest closed-constant certificate"
+        );
+        assert!(
+            finish_certificate_with(&hyps, &honest, &no_vars, &identity, AyCrossCheck::Advisory)
+                .is_some(),
+            "control: the advisory lane emits the honest closed-constant certificate"
+        );
+
+        // The 32-bit obligation's own disjuncts, and the WRONG-WIDTH pair.
+        let d_lt0 = || ClosedOrderAtom { a: 2, b: 0, is_lt: true };
+        let d_ge32 = ClosedOrderAtom { a: 32, b: 2, is_lt: false };
+        let d_ge64 = ClosedOrderAtom { a: 64, b: 2, is_lt: false };
+
+        // STATE B (plants). Each is a *term*, built and handed to the same gate
+        // the honest one passed.
+        let plants: Vec<(&str, Expr)> = vec![
+            // (1) WITNESS SWAP: a perfectly valid refutation of a DIFFERENT closed
+            //     claim — the 64-bit bound `2 ≥ 64` — aimed at this 32-bit
+            //     obligation's hypothesis. `2 ≥ 64` is false too, so the term is
+            //     internally sound; it simply is not a proof about THIS obligation.
+            (
+                "wrong-width bound (2 ≥ 64 refutation against the 2 ≥ 32 hypothesis)",
+                refute_closed_disjunction(&[d_lt0(), d_ge64], h.clone())
+                    .expect("the wrong-width refutation must still build a term to check"),
+            ),
+            // (2) BARE ASSERTION: the hypothesis offered as if it were the proof.
+            ("the hypothesis itself, unrefuted", h.clone()),
+            // (3) FORGED GAP WITNESS: the honest `Or.rec` shape with the
+            //     `Int.NonNeg.mk` gap off by one, so `2 < 32` is claimed from a
+            //     witness that only reduces to `2 < 33`. Nothing but reduction in
+            //     the kernel can catch this one.
+            ("off-by-one Int.NonNeg gap witness", forged_gap_disjunction(&d_lt0(), &d_ge32, &h)),
+        ];
+
+        for (what, forged) in plants {
+            assert_ne!(
+                serialize_term(&forged).ok(),
+                serialize_term(&honest).ok(),
+                "{what}: the plant must differ from the honest term"
+            );
+            // ay is not consulted here at all — this is the kernel, alone.
+            assert!(
+                !kernel_checks_false(&env, ctx.clone(), &forged, &no_vars),
+                "{what}: the clean CIC kernel MUST reject the planted certificate"
+            );
+            // …and the relaxed producer gate fails closed on it.
+            assert!(
+                finish_certificate_with(
+                    &hyps,
+                    &forged,
+                    &no_vars,
+                    &identity,
+                    AyCrossCheck::Advisory
+                )
+                .is_none(),
+                "{what}: the advisory lane MUST fail closed on the planted certificate"
+            );
+        }
+    }
+
+    /// The honest `Or.rec` refutation of `2 < 0 ∨ 32 ≤ 2` with the `inr` branch's
+    /// `Int.NonNeg.mk` gap forged one too large. Mirrors [`refute_false_atom`]'s
+    /// `a > b` arm (`k = a - b - 1`) at `k + 1`.
+    fn forged_gap_disjunction(
+        first: &ClosedOrderAtom,
+        rest: &ClosedOrderAtom,
+        h_or: &Expr,
+    ) -> Expr {
+        let d1 = closed_atom_prop(first).expect("first disjunct prop");
+        let rest_prop = closed_atom_prop(rest).expect("rest disjunct prop");
+        let (a, b) = (
+            int_literal_to_kernel(rest.a).expect("literal"),
+            int_literal_to_kernel(rest.b).expect("literal"),
+        );
+        // Honest witness is `a - b - 1`; this is one too large.
+        let pos = nonneg_mk_u128(nonneg_gap_u128(rest.a, rest.b).expect("gap"));
+        let lt_bb = const_app("Int.lt_of_lt_of_le", [b.clone(), a, b.clone(), pos, Expr::bvar(0)]);
+        let inr_body = Expr::app(const_app("Int.lt_irrefl", [b]), lt_bb);
+        let or_ty = const_app("Or", [d1.clone(), rest_prop.clone()]);
+        let motive = Expr::lam(BinderInfo::Default, or_ty, false_expr());
+        let inl = Expr::lam(
+            BinderInfo::Default,
+            d1.clone(),
+            refute_false_atom(first, Expr::bvar(0)).expect("honest inl"),
+        );
+        let inr = Expr::lam(BinderInfo::Default, rest_prop.clone(), inr_body);
+        const_app("Or.rec", [d1, rest_prop, motive, inl, inr, h_or.clone()])
+    }
+
+    /// The half of the cross-check that was KEPT: ay DISAGREEING still declines,
+    /// on the advisory lane as on every other. Simulates the encoder mismatch the
+    /// gate exists to catch — an SMT rendering that is satisfiable (`0 ≤ 2`)
+    /// paired with the honest, kernel-checking `Or` prop and its refutation. The
+    /// kernel accepts the term, ay returns a MODEL, and the lane must still
+    /// refuse: only abstention is waved through, never contradiction.
+    #[test]
+    fn advisory_ay_cross_check_still_declines_when_ay_disagrees() {
+        let violation = shift32_violation();
+        let normalized = normalize_violation(&violation).expect("supported violation");
+        let conjuncts = normalized.view();
+        let (honest_hyps, honest) =
+            closed_constant_refutation(&conjuncts).expect("the closed-constant shift shape");
+        let identity = ObligationIdentity::from_violation(&violation).expect("identity");
+        let no_vars = BTreeSet::new();
+        let env = build_env(&no_vars).expect("constructive arithmetic env");
+
+        // Same kernel prop, same term — only the SMT rendering is swapped for a
+        // satisfiable one, which is exactly what a producer/consumer encoder skew
+        // would look like from here.
+        let mismatched = vec![Hyp { smt: "(<= 0 2)".to_string(), ..honest_hyps[0].clone() }];
+        assert!(
+            kernel_checks_false(&env, build_ctx(&mismatched), &honest, &no_vars),
+            "control: the kernel still accepts the term — only ay can catch this skew"
+        );
+        assert!(
+            finish_certificate_with(
+                &mismatched,
+                &honest,
+                &no_vars,
+                &identity,
+                AyCrossCheck::Advisory
+            )
+            .is_none(),
+            "an ay MODEL of the asserted hypotheses must decline even on the advisory lane"
+        );
     }
 
     /// SOUNDNESS: the closed-constant path refutes ONLY genuinely-false atoms.
@@ -9500,6 +11334,507 @@ mod tests {
         assert!(
             certify_violation(&sat).is_none(),
             "satisfiable `idx <u 10 ∧ 5 ≤u idx` must NOT certify"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SEAM A — bounded two-variable product lifts (ChainNode::Product).
+    // -----------------------------------------------------------------------
+
+    /// The synthesized Int system of the guarded two-variable multiply
+    /// (`0 ≤ x ≤ 999 ∧ 0 ≤ y ≤ 999 ∧ x·y > u32::MAX`).
+    fn bounded_product_violation(bound: i128) -> Formula {
+        let v = |n: &str| Formula::Var(n.to_string(), Sort::Int);
+        let i = Formula::Int;
+        let ge = |a: Formula, b: Formula| Formula::Ge(Box::new(a), Box::new(b));
+        let le = |a: Formula, b: Formula| Formula::Le(Box::new(a), Box::new(b));
+        let gt = |a: Formula, b: Formula| Formula::Gt(Box::new(a), Box::new(b));
+        let mul = Formula::Mul(Box::new(v("x")), Box::new(v("y")));
+        Formula::And(vec![
+            ge(v("x"), i(0)),
+            le(v("x"), i(bound)),
+            ge(v("y"), i(0)),
+            le(v("y"), i(bound)),
+            gt(mul, i(u32::MAX as i128)),
+        ])
+    }
+
+    /// KERNEL REPLAY of the product-lift chain: `x ≤ 999 ∧ y ≤ 999 ⊢
+    /// x·y ≤ 998001` composed against the violation `x·y > u32::MAX` must
+    /// close through the transitive chain, and the composed term must be
+    /// INDEPENDENTLY re-checked (`: False`) by the clean kernel — the proof
+    /// authority is the kernel check, never the lift's Rust arithmetic.
+    #[test]
+    fn product_lift_chain_term_rechecks_against_kernel() {
+        let violation = bounded_product_violation(999);
+        let normalized = normalize_violation(&violation).expect("supported conjuncts");
+        let conjuncts = normalized.view();
+        let (atoms, var_names) = collect_supported_atoms(&conjuncts);
+        let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+        let term = transitive_chain_refutation(&atoms, &hyps)
+            .expect("the product-lift chain must close 4294967295 < x*y <= 998001");
+        let env = build_env(&var_names).expect("constructive arithmetic env");
+        let ctx = build_ctx(&hyps);
+        assert!(
+            kernel_checks_false(&env, ctx, &term, &var_names),
+            "the composed mul_le_mul_of_nonneg_right/mul_comm/le_trans term must type as False"
+        );
+    }
+
+    /// The UNDERFLOW side: `0 ≤ x ∧ 0 ≤ y` against `x·y < 0` closes via the
+    /// `Int.mul_nonneg` lower lift, kernel-re-checked.
+    #[test]
+    fn product_nonneg_lift_chain_term_rechecks_against_kernel() {
+        let v = |n: &str| Formula::Var(n.to_string(), Sort::Int);
+        let i = Formula::Int;
+        let ge = |a: Formula, b: Formula| Formula::Ge(Box::new(a), Box::new(b));
+        let lt = |a: Formula, b: Formula| Formula::Lt(Box::new(a), Box::new(b));
+        let violation = Formula::And(vec![
+            ge(v("x"), i(0)),
+            ge(v("y"), i(0)),
+            lt(Formula::Mul(Box::new(v("x")), Box::new(v("y"))), i(0)),
+        ]);
+        let normalized = normalize_violation(&violation).expect("supported conjuncts");
+        let conjuncts = normalized.view();
+        let (atoms, var_names) = collect_supported_atoms(&conjuncts);
+        let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+        let term = transitive_chain_refutation(&atoms, &hyps)
+            .expect("the mul_nonneg lift must close 0 <= x*y < 0");
+        let env = build_env(&var_names).expect("constructive arithmetic env");
+        let ctx = build_ctx(&hyps);
+        assert!(kernel_checks_false(&env, ctx, &term, &var_names));
+    }
+
+    /// MUTANT DIRECTION (bound magnitude): with the guard widened to `99999`
+    /// the product bound `99999² ≈ 1.0e10` EXCEEDS `u32::MAX`, so no
+    /// conflicting chain exists and nothing may certify — the lift must use
+    /// the actual bound values, never the mere existence of a guard.
+    #[test]
+    fn product_lift_declines_widened_mutant_bounds() {
+        let violation = bounded_product_violation(99_999);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "SAT system (x=y=99999 overflows u32) must NOT certify"
+        );
+    }
+
+    /// MUTANT DIRECTION (guard removed): without the per-factor upper bounds
+    /// the product is unbounded and the overflow is real — must decline.
+    #[test]
+    fn product_lift_declines_without_guard_bounds() {
+        let v = |n: &str| Formula::Var(n.to_string(), Sort::Int);
+        let i = Formula::Int;
+        let ge = |a: Formula, b: Formula| Formula::Ge(Box::new(a), Box::new(b));
+        let gt = |a: Formula, b: Formula| Formula::Gt(Box::new(a), Box::new(b));
+        let violation = Formula::And(vec![
+            ge(v("x"), i(0)),
+            ge(v("y"), i(0)),
+            gt(Formula::Mul(Box::new(v("x")), Box::new(v("y"))), i(u32::MAX as i128)),
+        ]);
+        assert!(certify_violation(&violation).is_none(), "unbounded product must NOT certify");
+    }
+
+    /// FAIL-CLOSED (missing non-negativity): the upper lift's
+    /// `mul_le_mul_of_nonneg_right` needs `0 ≤ y`; without it the product of
+    /// bounded-but-possibly-negative factors is NOT bounded by `Kx·Ky`
+    /// (e.g. x = -10^6, y = -10^6 has x·y = 10^12 > u32::MAX with both
+    /// factors ≤ 999), so the chain must not close.
+    #[test]
+    fn product_lift_declines_without_nonneg_hypotheses() {
+        let v = |n: &str| Formula::Var(n.to_string(), Sort::Int);
+        let i = Formula::Int;
+        let le = |a: Formula, b: Formula| Formula::Le(Box::new(a), Box::new(b));
+        let gt = |a: Formula, b: Formula| Formula::Gt(Box::new(a), Box::new(b));
+        let violation = Formula::And(vec![
+            le(v("x"), i(999)),
+            le(v("y"), i(999)),
+            gt(Formula::Mul(Box::new(v("x")), Box::new(v("y"))), i(u32::MAX as i128)),
+        ]);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "SAT system (two large negatives multiply positive) must NOT certify"
+        );
+    }
+
+    /// FAIL-CLOSED (i128 fold overflow): bound magnitudes whose product
+    /// overflows the i128 fold must decline via `checked_mul`, never wrap.
+    #[test]
+    fn product_lift_declines_on_i128_bound_product_overflow() {
+        let v = |n: &str| Formula::Var(n.to_string(), Sort::Int);
+        let i = Formula::Int;
+        let big = i128::MAX / 2;
+        let ge = |a: Formula, b: Formula| Formula::Ge(Box::new(a), Box::new(b));
+        let le = |a: Formula, b: Formula| Formula::Le(Box::new(a), Box::new(b));
+        let gt = |a: Formula, b: Formula| Formula::Gt(Box::new(a), Box::new(b));
+        let violation = Formula::And(vec![
+            ge(v("x"), i(0)),
+            le(v("x"), i(big)),
+            ge(v("y"), i(0)),
+            le(v("y"), i(big)),
+            gt(Formula::Mul(Box::new(v("x")), Box::new(v("y"))), i(u32::MAX as i128)),
+        ]);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "an i128-overflowing bound product must decline (and the system is SAT anyway)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SEAM B — unsigned BV multiply no-overflow recognizer.
+    // -----------------------------------------------------------------------
+
+    /// The exact vcgen shape (`v2_unsigned_bv_overflow_formula(Mul)` + the
+    /// dominating-guard constraints): fresh 32-bit operand reads, the
+    /// `a ≠ 0 ∧ bvudiv(bvmul(a,b),a) ≠ b` violation, guard bounds `< bound`.
+    fn guarded_bv_mul_violation(bound: i128) -> Formula {
+        let bvw = 32;
+        let a = || Box::new(Formula::Var("__trust_ovf_bv_lhs_a".to_string(), Sort::BitVec(bvw)));
+        let b = || Box::new(Formula::Var("__trust_ovf_bv_rhs_b".to_string(), Sort::BitVec(bvw)));
+        let bv = |value: i128| Box::new(Formula::BitVec { value, width: bvw });
+        let a_ne_zero = Formula::Not(Box::new(Formula::Eq(a(), bv(0))));
+        let prod = Formula::BvMul(a(), b(), bvw);
+        let recovered = Formula::BvUDiv(Box::new(prod), a(), bvw);
+        let mismatch = Formula::Not(Box::new(Formula::Eq(Box::new(recovered), b())));
+        Formula::And(vec![
+            Formula::And(vec![a_ne_zero, mismatch]),
+            Formula::BvULt(a(), bv(bound), bvw),
+            Formula::BvULt(b(), bv(bound), bvw),
+        ])
+    }
+
+    /// The guarded_two_var_mul fixture shape must certify: bounds `a,b < 1000`
+    /// give `a·b ≤ 999² = 998001 ≤ u32::MAX`, so the bvudiv-recovery mismatch
+    /// is unsatisfiable and the synthesized linear carrier system closes in
+    /// the kernel. Also pins the producer/consumer pairing.
+    #[test]
+    fn certifies_guarded_unsigned_bv_mul_no_overflow() {
+        assert_formula_certificate_pairs(&guarded_bv_mul_violation(1000));
+    }
+
+    /// MUTANT (widened bound): `a,b < 100000` admits `99999² > u32::MAX` — a
+    /// REAL overflow. The recognizer must decline at the `Bx·By ≤ UMAX` gate.
+    #[test]
+    fn unsigned_bv_mul_declines_widened_mutant_bound() {
+        assert!(
+            certify_violation(&guarded_bv_mul_violation(100_000)).is_none(),
+            "the mutant's widened bound admits a real overflow — must NOT certify"
+        );
+    }
+
+    /// DECLINE (derived operand): a sign-extended multiplicand is not a raw
+    /// exact-width read — its unsigned read-back may not equal the source
+    /// value, so the lift is unjustified and the recognizer must not match.
+    #[test]
+    fn unsigned_bv_mul_declines_derived_operand() {
+        let bvw = 32;
+        let a = || Box::new(Formula::Var("a".to_string(), Sort::BitVec(bvw)));
+        let b = || Box::new(Formula::Var("b".to_string(), Sort::BitVec(16)));
+        let bext = || Box::new(Formula::BvSignExt(b(), 16));
+        let bv = |value: i128| Box::new(Formula::BitVec { value, width: bvw });
+        let a_ne_zero = Formula::Not(Box::new(Formula::Eq(a(), bv(0))));
+        let prod = Formula::BvMul(a(), bext(), bvw);
+        let recovered = Formula::BvUDiv(Box::new(prod), a(), bvw);
+        let mismatch =
+            Formula::Not(Box::new(Formula::Eq(Box::new(recovered), bext())));
+        let violation = Formula::And(vec![
+            a_ne_zero,
+            mismatch,
+            Formula::BvULt(a(), bv(10), bvw),
+        ]);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "a derived (sign-extended) operand must fail the raw-Var match (decline)"
+        );
+    }
+
+    /// DECLINE (missing factor bound): with no upper bound on `b` the product
+    /// can reach `UMAX·999` — a real overflow; must decline.
+    #[test]
+    fn unsigned_bv_mul_declines_unbounded_factor() {
+        let bvw = 32;
+        let a = || Box::new(Formula::Var("a".to_string(), Sort::BitVec(bvw)));
+        let b = || Box::new(Formula::Var("b".to_string(), Sort::BitVec(bvw)));
+        let bv = |value: i128| Box::new(Formula::BitVec { value, width: bvw });
+        let a_ne_zero = Formula::Not(Box::new(Formula::Eq(a(), bv(0))));
+        let prod = Formula::BvMul(a(), b(), bvw);
+        let recovered = Formula::BvUDiv(Box::new(prod), a(), bvw);
+        let mismatch = Formula::Not(Box::new(Formula::Eq(Box::new(recovered), b())));
+        let violation =
+            Formula::And(vec![a_ne_zero, mismatch, Formula::BvULt(a(), bv(1000), bvw)]);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "a factor with no present bound may reach UMAX — must NOT certify"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // waveform_scale_div — late reification unfold (b1) + per-branch
+    // internal-contradiction disjuncts (b2).
+    // -----------------------------------------------------------------------
+
+    /// Builders shared by the waveform-shaped tests (the certdump.txt i32
+    /// signed-division overflow family: `d`, `n` i32-ranged, MIR bool
+    /// reifications `_6 ⟺ (d = 0)` etc.).
+    fn wf_v(n: &str) -> Formula {
+        Formula::Var(n.to_string(), Sort::Int)
+    }
+    fn wf_b(n: &str) -> Formula {
+        Formula::Var(n.to_string(), Sort::Bool)
+    }
+    fn wf_eq(a: Formula, b: Formula) -> Formula {
+        Formula::Eq(Box::new(a), Box::new(b))
+    }
+    fn wf_not(a: Formula) -> Formula {
+        Formula::Not(Box::new(a))
+    }
+    fn wf_range(n: &str) -> Formula {
+        Formula::And(vec![
+            Formula::Ge(Box::new(wf_v(n)), Box::new(Formula::Int(-2_147_483_648))),
+            Formula::Le(Box::new(wf_v(n)), Box::new(Formula::Int(2_147_483_647))),
+        ])
+    }
+
+    /// The VC2 shape (spent TRUE reification inside every disjunct): each
+    /// branch carries the guard `¬(d = 0)` AND the Or-common
+    /// `_6 ⟺ (d = 0)` + asserted `_6` — internally contradictory, but the
+    /// contradiction is only reachable once the LATE unfold derives `d = 0`
+    /// from the extraction-surfaced reification. Producer + consumer pairing.
+    #[test]
+    fn certifies_waveform_vc2_via_late_reification_unfold() {
+        let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
+        let spent = || Formula::And(vec![wf_eq(wf_b("_6"), d0()), wf_b("_6")]);
+        let branch1 = Formula::And(vec![
+            wf_not(d0()),
+            wf_not(wf_eq(wf_v("n"), Formula::Int(-2_147_483_648))),
+            wf_range("n"),
+            wf_range("d"),
+            spent(),
+        ]);
+        let branch2 = Formula::And(vec![
+            wf_not(d0()),
+            wf_eq(wf_v("n"), Formula::Int(-2_147_483_648)),
+            wf_not(wf_eq(wf_v("d"), Formula::Int(-1))),
+            wf_range("n"),
+            wf_range("d"),
+            spent(),
+        ]);
+        let violation = Formula::And(vec![
+            wf_range("d"),
+            wf_range("n"),
+            Formula::And(vec![Formula::Bool(true), Formula::Or(vec![branch1, branch2])]),
+        ]);
+        assert_formula_certificate_pairs(&violation);
+    }
+
+    /// The VC1 shape (BRANCH-LOCAL contradictions, invisible to the common
+    /// pool): branch 1 carries `¬(n = MIN)` against a nested `n = MIN`;
+    /// branch 2 carries `¬(d = -1)` against a nested `d = -1`. Closed by the
+    /// per-branch InternalAndPair disjuncts through `Or.rec`.
+    #[test]
+    fn certifies_waveform_vc1_via_per_branch_contradiction() {
+        let n_min = || wf_eq(wf_v("n"), Formula::Int(-2_147_483_648));
+        let d_neg1 = || wf_eq(wf_v("d"), Formula::Int(-1));
+        let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
+        let inner = || Formula::And(vec![wf_range("n"), wf_range("d"), n_min(), d_neg1()]);
+        let branch1 = Formula::And(vec![
+            wf_not(d0()),
+            wf_not(n_min()),
+            wf_range("n"),
+            wf_range("d"),
+            inner(),
+        ]);
+        let branch2 = Formula::And(vec![
+            wf_not(d0()),
+            n_min(),
+            wf_not(d_neg1()),
+            wf_range("n"),
+            wf_range("d"),
+            inner(),
+        ]);
+        let violation = Formula::And(vec![
+            wf_range("d"),
+            wf_range("n"),
+            Formula::And(vec![Formula::Bool(true), Formula::Or(vec![branch1, branch2])]),
+        ]);
+        assert_formula_certificate_pairs(&violation);
+    }
+
+    /// The `EqEq` sub-lane of `InternalAndPair` in isolation: a branch carrying
+    /// `Eq(v, 1) ∧ Eq(v, 2)` (two contradictory literal equalities on one
+    /// variable) and NO `X ∧ ¬X` pair, so pair-search (i) — `EqNeg`, which
+    /// always fires first when present — cannot mask a broken `EqEq` kernel
+    /// composition. Review defect: every waveform-shaped test closed via
+    /// `EqNeg`, leaving the `Eq.symm`/`Eq.trans` transport with zero positive
+    /// coverage; a silently-dead sub-lane would fail closed but also fail to
+    /// certify the shapes it exists for.
+    #[test]
+    fn certifies_internal_and_pair_eq_eq_sub_lane() {
+        let v1 = || wf_eq(wf_v("v"), Formula::Int(1));
+        let v2 = || wf_eq(wf_v("v"), Formula::Int(2));
+        // Two branches, each internally contradictory ONLY through the
+        // conflicting literal equalities (no negation pair anywhere).
+        let branch1 = Formula::And(vec![wf_range("v"), v1(), v2()]);
+        let branch2 = Formula::And(vec![wf_range("v"), v2(), v1()]);
+        let violation = Formula::And(vec![
+            wf_range("v"),
+            Formula::Or(vec![branch1, branch2]),
+        ]);
+        assert_formula_certificate_pairs(&violation);
+    }
+
+    /// The VC3 shape (direct `d = 0` in every branch against the common guard
+    /// `¬(d = 0)`): surfaced by common-conjunct extraction and closed by the
+    /// direct-disequality lane.
+    #[test]
+    fn certifies_waveform_vc3_via_common_conjunct_extraction() {
+        let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
+        let defs = || {
+            Formula::And(vec![
+                wf_eq(wf_b("_6"), d0()),
+                wf_eq(wf_b("_7"), wf_eq(wf_v("d"), Formula::Int(-1))),
+                d0(),
+            ])
+        };
+        let branch1 = Formula::And(vec![
+            wf_not(d0()),
+            wf_not(wf_eq(wf_v("n"), Formula::Int(-2_147_483_648))),
+            wf_not(wf_b("_6")),
+            wf_range("n"),
+            wf_range("d"),
+            defs(),
+        ]);
+        let branch2 = Formula::And(vec![
+            wf_not(d0()),
+            wf_eq(wf_v("n"), Formula::Int(-2_147_483_648)),
+            wf_not(wf_eq(wf_v("d"), Formula::Int(-1))),
+            wf_not(wf_b("_6")),
+            wf_range("n"),
+            wf_range("d"),
+            defs(),
+        ]);
+        let violation = Formula::And(vec![
+            wf_range("d"),
+            wf_range("n"),
+            Formula::And(vec![Formula::Bool(true), Formula::Or(vec![branch1, branch2])]),
+        ]);
+        assert_formula_certificate_pairs(&violation);
+    }
+
+    /// The EXACT captured VC1 (scratchpad certdump.txt line 1, transcribed
+    /// verbatim): full reification-definition clutter (`_3`,`_4`,`_6`,`_7`,
+    /// `_8` defs, asserted `¬_6`), duplicated range blocks in both operand
+    /// orders, and the deep nested tail carrying the branch-local `n = MIN`,
+    /// `d = -1`. Must certify through the per-branch InternalAndPair lane
+    /// despite the clutter, and pair with the consumer recheck.
+    #[test]
+    fn certifies_waveform_vc1_exact_certdump_shape() {
+        let min32 = -2_147_483_648;
+        let le = |a: Formula, b: Formula| Formula::Le(Box::new(a), Box::new(b));
+        let i = Formula::Int;
+        let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
+        let n_min = || wf_eq(wf_v("n"), Formula::Int(min32));
+        let d_neg1 = || wf_eq(wf_v("d"), Formula::Int(-1));
+        let range_rev = |n: &str| {
+            Formula::And(vec![
+                le(i(min32), wf_v(n)),
+                le(wf_v(n), i(2_147_483_647)),
+            ])
+        };
+        let defs_tail = || {
+            Formula::And(vec![
+                wf_eq(wf_b("_3"), wf_not(d0())),
+                wf_eq(wf_b("_4"), n_min()),
+                wf_eq(wf_b("_6"), d0()),
+                Formula::And(vec![
+                    wf_eq(wf_b("_7"), d_neg1()),
+                    wf_eq(wf_b("_8"), n_min()),
+                    Formula::And(vec![range_rev("n"), range_rev("d"), n_min(), d_neg1()]),
+                ]),
+            ])
+        };
+        let branch1 = Formula::And(vec![
+            wf_not(d0()),
+            wf_not(n_min()),
+            wf_not(wf_b("_6")),
+            wf_range("n"),
+            wf_range("d"),
+            defs_tail(),
+        ]);
+        let branch2 = Formula::And(vec![
+            wf_not(d0()),
+            n_min(),
+            wf_not(d_neg1()),
+            wf_not(wf_b("_6")),
+            wf_range("n"),
+            wf_range("d"),
+            defs_tail(),
+        ]);
+        let violation = Formula::And(vec![
+            Formula::And(vec![
+                Formula::Ge(Box::new(wf_v("d")), Box::new(i(min32))),
+                Formula::Le(Box::new(wf_v("d")), Box::new(i(2_147_483_647))),
+                Formula::Ge(Box::new(wf_v("n")), Box::new(i(min32))),
+                Formula::Le(Box::new(wf_v("n")), Box::new(i(2_147_483_647))),
+            ]),
+            Formula::And(vec![
+                range_rev("n"),
+                range_rev("d"),
+                Formula::And(vec![Formula::Bool(true), Formula::Or(vec![branch1, branch2])]),
+            ]),
+        ]);
+        assert_formula_certificate_pairs(&violation);
+    }
+
+    /// MUTANT DIRECTION: with the branch-local exclusions REMOVED each branch
+    /// is genuinely satisfiable (`n = MIN, d = -1` — the mutant's real signed
+    /// division overflow), so nothing may certify.
+    #[test]
+    fn waveform_mutant_shape_satisfiable_branches_decline() {
+        let n_min = || wf_eq(wf_v("n"), Formula::Int(-2_147_483_648));
+        let d_neg1 = || wf_eq(wf_v("d"), Formula::Int(-1));
+        let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
+        let inner = || Formula::And(vec![wf_range("n"), wf_range("d"), n_min(), d_neg1()]);
+        // branch1 WITHOUT `¬(n = MIN)`, branch2 WITHOUT `¬(d = -1)`.
+        let branch1 =
+            Formula::And(vec![wf_not(d0()), wf_range("n"), wf_range("d"), inner()]);
+        let branch2 =
+            Formula::And(vec![wf_not(d0()), n_min(), wf_range("n"), wf_range("d"), inner()]);
+        let violation = Formula::And(vec![
+            wf_range("d"),
+            wf_range("n"),
+            Formula::And(vec![Formula::Bool(true), Formula::Or(vec![branch1, branch2])]),
+        ]);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "satisfiable overflow branches (n=MIN, d=-1) must NOT certify"
+        );
+    }
+
+    /// MUTANT DIRECTION (reification spelling): a FALSE-asserted reification
+    /// (`_6 ⟺ (d = 0)` + `¬_6`) must NOT be unfolded into `d = 0` — the late
+    /// unfold derives `¬(d = 0)`, which agrees with the guard; the branch is
+    /// satisfiable and must decline.
+    #[test]
+    fn waveform_late_unfold_respects_negated_reification() {
+        let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
+        let spent_false = || Formula::And(vec![wf_eq(wf_b("_6"), d0()), wf_not(wf_b("_6"))]);
+        let branch1 =
+            Formula::And(vec![wf_not(d0()), wf_range("n"), wf_range("d"), spent_false()]);
+        let branch2 = Formula::And(vec![
+            wf_not(d0()),
+            wf_eq(wf_v("n"), Formula::Int(7)),
+            wf_range("n"),
+            wf_range("d"),
+            spent_false(),
+        ]);
+        let violation = Formula::And(vec![
+            wf_range("d"),
+            wf_range("n"),
+            Formula::Or(vec![branch1, branch2]),
+        ]);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "a false-asserted reification entails ¬(d=0), not d=0 — must NOT certify"
         );
     }
 
@@ -12183,6 +14518,476 @@ mod tests {
         match f {
             Formula::And(cs) => cs.iter().collect(),
             other => vec![other],
+        }
+    }
+
+    // ── Countdown-cursor unsigned-subtraction underflow: the shifted interval rung ──
+    //
+    // These tests run on the REAL violation formulas the compiler produced, not
+    // synthetic shapes: `fixtures/countdown/sub_underflow_certdump.txt` holds the
+    // verbatim `AY_CERT_DUMP=1` renders of the three `overflow:sub` obligations of
+    // `tests/trust-falsification/proved/countdown_digit_loop{,_u64}.rs` as emitted
+    // by stage2 trustc d8059bf39, where all three degrade to `runtime-checked`
+    // ("solver interval reported Proved without exact kernel/native proof
+    // authority") because no certificate rung reaches their two-atom contradiction.
+
+    /// The real countdown `overflow:sub` violation formulas, `(name, formula)`.
+    fn real_countdown_sub_violations() -> Vec<(String, Formula)> {
+        const DUMP: &str = include_str!("../fixtures/countdown/sub_underflow_certdump.txt");
+        let rows: Vec<(String, Formula)> = DUMP
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| {
+                let (name, body) = l.split_once('\t').expect("`<name>\\t<formula>` row");
+                (name.to_string(), parse_debug_formula(body))
+            })
+            .collect();
+        assert_eq!(rows.len(), 6, "3 obligations × 2 fixtures (u32/u64)");
+        rows
+    }
+
+    /// Parse the `{:?}` render of a `trust_types::Formula` back into a `Formula`.
+    /// Deliberately total-or-panic: a fixture that no longer parses is a broken
+    /// test input, never a silently-skipped assertion. Supports exactly the
+    /// constructors the countdown dumps contain.
+    fn parse_debug_formula(s: &str) -> Formula {
+        let mut p = DebugFormulaParser { s: s.as_bytes(), i: 0 };
+        let f = p.formula();
+        p.skip_ws();
+        assert_eq!(p.i, p.s.len(), "trailing input at byte {}", p.i);
+        f
+    }
+
+    struct DebugFormulaParser<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+
+    impl DebugFormulaParser<'_> {
+        fn skip_ws(&mut self) {
+            while self.i < self.s.len() && self.s[self.i] == b' ' {
+                self.i += 1;
+            }
+        }
+
+        fn expect(&mut self, c: u8) {
+            self.skip_ws();
+            assert_eq!(self.s[self.i], c, "expected `{}` at byte {}", c as char, self.i);
+            self.i += 1;
+        }
+
+        fn peek(&mut self) -> u8 {
+            self.skip_ws();
+            self.s[self.i]
+        }
+
+        fn ident(&mut self) -> String {
+            self.skip_ws();
+            let start = self.i;
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+            {
+                self.i += 1;
+            }
+            String::from_utf8(self.s[start..self.i].to_vec()).expect("ascii identifier")
+        }
+
+        /// A Rust `Debug` string literal. The countdown variable names contain no
+        /// escapes; assert that rather than implement an unexercised unescaper.
+        fn string(&mut self) -> String {
+            self.expect(b'"');
+            let start = self.i;
+            while self.s[self.i] != b'"' {
+                assert_ne!(self.s[self.i], b'\\', "escaped string at byte {}", self.i);
+                self.i += 1;
+            }
+            let out = String::from_utf8(self.s[start..self.i].to_vec()).expect("utf8 name");
+            self.i += 1;
+            out
+        }
+
+        fn int(&mut self) -> i128 {
+            self.skip_ws();
+            let start = self.i;
+            if self.s[self.i] == b'-' {
+                self.i += 1;
+            }
+            while self.i < self.s.len() && self.s[self.i].is_ascii_digit() {
+                self.i += 1;
+            }
+            std::str::from_utf8(&self.s[start..self.i])
+                .expect("ascii integer")
+                .parse()
+                .expect("i128 literal")
+        }
+
+        fn list(&mut self) -> Vec<Formula> {
+            self.expect(b'[');
+            let mut out = Vec::new();
+            loop {
+                out.push(self.formula());
+                match self.peek() {
+                    b',' => self.i += 1,
+                    b']' => {
+                        self.i += 1;
+                        return out;
+                    }
+                    c => panic!("expected `,` or `]`, got `{}` at byte {}", c as char, self.i),
+                }
+            }
+        }
+
+        fn binary(&mut self) -> (Box<Formula>, Box<Formula>) {
+            self.expect(b'(');
+            let a = Box::new(self.formula());
+            self.expect(b',');
+            let b = Box::new(self.formula());
+            self.expect(b')');
+            (a, b)
+        }
+
+        fn formula(&mut self) -> Formula {
+            let ctor = self.ident();
+            match ctor.as_str() {
+                "And" => {
+                    self.expect(b'(');
+                    let items = self.list();
+                    self.expect(b')');
+                    Formula::And(items)
+                }
+                "Or" => {
+                    self.expect(b'(');
+                    let items = self.list();
+                    self.expect(b')');
+                    Formula::Or(items)
+                }
+                "Not" => {
+                    self.expect(b'(');
+                    let inner = Box::new(self.formula());
+                    self.expect(b')');
+                    Formula::Not(inner)
+                }
+                "Var" => {
+                    self.expect(b'(');
+                    let name = self.string();
+                    self.expect(b',');
+                    let sort = match self.ident().as_str() {
+                        "Int" => Sort::Int,
+                        "Bool" => Sort::Bool,
+                        other => panic!("unsupported sort `{other}`"),
+                    };
+                    self.expect(b')');
+                    Formula::Var(name, sort)
+                }
+                "Int" => {
+                    self.expect(b'(');
+                    let n = self.int();
+                    self.expect(b')');
+                    Formula::Int(n)
+                }
+                "Bool" => {
+                    self.expect(b'(');
+                    let v = self.ident() == "true";
+                    self.expect(b')');
+                    Formula::Bool(v)
+                }
+                "Eq" => {
+                    let (a, b) = self.binary();
+                    Formula::Eq(a, b)
+                }
+                "Lt" => {
+                    let (a, b) = self.binary();
+                    Formula::Lt(a, b)
+                }
+                "Le" => {
+                    let (a, b) = self.binary();
+                    Formula::Le(a, b)
+                }
+                "Gt" => {
+                    let (a, b) = self.binary();
+                    Formula::Gt(a, b)
+                }
+                "Ge" => {
+                    let (a, b) = self.binary();
+                    Formula::Ge(a, b)
+                }
+                "Add" => {
+                    let (a, b) = self.binary();
+                    Formula::Add(a, b)
+                }
+                "Sub" => {
+                    let (a, b) = self.binary();
+                    Formula::Sub(a, b)
+                }
+                "Div" => {
+                    let (a, b) = self.binary();
+                    Formula::Div(a, b)
+                }
+                "Rem" => {
+                    let (a, b) = self.binary();
+                    Formula::Rem(a, b)
+                }
+                other => panic!("unsupported Debug constructor `{other}` at byte {}", self.i),
+            }
+        }
+    }
+
+    /// Control: the parser round-trips — reparsing each fixture's own `{:?}`
+    /// render reproduces the same `Formula`. Without this, a parser bug could
+    /// silently turn a real obligation into an easier synthetic one.
+    #[test]
+    fn countdown_certdump_fixtures_roundtrip_through_the_debug_parser() {
+        for (name, viol) in real_countdown_sub_violations() {
+            let reparsed = parse_debug_formula(&format!("{viol:?}"));
+            assert_eq!(reparsed, viol, "{name}: Debug/parse round-trip must be identity");
+        }
+    }
+
+    /// The load-bearing regression: all six real `overflow:sub` obligations now
+    /// mint a clean-CIC certificate. `certify_violation` returning `Some` means
+    /// the FULL producer gate passed — independent ay UNSAT over the asserted
+    /// hypotheses, `kernel_checks_false` (clean CIC re-check of `term : False`),
+    /// and the serialized payload round-trip re-check.
+    #[test]
+    fn certifies_real_countdown_sub_underflow_obligations() {
+        for (name, viol) in real_countdown_sub_violations() {
+            let evidence = certify_violation(&viol)
+                .unwrap_or_else(|| panic!("{name}: real countdown overflow:sub must certify"));
+            assert!(matches!(evidence, ProofEvidence::CleanCic { .. }), "{name}: CleanCic");
+        }
+    }
+
+    /// Anti-vacuity: pin that the SHIFTED rung is what closes these, i.e. the
+    /// test above cannot pass without it. The plain interval rung declines
+    /// (`atom_var_bound` wants a bare `Var` endpoint, the goal's is `Sub(x,c)`),
+    /// the chain rung declines (the surrounding VC exceeds `refute_via_chain_edges`'
+    /// 48-augmented-edge fail-closed cap), and Farkas declines.
+    #[test]
+    fn countdown_sub_underflow_is_reached_only_by_the_shifted_rung() {
+        for (name, viol) in real_countdown_sub_violations() {
+            let normalized = normalize_violation(&viol).expect("supported violation");
+            let conjuncts = normalized.view();
+            let (atoms, _vars) = collect_supported_atoms(&conjuncts);
+            let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+            assert!(
+                single_var_interval_refutation(&atoms, &hyps).is_none(),
+                "{name}: the plain interval rung must still decline"
+            );
+            assert!(
+                transitive_chain_refutation(&atoms, &hyps).is_none(),
+                "{name}: the chain rung must still decline (edge cap)"
+            );
+            assert!(
+                multi_var_farkas_refutation(&atoms, &hyps).is_none(),
+                "{name}: the Farkas rung must still decline"
+            );
+            assert!(
+                shifted_single_var_interval_refutation(&atoms, &hyps).is_some(),
+                "{name}: the shifted interval rung must close the contradiction"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL (soundness). Take the REAL u32 `offset -= 4` obligation and
+    /// weaken only its load-bearing countdown-cursor invariant from `offset ≥ 6` to
+    /// `offset ≥ 2`. The goal `offset - 4 < 0` then has a model (`offset = 2`), so
+    /// the new rung MUST decline: `build_interval_refutation` reaches the true
+    /// `2 < 4` and `ClosedOrderAtom::is_false` refuses it. If this ever certifies,
+    /// the rung is proving satisfiable formulas.
+    #[test]
+    fn shifted_rung_declines_the_satisfiable_countdown_mutation() {
+        let rows = real_countdown_sub_violations();
+        let (_, honest) = rows.iter().find(|(n, _)| n == "cd_u32_sub4").expect("u32 sub-4 row");
+        let text = format!("{honest:?}");
+        let guard = r#"Ge(Var("offset#s0_2_s3_0", Int), Int(6))"#;
+        assert_eq!(text.matches(guard).count(), 1, "exactly one countdown-cursor guard to weaken");
+        let weakened = parse_debug_formula(
+            &text.replace(guard, r#"Ge(Var("offset#s0_2_s3_0", Int), Int(2))"#),
+        );
+        assert_ne!(weakened, *honest, "the mutation must actually change the formula");
+
+        let normalized = normalize_violation(&weakened).expect("supported violation");
+        let conjuncts = normalized.view();
+        let (atoms, _vars) = collect_supported_atoms(&conjuncts);
+        let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+        assert!(
+            shifted_single_var_interval_refutation(&atoms, &hyps).is_none(),
+            "the shifted rung must decline a SATISFIABLE shifted interval (offset = 2 is a model)"
+        );
+        assert!(
+            certify_violation(&weakened).is_none(),
+            "no rung may certify the satisfiable countdown mutation"
+        );
+    }
+
+    /// Rebuild the shifted-rung upper bound for a `(x ± δ) R k` atom with the shift
+    /// amount perturbed by `delta_bias` and the claimed constant by `value_bias`.
+    /// `(0, 0)` reproduces [`shifted_atom_var_bound`]'s upper branch exactly, so the
+    /// biased variants differ from the honest certificate in exactly one number.
+    fn biased_shifted_upper_bound(
+        a: &Formula,
+        b: &Formula,
+        strict: bool,
+        hyp: Expr,
+        delta_bias: i128,
+        value_bias: i128,
+    ) -> Option<VarBound> {
+        let (v, delta) = linear_var_offset(a)?;
+        let k = int_literal_value(b)?;
+        let claimed = k.checked_sub(delta)?.checked_add(value_bias)?;
+        let x = Expr::const_(Name::from_string(&encoded_var_name(&v)), vec![]);
+        let claimed_e = int_literal_to_kernel(claimed)?;
+        let shifted = shift_hyp(strict, &x, &claimed_e, delta.checked_add(delta_bias)?, hyp)?;
+        Some(VarBound { is_upper: true, strict, value: claimed, var: v, hyp: shifted })
+    }
+
+    /// NEGATIVE CONTROL (the kernel is the checker, not the producer). A shifted
+    /// bound whose arithmetic is corrupted — a wrong shift amount, or a forged
+    /// tighter constant — still *builds* a well-formed-looking refutation term, and
+    /// the clean CIC kernel MUST reject every one of them. Paired with a
+    /// non-vacuity check that the honest term from the SAME code path is accepted:
+    /// a checker that accepts everything proves nothing.
+    #[test]
+    fn kernel_rejects_corrupted_shifted_bound_certificates() {
+        let rows = real_countdown_sub_violations();
+        let (_, viol) = rows.iter().find(|(n, _)| n == "cd_u32_sub4").expect("u32 sub-4 row");
+        let normalized = normalize_violation(viol).expect("supported violation");
+        let conjuncts = normalized.view();
+        let (atoms, var_names) = collect_supported_atoms(&conjuncts);
+        let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+        let env = build_env(&var_names).expect("constructive arithmetic env");
+        let ctx = build_ctx(&hyps);
+        let identity = ObligationIdentity::from_violation(viol).expect("identity");
+
+        // The goal atom `Lt(Sub(offset, 4), 0)` and the guard `6 ≤ offset` it
+        // contradicts, located in the real atom pool.
+        let goal = atoms
+            .iter()
+            .zip(&hyps)
+            .find_map(|(atom, hyp)| match atom {
+                Atom::Lt(a, b) if matches!(a, Formula::Sub(..)) => Some((*a, *b, hyp)),
+                _ => None,
+            })
+            .expect("the unsigned-subtraction underflow goal");
+        let lower = atoms
+            .iter()
+            .zip(&hyps)
+            .find_map(|(atom, hyp)| {
+                let bound = atom_var_bound(atom, Expr::fvar(hyp.fvar))?;
+                (!bound.is_upper && bound.var.starts_with("offset#") && bound.value == 6)
+                    .then_some(bound)
+            })
+            .expect("the countdown-cursor guard `6 ≤ offset`");
+
+        let build = |delta_bias: i128, value_bias: i128| {
+            let upper = biased_shifted_upper_bound(
+                goal.0,
+                goal.1,
+                true,
+                Expr::fvar(goal.2.fvar),
+                delta_bias,
+                value_bias,
+            )?;
+            build_interval_refutation(&lower, &upper)
+        };
+
+        // Non-vacuity: the honest term IS a kernel-checked proof of `False`, and it
+        // is byte-identical to what the production rung emits.
+        let honest = build(0, 0).expect("honest shifted refutation");
+        assert_eq!(
+            serialize_term(&honest).expect("serialize"),
+            serialize_term(&shifted_single_var_interval_refutation(&atoms, &hyps).expect("rung"))
+                .expect("serialize"),
+            "the test's honest term must be the production rung's term"
+        );
+        assert!(
+            kernel_checks_false(&env, ctx.clone(), &honest, &var_names),
+            "control: the kernel accepts the honest shifted certificate"
+        );
+        assert!(
+            finish_certificate(&hyps, &honest, &var_names, &identity).is_some(),
+            "control: the full producer gate accepts the honest shifted certificate"
+        );
+
+        // Corruptions. `(δ+1, 0)`: the cancellation lemma is instantiated at the
+        // wrong shift, so it demands `offset - 3 < 1` while the hypothesis proves
+        // `offset - 4 < 0`. `(0, -1)`: the shift is right but the bound is forged
+        // one tighter (`offset < 3` from a hypothesis that only gives `offset < 4`),
+        // which still conflicts with `6 ≤ offset` and so still *builds* a term.
+        for (delta_bias, value_bias, what) in [
+            (1, 0, "wrong shift amount"),
+            (-1, 0, "wrong shift amount"),
+            (0, -1, "forged tighter bound"),
+        ] {
+            let forged = build(delta_bias, value_bias)
+                .unwrap_or_else(|| panic!("{what}: corruption must still build a term to check"));
+            assert_ne!(
+                serialize_term(&forged).expect("serialize"),
+                serialize_term(&honest).expect("serialize"),
+                "{what}: the corrupted term must differ from the honest one"
+            );
+            assert!(
+                !kernel_checks_false(&env, ctx.clone(), &forged, &var_names),
+                "{what}: the clean CIC kernel MUST reject the corrupted certificate"
+            );
+            assert!(
+                finish_certificate(&hyps, &forged, &var_names, &identity).is_none(),
+                "{what}: the producer gate MUST fail closed on the corrupted certificate"
+            );
+        }
+    }
+
+    /// A MUTANT GUARD — deliberately not "THE" mutant guard; see the scope note.
+    ///
+    /// The refuted falsification mutant `countdown_short_buffer.rs` has exactly
+    /// three obligations that reach the certificate producer at all (`certify_all`
+    /// calls `certify_vc` only for rows the solver reported `Proved`; the refuted
+    /// row that makes the mutant fail never gets here). This test pins that the new
+    /// shifted rung does not fire on any of those three, and that their dispositions
+    /// are exactly what they were before it existed.
+    ///
+    /// SCOPE, corrected 2026-08-15 after an adversarial review measured it. An
+    /// earlier version of this comment said "the other four countdown mutants emit
+    /// no certdumps whatsoever" and that the rung "must buy coverage on the proved
+    /// fixtures without touching the mutants". BOTH are false:
+    ///   * there are ELEVEN `countdown_*` mutants, not five, and two never run
+    ///     (`div_by_one`, `two_digit_short`) DO reach the producer (2 and 3
+    ///     certdumps respectively);
+    ///   * the rung newly certifies a row in `mutant/countdown_two_digit_short`
+    ///     and in `mutant/r1_recursive_mutated_arg_oob`.
+    ///
+    /// That is not a soundness failure — those fixtures still exit rc=1 on their own
+    /// refuted rows, so no artifact is produced, and certifying an incidental
+    /// `Proved` row in a failing build changes no verdict. But this test does NOT
+    /// establish the corpus-wide claim, and must not be cited for it. Only a full
+    /// falsification gate run prices the rung's reach.
+    #[test]
+    fn shifted_rung_does_not_fire_on_the_refuted_countdown_mutant() {
+        const DUMP: &str = include_str!("../fixtures/countdown/short_buffer_mutant_certdump.txt");
+        let rows: Vec<(&str, Formula)> = DUMP
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| {
+                let (name, body) = l.split_once('\t').expect("`<name>\\t<formula>` row");
+                (name, parse_debug_formula(body))
+            })
+            .collect();
+        assert_eq!(rows.len(), 3, "the mutant's three certifier-reaching obligations");
+        for (name, viol) in rows {
+            let normalized = normalize_violation(&viol).expect("supported violation");
+            let conjuncts = normalized.view();
+            let (atoms, _vars) = collect_supported_atoms(&conjuncts);
+            let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+            assert!(
+                shifted_single_var_interval_refutation(&atoms, &hyps).is_none(),
+                "{name}: the shifted rung must not fire on a mutant obligation"
+            );
+            // Unchanged disposition: these already certified through the
+            // downstream ay-reconstruction path and still must.
+            assert!(
+                certify_violation(&viol).is_some(),
+                "{name}: the mutant's proved rows must keep their pre-existing disposition"
+            );
         }
     }
 }

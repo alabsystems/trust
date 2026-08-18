@@ -90,6 +90,8 @@ fn accumulate(total: &mut ProveScorecard, one: &ProveScorecard) {
     total.fully_faithful += one.fully_faithful;
     total.fully_faithful_via_trustir += one.fully_faithful_via_trustir;
     total.fully_faithful_mirsem_fallback += one.fully_faithful_mirsem_fallback;
+    // Trust (#54): the names travel with the counter (see ProveScorecard).
+    total.mirsem_fallback_rows.extend(one.mirsem_fallback_rows.iter().cloned());
     total.proven.extend(one.proven.iter().cloned());
     total.rejections.extend(one.rejections.iter().cloned());
 }
@@ -200,6 +202,12 @@ fn main() {
     eprintln!("fully_faithful               {}", agg.fully_faithful);
     eprintln!("  via_trustir                {}", agg.fully_faithful_via_trustir);
     eprintln!("  mirsem_fallback            {}  (teardown exit criterion: 0)", agg.fully_faithful_mirsem_fallback);
+    // Trust (#54): NAME them. A bare count cannot be worked, and these rows are
+    // composition-dependent -- proving a body alone does not reproduce the
+    // fallback, so outside-in attribution finds nothing.
+    for row in &agg.mirsem_fallback_rows {
+        eprintln!("    fallback row: {row}");
+    }
     if agg.fully_faithful
         != agg.fully_faithful_via_trustir + agg.fully_faithful_mirsem_fallback
     {

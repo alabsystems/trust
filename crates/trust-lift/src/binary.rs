@@ -1556,7 +1556,7 @@ mod tests {
         };
 
         let text_base = 0x1000;
-        let dmb_encoding = 0xD5033B9Fu32; // DMB ISH
+        let dmb_encoding = 0xD5033BBFu32; // DMB ISH
         let ret_encoding = 0xD65F03C0u32;
         let nop_encoding = 0xD503201Fu32;
 
@@ -1958,6 +1958,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             ssa: None,
             annotations: vec![],

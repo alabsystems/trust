@@ -680,7 +680,9 @@ impl<'a> State<'a> {
                 self.end(ib);
             }
             hir::ItemKind::CleanIsland { .. } => {
-                // Trust: span-only Clean island — body not reproducible here.
+                // Trust: the island body is withheld here, matching the AST
+                // printer; the payload carries it (ruling v7/D1) but printing
+                // it is a policy choice this printer does not make.
                 let (cb, ib) = self.head("clean");
                 self.word(" { /* Clean island (span-only) */ }");
                 self.end(cb);

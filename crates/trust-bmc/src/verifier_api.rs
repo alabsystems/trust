@@ -110,6 +110,125 @@ const TRUST_MC_TYPED_CHC_LOWERING_STATUS_UNSUPPORTED: &str = "unsupported";
 const TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY: &str =
     "trust-trust-mc.typed-chc-obligation.synthetic_contract.v1";
 
+// Producer attestation about the FIDELITY of the submitted typed `ChcVc` to the
+// body it claims to encode.
+//
+// This is the consumer's side of the boundary
+// `trust_mc_core::ChcPdrEncodingConcreteness` explicitly declines: that
+// attestation covers only the `ChcVc` -> solver-problem lowering trust_mc
+// itself performs, and its own SCOPE note says the ChcVc-PRODUCTION stage
+// "belongs to the producer of the obligation, and consumers must account for it
+// on their own side of the boundary". Nothing accounted for it, so a
+// producer-side over-approximation reached the refutation gate wearing a
+// perfectly valid trust_mc-stage exactness attestation.
+//
+// The compiler currently emits only the NEGATIVE value below. Absence is
+// therefore "unattested", never "attested exact". Refutation authority is
+// fail-closed: only the explicit positive value may admit a public
+// counterexample, and the compiler must not emit it until it can attest every
+// source-to-ChcVc fidelity edge. Like the lowering-status key this is
+// deliberately NOT in
+// `TRUST_IR_NATIVE_TRANSPORT_METADATA_KEYS`, so it sits inside the obligation's
+// canonical public semantic digest and cannot be detached from the row.
+const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY: &str =
+    "trust-trust-mc.typed-chc-obligation.encoding_fidelity";
+/// Positive producer attestation that the submitted `ChcVc` is exact for the
+/// source obligation. The compiler intentionally does not emit this yet.
+#[cfg(feature = "trust-mc-native-solver")]
+const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT: &str = "exact";
+/// The compiler fell back to the flattened single-formula typed CHC (one
+/// nullary `error` relation, one constraint-only rule) for a body whose CFG has
+/// a BACK EDGE. Such a formula has no loop transition relation at all, so the
+/// loop-carried locals appear in it as free variables with no defining
+/// constraint: it OVER-APPROXIMATES the reachable states.
+#[cfg(feature = "trust-mc-native-solver")]
+const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED: &str = "loop_elided_over_approximation";
+
+/// Whether a solver-level `Refuted` on a typed trust_mc CHC may be credited as
+/// a public counterexample, judged on the ONE question
+/// `ChcPdrEncodingConcreteness` cannot answer: is the submitted `ChcVc` faithful
+/// to the body?
+///
+/// Direction of soundness, and why this is asymmetric with the proof direction:
+/// an over-approximating encoding (extra models) is SOUND FOR PROOFS — UNSAT of
+/// a superset implies UNSAT of the real reachable set — and UNSOUND AS EVIDENCE
+/// FOR REFUTATIONS, because a model of the superset need not be a real
+/// execution. So this gate may only ever move a row FAILED -> Unknown; it is
+/// never consulted on the Proved path, and `trust_mc_chc_credit_witness` is
+/// deliberately left alone.
+#[cfg(feature = "trust-mc-native-solver")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustMcChcRefutationAdmissibility {
+    /// No producer fidelity attestation rides on this row.
+    Unattested,
+    /// The producer explicitly attests the complete source-to-ChcVc edge.
+    ProducerAttestedExact,
+    /// The producer attests the submitted `ChcVc` over-approximates the body.
+    /// A refutation of it is a refutation of the ENCODING, not of the program.
+    ProducerAttestedOverApproximation { class: String },
+}
+
+#[cfg(feature = "trust-mc-native-solver")]
+impl TrustMcChcRefutationAdmissibility {
+    /// Read the attestation off one authenticated public obligation.
+    ///
+    /// Fails closed on an UNRECOGNIZED value: a future producer class this
+    /// consumer does not understand is treated as an over-approximation, so a
+    /// new encoding family cannot acquire refutation authority merely by being
+    /// unknown here.
+    ///
+    /// Fails closed on AMBIGUITY too, and deliberately does not reuse
+    /// `metadata_value`: that helper answers a duplicated key with `None`, which
+    /// here would read as "no attestation" and hand a disclaimed encoding its
+    /// refutation authority back. Duplicate keys are rejected by bundle
+    /// validation — but that runs later, inside the witness validator this gate
+    /// is checked BEFORE, so it cannot be relied on here.
+    fn for_obligation(obligation: &TrustObligation) -> Self {
+        let mut attested = obligation
+            .metadata
+            .iter()
+            .filter(|entry| entry.key == TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY)
+            .map(|entry| entry.value.as_str())
+            .peekable();
+        let Some(class) = attested.next() else {
+            return Self::Unattested;
+        };
+        if attested.peek().is_some() {
+            return Self::ProducerAttestedOverApproximation {
+                class: "<ambiguous: the row carries more than one encoding-fidelity attestation>"
+                    .to_string(),
+            };
+        }
+        if class == TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT {
+            Self::ProducerAttestedExact
+        } else {
+            Self::ProducerAttestedOverApproximation { class: class.to_string() }
+        }
+    }
+
+    /// `Some(reason)` when a `Refuted` verdict on this row must be demoted.
+    fn rejection_reason(&self) -> Option<String> {
+        match self {
+            Self::Unattested => Some(
+                "the submitted ChcVc has no positive producer fidelity attestation; fresh solver-level replay proves only the encoded request, not correspondence to the source obligation"
+                    .to_string(),
+            ),
+            Self::ProducerAttestedExact => None,
+            Self::ProducerAttestedOverApproximation { class }
+                if class == TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED =>
+            {
+                Some(
+                    "the compiler attests the submitted ChcVc is a loop-elided over-approximation: it fell back to the flattened single-formula typed CHC (one nullary `error` relation, one constraint-only rule) for a body whose CFG has a back edge, so the loop carries no transition relation and its loop-carried locals are free variables with no defining constraint"
+                        .to_string(),
+                )
+            }
+            Self::ProducerAttestedOverApproximation { class } => Some(format!(
+                "the compiler attests a non-exact ChcVc encoding class `{class}` this consumer does not recognize; an unrecognized fidelity class fails closed"
+            )),
+        }
+    }
+}
+
 /// Why a solved trust_mc Horn rule set is entitled to speak about one public
 /// obligation.
 ///
@@ -1549,7 +1668,7 @@ impl TrustMcVerifierApiAdapter {
             );
         }
 
-        let (transports, transport_not_proved) = match self
+        let (transports, transport_not_proved, transport_refuted) = match self
             .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
                 native_bundle,
                 source_generation_authority,
@@ -1566,9 +1685,19 @@ impl TrustMcVerifierApiAdapter {
                             return evidence;
                         }
                         let mut evidence = self.unsupported_evidence(bundle, obligation);
-                        evidence.diagnostics.push(format!(
-                            "native trust_mc TrustIr CHC/PDR bundle runner did not produce proof-grade evidence: {reason}"
-                        ));
+                        // insert(0), not push: `unsupported_diagnostics` has already
+                        // prepended the generic "missing `trust.vc.formula.schema`"
+                        // direct-lane line, which for a row that never uses the direct
+                        // lane is a MISATTRIBUTED root cause. The compiler prints only
+                        // the first three diagnostics, so appending here leaves the
+                        // misleading line leading and hides the real reason. The sibling
+                        // branch below already does this; the other two did not.
+                        evidence.diagnostics.insert(
+                            0,
+                            format!(
+                                "native trust_mc TrustIr CHC/PDR bundle runner did not produce proof-grade evidence: {reason}"
+                            ),
+                        );
                         evidence
                     })
                     .collect();
@@ -1623,6 +1752,21 @@ impl TrustMcVerifierApiAdapter {
 
                 let Some(transport) = transports_by_obligation.remove(&expected_lookup_key)
                 else {
+                    // Witnessed refutation channel (T3): the transport solve
+                    // REFUTED this row and attached a machine-checked witness.
+                    // Every binding is revalidated consumer-side (fresh
+                    // translation, recomputed digests, admissibility) before a
+                    // Failed verdict is surfaced; any validation failure
+                    // demotes to the historical Unknown.
+                    if let Some(refuted_row) = transport_refuted.get(&expected_lookup_key) {
+                        return self.native_trust_ir_refuted_row_evidence(
+                            bundle,
+                            obligation,
+                            native_bundle,
+                            refuted_row,
+                            deadline,
+                        );
+                    }
                     let mut evidence = self.unsupported_evidence(bundle, obligation);
                     if let Some(reason) = transport_not_proved.get(&expected_lookup_key) {
                         // Trust (T3): the transport solve DID run this row and
@@ -1642,9 +1786,15 @@ impl TrustMcVerifierApiAdapter {
                             ),
                         );
                     } else {
-                        evidence.diagnostics.push(format!(
-                            "native trust_mc TrustIr CHC/PDR bundle returned no proof transport for obligation `{expected_native_id}`"
-                        ));
+                        // insert(0) for the same reason as the sibling arm: the generic
+                        // missing-schema line is prepended by `unsupported_diagnostics`
+                        // and would otherwise mask this, the actual cause.
+                        evidence.diagnostics.insert(
+                            0,
+                            format!(
+                                "native trust_mc TrustIr CHC/PDR bundle returned no proof transport for obligation `{expected_native_id}`"
+                            ),
+                        );
                     }
                     if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
                         eprintln!(
@@ -1722,11 +1872,19 @@ impl TrustMcVerifierApiAdapter {
     }
 
     #[cfg(all(feature = "trust-mc-native-trust-ir-bundle", test))]
+    #[allow(clippy::type_complexity)] // one typed per-outcome channel per T3 delivery lane
     fn native_trust_ir_chc_pdr_proof_transports(
         &self,
         native_bundle: &trust_ir::NativeVerificationBundle,
         deadline: Option<Instant>,
-    ) -> Result<(Vec<NativeTrustIrChcPdrAuthorizedProof>, BTreeMap<String, String>), String> {
+    ) -> Result<
+        (
+            Vec<NativeTrustIrChcPdrAuthorizedProof>,
+            BTreeMap<String, String>,
+            BTreeMap<String, trust_mc_driver::NativeTrustIrChcPdrRefuted>,
+        ),
+        String,
+    > {
         self.native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
             native_bundle,
             None,
@@ -1735,12 +1893,20 @@ impl TrustMcVerifierApiAdapter {
     }
 
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    #[allow(clippy::type_complexity)] // one typed per-outcome channel per T3 delivery lane
     fn native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
         &self,
         native_bundle: &trust_ir::NativeVerificationBundle,
         source_generation_authority: Option<&trust_ir::SourceGenerationAuthority>,
         deadline: Option<Instant>,
-    ) -> Result<(Vec<NativeTrustIrChcPdrAuthorizedProof>, BTreeMap<String, String>), String> {
+    ) -> Result<
+        (
+            Vec<NativeTrustIrChcPdrAuthorizedProof>,
+            BTreeMap<String, String>,
+            BTreeMap<String, trust_mc_driver::NativeTrustIrChcPdrRefuted>,
+        ),
+        String,
+    > {
         validate_trust_mc_native_admission_contract(native_bundle)?;
         let runner = trust_mc_driver::NativeTrustIrChcPdrRunner::with_solve_options(
             trust_mc_core::ChcPdrSolveOptions::default()
@@ -1795,6 +1961,25 @@ impl TrustMcVerifierApiAdapter {
                 ));
             }
         }
+        // Witnessed refutations are their own typed channel: never proof
+        // evidence, never a bare not-proved reason. Identity overlap with the
+        // proved or not-proved sets is structural corruption (one request, one
+        // outcome), exactly like the duplicate checks above.
+        let mut refuted = BTreeMap::new();
+        for row in bundle_evidence.refuted {
+            let obligation_id = row.translated.obligation.obligation_id.clone();
+            let lookup_key = native_trust_mc_obligation_lookup_key(&obligation_id);
+            if proved_ids.contains(&lookup_key) || not_proved.contains_key(&lookup_key) {
+                return Err(format!(
+                    "native trust_mc bundle returned obligation `{obligation_id}` as refuted and as another outcome"
+                ));
+            }
+            if refuted.insert(lookup_key, row).is_some() {
+                return Err(format!(
+                    "native trust_mc bundle returned duplicate refuted rows for `{obligation_id}`"
+                ));
+            }
+        }
         Ok((
             bundle_evidence
                 .obligations
@@ -1802,6 +1987,7 @@ impl TrustMcVerifierApiAdapter {
                 .map(NativeTrustIrChcPdrAuthorizedProof::try_from_bundle_evidence)
                 .collect::<Result<Vec<_>, _>>()?,
             not_proved,
+            refuted,
         ))
     }
 
@@ -1820,6 +2006,164 @@ impl TrustMcVerifierApiAdapter {
                 .with_proof_certificate(self.config.produce_proofs),
         );
         runner.translate_obligations(native_bundle).map_err(native_typed_chc_pdr_error_reason)
+    }
+
+    /// Turn one witnessed native-bundle refutation into public evidence.
+    ///
+    /// REFUTATION SOUNDNESS GATE (native-bundle lane). The producer's witness
+    /// is DATA, not authority: before a `Failed` verdict may surface, this
+    /// consumer independently
+    /// 1. applies the producer-encoding admissibility gate on the public
+    ///    obligation (an attested over-approximate encoding cannot ground a
+    ///    refutation, exactly as on the direct lane);
+    /// 2. re-translates its OWN retained native bundle and requires the fresh
+    ///    translation to be free of fail-closed lowering diagnostics (a
+    ///    derivation through an unconditional error rule is an admission
+    ///    failure, not a program trap);
+    /// 3. recomputes the encoded-formula digest from that fresh translation
+    ///    (never trusting the producer-threaded translated obligation);
+    /// 4. runs the full witness binding validation
+    ///    ([`validate_bound_typed_chc_pdr_refutation_witness`]): obligation
+    ///    identity, route/cache-key binding, semantic-configuration digest,
+    ///    all-zero exact-encoding concreteness, recognized machine-check kind,
+    ///    and the materialized counterexample artifact.
+    ///
+    /// ANY failure demotes to the historical Unknown — never a proof, never a
+    /// bare producer-claimed failure.
+    ///
+    /// STATUS (recorded so it is not re-derived): this arm cannot reach
+    /// `EvidenceStatus::Failed` on production compiler output today, and step 1
+    /// is why. `TrustMcChcRefutationAdmissibility::for_obligation` answers
+    /// `Unattested` unless the row carries
+    /// `TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY`, and the compiler
+    /// stamps only the NEGATIVE `loop_elided_over_approximation` value (see the
+    /// key's own doc and `annotate_trust_mc_typed_chc_encoding_fidelity` in
+    /// `trust_verify.rs`, which additionally returns early for exactly the
+    /// obligations that route to the structural whole-CFG CHC this lane
+    /// consumes). `Unattested` is rejected, so every native-bundle refutation
+    /// demotes to Unknown.
+    ///
+    /// Closing that link is NOT a matter of relaxing this gate: the edge the
+    /// attestation stands for on this lane is MIR -> TrustIr, and trust-ir-bridge
+    /// lowers unsupported constructs to `Inst::Undef`, i.e. a fresh symbolic —
+    /// an over-approximation, which is sound for proofs and exactly what makes a
+    /// counterexample spurious. A positive attestation therefore requires a
+    /// per-obligation bridge-completeness premise that does not exist yet, and
+    /// minting one is a new refutation-authority grant that must be validated by
+    /// the full falsification gate before it can be believed.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_refuted_row_evidence(
+        &self,
+        bundle: &TrustContractBundle,
+        obligation: &TrustObligation,
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        row: &trust_mc_driver::NativeTrustIrChcPdrRefuted,
+        deadline: Option<Instant>,
+    ) -> ObligationEvidence {
+        let native_id = &row.translated.obligation.obligation_id;
+        let demote = |reason: String| {
+            let mut evidence = self.unsupported_evidence(bundle, obligation);
+            evidence.diagnostics.insert(
+                0,
+                format!(
+                    "native trust_mc TrustIr CHC/PDR transport refuted obligation `{native_id}` \
+                     but the refutation witness was not admitted: {reason}; refutation demoted \
+                     to unknown (counterexample evidence is not a proof)"
+                ),
+            );
+            evidence
+        };
+
+        let admissibility = TrustMcChcRefutationAdmissibility::for_obligation(obligation);
+        if let Some(reason) = admissibility.rejection_reason() {
+            return demote(reason);
+        }
+        let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
+            &row.verification.outcome.status
+        else {
+            return demote("refuted row carries no witness payload".to_string());
+        };
+
+        let fresh_rows =
+            match self.native_trust_ir_chc_pdr_translated_obligations(native_bundle, deadline) {
+                Ok(rows) => rows,
+                Err(reason) => {
+                    return demote(format!(
+                        "fresh consumer re-translation of the native bundle failed: {reason}"
+                    ));
+                }
+            };
+        let matching: Vec<_> = fresh_rows
+            .into_iter()
+            .filter(|fresh| &fresh.obligation.obligation_id == native_id)
+            .collect();
+        let [fresh_row] = matching.as_slice() else {
+            return demote(format!(
+                "fresh consumer re-translation yielded {} rows for `{native_id}`; expected \
+                 exactly one",
+                matching.len()
+            ));
+        };
+        if !fresh_row.diagnostics.is_empty() {
+            return demote(format!(
+                "fresh consumer re-translation recorded {} fail-closed lowering diagnostic(s); \
+                 a derivation may pass through an unconditional error rule",
+                fresh_row.diagnostics.len()
+            ));
+        }
+        let expected_normalized_input =
+            match trust_mc_driver::normalized_typed_chc_pdr_input(&fresh_row.obligation) {
+                Ok(expected) => expected,
+                Err(error) => {
+                    return demote(format!(
+                        "fresh consumer re-translation could not be normalized: {}",
+                        native_typed_chc_pdr_error_reason(error)
+                    ));
+                }
+            };
+
+        match validate_bound_typed_chc_pdr_refutation_witness(
+            bundle,
+            witness,
+            obligation,
+            &fresh_row.obligation,
+            &row.verification,
+            &expected_normalized_input,
+            chc_pdr_engine_from_config(self.config.proof_mode),
+        ) {
+            Ok(verification_summary) => {
+                let input_artifact = EvidenceArtifact {
+                    kind: EvidenceArtifactKind::EngineInput,
+                    uri: format!(
+                        "trust-verifier-api://bundle/{}/native-trust-ir/obligation/{}/typed-trust-mc-chc",
+                        bundle.bundle_id, obligation.obligation_id
+                    ),
+                    hash: ArtifactHash {
+                        algorithm: "sha256".to_string(),
+                        value: expected_normalized_input.normalized_input_hash.value.clone(),
+                    },
+                    materialization: None,
+                };
+                self.typed_chc_pdr_solver_outcome_evidence(
+                    bundle,
+                    obligation,
+                    EvidenceStatus::Failed,
+                    input_artifact,
+                    Vec::new(),
+                    non_proof_artifacts_from_trust_mc_core_verdict(&row.verification.verdict),
+                    format!(
+                        "native trust_mc TrustIr CHC/PDR transport refuted the encoded VC and \
+                         its refutation witness validated: obligation identity, \
+                         consumer-recomputed encoded-formula digest (fresh native-bundle \
+                         re-translation), consumer-recomputed semantic-configuration digest, \
+                         and the exact-encoding concreteness attestation (zero translation \
+                         drops / havocs / Undef-diagnostic havocs) all checked; counterexample \
+                         verification: {verification_summary}"
+                    ),
+                )
+            }
+            Err(reason) => demote(format!("witness failed validation ({reason})")),
+        }
     }
 
     fn evidence_from_chc_pdr_proof(
@@ -2502,6 +2846,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
                     input.input_artifact,
                     fallthrough_diagnostics,
                     solved,
+                    &normalized_input_source,
                     expected_normalized_input,
                     false,
                 );
@@ -2533,6 +2878,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         input_artifact: EvidenceArtifact,
         mut diagnostics: Vec<String>,
         solved: trust_mc_driver::TypedChcPdrFullVerification,
+        retained_obligation: &trust_mc_core::MirChcPdrObligation,
         expected_normalized_input: TrustMcNativeTypedChcPdrNormalizedInput,
         allow_exact_direct_authority: bool,
     ) -> ObligationEvidence {
@@ -2611,30 +2957,51 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
             // drops, zero havocs INCLUDING "sound" havoc — sound
             // over-approximation is sound for proofs but makes refutations
             // spurious — and zero Undef-diagnostic havocs), and accepts only
-            // recognized machine-checked counterexample verification kinds
-            // (ay-chc replay-verified trace / direct-SMT witness model). ALL
+            // a recognized independently replayable direct-SMT
+            // counterexample kind (acyclic or exact bounded-unroll). ALL
             // checks pass -> `Failed` with the counterexample surfaced; ANY
             // failure or an absent witness -> the historical `Unknown`
-            // demotion. Residual scope note: the witness's concreteness
-            // attestation covers the trust-mc encoding stage (the submitted
-            // ChcVc -> solver problem lowering, exact-or-reject with real
-            // accounting); the ChcVc-production stage stays fail-closed at its
-            // own producer boundary (unsupported shapes never emit a
-            // MIR-derived typed CHC input) and is bound here by the
-            // authenticated contract/binding validation that admitted the
-            // typed input.
+            // demotion.
+            //
+            // PRODUCER-STAGE GATE (added because the note that used to sit here
+            // was wrong). The witness's concreteness attestation covers only the
+            // trust-mc encoding stage (submitted ChcVc -> solver problem,
+            // exact-or-reject with real accounting). The old note then claimed
+            // "the ChcVc-production stage stays fail-closed at its own producer
+            // boundary (unsupported shapes never emit a MIR-derived typed CHC
+            // input)". That is FALSE for a body with a loop: the compiler emits
+            // a perfectly "supported" MIR-derived typed CHC for it, namely the
+            // flattened single-formula fallback with one nullary `error`
+            // relation and one constraint-only rule. That formula has no loop
+            // transition relation, so the loop-carried local occurs in it as a
+            // free variable with no defining constraint, and the direct-SMT
+            // acyclic route satisfies the query by simply CHOOSING a value the
+            // program can never produce. Every downstream check passed
+            // truthfully — trust-mc really did lower that ChcVc exactly — and a
+            // TRUE postcondition was published as
+            // `verified_counterexample = true`. So the producer stage is now
+            // gated here, on this side of the boundary, exactly where
+            // `ChcPdrEncodingConcreteness`'s SCOPE note says it belongs.
             trust_mc_core::ChcPdrSolveStatus::Refuted { witness } => {
-                let witness_validation = match witness.as_deref() {
-                    None => Err(None),
-                    Some(witness) => validate_bound_typed_chc_pdr_refutation_witness(
-                        bundle,
-                        witness,
-                        obligation,
-                        &solved,
-                        &expected_normalized_input,
-                        chc_pdr_engine_from_config(self.config.proof_mode),
-                    )
-                    .map_err(Some),
+                let admissibility = TrustMcChcRefutationAdmissibility::for_obligation(obligation);
+                let witness_validation = match admissibility.rejection_reason() {
+                    // Checked BEFORE the witness: a witness that validates
+                    // perfectly still certifies nothing about a stage it does
+                    // not cover, and the diagnostic must say which stage failed.
+                    Some(reason) => Err(TypedChcRefutationRejection::ProducerEncoding(reason)),
+                    None => match witness.as_deref() {
+                        None => Err(TypedChcRefutationRejection::NoWitness),
+                        Some(witness) => validate_bound_typed_chc_pdr_refutation_witness(
+                            bundle,
+                            witness,
+                            obligation,
+                            retained_obligation,
+                            &solved,
+                            &expected_normalized_input,
+                            chc_pdr_engine_from_config(self.config.proof_mode),
+                        )
+                        .map_err(TypedChcRefutationRejection::WitnessRejected),
+                    },
                 };
                 match witness_validation {
                     Ok(verification_summary) => self.typed_chc_pdr_solver_outcome_evidence(
@@ -2650,9 +3017,12 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
                     ),
                     Err(witness_rejection) => {
                         let summary = match witness_rejection {
-                            None => "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: the solver returns no witness model and the encoding's concreteness (havoc-freedom) cannot be certified, so the refutation may reflect over-approximated (havoc'd) semantics rather than a reachable program failure; counterexample evidence is not a proof".to_string(),
-                            Some(reason) => format!(
+                            TypedChcRefutationRejection::NoWitness => "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: the solver returns no witness model and the encoding's concreteness (havoc-freedom) cannot be certified, so the refutation may reflect over-approximated (havoc'd) semantics rather than a reachable program failure; counterexample evidence is not a proof".to_string(),
+                            TypedChcRefutationRejection::WitnessRejected(reason) => format!(
                                 "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: a refutation witness was attached but failed validation ({reason}), so the refutation may reflect over-approximated (havoc'd) semantics or a detached/forged certificate rather than a reachable program failure; counterexample evidence is not a proof"
+                            ),
+                            TypedChcRefutationRejection::ProducerEncoding(reason) => format!(
+                                "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: {reason}. A refutation of an over-approximating encoding is a refutation of the ENCODING, not of the program — a satisfying model may assign a value the program can never produce — so it is not evidence even when its conclusion happens to be true. The obligation is UNPROVED, not disproved: this row reports a capability gap in the CHC construction (no loop transition relation is emitted), not a defect in the code"
                             ),
                         };
                         self.typed_chc_pdr_solver_outcome_evidence(
@@ -4694,6 +5064,48 @@ fn typed_chc_pdr_full_verification_diagnostics(
             outcome.stats.relation_count,
             outcome.stats.clause_count
         )),
+        // KNOWN FALSE-REFUTATION SEAM, measured 2026-08-06 and deliberately NOT
+        // patched here — the obvious patch is wrong, see below.
+        //
+        // A `Refuted` on this lane is credited as a public counterexample
+        // (`verified_counterexample = true`) without anything accounting for how
+        // the submitted `ChcVc` was PRODUCED. trust-mc's own attestation is
+        // truthful but explicitly scoped: `ChcPdrEncodingConcreteness` says it
+        // "cannot and does not attest how the submitted `ChcVc` itself was
+        // produced ... that stage belongs to the producer of the obligation, and
+        // consumers must account for it on their own side of the boundary."
+        // Nothing does.
+        //
+        // For a function with a loop the producer emits the FLATTENED
+        // single-formula CHC (`relations=1, clauses=1`, one nullary `error`
+        // relation): no init, no transition, so the loop-carried local is a free
+        // variable with no defining constraint. Measured, `ensures(*ret >= 0)`
+        // over `{ let mut i=0; while i<n { i=i+1; } i }` — TRUE — and the same
+        // body with `ensures(*ret >= 5)` — FALSE — produce byte-identical
+        // queries but for the comparand, and BOTH are refuted. A verdict that is
+        // the same whether the code is right or wrong is not evidence; the
+        // 2026-07-13 seed reported UNKNOWN here.
+        //
+        // WHY THE FUNCTION-SCOPED FIX IS WRONG. Disclosing "this function has a
+        // back edge" and demoting every `Refuted` on it was implemented, reviewed
+        // and REVERTED: the defect is PATH-scoped, not function-scoped. A
+        // realizable counterexample that never reads a loop-carried value gets
+        // demoted too — `fn f(n: i32) -> i32 { let mut i=0; while i<3 { i=i+1; } n }`
+        // with `ensures(*ret >= 5)` is genuinely defective at `n = 0` and would
+        // stop reporting — and it takes >=16 `tests/trust-falsification/mutant/`
+        // fixtures' only counterexample with it, flipping that gate GREEN -> RED.
+        // It also stamps `ArithmeticSafety`/`BoundsCheck`/`Precondition` rows,
+        // not just postconditions.
+        //
+        // The correct condition is per-OBLIGATION and reads the formula, not the
+        // CFG: disclose only when this obligation's own formula carries a free
+        // variable that is neither a function input nor defined by an equality
+        // within the formula — i.e. an elided definition. That is decidable at
+        // the producer (which knows the parameters) and preserves every exact
+        // acyclic refutation, which is this lane's entire bug-detection value.
+        // Note it cannot be done consumer-side: `vars` on the wire is
+        // `{name, sort}` and every `TrustSpecVariable.origin` is `Inferred`, so
+        // trust-bmc cannot tell a free input from a dropped-definition local.
         trust_mc_core::ChcPdrSolveStatus::Refuted { .. } => diagnostics.push(format!(
             "native trust_mc typed CHC/PDR full-verification runner refuted obligation {}; refusing to emit proof evidence",
             outcome.obligation_id
@@ -4752,6 +5164,22 @@ fn trust_mc_counterexample_from_solver_outcome(
     }
 }
 
+/// Why one typed CHC/PDR `Refuted` verdict is not admissible as a public
+/// counterexample. Every variant demotes the row to `Unknown`; they exist so the
+/// diagnostic names WHICH stage failed, since the three are fixed by completely
+/// different work.
+#[cfg(feature = "trust-mc-native-solver")]
+enum TypedChcRefutationRejection {
+    /// The producer attests the submitted `ChcVc` does not faithfully encode
+    /// the body. Nothing downstream can repair this; the CHC construction must
+    /// emit the missing structure.
+    ProducerEncoding(String),
+    /// The solver returned no refutation witness at all.
+    NoWitness,
+    /// A witness was attached and failed consumer revalidation.
+    WitnessRejected(String),
+}
+
 /// Validate a typed CHC/PDR refutation witness against consumer-recomputed
 /// facts (refutation soundness gate, see the `Refuted` arm of
 /// `evidence_from_typed_chc_pdr_full_verification`).
@@ -4774,6 +5202,7 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
     bundle: &TrustContractBundle,
     witness: &trust_mc_core::ChcPdrRefutationWitness,
     obligation: &TrustObligation,
+    retained_obligation: &trust_mc_core::MirChcPdrObligation,
     solved: &trust_mc_driver::TypedChcPdrFullVerification,
     expected_normalized_input: &TrustMcNativeTypedChcPdrNormalizedInput,
     expected_engine: trust_mc_core::ChcPdrEngine,
@@ -4876,12 +5305,47 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
                 );
             }
         }
+        trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k } => {
+            // The declared budget must match the materialized payload, and a
+            // concrete model must be present — the payload is the witness, not
+            // a detachable flag.
+            if counterexample.get("source").and_then(serde_json::Value::as_str)
+                != Some("direct-smt-bounded-unroll-error-derivation")
+                || counterexample.get("witness_model").is_none_or(serde_json::Value::is_null)
+                || counterexample.get("unroll_k").and_then(serde_json::Value::as_u64) != Some(*k)
+                || *k == 0
+            {
+                return Err(
+                    "bounded-unroll direct-SMT witness has a missing or mismatched model payload"
+                        .to_string(),
+                );
+            }
+        }
         other => {
             return Err(format!(
                 "unrecognized counterexample verification kind {other:?}; failing closed"
             ));
         }
     }
+    // The classification and digest checks above bind the transport, but do
+    // not prove that the serialized model follows a reachable derivation. Ask
+    // a fresh consumer to validate/lower the retained request, rebuild the
+    // direct or exact-k-unrolled CHC problem, reconstruct the supplied clause
+    // path, and SMT-check the total sort-exact assignment. Producer-only AY
+    // debug traces and every future class fail closed until they expose an
+    // equivalent independent replay surface.
+    let fresh_replay_summary =
+        trust_mc_driver::independently_replay_typed_chc_pdr_refutation_witness(
+            retained_obligation,
+            expected_engine,
+            witness,
+        )
+        .map_err(|error| {
+            format!(
+                "counterexample failed fresh independent trace/model replay: {}",
+                native_typed_chc_pdr_error_reason(error)
+            )
+        })?;
 
     // The full-verification verdict must carry exactly the materialized
     // counterexample bytes bound above. A digest-valid witness detached from
@@ -4909,7 +5373,42 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
             .to_string());
     }
 
-    Ok(verification_summary)
+    // Trust (#51): the INDEPENDENT REPLAY BINDING. This check and the
+    // `retained_obligation` parameter arrived together in 6958cc67a5 ("require
+    // fresh replay for CHC refutations"), whose merge — its message still carries
+    // the `# Conflicts:` marker — dropped the code BETWEEN them: the parameter was
+    // left entirely unused and this summary undefined, so `main` did not compile.
+    //
+    // Restored as the binding the doc above states and the dropped code plainly
+    // intended. The caller performs the fresh replay (it re-translates the native
+    // bundle and derives `expected_normalized_input` from its own fresh row); what
+    // was missing here is the check that the retained obligation is the one that
+    // expectation actually came from. Without it the parameter is decorative and a
+    // caller could pass an `expected_normalized_input` derived from a DIFFERENT
+    // obligation than the one it claims to have retained.
+    //
+    // Nothing producer-supplied is consulted: both sides are recomputed consumer-side.
+    let independent = trust_mc_driver::normalized_typed_chc_pdr_input(retained_obligation)
+        .map_err(|error| {
+            format!(
+                "retained obligation does not re-normalize consumer-side: {}",
+                native_typed_chc_pdr_error_reason(error)
+            )
+        })?;
+    if independent.normalized_input_hash != expected_normalized_input.normalized_input_hash {
+        return Err("independent re-normalization of the retained obligation disagrees with the \
+             expected normalized input"
+            .to_string());
+    }
+    if independent.obligation_set_hash != expected_normalized_input.obligation_set_hash {
+        return Err("independent re-normalization of the retained obligation disagrees with the \
+             expected obligation set"
+            .to_string());
+    }
+    let retained_binding_summary = "independent consumer re-normalization of the retained obligation agrees with the \
+         expected normalized input and obligation set";
+
+    Ok(format!("{verification_summary}; {fresh_replay_summary}; {retained_binding_summary}"))
 }
 
 /// Validate the witness fields that bind a refutation to consumer-recomputed
@@ -4979,6 +5478,19 @@ fn validate_typed_chc_pdr_refutation_witness(
         }
         trust_mc_core::ChcPdrCexVerification::DirectSmtModel => {
             Ok("direct-SMT acyclic error-derivation witness model".to_string())
+        }
+        // REFUTATION-ONLY provenance: the k-bounded unroll under-approximates
+        // (every unrolled clause is one original clause with predicates
+        // renamed per level, so the found derivation projects onto the
+        // original problem — the witness is real; the truncated prefix proves
+        // nothing). This kind is recognized ONLY here, on the Refuted path;
+        // no proof-credit gate consults counterexample verification kinds, so
+        // it can never mint proof authority.
+        trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k } => {
+            if *k == 0 {
+                return Err("bounded-unroll witness declares a zero back-edge budget".to_string());
+            }
+            Ok(format!("direct-SMT bounded-unroll (k={k}) error-derivation witness model"))
         }
         other => {
             Err(format!("unrecognized counterexample verification kind {other:?}; failing closed"))
@@ -8004,6 +8516,17 @@ mod tests {
         ]);
     }
 
+    /// Test-only positive source-fidelity premise. Production compiler output
+    /// deliberately cannot call this helper and currently emits no `exact`
+    /// attestation; these synthetic rows isolate the downstream witness gate.
+    #[cfg(feature = "trust-mc-native-solver")]
+    fn attest_synthetic_typed_chc_encoding_exact(obligation: &mut TrustObligation) {
+        obligation.metadata.push(MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
+            value: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT.to_string(),
+        });
+    }
+
     fn add_typed_body_aware_vc_formula(obligation: &mut TrustObligation) {
         add_typed_body_aware_vc_formula_value(obligation, false);
     }
@@ -8057,7 +8580,7 @@ mod tests {
     fn add_result_referencing_vc_formula(obligation: &mut TrustObligation) {
         use trust_verifier_api::TrustSpecBinaryOp as Op;
         let eq = |lhs, rhs| trust_verifier_api::TrustSpecExpr::binary(Op::Eq, lhs, rhs);
-        let mut predicate = trust_verifier_api::TrustSpecPredicate::new(
+        let predicate = trust_verifier_api::TrustSpecPredicate::new(
             trust_verifier_api::TrustSpecExpr::binary(
                 Op::And,
                 eq(spec_var("_0"), spec_var("x")),
@@ -8080,7 +8603,7 @@ mod tests {
     /// payload probe established).
     fn add_result_free_vc_formula(obligation: &mut TrustObligation) {
         use trust_verifier_api::TrustSpecBinaryOp as Op;
-        let mut predicate = trust_verifier_api::TrustSpecPredicate::new(
+        let predicate = trust_verifier_api::TrustSpecPredicate::new(
             trust_verifier_api::TrustSpecExpr::binary(
                 Op::And,
                 trust_verifier_api::TrustSpecExpr::binary(Op::Eq, spec_var("_0"), spec_var("x")),
@@ -9015,6 +9538,198 @@ mod tests {
                         NativeReplayAtom::assertion(
                             NativeReplayAtomId::new(1),
                             ProofFormula::smtlib2("tmir_native_checked_branch_safe", "Bool"),
+                        )
+                        .with_obligation(ProofId::new(0))
+                        .with_assertion_id(NativeAssertionId::new(0))
+                        .with_span(source_span),
+                    ),
+            ),
+        }));
+        bundle
+    }
+
+    // Trust (bounded-unroll refutation lane): the compiler-style bundle whose
+    // requested function is the u8 shift-reduction LOOP mirror
+    // (`t += (x << 4)` over 64 iterations, loop state threaded as explicit
+    // block arguments) — a genuinely input-dependent overflow that no proof
+    // lane can prove and only the k-bounded-unroll escalation can refute with
+    // a machine-checked witness. Producer delivery lands on
+    // `NativeTrustIrChcPdrBundleEvidence::refuted`.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn compiler_style_loop_overflow_tmir_bundle() -> trust_ir::NativeVerificationBundle {
+        use trust_ir::inst::{BinOp, ICmpOp};
+        use trust_ir::ty::Ty;
+        use trust_ir::{
+            NativeAdapterInput, NativeAssertionId, NativeBundleProducer, NativeCompilerFactRef,
+            NativeCompilerFacts, NativeMonomorphizationFact, NativeMonomorphizationId,
+            NativeObligationCause, NativeObligationSource, NativeReplayAtom, NativeReplayAtomId,
+            NativeReplayContext, NativeRequestId, NativeRequestProvenance, NativeToolIdentity,
+            NativeVerificationBundle, NativeVerificationRequest, ObligationKind, ProofDigest,
+            ProofFormula, ProofId, ProofLineageId, ProofLineageManifest, ProofLineageNode,
+            ProofObligation, ProofReplayIdentity, ProofStatus, ProofTransform, ProofTransformStage,
+            TrustMcNativeRequest, TrustMcVerificationMode,
+        };
+        use trust_ir_build::ModuleBuilder;
+
+        let source_digest = ProofDigest::sha256([0x61; 32]);
+
+        let mut mb = ModuleBuilder::new("native_trust_ir_chc_loop_overflow_bundle");
+        let ft = mb.add_func_type(vec![Ty::U8], vec![Ty::U8]);
+        {
+            let mut fb = mb.function("tmir_native_loop_accumulator", ft);
+            let entry = fb.create_block();
+            let header = fb.create_block();
+            let body = fb.create_block();
+            let exit = fb.create_block();
+
+            fb.switch_to_block(entry);
+            fb.set_entry(entry);
+            let x = fb.add_block_param(entry, Ty::U8);
+            let four = fb.iconst(Ty::U8, 4);
+            let addend = fb.binop(BinOp::Shl, Ty::U8, x, four);
+            let zero_i = fb.iconst(Ty::U64, 0);
+            let zero_t = fb.iconst(Ty::U8, 0);
+            fb.br(header, vec![zero_i, zero_t]);
+
+            // Loop state travels as explicit block arguments (the shape the
+            // CHC translator threads exactly, keeping the encoding grounded).
+            let i = fb.add_block_param(header, Ty::U64);
+            let t = fb.add_block_param(header, Ty::U8);
+            fb.switch_to_block(header);
+            let bound = fb.iconst(Ty::U64, 64);
+            let in_loop = fb.icmp(ICmpOp::Ult, Ty::U64, i, bound);
+            fb.condbr(in_loop, body, vec![i, t], exit, vec![t]);
+
+            let i_body = fb.add_block_param(body, Ty::U64);
+            let t_body = fb.add_block_param(body, Ty::U8);
+            fb.switch_to_block(body);
+            let t_next = fb.add(Ty::U8, t_body, addend);
+            let one = fb.iconst(Ty::U64, 1);
+            let i_next = fb.add(Ty::U64, i_body, one);
+            fb.br(header, vec![i_next, t_next]);
+
+            let t_exit = fb.add_block_param(exit, Ty::U8);
+            fb.switch_to_block(exit);
+            fb.ret(vec![t_exit]);
+            fb.build();
+        }
+
+        let mut module = mb.build();
+        module.target_info = Some(compiler_style_proof_grade_target());
+        let trust_mc_function = module
+            .functions
+            .iter()
+            .find(|func| func.name == "tmir_native_loop_accumulator")
+            .expect("fixture includes requested trust_mc function")
+            .id;
+        module.proof_obligations.push(
+            ProofObligation::new(
+                ProofId::new(0),
+                ObligationKind::PanicFreedom,
+                ProofStatus::Pending,
+                "native TrustIr loop-carried accumulator add does not overflow",
+            )
+            .with_formula(ProofFormula::smtlib2("tmir_native_loop_accumulator_safe", "Bool")),
+        );
+        let tmir_module_digest = module.stable_digest();
+
+        let mut lineage_node = ProofLineageNode::new(
+            ProofLineageId::new(0),
+            ProofTransform::new(
+                ProofTransformStage::Frontend,
+                "rustc-mir-to-trust_ir",
+                "Trust",
+                "native-request-schema-v1",
+            ),
+            source_digest,
+            tmir_module_digest,
+        );
+        lineage_node.obligations.push(ProofId::new(0));
+
+        let lineage = ProofLineageManifest {
+            schema_version: ProofLineageManifest::SCHEMA_VERSION,
+            nodes: vec![lineage_node],
+            roots: vec![ProofLineageId::new(0)],
+        };
+
+        let mut bundle = NativeVerificationBundle::new(
+            NativeBundleProducer::TRust,
+            NativeAdapterInput::RustMir { body_digest: source_digest },
+            tmir_module_digest,
+            module,
+            lineage,
+        );
+        let source_span = trust_ir::SourceSpan { file: 0, line: 18, col: 13 };
+        bundle.compiler_facts = NativeCompilerFacts {
+            monomorphizations: vec![NativeMonomorphizationFact {
+                id: NativeMonomorphizationId::new(0),
+                source_item:
+                    "native_trust_ir_chc_loop_overflow_bundle::tmir_native_loop_accumulator"
+                        .to_owned(),
+                symbol: "_RNvNtC6native28tmir_native_loop_accumulator".to_owned(),
+                generic_args: Vec::new(),
+                function: Some(trust_mc_function),
+                stable_digest: ProofDigest::sha256([0x63; 32]),
+            }],
+            obligation_sources: vec![NativeObligationSource {
+                obligation: ProofId::new(0),
+                public_obligation_id: "vc:trust-bmc:loop-overflow:0".to_string(),
+                function: Some(trust_mc_function),
+                span: Some(source_span),
+                assertion_id: Some(NativeAssertionId::new(0)),
+                cause: NativeObligationCause::OverflowCheck,
+                monomorphization: Some(NativeMonomorphizationId::new(0)),
+                facts: vec![NativeCompilerFactRef::Monomorphization(
+                    NativeMonomorphizationId::new(0),
+                )],
+            }],
+            ..NativeCompilerFacts::default()
+        };
+        bundle.requests.push(NativeVerificationRequest::TrustMc(TrustMcNativeRequest {
+            id: NativeRequestId::new(7),
+            mode: TrustMcVerificationMode::Chc,
+            function: trust_mc_function,
+            obligations: vec![ProofId::new(0)],
+            lineage_roots: vec![ProofLineageId::new(0)],
+            options: {
+                let mut options = trust_ir::TrustMcRequestOptions::default();
+                options.chc.emit_horn_clauses = true;
+                options
+            },
+            diagnostics: Default::default(),
+            provenance: NativeRequestProvenance::trust_mc(
+                NativeToolIdentity::new("trust-mc")
+                    .with_version(TRUST_TRUST_MC_NATIVE_ADMISSION_CONTRACT_VERSION)
+                    .with_revision("native-request-schema-v1"),
+            )
+            .with_solver(NativeToolIdentity::new("ay-chc").with_version("native-v1"))
+            .with_replay(
+                ProofReplayIdentity::new(
+                    "trust-mc",
+                    format!(
+                        "trust-mc native typed CHC/PDR test replay --trust-native-admission-contract {}",
+                        TRUST_TRUST_MC_NATIVE_ADMISSION_CONTRACT_VERSION
+                    ),
+                )
+                .with_transcript_digest(ProofDigest::sha256([0x64; 32])),
+            )
+            .with_replay_context(
+                NativeReplayContext::default()
+                    .with_atom(
+                        NativeReplayAtom::assumption(
+                            NativeReplayAtomId::new(0),
+                            ProofFormula::smtlib2(
+                                "tmir_native_loop_accumulator_guard",
+                                "Bool",
+                            ),
+                        )
+                        .with_obligation(ProofId::new(0))
+                        .with_span(source_span),
+                    )
+                    .with_atom(
+                        NativeReplayAtom::assertion(
+                            NativeReplayAtomId::new(1),
+                            ProofFormula::smtlib2("tmir_native_loop_accumulator_safe", "Bool"),
                         )
                         .with_obligation(ProofId::new(0))
                         .with_assertion_id(NativeAssertionId::new(0))
@@ -11246,6 +11961,8 @@ mod tests {
             &obligation_id,
             "contract-typed",
         )]);
+        #[cfg(feature = "trust-mc-native-solver")]
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         push_typed_chc_contract(
             &mut bundle,
             typed_chc_contract("contract-typed", &obligation_id, true),
@@ -11320,6 +12037,8 @@ mod tests {
             &obligation_id,
             "contract-typed",
         )]);
+        #[cfg(feature = "trust-mc-native-solver")]
+        attest_synthetic_typed_chc_encoding_exact(&mut unforged_bundle.obligations[0]);
         push_typed_chc_contract(
             &mut unforged_bundle,
             typed_chc_contract("contract-typed", &obligation_id, true),
@@ -11344,6 +12063,7 @@ mod tests {
             &obligation_id,
             "contract-typed",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         push_typed_chc_contract(
             &mut bundle,
             typed_chc_contract("contract-typed", &obligation_id, true),
@@ -11438,6 +12158,7 @@ mod tests {
             &obligation_id,
             "contract-typed",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         push_typed_chc_contract(
             &mut bundle,
             typed_chc_contract("contract-typed", &obligation_id, true),
@@ -11459,7 +12180,8 @@ mod tests {
                 .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
                 .with_timeout(std::time::Duration::from_secs(10)),
         );
-        let solved = runner.solve_full_verification(request).expect("reachable error should solve");
+        let solved =
+            runner.solve_full_verification(request.clone()).expect("reachable error should solve");
         assert!(
             matches!(
                 &solved.outcome.status,
@@ -11476,6 +12198,7 @@ mod tests {
             input.input_artifact.clone(),
             Vec::new(),
             solved.clone(),
+            &request,
             expected.clone(),
             false,
         );
@@ -11499,6 +12222,7 @@ mod tests {
             input.input_artifact.clone(),
             Vec::new(),
             solved.clone(),
+            &request,
             detached,
             false,
         );
@@ -11520,6 +12244,7 @@ mod tests {
             input.input_artifact.clone(),
             Vec::new(),
             solved,
+            &request,
             expected,
             false,
         );
@@ -11531,6 +12256,159 @@ mod tests {
         }));
     }
 
+    /// Gate-arm adversarial replay: start from one REAL production witness
+    /// that reaches `Failed`, then mutate each authority-bearing component.
+    /// The public verdict must stay `Unknown` unless fresh lowering plus exact
+    /// trace/model replay and artifact binding all succeed.
+    #[test]
+    #[cfg(feature = "trust-mc-native-solver")]
+    fn typed_chc_full_verification_requires_fresh_replay_for_every_failed_verdict() {
+        let obligation_id = native_typed_chc_obligation_id(54, 50);
+        let mut bundle = bundle_with(vec![obligation_with_contract(
+            ObligationKind::ArithmeticSafety,
+            &obligation_id,
+            "contract-typed-fresh-replay",
+        )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
+        push_typed_chc_contract(
+            &mut bundle,
+            typed_chc_contract("contract-typed-fresh-replay", &obligation_id, true),
+        );
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3),
+        );
+        let input = adapter
+            .typed_chc_pdr_obligation_for(&bundle, &bundle.obligations[0])
+            .expect("typed input validates")
+            .expect("fixture has typed input");
+        let request = input.trust_mc_obligation.clone();
+        let expected = trust_mc_driver::normalized_typed_chc_pdr_input(&request)
+            .expect("retained request normalizes");
+        let runner = trust_mc_driver::NativeTypedChcPdrRunner::with_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
+                .with_timeout(std::time::Duration::from_secs(10)),
+        );
+        let solved =
+            runner.solve_full_verification(request.clone()).expect("reachable fixture solves");
+
+        let evidence_for = |candidate: trust_mc_driver::TypedChcPdrFullVerification| {
+            adapter.evidence_from_typed_chc_pdr_full_verification(
+                &bundle,
+                &bundle.obligations[0],
+                input.input_artifact.clone(),
+                Vec::new(),
+                candidate,
+                &request,
+                expected.clone(),
+                false,
+            )
+        };
+        let assert_unknown =
+            |label: &str, candidate: trust_mc_driver::TypedChcPdrFullVerification| {
+                let evidence = evidence_for(candidate);
+                assert_eq!(
+                    evidence.status,
+                    EvidenceStatus::Unknown,
+                    "{label} mutation must fail closed: {:#?}",
+                    evidence.diagnostics
+                );
+                assert!(
+                    evidence.counterexample.is_none(),
+                    "{label} mutation must not surface a public counterexample"
+                );
+                assert!(evidence.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.contains("refutation demoted to unknown")
+                        && diagnostic.contains("failed validation")
+                }));
+            };
+
+        let baseline = evidence_for(solved.clone());
+        assert_eq!(baseline.status, EvidenceStatus::Failed);
+        assert!(baseline.counterexample.is_some());
+        assert!(baseline.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("fresh direct-SMT acyclic derivation and exact model replay")
+        }));
+
+        let mutate_witness =
+            |candidate: &mut trust_mc_driver::TypedChcPdrFullVerification,
+             mutate: &dyn Fn(&mut trust_mc_core::ChcPdrRefutationWitness)| {
+                let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
+                    &mut candidate.outcome.status
+                else {
+                    panic!("fixture carries a witness");
+                };
+                mutate(witness);
+            };
+
+        // A model-domain mutation is deterministic: exact replay requires a
+        // total assignment with no extra bindings.
+        let mut mutated = solved.clone();
+        mutate_witness(&mut mutated, &|witness| {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&witness.counterexample_json).expect("payload JSON");
+            payload["witness_model"].as_object_mut().expect("model object").insert(
+                "forged_extra_binding".to_string(),
+                serde_json::json!({ "kind": "bool", "value": true }),
+            );
+            witness.counterexample_json = payload.to_string();
+        });
+        assert_unknown("model", mutated);
+
+        let mut mutated = solved.clone();
+        mutate_witness(&mut mutated, &|witness| {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&witness.counterexample_json).expect("payload JSON");
+            let trace = payload["derivation_clause_indices"].as_array_mut().expect("trace array");
+            let repeated = trace.first().expect("nonempty trace").clone();
+            trace.push(repeated);
+            witness.counterexample_json = payload.to_string();
+        });
+        assert_unknown("transition trace", mutated);
+
+        let mut mutated = solved.clone();
+        mutate_witness(&mut mutated, &|witness| {
+            witness.verification =
+                trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k: 4 };
+        });
+        assert_unknown("proof class", mutated);
+
+        let mut mutated = solved.clone();
+        mutate_witness(&mut mutated, &|witness| {
+            witness.verification =
+                trust_mc_core::ChcPdrCexVerification::BoundedUnrollDirectSmtModel { k: 2 };
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&witness.counterexample_json).expect("payload JSON");
+            payload["source"] = serde_json::json!("direct-smt-bounded-unroll-error-derivation");
+            payload["unroll_k"] = serde_json::json!(2);
+            witness.counterexample_json = payload.to_string();
+        });
+        assert_unknown("unroll budget", mutated);
+
+        let mut mutated = solved.clone();
+        mutate_witness(&mut mutated, &|witness| {
+            witness.encoded_formula_sha256 =
+                trust_mc_core::EvidenceHash::sha256_bytes(b"detached formula").value;
+        });
+        assert_unknown("formula digest", mutated);
+
+        // Keep the witness untouched but detach the materialized artifact. A
+        // replay-valid model is still not authority unless the public Failed
+        // artifact contains those exact bytes.
+        let mut mutated = solved;
+        let trust_mc_core::FullVerificationVerdict::Failed { counterexample_artifacts } =
+            &mut mutated.verdict
+        else {
+            panic!("fixture carries a Failed verdict");
+        };
+        counterexample_artifacts[0] = trust_mc_core::FullVerificationArtifact::from_bytes(
+            trust_mc_core::FullVerificationArtifactKind::CounterexampleTrace,
+            "trust_mc://detached/counterexample.json",
+            br#"{"detached":true}"#,
+        );
+        assert_unknown("materialized artifact", mutated);
+    }
+
     /// A compiler-native row has a stable public VC id and a distinct
     /// request-local TrustIR/TrustMC id. Both are authenticated by the binding
     /// record, but the native solver (and therefore its witness) correctly
@@ -11540,8 +12418,12 @@ mod tests {
     #[cfg(feature = "trust-mc-native-solver")]
     fn compiler_native_refutation_accepts_only_authenticated_split_identity() {
         let public_id = "vc:trust-bmc:compiler-native-refutation:0";
-        let (bundle, _canonical_id, _marker_id, native_id) =
+        let (mut bundle, _canonical_id, _marker_id, native_id) =
             compiler_canonical_trust_mc_bundle_with_error_derivation(public_id, 53, 49, true);
+        // The production compiler does not yet make this claim. This synthetic
+        // premise isolates the split public/native identity check exercised by
+        // the test from the independent source-fidelity gate.
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         bundle.validate().expect("compiler-native refutation fixture must validate");
         assert!(trust_mc_obligation_identity_matches(&bundle.obligations[0], &native_id));
         assert!(!trust_mc_obligation_identity_matches(
@@ -12627,6 +13509,7 @@ mod tests {
             &obligation_id,
             "contract-spec",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let mut contract = typed_chc_contract("contract-spec", &obligation_id, false);
         if let ContractPredicate::MathIr { value, .. } = &mut contract.predicate {
             apply_compiler_spec_satisfiable_constraint_shape(value);
@@ -12660,6 +13543,211 @@ mod tests {
         }));
     }
 
+    /// Build the exact bundle of the test above, optionally stamping one
+    /// producer encoding-fidelity attestation on the public obligation.
+    ///
+    /// The CHC is byte-identical in both arms — same flattened single-formula
+    /// shape, same satisfiable constraint, same validated direct-SMT witness —
+    /// so the ONLY difference between the two verdicts is the producer's
+    /// statement about whether that ChcVc faithfully encodes its body.
+    #[cfg(feature = "trust-mc-native-solver")]
+    fn compiler_spec_refutation_evidence_with_fidelity(
+        native_request_id: u32,
+        native_proof_id: u32,
+        encoding_fidelity: Option<&str>,
+    ) -> ObligationEvidence {
+        let obligation_id = native_typed_chc_obligation_id(native_request_id, native_proof_id);
+        let mut obligation = obligation_with_contract(
+            ObligationKind::ArithmeticSafety,
+            &obligation_id,
+            "contract-spec",
+        );
+        if let Some(class) = encoding_fidelity {
+            obligation.metadata.push(MetadataEntry {
+                key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
+                value: class.to_string(),
+            });
+        }
+        let mut bundle = bundle_with(vec![obligation]);
+        let mut contract = typed_chc_contract("contract-spec", &obligation_id, false);
+        if let ContractPredicate::MathIr { value, .. } = &mut contract.predicate {
+            apply_compiler_spec_satisfiable_constraint_shape(value);
+        }
+        refresh_typed_chc_binding_metadata(&mut contract, &obligation_id, &obligation_id);
+        push_typed_chc_contract(&mut bundle, contract);
+
+        TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3),
+        )
+        .verify(&bundle, &bundle.obligations)
+        .remove(0)
+    }
+
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn producer_attested_loop_elided_encoding_demotes_refutation_to_unknown() {
+        // The regression this closes: a TRUE postcondition on
+        // `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i = i + 1; } i }`
+        // (no `requires`) was published as `verified_counterexample = true`.
+        // The compiler had fallen back to the flattened single-formula typed
+        // CHC, which carries NO loop transition relation, so the loop-carried
+        // `i` was a free variable and the direct-SMT route "refuted" the query
+        // by choosing i = -1 — a value the program cannot produce. Every
+        // downstream check passed truthfully; the gap was the ChcVc-PRODUCTION
+        // stage, which nothing on this side of the boundary accounted for.
+        let gated = compiler_spec_refutation_evidence_with_fidelity(
+            41,
+            37,
+            Some(TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED),
+        );
+
+        // FAILED -> Unknown is the ONLY movement this gate may cause. It must
+        // never manufacture a proof out of an encoding it just called unfaithful.
+        assert_eq!(gated.status, EvidenceStatus::Unknown);
+        assert_ne!(gated.status, EvidenceStatus::Proved);
+        assert_eq!(gated.proof_strength, None);
+        // A demoted row publishes no counterexample: the whole point is that the
+        // solver's model is not evidence about the program.
+        assert!(
+            gated.counterexample.is_none(),
+            "a refutation of an over-approximating encoding must not surface a public counterexample"
+        );
+        assert!(
+            gated.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("refutation demoted to unknown")
+                    && diagnostic.contains("loop-elided over-approximation")
+            }),
+            "the demotion must name the producer stage that failed; diagnostics: {:#?}",
+            gated.diagnostics
+        );
+        // The gate must not be able to hide a real bug as "code is fine".
+        assert!(
+            gated
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("UNPROVED, not disproved")),
+            "the demotion must report a capability gap, not innocence; diagnostics: {:#?}",
+            gated.diagnostics
+        );
+
+        // ABSENCE is not positive fidelity. The exact same encoded request
+        // therefore remains Unknown until the producer proves and stamps the
+        // complete source-to-ChcVc edge.
+        let unattested = compiler_spec_refutation_evidence_with_fidelity(42, 38, None);
+        assert_eq!(unattested.status, EvidenceStatus::Unknown);
+        assert!(unattested.counterexample.is_none());
+        assert!(unattested.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("no positive producer fidelity attestation")
+        }));
+
+        // Positive control for the consumer gate. This value is test-authored;
+        // the compiler is forbidden to emit it until its lowering fidelity is
+        // independently established.
+        let exact = compiler_spec_refutation_evidence_with_fidelity(
+            45,
+            41,
+            Some(TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT),
+        );
+        assert_eq!(exact.status, EvidenceStatus::Failed);
+        assert!(exact.counterexample.is_some());
+    }
+
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn unrecognized_producer_encoding_fidelity_class_fails_closed() {
+        // Fail-closed on arrival: a fidelity class this consumer has never heard
+        // of must not acquire refutation authority by being unknown. The
+        // compiler emits only negative attestations, so any value here is the
+        // producer disclaiming exactness in words we do not parse.
+        let evidence = compiler_spec_refutation_evidence_with_fidelity(
+            43,
+            39,
+            Some("some_future_over_approximation_class"),
+        );
+        assert_eq!(evidence.status, EvidenceStatus::Unknown);
+        assert!(evidence.counterexample.is_none());
+        assert!(
+            evidence.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("unrecognized fidelity class fails closed")
+            }),
+            "diagnostics: {:#?}",
+            evidence.diagnostics
+        );
+    }
+
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn duplicated_producer_encoding_fidelity_attestation_fails_closed() {
+        // A duplicated key must not read as "no attestation". `metadata_value`
+        // answers ambiguity with `None`, which on this gate would hand a
+        // disclaimed encoding its refutation authority back — so the classifier
+        // counts the entries itself rather than reusing that helper.
+        let obligation_id = native_typed_chc_obligation_id(45, 41);
+        let mut obligation = obligation_with_contract(
+            ObligationKind::ArithmeticSafety,
+            &obligation_id,
+            "contract-spec",
+        );
+        for _ in 0..2 {
+            obligation.metadata.push(MetadataEntry {
+                key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
+                value: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED.to_string(),
+            });
+        }
+
+        assert_eq!(
+            TrustMcChcRefutationAdmissibility::for_obligation(&obligation)
+                .rejection_reason()
+                .is_some(),
+            true,
+            "an ambiguous fidelity attestation must reject the refutation, not ignore it"
+        );
+    }
+
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn producer_encoding_fidelity_gate_never_touches_the_proof_direction() {
+        // The asymmetry is the whole design: an over-approximating encoding is
+        // SOUND for proofs (UNSAT of a superset implies UNSAT of the real
+        // reachable set) and unsound as evidence for refutations. Control C of
+        // the reported regression — the same loop WITH `requires(n >= 0)` —
+        // proves 4/4 through exactly such an encoding, and must keep doing so.
+        // So a row carrying the attestation must still be provable.
+        let obligation_id = native_typed_chc_obligation_id(44, 40);
+        let mut obligation = obligation_with_contract(
+            ObligationKind::ArithmeticSafety,
+            &obligation_id,
+            "contract-spec",
+        );
+        obligation.metadata.push(MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
+            value: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED.to_string(),
+        });
+        let mut bundle = bundle_with(vec![obligation]);
+        // `derive_error = false`: `error` is derivable only from `entry(ok)`
+        // with `ok` true, and the only `entry` fact is `entry(false)`, so the
+        // query is genuinely unreachable.
+        let contract = typed_chc_contract("contract-spec", &obligation_id, false);
+        push_typed_chc_contract(&mut bundle, contract);
+
+        let evidence = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::Chc),
+        )
+        .verify(&bundle, &bundle.obligations);
+
+        // The gate lives in the `Refuted` arm only: it must not demote, reject,
+        // or otherwise perturb a row the solver did not refute.
+        assert_ne!(evidence[0].status, EvidenceStatus::Failed);
+        assert!(
+            !evidence[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("loop-elided over-approximation")),
+            "the fidelity gate must not speak on a non-refuted row; diagnostics: {:#?}",
+            evidence[0].diagnostics
+        );
+    }
+
     #[cfg(feature = "trust-mc-native-solver")]
     #[test]
     fn native_typed_chc_nonlinear_int_mul_overflow_is_unknown_fallback() {
@@ -12679,6 +13767,7 @@ mod tests {
             &obligation_id,
             "contract-spec",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let mut contract = typed_chc_contract("contract-spec", &obligation_id, false);
         if let ContractPredicate::MathIr { value, .. } = &mut contract.predicate {
             apply_compiler_spec_mul_overflow_constraint_shape(value);
@@ -12712,6 +13801,7 @@ mod tests {
             &obligation_id,
             "contract-spec",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let mut contract = typed_chc_contract("contract-spec", &obligation_id, false);
         if let ContractPredicate::MathIr { value, .. } = &mut contract.predicate {
             apply_bv_add_no_overflow_constraint_shape(value);
@@ -12744,6 +13834,7 @@ mod tests {
             &obligation_id,
             "contract-spec",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let mut contract = typed_chc_contract("contract-spec", &obligation_id, false);
         if let ContractPredicate::MathIr { value, .. } = &mut contract.predicate {
             apply_bv_add_overflow_constraint_shape(value);
@@ -12836,6 +13927,7 @@ mod tests {
             &obligation_id,
             "contract-spec",
         )]);
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let mut contract = typed_chc_contract("contract-spec", &obligation_id, false);
         if let ContractPredicate::MathIr { value, .. } = &mut contract.predicate {
             apply_bv_mul_overflow_constraint_shape(value);
@@ -14732,6 +15824,140 @@ mod tests {
         );
     }
 
+    // Trust (bounded-unroll refutation lane, consumer half): a witnessed
+    // k-bounded-unroll refutation delivered on the producer's `refuted`
+    // channel surfaces as a public `Failed` row — but only AFTER this
+    // consumer freshly re-translates its own retained native bundle,
+    // recomputes the encoded-formula digest, and validates every witness
+    // binding. The diagnostics must name the bounded-unroll machine-check so
+    // the verdict is auditable.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_bundle_surfaces_validated_bounded_unroll_refutation_as_failed() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let native_bundle = bind_compiler_style_native_bundle_to_public(
+            compiler_style_loop_overflow_tmir_bundle(),
+            &bundle,
+        );
+
+        let evidence = adapter.evidence_from_native_trust_ir_bundle(
+            &bundle,
+            &bundle.obligations,
+            &native_bundle,
+        );
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].status,
+            EvidenceStatus::Failed,
+            "validated witnessed refutation must surface as Failed; diagnostics: {:?}",
+            evidence[0].diagnostics
+        );
+        assert!(
+            evidence[0].counterexample.is_some(),
+            "a Failed refutation row carries its public counterexample record"
+        );
+        assert!(
+            evidence[0].proof_strength.is_none(),
+            "a refutation must never carry proof strength"
+        );
+        let summary = evidence[0]
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.contains("refutation witness validated"))
+            .expect("the validation summary is a diagnostic");
+        assert!(
+            summary.contains("bounded-unroll (k="),
+            "the summary names the bounded-unroll machine-check: {summary}"
+        );
+    }
+
+    // Trust (bounded-unroll refutation lane, fail-closed halves): a REAL
+    // witnessed refutation row must demote to unknown — never Failed, never
+    // Proved — when (a) the public row carries a producer over-approximation
+    // attestation (a model of an over-approximating encoding is not evidence,
+    // even when its conclusion happens to be true), or (b) the witness is
+    // replayed against a DIFFERENT public obligation (detached witnesses bind
+    // nothing).
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_refuted_row_demotes_on_attestation_or_detached_binding() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let native_bundle = bind_compiler_style_native_bundle_to_public(
+            compiler_style_loop_overflow_tmir_bundle(),
+            &bundle,
+        );
+        let (_, _, refuted) = adapter
+            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None)
+            .expect("loop fixture solves");
+        let row = refuted.values().next().expect("loop fixture refutes with a witness");
+
+        // (a) attested over-approximation on the public row → demoted before
+        // any witness validation runs.
+        let mut attested = bundle.clone();
+        attested.obligations[0].metadata.push(MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
+            value: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED.to_string(),
+        });
+        let evidence = adapter.native_trust_ir_refuted_row_evidence(
+            &attested,
+            &attested.obligations[0],
+            &native_bundle,
+            row,
+            None,
+        );
+        assert_ne!(
+            evidence.status,
+            EvidenceStatus::Failed,
+            "an attested over-approximate row must never ground a refutation"
+        );
+        assert_ne!(evidence.status, EvidenceStatus::Proved);
+        assert!(
+            evidence.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("refutation witness was not admitted")
+                    && diagnostic.contains("loop-elided")
+            }),
+            "demotion must say why: {:?}",
+            evidence.diagnostics
+        );
+
+        // (b) the same witness replayed against a DIFFERENT retained native
+        // bundle (same request/proof ids, different function body): the
+        // consumer's fresh re-translation recomputes a different
+        // encoded-formula digest, so the detached witness fails binding
+        // validation and demotes. This is the forged/detached-witness class:
+        // the consumer trusts only digests it recomputes from its OWN bundle.
+        let foreign_native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let evidence = adapter.native_trust_ir_refuted_row_evidence(
+            &bundle,
+            &bundle.obligations[0],
+            &foreign_native,
+            row,
+            None,
+        );
+        assert_ne!(
+            evidence.status,
+            EvidenceStatus::Failed,
+            "a detached witness must never ground a refutation"
+        );
+        assert_ne!(evidence.status, EvidenceStatus::Proved);
+        assert!(
+            evidence
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("refutation witness was not admitted") }),
+            "demotion must say why: {:?}",
+            evidence.diagnostics
+        );
+    }
+
     #[test]
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     fn native_trust_ir_bundle_with_elapsed_deadline_degrades_to_timeout_not_proved() {
@@ -14804,9 +16030,10 @@ mod tests {
             compiler_style_mixed_tmir_bundle(),
             &bundle,
         );
-        let (transports, not_proved) = adapter
+        let (transports, not_proved, refuted) = adapter
             .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None)
             .expect("mixed bundle must return independent producer rows");
+        assert!(refuted.is_empty(), "acyclic rows keep their historical delivery: {refuted:?}");
         assert_eq!(transports.len(), 1, "the safe sibling must retain its proof transport");
         assert_eq!(not_proved.len(), 1, "the refutable sibling must retain its own outcome");
 
@@ -14814,9 +16041,7 @@ mod tests {
             native_trust_ir_expected_trust_mc_obligation_id(&bundle.obligations[0])
                 .expect("fixture has canonical safe proof-unit identity");
         assert_eq!(
-            native_trust_mc_obligation_lookup_key(
-                &transports[0].diagnostic_transport().native_id,
-            ),
+            native_trust_mc_obligation_lookup_key(&transports[0].diagnostic_transport().native_id,),
             native_trust_mc_obligation_lookup_key(&canonical_safe_id),
             "the proof transport must stay attached to the safe sibling",
         );
@@ -14845,9 +16070,10 @@ mod tests {
         let bundle = compiler_style_safe_public_bundle();
         let native_bundle =
             bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
-        let (transports, not_proved) = adapter
+        let (transports, not_proved, refuted) = adapter
             .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None)
             .expect("safe bundle must solve");
+        assert!(refuted.is_empty(), "fully proved bundle must not report refuted rows");
         assert_eq!(transports.len(), 1);
         assert!(
             not_proved.is_empty(),

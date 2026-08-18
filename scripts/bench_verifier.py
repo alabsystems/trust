@@ -140,6 +140,15 @@ def run_one(trustc: Path, lib_rs: Path, label: str) -> RunResult:
         "--edition=2021",
         "--crate-type", "lib",
         "-C", "opt-level=0",
+        # Pinned explicitly, not inherited. rustc infers debug-assertions from
+        # the opt level when the flag is absent -- ON at 0, OFF above
+        # (re-measured 2026-08-13, rustc 1.97.1) -- so a bare `-Copt-level=0`
+        # benchmarks a debug_assertions-ON crate: extra overflow-check assert
+        # arms, more MIR, more verifier work. That is a real cost but it is not
+        # the deployed shape, and it moved silently with the opt level.
+        # SUSPECT BASELINE: timings recorded before 2026-08-13 include those
+        # assert arms.
+        "-C", "debug-assertions=off",
         # The verifier is an optimized-MIR pass; metadata-only emission can
         # avoid querying optimized MIR and turn this benchmark into a no-op.
         "--emit=link",

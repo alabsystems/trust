@@ -493,6 +493,16 @@ fn recognize_single_block(func: &VerifiableFunction) -> Option<AdmissibleBody> {
 /// Every deviation fails closed. The `switchInt` sends `0` (the comparison being
 /// FALSE) to the false branch and everything else (TRUE) to `otherwise`, so the
 /// `otherwise` branch is `then` and the `0` branch is `else`.
+///
+/// A third, ARM-COALESCED `-O` spelling is also recognized (2026-08-13, the
+/// `e9_release_mode_discharge` debug/release divergence): DestinationPropagation
+/// may merge the select temp into the very PARAMETER local one arm selects,
+/// leaving that arm empty — `min2` under `-O` becomes
+/// `bb_true: goto bb_join`, `bb_false: _1 = copy _2`, `bb_join: _0 = copy _1`.
+/// The empty arm's value is the temp local's untouched entry value, so it is
+/// admissible only when the temp IS a parameter and the entry comparison only
+/// COPY-reads its operands (so no path consumed that parameter before the arm);
+/// the empty arm then selects exactly that parameter. See `select_arm`.
 fn recognize_select(func: &VerifiableFunction) -> Option<AdmissibleBody> {
     let blocks = &func.body.blocks;
     if blocks.len() != 4 {
@@ -527,12 +537,45 @@ fn recognize_select(func: &VerifiableFunction) -> Option<AdmissibleBody> {
     let false_blk = by_id(targets[0].1)?;
     let true_blk = by_id(*otherwise)?;
 
-    // Each branch assigns one temp from a parameter, then jumps to the join.
-    let (then_param, then_temp, then_join) = branch_arm(true_blk, n)?;
-    let (else_param, else_temp, else_join) = branch_arm(false_blk, n)?;
-    if then_temp != else_temp || then_join != else_join {
+    // Each branch either assigns one temp from a parameter and jumps to the
+    // join, or (arm-coalesced -O spelling) is empty except for that jump.
+    let (then_assign, then_join) = select_arm(true_blk, n)?;
+    let (else_assign, else_join) = select_arm(false_blk, n)?;
+    if then_join != else_join {
         return None;
     }
+    let (then_param, else_param, then_temp) = match (then_assign, else_assign) {
+        (Some((then_param, then_temp)), Some((else_param, else_temp))) => {
+            if then_temp != else_temp {
+                return None;
+            }
+            (then_param, else_param, then_temp)
+        }
+        // Two empty arms select nothing nameable; fail closed.
+        (None, None) => return None,
+        // Exactly one arm is empty: its value is the shared temp's UNTOUCHED
+        // entry value, so the temp must itself be a parameter (`1..=n`; this
+        // also excludes the return place `_0`, which has no entry value), and
+        // the entry comparison must only COPY-read its operands so that
+        // parameter still holds its entry value on every path into the arm.
+        // The entry block's sole effectful statement is the comparison
+        // (checked above), and the assigning arm runs only on the OTHER path,
+        // so the empty arm returns exactly that parameter.
+        (empty_or_then, empty_or_else) => {
+            if !matches!(opl, Operand::Copy(_)) || !matches!(opr, Operand::Copy(_)) {
+                return None;
+            }
+            match (empty_or_then, empty_or_else) {
+                (None, Some((else_param, temp))) if (1..=n).contains(&temp) => {
+                    (temp - 1, else_param, temp)
+                }
+                (Some((then_param, temp)), None) if (1..=n).contains(&temp) => {
+                    (then_param, temp - 1, temp)
+                }
+                _ => return None,
+            }
+        }
+    };
 
     // Join: return the selected value. Two equivalent spellings:
     //  - O0: the branches assigned a TEMP and the join copies it to the return
@@ -599,21 +642,35 @@ fn select_cmp(binop: &BinOp) -> Option<SelectCmp> {
     })
 }
 
-/// A select branch block: `_temp = <param>; goto <join>`. Returns
-/// `(param_index, temp_local, join_block)`, else `None`.
-fn branch_arm(block: &BasicBlock, arg_count: usize) -> Option<(usize, usize, BlockId)> {
+/// A select branch block. Two admissible forms:
+/// - `_temp = <param>; goto <join>` — returns `(Some((param_index, temp_local)), join)`;
+/// - NO effectful statement at all, `goto <join>` — returns `(None, join)`;
+///   admissible only when the caller can bind the shared temp to a parameter
+///   (the arm-coalesced `-O` spelling; see `recognize_select`).
+///
+/// Anything else fails closed.
+fn select_arm(
+    block: &BasicBlock,
+    arg_count: usize,
+) -> Option<(Option<(usize, usize)>, BlockId)> {
     let Terminator::Goto(join) = &block.terminator else {
         return None;
     };
-    let Statement::Assign { place, rvalue: Rvalue::Use(op), .. } = sole_effectful(&block.stmts)?
-    else {
+    let mut effectful = block.stmts.iter().filter(|s| !is_value_neutral(s));
+    let Some(stmt) = effectful.next() else {
+        return Some((None, *join));
+    };
+    if effectful.next().is_some() {
+        return None;
+    }
+    let Statement::Assign { place, rvalue: Rvalue::Use(op), .. } = stmt else {
         return None;
     };
     if !place.projections.is_empty() {
         return None;
     }
     let param = param_of_operand(op, arg_count)?;
-    Some((param, place.local, *join))
+    Some((Some((param, place.local)), *join))
 }
 
 #[cfg(test)]
@@ -636,6 +693,7 @@ mod tests {
                 blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: term }],
                 arg_count,
                 return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -1048,6 +1106,122 @@ mod tests {
             .stmts
             .push(assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(2)))));
         assert_eq!(recognize_admissible_body(&g), None);
+    }
+
+    #[test]
+    fn recognizes_the_arm_coalesced_optimized_select_form() {
+        use crate::BinOp;
+        // The SAME min2 under -O after DestinationPropagation coalesced the
+        // select temp into parameter `_1` (the exact stage2 `-Ztrust-dump=mir:`
+        // shape behind the `e9_release_mode_discharge` debug/release
+        // divergence, 2026-08-13): the TRUE arm is empty (its value stays in
+        // `_1`), the FALSE arm overwrites `_1 = copy _2`, and the join returns
+        // `_0 = copy _1`. Semantically identical select; must recognize.
+        let f = func_blocks(
+            2,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::StorageLive(3),
+                        assign(
+                            Place::local(3),
+                            Rvalue::BinaryOp(
+                                BinOp::Lt,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(2)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(3)),
+                        targets: vec![(0, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                // otherwise / true branch: a < b ⇒ the value is already in _1.
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Goto(BlockId(3)) },
+                // 0 / false branch ⇒ overwrite the coalesced parameter with b.
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(Place::local(1), Rvalue::Use(Operand::Copy(Place::local(2))))],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![
+                        Statement::StorageDead(3),
+                        assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(1)))),
+                    ],
+                    terminator: Terminator::Return,
+                },
+            ],
+        );
+        assert_eq!(
+            recognize_admissible_body(&f),
+            Some(AdmissibleBody::Select {
+                cmp: SelectCmp::Lt,
+                cmp_left: 0,
+                cmp_right: 1,
+                then_param: 0, // a < b true ⇒ untouched _1 = a (param 0)
+                else_param: 1, // else ⇒ _1 = copy _2 = b (param 1)
+            })
+        );
+
+        // The mirrored coalescing (empty FALSE arm) resolves symmetrically.
+        let mut g = f.clone();
+        g.body.blocks[1].stmts =
+            vec![assign(Place::local(1), Rvalue::Use(Operand::Copy(Place::local(2))))];
+        g.body.blocks[2].stmts = vec![];
+        assert_eq!(
+            recognize_admissible_body(&g),
+            Some(AdmissibleBody::Select {
+                cmp: SelectCmp::Lt,
+                cmp_left: 0,
+                cmp_right: 1,
+                then_param: 1,
+                else_param: 0,
+            })
+        );
+
+        // TWO empty arms select nothing nameable; fail closed.
+        let mut bad = f.clone();
+        bad.body.blocks[2].stmts = vec![];
+        assert_eq!(recognize_admissible_body(&bad), None);
+
+        // An empty arm whose sibling writes a NON-parameter temp has no entry
+        // value to name; fail closed (this is the plain temp form with a
+        // missing arm, not a coalescing).
+        let mut bad = f.clone();
+        bad.body.blocks[2].stmts =
+            vec![assign(Place::local(5), Rvalue::Use(Operand::Copy(Place::local(2))))];
+        assert_eq!(recognize_admissible_body(&bad), None);
+
+        // A MOVE comparison operand may have consumed the coalesced parameter
+        // before the empty arm reads it; fail closed.
+        let mut bad = f.clone();
+        bad.body.blocks[0].stmts = vec![
+            Statement::StorageLive(3),
+            assign(
+                Place::local(3),
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Move(Place::local(1)),
+                    Operand::Copy(Place::local(2)),
+                ),
+            ),
+        ];
+        assert_eq!(recognize_admissible_body(&bad), None);
+
+        // The join must read the coalesced parameter, not something else.
+        let mut bad = f;
+        bad.body.blocks[3].stmts = vec![
+            Statement::StorageDead(3),
+            assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(2)))),
+        ];
+        assert_eq!(recognize_admissible_body(&bad), None);
     }
 
     #[test]

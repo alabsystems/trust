@@ -101,7 +101,25 @@ enum ParamClass {
     /// `InterpretValue`'s `Ty::Enum(id)` carries a MODULE-LOCAL id, so one shared value
     /// cannot type against both modules).
     Enum,
+    /// Trust (aggregate param lane): eligible BY-VALUE STRUCT param — same index-encoded
+    /// column shape as `Enum`, realized PER SIDE against that module's OWN `StructDef`
+    /// (`Ty::Struct(id)` is module-local for the identical reason). Eligibility is
+    /// deliberately narrower than `tys_agree`'s comparison: see `struct_param_admissible`.
+    Struct,
 }
+
+/// Cap on the nesting depth of an eligible by-value struct param. A struct whose fields are
+/// themselves structs is marshalled recursively; anything deeper than this fails CLOSED
+/// (coverage-only), never approximately.
+const MAX_STRUCT_DEPTH: u32 = 4;
+
+/// Cap on the number of SCALAR LEAVES an eligible by-value struct param may carry. Every leaf
+/// is an independent sample column inside the aggregate, so this bounds both the marshalling
+/// work and the width over which the leaf-rotation recipe below can keep leaves distinguishable.
+const MAX_STRUCT_LEAVES: usize = 8;
+
+/// Number of abstract samples minted for one by-value struct param.
+const MAX_STRUCT_SAMPLES: usize = 8;
 
 /// Trust (B9-A): is this body DEFERRED to the crate-finalize seam differential? Clean (no
 /// unsupported shapes, no pending consts) but call-bearing — the per-body module carries its
@@ -625,6 +643,34 @@ pub(crate) fn compare_entries(
                 continue;
             }
         }
+        // Trust (aggregate param lane): an eligible BY-VALUE STRUCT param samples as a
+        // positional aggregate of its scalar leaves, realized per side at the args site.
+        //
+        // Unlike the `Enum` arm above, eligibility here is TWO-SIDED and is checked BEFORE
+        // the body is admitted, not left to `sig_tys_agree` at step (5). That is deliberate:
+        // today every struct param returns the byte-identical non-scalar refusal below and
+        // therefore NEVER REACHES step (5), so admitting one on a THIR-local test alone would
+        // newly expose it to the divergence-publication channel on a SPELLING split — exactly
+        // the divergence-manufacturing hole the B3-3 tuple-vs-struct reclass and TEST_P1S3_Foo
+        // both came from. Two-sided admission keeps an unmarshallable shape on its existing
+        // `not-run`, and admits only shapes whose marshalling is identical on both sides.
+        //
+        // `struct_param_admissible` is also STRICTER than `tys_agree`'s struct arm, which
+        // compares field COUNT and field TYPES only: it additionally requires the two
+        // `StructDef`s to agree on field NAMES, pairwise and recursively. Both producers read
+        // that name from the SAME rustc `FieldDef` in source-declaration index order
+        // (`trust-thir-lower`'s `register_struct` over `non_enum_variant().fields`;
+        // `trust-mir-extract`'s `convert_ty_inner` over `adt_def.all_fields()`), so equality
+        // is provable and cheap — and it is what pins FIELD IDENTITY rather than merely field
+        // shape. Without it, `MemoryRegion { AllocationId, usize, usize }` would compare equal
+        // to itself with its two `usize` fields transposed, and a positional marshalling would
+        // then feed the two sides semantically different inputs.
+        if let (Ty::Struct(_), Some(ot @ Ty::Struct(_))) = (t, oracle_sig.params.get(i)) {
+            if struct_param_admissible(thir_module, oracle, t, ot) {
+                classes.push(ParamClass::Struct);
+                continue;
+            }
+        }
         // Trust (B2-3): a trait-object fat param joins the opacity-provable set — like
         // `Ty::Ptr` it is admitted ONLY under the two-sided `param_never_read` proof
         // below, preserving the Opaque-sampleability the class had when `&dyn` was
@@ -657,8 +703,11 @@ pub(crate) fn compare_entries(
     }
     // Trust (B3/E6): enum columns enter the product, so they count against the cap
     // (the note string stays verbatim — it is a classifier key).
-    let scalar_params =
-        classes.iter().filter(|c| matches!(c, ParamClass::Scalar | ParamClass::Enum)).count();
+    // Trust (aggregate param lane): struct columns do too, for the same reason.
+    let scalar_params = classes
+        .iter()
+        .filter(|c| matches!(c, ParamClass::Scalar | ParamClass::Enum | ParamClass::Struct))
+        .count();
     if scalar_params > MAX_PARAMS {
         report.mode = DiffMode::NotRun;
         report.notes.push(format!(
@@ -706,6 +755,53 @@ pub(crate) fn compare_entries(
         }
     }
 
+    // (5.5) Trust (wave-DA): THE ADT-INTERIOR BYTE-ARITHMETIC GATE. A body that walks an ADT
+    //       interior by a literal rustc byte offset must not be interpreted, because the
+    //       interpreter derives its own ADT image rather than reading that offset — see
+    //       `first_adt_interior_byte_arithmetic` for the two consumer rules and why neither is a
+    //       claim of rustc parity. Interpreting such a body compares two addresses that were
+    //       derived by different rules and reports the result as a verdict.
+    //
+    //       This is where the invariant "no verdict in this programme has ever been minted from
+    //       an executed ADT-interior byte offset" stops being a measurement and becomes a gate.
+    //       Placed LAST among the pre-sampling guards on purpose: every body already skipped for
+    //       an earlier reason keeps its existing note verbatim (the notes are the burn-down
+    //       ratchet's classifier keys), so this fires only on a body that would OTHERWISE HAVE
+    //       RUN. Measured at the time of landing: of the 1,270 clean-kernel bodies that emit this
+    //       shape, ZERO reach this point at either opt level — every one is held by a gate that
+    //       exists for some other reason (1,256 by the cross-module-call guard, 6 by the
+    //       pointer-parameter gate, 8 by an oracle incapacity) — so it costs no verdict today and
+    //       refuses the class the moment one of those reasons is relaxed.
+    //
+    //       SCOPED to the entry's REACHABLE CLOSURE, and that scoping is load-bearing rather than
+    //       tidy: the whole-module spelling was measured withdrawing two real `seam: agreed`
+    //       verdicts over a byte walk in `cache::TypeCheckCache::stats`, which neither entry can
+    //       reach. See `first_adt_interior_byte_arithmetic`.
+    //
+    //       BOTH sides are checked. The oracle does not emit this shape today (the bridge's five
+    //       `Inst::GEP` sites all carry a typed `pointee_ty`), so the second conjunct is free; it
+    //       is present because the hazard is a property of the SHAPE, not of which front-end
+    //       produced it.
+    //
+    //       FREEZE, as scoped: this edit makes the oracle ACCEPT STRICTLY LESS — it can only turn
+    //       a would-be sample into `NotRun`, never a `NotRun` into an `Agreed`. That is the
+    //       permitted direction.
+    let adt_byte_walk = first_adt_interior_byte_arithmetic(thir_module, thir_entry)
+        .map(|why| format!("THIR side: {why}"))
+        .or_else(|| {
+            first_adt_interior_byte_arithmetic(oracle, oracle_entry)
+                .map(|why| format!("MIR oracle side: {why}"))
+        });
+    if let Some(why) = adt_byte_walk {
+        report.equal = false;
+        report.mode = DiffMode::NotRun;
+        report.notes.push(format!(
+            "ADT-interior literal byte arithmetic ({why}); the interpreter derives its own ADT \
+             layout and would execute an offset it did not derive; coverage-only skip"
+        ));
+        return report;
+    }
+
     // (6) Sample space: cross-product of per-SCALAR-param boundary+mid values (one empty
     //     tuple when every param is opaque or there are none); opaque params contribute one
     //     placeholder each, outside the product.
@@ -713,10 +809,31 @@ pub(crate) fn compare_entries(
     // over a parallel abstract-samples table — the i128 product machinery stays
     // untouched; realization happens per side at the args site.
     let mut enum_samples: Vec<Option<Vec<(usize, Vec<i128>)>>> = vec![None; thir_sig.params.len()];
+    // Trust (aggregate param lane): the struct twin of `enum_samples` — one abstract sample is
+    // the FLAT depth-first list of scalar-leaf raws, side-portable because the two `StructDef`s
+    // were proven to agree (shape AND field names) at the admission gate.
+    let mut struct_samples: Vec<Option<Vec<Vec<i128>>>> = vec![None; thir_sig.params.len()];
     let mut per_param: Vec<Vec<i128>> = Vec::new();
     for (i, (t, c)) in thir_sig.params.iter().zip(classes.iter()).enumerate() {
         match c {
             ParamClass::Scalar => per_param.push(sample_values(t)),
+            ParamClass::Struct => {
+                let samples = (|| {
+                    let Ty::Struct(sid) = t else { return None };
+                    struct_abstract_samples(thir_module, *sid)
+                })();
+                let Some(samples) = samples else {
+                    report.mode = DiffMode::NotRun;
+                    report.notes.push(
+                        "could not build sample argument (coverage-only skip): struct sample \
+                         description unavailable"
+                            .to_string(),
+                    );
+                    return report;
+                };
+                per_param.push((0..samples.len() as i128).collect());
+                struct_samples[i] = Some(samples);
+            }
             ParamClass::Enum => {
                 let samples = (|| {
                     let Ty::Enum(eid) = t else { return None };
@@ -773,8 +890,10 @@ pub(crate) fn compare_entries(
         // entry check is exact Ty equality. A one-sided construction failure must
         // never reach execute_func: a mistyped THIR-side sample would surface as a
         // THIR-defect error code and MINT A FALSE DIVERGENCE via the (Err, Ok) arm.
-        let thir_args = build_side_args(&thir_module, thir_sig, &classes, &enum_samples, &tuple);
-        let oracle_args = build_side_args(&oracle, oracle_sig, &classes, &enum_samples, &tuple);
+        let thir_args =
+            build_side_args(&thir_module, thir_sig, &classes, &enum_samples, &struct_samples, &tuple);
+        let oracle_args =
+            build_side_args(&oracle, oracle_sig, &classes, &enum_samples, &struct_samples, &tuple);
         let (args_thir, args_oracle) = match (thir_args, oracle_args) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(why), _) | (_, Err(why)) => {
@@ -1418,6 +1537,205 @@ pub(crate) fn oracle_has_const_false_assert(module: &Module) -> bool {
     false
 }
 
+/// Trust (wave-DA): the FIRST **ADT-interior literal byte arithmetic** in `module`, named, or
+/// `None`.
+///
+/// # What this recognizes, and why exactly this shape
+///
+/// A flat-byte `GEP` whose displacement is a compile-time literal and which is `inbounds` is this
+/// producer's one spelling for "the address of a field inside an ADT, at rustc's byte offset".
+/// All three sites that emit it are ADT-interior — the `&self.field` shared interior return
+/// (`lib.rs:8665`), the `Deref`-accessor `&mut` interior (`lib.rs:14940`), and the by-REF enum
+/// payload binding (`lib.rs:23921`, single-level and nested) — and all three take their number
+/// from a `layout_of` query on rustc's layout. The producer's other two `GEP` sites are element
+/// arithmetic, not ADT-interior, and are excluded by construction: the slice index scales a typed
+/// `pointee_ty` and the string-literal byte walk is `inbounds: false`. Both byte spellings
+/// (`I8`/`U8`) are matched so a respelling cannot slip past.
+///
+/// # Why it must gate the interpreter
+///
+/// The reference interpreter does not read that offset from the instruction stream — it derives
+/// its OWN image of the ADT. For an enum it uses the producer-supplied
+/// `EnumLayoutDescriptor` when one is present and otherwise trust-ir's CANONICAL tagged-union
+/// layout, whose doc says in terms that it is "not a claim of rustc layout parity"
+/// (`interpret.rs:2607`). For a STRUCT it has no descriptor path at all:
+/// `interpret::struct_layout` (`interpret.rs:2543`) ignores `FieldDef::offset` entirely and lays
+/// fields out C-style in DECLARATION order. So a producer byte offset executed by the interpreter
+/// is a number one side derived from rustc and the other side did not derive at all — and any
+/// verdict minted from it is a verdict about two different addresses.
+///
+/// Today no such verdict exists, because every body in this shape happens to be skipped for an
+/// unrelated reason (the enum ones by the oracle's own address-walk refusal,
+/// `trust-ir-bridge/src/lower.rs:1861`; the struct ones by the pointer-parameter interpretability
+/// gate at step (4), which is a COVERAGE gate, not a soundness one, and which a future lane could
+/// lift for reasons that have nothing to do with layout). This makes that accident a GATE.
+///
+/// # Scoped to the REACHABLE CLOSURE, not the whole module — and why that is not a weakening
+///
+/// The walk is `first_unmodeled_observation`'s, deliberately: that function is this model's own
+/// definition of "what an interpretation of `entry` can observe", and the set of bodies whose
+/// instructions can EXECUTE is the same set. A whole-module scan is not more conservative in any
+/// useful sense, it is merely wrong about scope — MEASURED on clean-kernel at -O3, it withdrew the
+/// `seam: agreed` verdicts of `<expr::types::BinderData as Default>::default` (1 sample) and
+/// `env::origin::OriginTrust::needs_recheck` (3 samples) because `cache::TypeCheckCache::stats`
+/// emits `gep inbounds i8, +64` somewhere else in the crate; the reachable closures of those two
+/// entries are 3 and 2 functions and contain no byte walk at all. Withdrawing a verdict a body
+/// earned is a cost, and paying it for a body that cannot run is a cost for nothing.
+///
+/// It is nevertheless WIDER than that walk in one direction: a function whose address is taken
+/// (`Const { value: Constant::FnDef(..) }`) is followed too, because such a callee can be entered
+/// through `CallIndirect` without ever appearing as an `Inst::Call { callee }`. Fail-closed on a
+/// missing function, exactly as `first_unmodeled_observation` is.
+///
+/// FAIL-CLOSED and strictly subtractive: it can only turn a body that would have been SAMPLED
+/// into `NotRun`. It cannot mint an `Agreed`, and it cannot move a flip — `flip.rs` reads
+/// `DerivedAgreed` from the structural MIR comparator, not from this channel.
+/// # wave-DZ: the walk now carries the CALLER'S literals into the callee
+///
+/// wave-DA judged each reachable function against its OWN constants only, so a displacement
+/// materialized in a caller and handed to a callee that GEPs by its own parameter walked past
+/// the gate (demonstrated by a passing adversarial test at review time, and recorded in the
+/// wave-DA merge message as an admitted shape). The walk therefore carries, per reachable
+/// function, the SET OF ENTRY-BLOCK PARAMETER POSITIONS that some reachable call site is proven
+/// to pass a committed displacement into; [`committed_displacements`] seeds those params into
+/// the callee's table. The ENTRY starts with an EMPTY mask, which is what keeps a byte GEP
+/// indexed by a *sampled* parameter green — nothing has committed to a rustc offset there, and
+/// that discrimination control is `element_arithmetic_and_non_literal_displacements_stay_green`.
+///
+/// An ADDRESS-TAKEN function (`Const { value: Constant::FnDef(..) }`) is entered with the FULL
+/// mask, not the empty one: it can be reached through `CallIndirect` with arguments this walk
+/// cannot see, so every parameter is assumed to carry a committed displacement. That is the
+/// fail-closed direction for the one edge the walk cannot follow.
+///
+/// Termination: masks only ever GROW (a function is re-processed exactly when its known mask
+/// gains a bit), and a mask has at most 64 bits, so each function is processed at most 65 times.
+pub(crate) fn first_adt_interior_byte_arithmetic(module: &Module, entry: FuncId) -> Option<String> {
+    // (function, mask of entry-block param indices proven to receive a committed displacement).
+    let mut pending: Vec<(FuncId, u64)> = vec![(entry, 0)];
+    let mut seen: HashMap<FuncId, u64> = HashMap::new();
+    while let Some((func_id, mask)) = pending.pop() {
+        let known = match seen.get(&func_id) {
+            // Already judged with at least this much literal knowledge — nothing to re-derive.
+            Some(&prev) if (prev | mask) == prev => continue,
+            Some(&prev) => prev | mask,
+            None => mask,
+        };
+        seen.insert(func_id, known);
+        let Some(func) = module.function_by_id(func_id) else {
+            return Some(format!("reachable function {func_id:?} is missing from the module"));
+        };
+        let committed = committed_displacements(func, known);
+        if let Some(why) = function_adt_interior_byte_walk(func, &committed) {
+            return Some(why);
+        }
+        for node in func.blocks.iter().flat_map(|b| b.body.iter()) {
+            match &node.inst {
+                Inst::Call { callee, args } => {
+                    let mut callee_mask = 0u64;
+                    for (position, arg) in args.iter().enumerate() {
+                        if position < 64 && committed.contains_key(arg) {
+                            callee_mask |= 1u64 << position;
+                        }
+                    }
+                    pending.push((*callee, callee_mask));
+                }
+                // Address-taken: reachable through `CallIndirect` with unseen arguments, so
+                // every parameter is assumed committed (fail-closed).
+                Inst::Const { value: Constant::FnDef(callee), .. } => {
+                    pending.push((*callee, u64::MAX))
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The displacement values in `func` that are COMMITTED compile-time byte offsets — the table
+/// [`function_adt_interior_byte_walk`] judges every flat-byte `GEP` against. `Some(k)` is a
+/// known constant (so the diagnostic can name it); `None` is "committed, value not visible
+/// here" (a parameter fed by a caller's literal).
+///
+/// Built over the WHOLE function before any `GEP` is judged, so a displacement constant
+/// materialized in an earlier block — or, after any future scheduling change, a later one —
+/// still counts. Missing one would be the fail-OPEN direction.
+///
+/// # wave-DZ: every integer SPELLING, not four of them
+///
+/// wave-DA matched `Ty::I64 | Ty::U64 | Ty::Isize | Ty::Usize`. All three producer sites emit
+/// `Ty::I64` today, so the narrower table cost nothing — but the gate's claim is about the
+/// SHAPE, and a `Const { ty: U32 }` respelling of the same offset walked straight past it
+/// (again, demonstrated by a passing adversarial test at review time). A byte displacement is
+/// a byte displacement in every integer width, so every integer `Const` enters the table.
+///
+/// STILL NOT MODELLED, stated rather than implied: a displacement that is COMPUTED
+/// (`add %k, 8`), copied through a `Cast`, or loaded from memory is not in this table. Those
+/// are not shapes any producer site emits — all three materialize the offset as one `Const`
+/// immediately before the `GEP` — and following them is a dataflow analysis, not a table.
+fn committed_displacements(func: &Function, literal_params: u64) -> HashMap<ValueId, Option<i128>> {
+    let mut committed: HashMap<ValueId, Option<i128>> = HashMap::new();
+    if let Some(entry) = func.block(func.entry) {
+        for (position, (vid, _)) in entry.params.iter().enumerate() {
+            // A parameter beyond bit 63 cannot be tracked in the mask, so it is treated as
+            // committed unconditionally — the fail-closed reading of "unknown".
+            if position >= 64 || literal_params & (1u64 << position) != 0 {
+                committed.insert(*vid, None);
+            }
+        }
+    }
+    for node in func.blocks.iter().flat_map(|b| b.body.iter()) {
+        if let Inst::Const { ty, value: Constant::Int(k) } = &node.inst {
+            if ty.is_integer() {
+                if let Some(&r) = node.results.first() {
+                    committed.insert(r, Some(*k));
+                }
+            }
+        }
+    }
+    committed
+}
+
+/// [`first_adt_interior_byte_arithmetic`] for one function, against a prepared displacement
+/// table.
+///
+/// # wave-DZ: EVERY index position, not just the first
+///
+/// wave-DA read `indices.first()`. A flat-byte `GEP` carrying its literal in index position 1
+/// was therefore admitted (the third shape the review demonstrated). The producer emits exactly
+/// one index at all three sites, so this costs nothing today; it removes a recognizer limit
+/// that a future multi-index spelling would turn into a hole.
+fn function_adt_interior_byte_walk(
+    func: &Function,
+    committed: &HashMap<ValueId, Option<i128>>,
+) -> Option<String> {
+    for node in func.blocks.iter().flat_map(|b| b.body.iter()) {
+        if let Inst::GEP { pointee_ty: Ty::I8 | Ty::U8, indices, inbounds: true, .. } = &node.inst {
+            for (position, index) in indices.iter().enumerate() {
+                let Some(k) = committed.get(index) else { continue };
+                return Some(match k {
+                    Some(k) => format!(
+                        "`{}` emits `gep inbounds i8, +{k}` (index {position}) — a literal rustc \
+                         byte offset into an ADT interior",
+                        func.name
+                    ),
+                    None => format!(
+                        "`{}` emits `gep inbounds i8` whose index {position} arrives as a \
+                         call-site literal — a rustc byte offset into an ADT interior",
+                        func.name
+                    ),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// [`function_adt_interior_byte_walk`] against `func`'s OWN constants only — the single-function
+/// spelling the scope control uses to prove an orphan really does carry the shape.
+fn function_adt_interior_byte_arithmetic(func: &Function) -> Option<String> {
+    function_adt_interior_byte_walk(func, &committed_displacements(func, 0))
+}
+
 /// True iff `func` contains an `Inst::Undef` anywhere (Trust B9-A: the per-closure-scoped
 /// THIR tripwire — the seam must not over-skip every deferred body because ONE unrelated
 /// body violates the invariant).
@@ -1881,9 +2199,35 @@ fn int_shape(t: &Ty) -> Option<(u32, bool)> {
 /// trust-ir 0c probe — so validity is THIS function's obligation). Capped at
 /// `MAX_ENUM_SAMPLES` with VARIANT-COVERAGE-FIRST ordering: one sample per variant (the
 /// first boundary value per payload field) before any variant's payload product deepens,
-/// so truncation never drops a variant. Enums with zero or more than eight
+/// so truncation never drops a variant. Enums with zero or more than `MAX_ENUM_SAMPLES`
 /// variants fail closed instead of silently omitting a variant.
-const MAX_ENUM_SAMPLES: usize = 8;
+///
+/// **THE CONSTANT DOES TWO JOBS, AND ONE INVARIANT TIES THEM.** It is the ADMISSION gate
+/// (`variants.len() > MAX_ENUM_SAMPLES` fails closed, here and at the param-class gate) and
+/// it is the SAMPLE BUDGET (pass 2 stops at it). Pass 1 spends one sample per variant, so
+/// "truncation never drops a variant" is exactly `budget >= variant count` — which one
+/// constant guarantees for free. Do not split it without carrying that inequality.
+///
+/// **8 -> 12, 2026-08-17, MEASURED rather than chosen.** The value was 8, matching the widest
+/// scalar pool (`sample_values` yields at most 8 values, for the floats) so an enum column could
+/// never widen the cartesian product beyond what a scalar column already could. Measured over the
+/// producer's own `clean_kernel.trust-ir.txt` (8,723 bodies, 209 enum defs, 52 distinct enums in
+/// by-value param position), that symmetry was costing exactly one body and buying nothing:
+///
+///   * ONE enum is refused by the variant-count gate ALONE — `mode::SourceSystem`, 12 payload-free
+///     variants, whose only user is `mode::CleanMode::from_source_system`, an UNBACKED codegen
+///     flip. Every other >8-variant param enum (`ExprKind` 25, `ProofCert` 25, `ProofCertWire` 25,
+///     `EnvError` 24, `TypeError` 23, `InductiveError` 16) is ALSO refused for a payload reason —
+///     struct/enum/fat-pointer payload fields — so no value of this constant reaches them.
+///   * The "deepens every enum already backed" worry is 2 bodies. 18 of the 20 admitted enums
+///     already exercise their COMPLETE described sample space at 8. The two that truncate are
+///     `CofibAtom` (space 10; 8 -> 10, i.e. now EXHAUSTIVE) in `CofibAtom::{var,value}`, and
+///     `DecompressError` (space 29; 8 -> 12) whose one user is `not-run` for an unrelated reason
+///     (a direct call) and therefore costs zero samples.
+///   * Worst case per body rises 8^4 -> 12^4 against `MAX_PARAMS`. Measured, the largest sample
+///     count anywhere in clean-kernel is 125 and no body carries more than two admitted enum
+///     columns, the widest of which is 8 — so the ceiling stays theoretical.
+const MAX_ENUM_SAMPLES: usize = 12;
 fn enum_abstract_samples(def: &trust_ir::EnumDef) -> Option<Vec<(usize, Vec<i128>)>> {
     if def.variants.is_empty() || def.variants.len() > MAX_ENUM_SAMPLES {
         return None;
@@ -1957,6 +2301,191 @@ fn enum_abstract_samples(def: &trust_ir::EnumDef) -> Option<Vec<(usize, Vec<i128
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Trust (aggregate param lane): the depth-first list of SCALAR LEAF types of an eligible
+/// by-value struct, or `None` if the struct is not eligible.
+///
+/// Eligible means, exactly (fail CLOSED on everything else — a shape this cannot marshal
+/// EXACTLY must stay `not-run`, because a wrong marshalling is a wrong verdict):
+///   * the `StructId` resolves in `module`'s own table;
+///   * the struct has at least one field (a field-less struct carries no observable value, so
+///     admitting it would buy a verdict over an empty input space);
+///   * every field is either an `is_interpretable_scalar` leaf or another eligible struct,
+///     recursively, within `MAX_STRUCT_DEPTH`;
+///   * the total leaf count is at most `MAX_STRUCT_LEAVES`.
+///
+/// Deliberately NOT eligible, each because the exact value model is not this lane's to invent:
+///   * `Ty::Unit` fields — a producer `Ty::Unit` at a struct-field position is ALSO how the
+///     union lane spells a `union` member (`struct_field_tys`), and the oracle spells the same
+///     member as its real field type. Those bodies are already `not-run` (the union lane forces
+///     `contains_call`), so this arm never sees one — but the refusal is written down rather
+///     than relied upon, because a genuine ZST field and a union placeholder are the same
+///     `Ty::Unit` here and only one of them is value-less.
+///   * `Ty::Enum` fields — the tag/payload encoding is the `Enum` arm's discipline and carries
+///     its own discriminant and tag-repr obligations; nesting it inside the struct recipe would
+///     duplicate them at a second site.
+///   * arrays, tuples, pointers, fat pointers, closures, records — no exact positional
+///     marshalling is established for them here.
+fn struct_leaf_tys(module: &Module, sid: trust_ir::StructId, depth: u32) -> Option<Vec<Ty>> {
+    if depth == 0 {
+        return None;
+    }
+    let def = module.struct_def(sid)?;
+    if def.fields.is_empty() {
+        return None;
+    }
+    let mut leaves = Vec::new();
+    for field in &def.fields {
+        match &field.ty {
+            t if is_interpretable_scalar(t) => leaves.push(t.clone()),
+            Ty::Struct(inner) => leaves.extend(struct_leaf_tys(module, *inner, depth - 1)?),
+            _ => return None,
+        }
+        if leaves.len() > MAX_STRUCT_LEAVES {
+            return None;
+        }
+    }
+    if leaves.is_empty() || leaves.len() > MAX_STRUCT_LEAVES { None } else { Some(leaves) }
+}
+
+/// Trust (aggregate param lane): do the two sides' `StructDef`s agree on FIELD NAMES, pairwise
+/// and recursively? This is the identity pin `tys_agree`'s struct arm deliberately does not
+/// carry (it ignores names so the oracle may name closure envs differently), and it is what
+/// makes a POSITIONAL marshalling sound: two same-typed sibling fields cannot be transposed
+/// between the producer and the oracle without this disagreeing.
+///
+/// Both sides read the name from the same rustc `FieldDef` in source-declaration index order,
+/// so agreement is the expected case and disagreement is a real spelling split — which returns
+/// `false` and leaves the body on its existing `not-run`, never on a manufactured verdict.
+fn struct_field_names_agree(
+    am: &Module,
+    bm: &Module,
+    a: trust_ir::StructId,
+    b: trust_ir::StructId,
+    depth: u32,
+) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let (Some(da), Some(db)) = (am.struct_def(a), bm.struct_def(b)) else {
+        return false;
+    };
+    if da.fields.len() != db.fields.len() {
+        return false;
+    }
+    da.fields.iter().zip(&db.fields).all(|(fa, fb)| {
+        fa.name == fb.name
+            && match (&fa.ty, &fb.ty) {
+                (Ty::Struct(x), Ty::Struct(y)) => {
+                    struct_field_names_agree(am, bm, *x, *y, depth - 1)
+                }
+                (Ty::Struct(_), _) | (_, Ty::Struct(_)) => false,
+                _ => true,
+            }
+    })
+}
+
+/// Trust (aggregate param lane): the TWO-SIDED admission gate for a by-value struct param.
+///
+/// Every conjunct is an ADMISSION condition, never a comparison: failing any one of them leaves
+/// the parameter on the byte-identical non-scalar refusal it has today (a `not-run`), so this
+/// predicate can only ever produce MORE sampled verdicts, never a laxer comparison.
+fn struct_param_admissible(am: &Module, bm: &Module, a: &Ty, b: &Ty) -> bool {
+    let (Ty::Struct(sa), Ty::Struct(sb)) = (a, b) else {
+        return false;
+    };
+    // (i) both sides marshal EXACTLY, to the same leaf sequence.
+    let (Some(la), Some(lb)) =
+        (struct_leaf_tys(am, *sa, MAX_STRUCT_DEPTH), struct_leaf_tys(bm, *sb, MAX_STRUCT_DEPTH))
+    else {
+        return false;
+    };
+    if la != lb {
+        return false;
+    }
+    // (ii) field identity, not merely field shape.
+    if !struct_field_names_agree(am, bm, *sa, *sb, MAX_STRUCT_DEPTH) {
+        return false;
+    }
+    // (iii) the standard structural agreement the rest of the differential runs on. Checked
+    //       HERE rather than left to step (5) because a struct param that reaches step (5)
+    //       for the first time would publish a spelling split as a DIVERGENCE.
+    matches!(tys_agree(am, bm, a, b, TY_CMP_DEPTH), Ok(true))
+}
+
+/// Trust (aggregate param lane): abstract, side-portable samples for one by-value struct param —
+/// each sample is the FLAT depth-first list of raws for the struct's scalar leaves, realized per
+/// side at the args site against that module's own `StructDef`.
+///
+/// THE LEAF ROTATION, and why it is not a plain diagonal. Sample `k` gives leaf `i` the value
+/// `pool_i[(k + i) % pool_i.len()]`. Rotating by the leaf INDEX is what keeps sibling leaves at
+/// DIFFERENT pool positions, and `sample_values` is sorted and deduplicated, so same-typed
+/// siblings therefore hold pairwise-DISTINCT values in every sample. A plain diagonal
+/// (`pool_i[k]`) would hand `MemoryRegion { AllocationId(u64), usize, usize }` the same number in
+/// all three leaves, and `offset()` versus `len()` — two functions that differ only in which
+/// field they read — would agree VACUOUSLY. The rotation is what makes the sample able to fail.
+///
+/// Coverage: `k` runs over the widest leaf pool (capped at `MAX_STRUCT_SAMPLES`), so every leaf
+/// sees the boundary values `sample_values` mints for its own type, modulo its pool length.
+fn struct_abstract_samples(module: &Module, sid: trust_ir::StructId) -> Option<Vec<Vec<i128>>> {
+    let leaves = struct_leaf_tys(module, sid, MAX_STRUCT_DEPTH)?;
+    let pools: Vec<Vec<i128>> = leaves.iter().map(|t| sample_values(t)).collect();
+    if pools.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let widest = pools.iter().map(Vec::len).max()?;
+    let count = widest.min(MAX_STRUCT_SAMPLES);
+    let mut out = Vec::with_capacity(count);
+    for k in 0..count {
+        out.push(
+            pools
+                .iter()
+                .enumerate()
+                .map(|(i, pool)| pool[(k + i) % pool.len()])
+                .collect::<Vec<i128>>(),
+        );
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Trust (aggregate param lane): realize one abstract struct sample against THIS module's own
+/// `StructDef`, consuming `leaves` depth-first through `cursor`.
+///
+/// The value is a POSITIONAL `InterpretValueKind::Aggregate` with exactly one element per
+/// declared field, in declaration order — the shape `eval_extract_field` indexes (`values.get(field)`)
+/// and `eval_insert_field` rebuilds. trust-ir's aggregate value model carries NO padding and no
+/// offsets (`size`/`align`/`FieldDef::offset` are layout METADATA, never elements), so there is
+/// no padding lane to fabricate; `repr` likewise changes bytes, not the field list, so a
+/// `repr(C)`/`repr(transparent)`/`repr(packed)` struct marshals identically here.
+fn realize_struct_arg(
+    module: &Module,
+    sid: trust_ir::StructId,
+    leaves: &[i128],
+    cursor: &mut usize,
+    depth: u32,
+) -> Result<InterpretValue, String> {
+    if depth == 0 {
+        return Err("struct nesting exceeds marshalling depth".to_string());
+    }
+    let def = module
+        .struct_def(sid)
+        .ok_or_else(|| format!("struct id {} unresolvable at args site", sid.index()))?;
+    let mut elems = Vec::with_capacity(def.fields.len());
+    for field in &def.fields {
+        match &field.ty {
+            Ty::Struct(inner) => {
+                elems.push(realize_struct_arg(module, *inner, leaves, cursor, depth - 1)?);
+            }
+            t if is_interpretable_scalar(t) => {
+                let raw = *leaves.get(*cursor).ok_or("struct sample leaf missing")?;
+                *cursor += 1;
+                elems.push(build_arg(t, raw)?);
+            }
+            other => return Err(format!("no struct marshalling for field type {other}")),
+        }
+    }
+    Ok(InterpretValue { ty: Ty::Struct(sid), kind: InterpretValueKind::Aggregate(elems) })
+}
+
 /// Decode enum columns for diagnostics without making note rendering an
 /// admission condition. Construction has already succeeded before this helper
 /// runs; any unexpected recipe drift simply omits the suffix.
@@ -1974,6 +2503,11 @@ fn decoded_enum_sample_suffix(
             match class {
                 ParamClass::Scalar => column += 1,
                 ParamClass::Opaque => {}
+                // Trust (aggregate param lane): a struct column consumes its slot like any
+                // other. Its decoded rendering lives with the struct sample table, which this
+                // enum-only helper does not carry; the raw column value still appears in the
+                // `input {tuple:?}` prefix every note already prints.
+                ParamClass::Struct => column += 1,
                 ParamClass::Enum => {
                     let raw = *tuple.get(column)?;
                     column += 1;
@@ -2009,6 +2543,7 @@ fn build_side_args(
     sig: &trust_ir::FuncTy,
     classes: &[ParamClass],
     enum_samples: &[Option<Vec<(usize, Vec<i128>)>>],
+    struct_samples: &[Option<Vec<Vec<i128>>>],
     tuple: &[i128],
 ) -> Result<Vec<InterpretValue>, String> {
     if classes.len() != sig.params.len() {
@@ -2017,15 +2552,30 @@ fn build_side_args(
     if enum_samples.len() != sig.params.len() {
         return Err("enum sample table length does not match signature".to_string());
     }
+    if struct_samples.len() != sig.params.len() {
+        return Err("struct sample table length does not match signature".to_string());
+    }
     for (class, slot) in classes.iter().zip(enum_samples) {
         match (class, slot) {
-            (ParamClass::Enum, Some(_)) | (ParamClass::Scalar | ParamClass::Opaque, None) => {}
+            (ParamClass::Enum, Some(_))
+            | (ParamClass::Scalar | ParamClass::Opaque | ParamClass::Struct, None) => {}
             _ => return Err("enum sample table is not aligned with parameter classes".to_string()),
+        }
+    }
+    for (class, slot) in classes.iter().zip(struct_samples) {
+        match (class, slot) {
+            (ParamClass::Struct, Some(_))
+            | (ParamClass::Scalar | ParamClass::Opaque | ParamClass::Enum, None) => {}
+            _ => {
+                return Err("struct sample table is not aligned with parameter classes".to_string());
+            }
         }
     }
     let expected_columns = classes
         .iter()
-        .filter(|class| matches!(class, ParamClass::Scalar | ParamClass::Enum))
+        .filter(|class| {
+            matches!(class, ParamClass::Scalar | ParamClass::Enum | ParamClass::Struct)
+        })
         .count();
     if tuple.len() != expected_columns {
         return Err(format!(
@@ -2092,6 +2642,31 @@ fn build_side_args(
                     ty: Ty::Enum(*eid),
                     kind: InterpretValueKind::Aggregate(elems),
                 })
+            }
+            ParamClass::Struct => {
+                // MUST consume the tuple exactly like Scalar (column desync otherwise).
+                let raw = tuple.get(k).copied().ok_or("sample tuple column missing")?;
+                k += 1;
+                let samples = struct_samples
+                    .get(i)
+                    .and_then(|s| s.as_ref())
+                    .ok_or("struct sample table missing")?;
+                let sample_index = usize::try_from(raw)
+                    .map_err(|_| "struct sample index is negative or too large")?;
+                let leaves =
+                    samples.get(sample_index).ok_or("struct sample index out of bounds")?;
+                let Ty::Struct(sid) = ty else {
+                    return Err("struct param class on a non-struct signature type".to_string());
+                };
+                let mut cursor = 0usize;
+                let value = realize_struct_arg(module, *sid, leaves, &mut cursor, MAX_STRUCT_DEPTH)?;
+                if cursor != leaves.len() {
+                    return Err(
+                        "struct sample leaves were not consumed exactly (side shape drift)"
+                            .to_string(),
+                    );
+                }
+                Ok(value)
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2395,12 +2970,14 @@ mod tests {
         let classes =
             vec![ParamClass::Scalar, ParamClass::Enum, ParamClass::Opaque, ParamClass::Scalar];
         let samples = vec![None, Some(vec![(0, Vec::new()), (1, vec![42])]), None, None];
+        let no_structs: Vec<Option<Vec<Vec<i128>>>> = vec![None; 4];
         let tuple = [17, 1, 1];
         let thir_args = build_side_args(
             &thir,
             thir.func_type(thir_sig_id).expect("THIR signature"),
             &classes,
             &samples,
+            &no_structs,
             &tuple,
         )
         .expect("THIR-side recipe");
@@ -2409,6 +2986,7 @@ mod tests {
             oracle.func_type(oracle_sig_id).expect("oracle signature"),
             &classes,
             &samples,
+            &no_structs,
             &tuple,
         )
         .expect("oracle-side recipe");
@@ -2430,6 +3008,7 @@ mod tests {
             thir.func_type(thir_sig_id).expect("THIR signature"),
             &classes,
             &samples,
+            &no_structs,
             &[17, 0, 1],
         )
         .expect("fieldless recipe");
@@ -2452,18 +3031,23 @@ mod tests {
     }
 
     #[test]
-    fn enum_samples_cover_eight_and_reject_nine() {
-        let eight = enum_abstract_samples(&tagged_enum_def(EnumId::new(0), 8))
-            .expect("eight variants fit the complete-coverage cap");
-        assert_eq!(eight.len(), 8);
+    fn enum_samples_cover_the_cap_and_reject_one_more() {
+        // Written against `MAX_ENUM_SAMPLES` rather than a literal: the property under test is
+        // "pass 1 spends one sample per variant, so the cap IS the admissible variant count",
+        // which must hold at whatever the constant is. A literal here silently became a
+        // restatement of the constant the day the cap moved.
+        let cap = MAX_ENUM_SAMPLES;
+        let at_cap = enum_abstract_samples(&tagged_enum_def(EnumId::new(0), cap))
+            .expect("cap-many variants fit the complete-coverage cap");
+        assert_eq!(at_cap.len(), cap);
         assert_eq!(
-            eight.iter().map(|(variant, _)| *variant).collect::<Vec<_>>(),
-            (0..8).collect::<Vec<_>>()
+            at_cap.iter().map(|(variant, _)| *variant).collect::<Vec<_>>(),
+            (0..cap).collect::<Vec<_>>()
         );
-        assert!(enum_abstract_samples(&tagged_enum_def(EnumId::new(0), 9)).is_none());
+        assert!(enum_abstract_samples(&tagged_enum_def(EnumId::new(0), cap + 1)).is_none());
 
-        let thir = enum_detector_module("nine_thir", false, 9, false);
-        let oracle = enum_detector_module("nine_oracle", true, 9, false);
+        let thir = enum_detector_module("over_cap_thir", false, cap + 1, false);
+        let oracle = enum_detector_module("over_cap_oracle", true, cap + 1, false);
         let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
         assert_eq!(report.mode, DiffMode::NotRun);
         assert_eq!(report.samples_checked, 0);
@@ -2498,9 +3082,11 @@ mod tests {
         let classes =
             vec![ParamClass::Scalar, ParamClass::Enum, ParamClass::Opaque, ParamClass::Scalar];
         let tables = vec![None, Some(vec![(0, Vec::new()), (1, vec![42])]), None, None];
+        let no_structs: Vec<Option<Vec<Vec<i128>>>> = vec![None; 4];
         let rejects =
             |classes: &[ParamClass], tables: &[Option<Vec<(usize, Vec<i128>)>>], tuple: &[i128]| {
-                build_side_args(&module, sig, classes, tables, tuple).is_err()
+                build_side_args(&module, sig, classes, tables, &no_structs[..classes.len()], tuple)
+                    .is_err()
             };
 
         assert!(rejects(&classes, &tables, &[17, 1]));
@@ -2536,7 +3122,14 @@ mod tests {
             "different local ids must agree: {:?}",
             agreed.notes
         );
-        assert_eq!(agreed.samples_checked, 8);
+        // The count is a function of the cap, stated rather than pasted. Pass 1 spends one
+        // sample per variant (8 here); pass 2 then deepens the ONLY payload-bearing variant
+        // (`tagged_enum_def` gives variant 1 an `i32`, whose `sample_values` pool is 7 wide)
+        // one sample per round, so the recipe tops out at 8 + (7 - 1) = 14 and the budget
+        // decides below that. Variant coverage — the property under test — is pass 1's, and
+        // is therefore complete at every cap >= 8.
+        assert!(MAX_ENUM_SAMPLES >= 8, "the 8-variant detector must fit the cap");
+        assert_eq!(agreed.samples_checked, MAX_ENUM_SAMPLES.min(8 + 6));
 
         let perturbed = enum_detector_module("enum_perturbed", true, 8, true);
         let mismatch = compare_entries(&thir, FuncId::new(0), &perturbed, FuncId::new(0));
@@ -3526,6 +4119,443 @@ mod tests {
         assert!(rep.samples_checked > 0, "at least one i64 sample must be interpreted");
     }
 
+    /// Splice a DEAD ADT-interior byte walk (`%c = const i64 <off>; %p = gep inbounds i8, %base,
+    /// %c`) into `func`'s entry block, immediately before its terminator. Dead on purpose: the
+    /// result is never used, so nothing about the module's VALUES changes and the only thing the
+    /// gate can be reacting to is the SHAPE.
+    /// Append an UNREACHABLE block carrying one byte walk (`%c = const i64 <off>;
+    /// %p = gep [inbounds] <pointee>, %base, %c`) to `func`.
+    ///
+    /// Unreachable on purpose, and it is the point of the construction: the recognizer is
+    /// SYNTACTIC, so the gate must fire on an offset that is merely COMMITTED TO, and the
+    /// discrimination controls below must stay green without the interpreter ever executing the
+    /// spliced instruction (a `GEP` off an `i64` block param would trap, and a trap would make
+    /// every control pass for the wrong reason).
+    fn splice_byte_walk(m: &mut Module, func: usize, off: Option<i128>, pointee: Ty, inbounds: bool) {
+        let f = &mut m.functions[func];
+        let next = 900 + func as u32 * 10;
+        let (kc, kp) = (ValueId::new(next), ValueId::new(next + 1));
+        let mut blk = Block::new(trust_ir::BlockId::new(90 + func as u32));
+        let idx = match off {
+            Some(k) => {
+                blk.body.push(
+                    InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(k) })
+                        .with_result(kc),
+                );
+                kc
+            }
+            // No literal: index the walk by the entry block's own param instead.
+            None => ValueId::new(0),
+        };
+        blk.body.push(
+            InstrNode::new(Inst::GEP {
+                pointee_ty: pointee,
+                base: ValueId::new(0),
+                indices: vec![idx],
+                inbounds,
+            })
+            .with_result(kp),
+        );
+        blk.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+        f.blocks.push(blk);
+    }
+
+    /// **THE RED PROOF OF THE ADT-INTERIOR BYTE-ARITHMETIC GATE (wave-DA).**
+    ///
+    /// The control is `compare_entries_two_fn_identity_agrees`: an identical pair that AGREES on
+    /// every sampled input. Splice one dead `gep inbounds i8, +4` into the THIR side and the
+    /// verdict must become `NotRun` — because the interpreter would be laying that ADT out by its
+    /// own rule and executing an offset it did not derive. Without the gate this pair still
+    /// reports `Agreed`, which is the wrong verdict the gate exists to refuse.
+    #[test]
+    fn adt_interior_byte_walk_turns_an_otherwise_green_pair_into_not_run() {
+        // ACCEPT CONTROL first — the pair must be green BEFORE the perturbation, or the refusal
+        // below proves nothing.
+        let clean_thir = two_fn_module("da_ctrl_thir", true);
+        let clean_oracle = two_fn_module("da_ctrl_oracle", true);
+        let green = compare_entries(&clean_thir, FuncId::new(0), &clean_oracle, FuncId::new(0));
+        assert_eq!(green.mode, DiffMode::Agreed, "control must be green: {:?}", green.notes);
+        assert!(green.samples_checked > 0);
+
+        let mut thir = two_fn_module("da_thir", true);
+        splice_byte_walk(&mut thir, 0, Some(4), Ty::I8, true);
+        let oracle = two_fn_module("da_oracle", true);
+        let rep = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(
+            rep.mode,
+            DiffMode::NotRun,
+            "an ADT-interior literal byte walk must refuse the interpreter channel: {:?}",
+            rep.notes
+        );
+        assert!(!rep.equal, "a coverage-only skip is never `equal`");
+        assert_eq!(rep.samples_checked, 0, "the gate must refuse BEFORE any sample is run");
+        assert!(
+            rep.notes.iter().any(|n| n.contains("ADT-interior literal byte arithmetic")
+                && n.contains("THIR side")
+                && n.contains("+4")),
+            "the note must name the side and the offset: {:?}",
+            rep.notes
+        );
+    }
+
+    /// The gate is SIDE-SYMMETRIC. The oracle does not emit this shape today, but the hazard is a
+    /// property of the shape, not of which front-end produced it — so an oracle carrying it is
+    /// refused with the oracle named.
+    #[test]
+    fn adt_interior_byte_walk_is_refused_on_the_oracle_side_too() {
+        let thir = two_fn_module("da_o_thir", true);
+        let mut oracle = two_fn_module("da_o_oracle", true);
+        splice_byte_walk(&mut oracle, 0, Some(16), Ty::U8, true);
+        let rep = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(rep.mode, DiffMode::NotRun, "{:?}", rep.notes);
+        assert!(
+            rep.notes.iter().any(|n| n.contains("MIR oracle side") && n.contains("+16")),
+            "the oracle side must be named: {:?}",
+            rep.notes
+        );
+    }
+
+    /// It catches the walk in a NON-ENTRY function that the entry CAN REACH — the seam links
+    /// callees, and a reachable callee that walks an ADT interior is executed by the same
+    /// interpreter. `two_fn_module`'s entry calls `callee`, so the walk spliced into `callee` is
+    /// inside the closure.
+    #[test]
+    fn adt_interior_byte_walk_is_caught_in_a_linked_callee() {
+        let mut thir = two_fn_module("da_callee_thir", true);
+        splice_byte_walk(&mut thir, 1, Some(8), Ty::I8, true);
+        let oracle = two_fn_module("da_callee_oracle", true);
+        let rep = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(rep.mode, DiffMode::NotRun, "{:?}", rep.notes);
+        assert!(rep.notes.iter().any(|n| n.contains("callee")), "{:?}", rep.notes);
+    }
+
+    /// **The discrimination controls.** A gate that refused every `GEP` would pass the RED proof
+    /// above and cost the programme every element-arithmetic body for nothing. These are the three
+    /// shapes the producer emits that are NOT ADT-interior byte arithmetic, and each must stay
+    /// green: the slice index (typed `pointee_ty`), the string-literal byte walk
+    /// (`inbounds: false`), and any byte GEP whose displacement is not a literal.
+    #[test]
+    fn element_arithmetic_and_non_literal_displacements_stay_green() {
+        // (a) typed pointee — the slice-index shape.
+        let mut typed = two_fn_module("da_typed_thir", true);
+        splice_byte_walk(&mut typed, 0, Some(4), Ty::I64, true);
+        let rep = compare_entries(
+            &typed,
+            FuncId::new(0),
+            &two_fn_module("da_typed_oracle", true),
+            FuncId::new(0),
+        );
+        assert_eq!(rep.mode, DiffMode::Agreed, "a TYPED pointee is element arithmetic: {:?}", rep.notes);
+
+        // (b) `inbounds: false` — the string-literal byte walk.
+        let mut oob = two_fn_module("da_oob_thir", true);
+        splice_byte_walk(&mut oob, 0, Some(4), Ty::U8, false);
+        let rep = compare_entries(
+            &oob,
+            FuncId::new(0),
+            &two_fn_module("da_oob_oracle", true),
+            FuncId::new(0),
+        );
+        assert_eq!(
+            rep.mode,
+            DiffMode::Agreed,
+            "a non-`inbounds` byte walk is the literal-bytes shape, not an ADT interior: {:?}",
+            rep.notes
+        );
+
+        // (c) a byte GEP whose index is a block PARAM, not a literal — no rustc offset is being
+        //     committed to, so there is nothing for the two sides to disagree about.
+        let mut dyn_idx = two_fn_module("da_dyn_thir", true);
+        splice_byte_walk(&mut dyn_idx, 0, None, Ty::I8, true);
+        let rep = compare_entries(
+            &dyn_idx,
+            FuncId::new(0),
+            &two_fn_module("da_dyn_oracle", true),
+            FuncId::new(0),
+        );
+        assert_eq!(
+            rep.mode,
+            DiffMode::Agreed,
+            "a non-literal displacement is not a committed rustc offset: {:?}",
+            rep.notes
+        );
+    }
+
+    /// Splice `%k = const{ty} off ; %p = gep{pointee,inbounds} base=%0 indices ; ret %0` into
+    /// `func`, where `indices` is built from `positions` — `None` = the entry block's own param,
+    /// `Some(())` = the spliced constant. Lets each wave-DZ recognizer limit be perturbed one at
+    /// a time (the spelling, the index position) off ONE shared shape.
+    fn splice_byte_walk_at(
+        m: &mut Module,
+        func: usize,
+        const_ty: Ty,
+        off: i128,
+        positions: &[Option<()>],
+    ) {
+        let f = &mut m.functions[func];
+        let next = 940 + func as u32 * 10;
+        let (kc, kp) = (ValueId::new(next), ValueId::new(next + 1));
+        let mut blk = Block::new(trust_ir::BlockId::new(94 + func as u32));
+        blk.body.push(
+            InstrNode::new(Inst::Const { ty: const_ty, value: Constant::Int(off) }).with_result(kc),
+        );
+        let indices =
+            positions.iter().map(|p| if p.is_some() { kc } else { ValueId::new(0) }).collect();
+        blk.body.push(
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::I8,
+                base: ValueId::new(0),
+                indices,
+                inbounds: true,
+            })
+            .with_result(kp),
+        );
+        blk.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+        f.blocks.push(blk);
+    }
+
+    /// **wave-DZ RED PROOF — a `Const { U32 }` respelling of the same byte offset.**
+    ///
+    /// wave-DA's table matched `I64 | U64 | Isize | Usize` only, so this exact module was
+    /// ADMITTED at that HEAD (demonstrated by a passing adversarial test during the wave-DA
+    /// review, and recorded in its merge message). A byte displacement is a byte displacement in
+    /// every integer width.
+    #[test]
+    fn a_u32_spelled_displacement_is_refused() {
+        let mut m = two_fn_module("dz_u32", true);
+        splice_byte_walk_at(&mut m, 0, Ty::U32, 12, &[Some(())]);
+        assert!(
+            first_adt_interior_byte_arithmetic(&m, FuncId::new(0))
+                .is_some_and(|why| why.contains("+12")),
+            "a U32-spelled rustc byte offset is still a committed rustc byte offset",
+        );
+        // Every other integer spelling too — the point is the CLASS, not four more names.
+        for ty in [Ty::I8, Ty::U8, Ty::I16, Ty::U16, Ty::I32, Ty::I128, Ty::U128] {
+            let mut m = two_fn_module("dz_widths", true);
+            splice_byte_walk_at(&mut m, 0, ty.clone(), 12, &[Some(())]);
+            assert!(
+                first_adt_interior_byte_arithmetic(&m, FuncId::new(0)).is_some(),
+                "a {ty}-spelled displacement must be refused",
+            );
+        }
+        // ACCEPT CONTROL: a NON-integer const in index position commits to no byte offset.
+        let mut boolish = two_fn_module("dz_bool", true);
+        splice_byte_walk_at(&mut boolish, 0, Ty::Bool, 1, &[Some(())]);
+        assert_eq!(first_adt_interior_byte_arithmetic(&boolish, FuncId::new(0)), None);
+    }
+
+    /// **wave-DZ RED PROOF — the literal in index position 1.** wave-DA read `indices.first()`,
+    /// so a flat-byte GEP carrying its displacement anywhere else walked past. The producer emits
+    /// one index at all three sites, so this costs nothing today and removes the limit.
+    #[test]
+    fn a_literal_in_a_later_index_position_is_refused() {
+        let mut m = two_fn_module("dz_pos1", true);
+        // index 0 = the entry block's own (uncommitted) param; index 1 = the literal.
+        splice_byte_walk_at(&mut m, 0, Ty::I64, 12, &[None, Some(())]);
+        assert!(
+            first_adt_interior_byte_arithmetic(&m, FuncId::new(0))
+                .is_some_and(|why| why.contains("+12") && why.contains("index 1")),
+            "a committed displacement is committed wherever it sits in the index list",
+        );
+    }
+
+    /// A caller that materializes the displacement and hands it to a callee which GEPs by its
+    /// OWN parameter — `func 0: %k = const 24 ; call callee(%0, %k)`, `callee: gep i8 %0[%1]`.
+    fn call_boundary_module(name: &str, pass_literal: bool) -> Module {
+        use trust_ir::{BlockId, Function as IrFunction};
+        let v = ValueId::new;
+        let mut m = Module::new(name.to_string());
+        let sig = m.add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            is_vararg: false,
+        });
+
+        let mut eb = Block::new(BlockId::new(0)).with_param(v(0), Ty::I64).with_param(v(1), Ty::I64);
+        eb.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(24) }).with_result(v(2)),
+        );
+        // The second argument is the caller's LITERAL, or (the control) its own opaque param.
+        let passed = if pass_literal { v(2) } else { v(1) };
+        eb.body.push(
+            InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![v(0), passed] })
+                .with_result(v(3)),
+        );
+        eb.body.push(InstrNode::new(Inst::Return { values: vec![v(3)] }));
+        let mut entry = IrFunction::new(FuncId::new(0), "entry", sig, BlockId::new(0));
+        entry.blocks.push(eb);
+        m.add_function(entry);
+
+        let mut cb = Block::new(BlockId::new(0)).with_param(v(0), Ty::I64).with_param(v(1), Ty::I64);
+        cb.body.push(
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::I8,
+                base: v(0),
+                indices: vec![v(1)],
+                inbounds: true,
+            })
+            .with_result(v(2)),
+        );
+        cb.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
+        let mut callee = IrFunction::new(FuncId::new(1), "callee", sig, BlockId::new(0));
+        callee.blocks.push(cb);
+        m.add_function(callee);
+        m
+    }
+
+    /// **wave-DZ RED PROOF — the displacement that crosses a call boundary.** wave-DA judged each
+    /// reachable function against its OWN constants, so a literal materialized in the caller and
+    /// GEP'd by the callee's parameter was admitted. The walk now carries the caller's committed
+    /// values into the callee's parameter positions.
+    ///
+    /// The CONTROL is the same module with the caller passing its own opaque parameter instead:
+    /// nothing has committed to a rustc offset, so the callee's GEP stays green. That control is
+    /// what keeps this from being "refuse every byte GEP", which would have cost the programme
+    /// every element-arithmetic body — the discrimination
+    /// `element_arithmetic_and_non_literal_displacements_stay_green` also holds.
+    #[test]
+    fn a_displacement_that_crosses_a_call_boundary_is_refused() {
+        let m = call_boundary_module("dz_callarg", true);
+        assert!(
+            first_adt_interior_byte_arithmetic(&m, FuncId::new(0))
+                .is_some_and(|why| why.contains("callee") && why.contains("call-site literal")),
+            "a literal that reaches the GEP through a parameter is still a committed offset",
+        );
+        // CONTROL: the identical shape with an opaque argument commits to nothing.
+        let control = call_boundary_module("dz_callarg_ctrl", false);
+        assert_eq!(
+            first_adt_interior_byte_arithmetic(&control, FuncId::new(0)),
+            None,
+            "a byte GEP indexed by a value nobody committed a rustc offset to stays green",
+        );
+        // And entering AT the callee — where no call site is visible — is likewise green, so the
+        // refusal above really is the propagation and not a recognizer that refuses every param.
+        assert_eq!(first_adt_interior_byte_arithmetic(&m, FuncId::new(1)), None);
+    }
+
+    /// **THE ZERO DISPLACEMENT, which is the whole point of wave-DZ.** The recognizer always
+    /// refused a literal `+0`; nothing ever EMITTED one, because both struct-interior producer
+    /// sites short-circuited `off == 0` to a bare `return pv`. `zero_displacement_agrees` now
+    /// makes the producer spell the contested case out, and this is the receiving end.
+    #[test]
+    fn a_zero_displacement_byte_walk_is_refused_exactly_like_a_nonzero_one() {
+        let mut m = two_fn_module("dz_zero", true);
+        splice_byte_walk(&mut m, 0, Some(0), Ty::I8, true);
+        assert!(
+            first_adt_interior_byte_arithmetic(&m, FuncId::new(0))
+                .is_some_and(|why| why.contains("+0")),
+            "a zero displacement is a committed rustc offset like any other — `Mixed.b` is at \
+             rustc byte 0 and at trust-ir byte 8",
+        );
+        let rep = compare_entries(
+            &m,
+            FuncId::new(0),
+            &two_fn_module("dz_zero_oracle", true),
+            FuncId::new(0),
+        );
+        assert_eq!(rep.mode, DiffMode::NotRun, "{:?}", rep.notes);
+        assert_eq!(rep.samples_checked, 0, "the gate must refuse BEFORE any sample is run");
+    }
+
+    /// The literal table is built over the WHOLE function before any `GEP` is judged, so a
+    /// displacement materialized in an EARLIER block still counts. A one-pass recognizer that
+    /// scanned instructions in order would already catch this; one that reset per block would not,
+    /// and that is the fail-OPEN direction.
+    #[test]
+    fn adt_interior_byte_walk_is_caught_across_blocks() {
+        // The GEP goes in one appended block and its displacement constant in ANOTHER, so a
+        // recognizer that reset its literal table per block would miss it. That is the fail-OPEN
+        // direction, which is why the table is built over the whole function first.
+        let mut m = two_fn_module("da_xblock", true);
+        let k = ValueId::new(970);
+        let f = &mut m.functions[0];
+        let mut gep_blk = Block::new(trust_ir::BlockId::new(80));
+        gep_blk.body.push(
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::I8,
+                base: ValueId::new(0),
+                indices: vec![k],
+                inbounds: true,
+            })
+            .with_result(ValueId::new(971)),
+        );
+        gep_blk.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+        f.blocks.push(gep_blk);
+        let mut const_blk = Block::new(trust_ir::BlockId::new(81));
+        const_blk.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(24) }).with_result(k),
+        );
+        const_blk.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+        f.blocks.push(const_blk);
+
+        assert!(
+            first_adt_interior_byte_arithmetic(&m, FuncId::new(0))
+                .is_some_and(|why| why.contains("+24") && why.contains("entry")),
+            "a displacement defined in a LATER block must still be recognized",
+        );
+        // ACCEPT CONTROL: drop the constant and the same GEP commits to nothing.
+        let mut clean = m.clone();
+        clean.functions[0].blocks.pop();
+        assert_eq!(
+            first_adt_interior_byte_arithmetic(&clean, FuncId::new(0)),
+            None,
+            "without a literal displacement there is nothing committed to",
+        );
+    }
+
+    /// **THE SCOPE CONTROL, and it is not hypothetical.** A byte walk in a function the entry
+    /// CANNOT REACH must not refuse anything. Written after the whole-module version of this gate
+    /// was MEASURED withdrawing two real `seam: agreed` verdicts
+    /// (`<expr::types::BinderData as Default>::default`, 1 sample, and
+    /// `env::origin::OriginTrust::needs_recheck`, 3 samples) because
+    /// `cache::TypeCheckCache::stats` emits `gep inbounds i8, +64` elsewhere in clean-kernel —
+    /// while those entries' reachable closures are 3 and 2 functions and contain no byte walk.
+    /// Withdrawing a verdict a body earned is a cost; paying it for a body that cannot run buys
+    /// nothing.
+    #[test]
+    fn a_byte_walk_outside_the_reachable_closure_refuses_nothing() {
+        let mut thir = two_fn_module("da_unreach_thir", true);
+        // A third function nobody calls, carrying the exact shape the RED proof uses.
+        let sig = thir.functions[0].ty;
+        let mut orphan = trust_ir::Function::new(FuncId::new(7), "orphan", sig, trust_ir::BlockId::new(0));
+        orphan.blocks.push(Block::new(trust_ir::BlockId::new(0)).with_param(ValueId::new(0), Ty::I64));
+        thir.functions.push(orphan);
+        splice_byte_walk(&mut thir, 2, Some(4), Ty::I8, true);
+
+        assert!(
+            function_adt_interior_byte_arithmetic(&thir.functions[2]).is_some(),
+            "the orphan really does carry the shape — without this the test is vacuous",
+        );
+        assert_eq!(
+            first_adt_interior_byte_arithmetic(&thir, FuncId::new(0)),
+            None,
+            "a walk outside the entry's reachable closure must not be reported",
+        );
+        let rep = compare_entries(
+            &thir,
+            FuncId::new(0),
+            &two_fn_module("da_unreach_oracle", true),
+            FuncId::new(0),
+        );
+        assert_eq!(
+            rep.mode,
+            DiffMode::Agreed,
+            "an unreachable byte walk must not withdraw a verdict the body earned: {:?}",
+            rep.notes
+        );
+        // ACCEPT CONTROL: entering AT the orphan does report it, so the scoping is real and not
+        // a recognizer that simply stopped working.
+        assert!(first_adt_interior_byte_arithmetic(&thir, FuncId::new(7)).is_some());
+    }
+
+    /// The recognizer must be silent on a module that carries no byte walk at all — otherwise
+    /// every refusal above is vacuous and the whole interpreter channel is dead.
+    #[test]
+    fn the_byte_walk_recognizer_is_silent_on_a_clean_module() {
+        assert_eq!(first_adt_interior_byte_arithmetic(&two_fn_module("da_clean", true), FuncId::new(0)), None);
+        assert_eq!(first_adt_interior_byte_arithmetic(&unit_call_module("da_clean_unit"), FuncId::new(0)), None);
+    }
+
     #[test]
     fn compare_entries_divergent_callee_is_mir_oracle() {
         // The perturbation control the plan requires: only the ORACLE-side callee body differs
@@ -3942,6 +4972,252 @@ mod tests {
             tys_agree(&thir, &oracle, &Ty::Enum(thir_level), &Ty::Enum(oracle_level), TY_CMP_DEPTH),
             Ok(false),
             "effective-discriminant disagreement must be a detected divergence"
+        );
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Trust (aggregate param lane): the `ParamClass::Struct` arm.
+    // ----------------------------------------------------------------------------------------
+
+    fn sfield(name: &str, ty: Ty) -> trust_ir::FieldDef {
+        trust_ir::FieldDef { name: name.to_string(), ty, offset: None }
+    }
+
+    fn sdef_named(id: u32, name: &str, fields: Vec<trust_ir::FieldDef>) -> trust_ir::StructDef {
+        trust_ir::StructDef {
+            id: trust_ir::StructId::new(id),
+            name: name.to_string(),
+            fields,
+            size: None,
+            align: None,
+            repr: trust_ir::StructRepr::Rust,
+        }
+    }
+
+    /// `AllocationId(u64)` at id 0, `MemoryRegion { alloc: AllocationId, offset: usize,
+    /// len: usize }` at id 1 — the real three-field / nested shape from the census (§2a).
+    /// `swap_names` transposes the two same-typed `usize` field NAMES, which is exactly the
+    /// transposition `tys_agree` alone cannot see.
+    fn memory_region_module(name: &str, swap_names: bool) -> Module {
+        let mut module = Module::new(name);
+        module.add_struct(sdef_named(0, "AllocationId", vec![sfield("0", Ty::U64)]));
+        let (a, b) = if swap_names { ("len", "offset") } else { ("offset", "len") };
+        module.add_struct(sdef_named(
+            1,
+            "MemoryRegion",
+            vec![
+                sfield("alloc", Ty::Struct(trust_ir::StructId::new(0))),
+                sfield(a, Ty::Usize),
+                sfield(b, Ty::Usize),
+            ],
+        ));
+        module
+    }
+
+    /// A body over `MemoryRegion` that returns field `read_field` of the top-level struct
+    /// (1 = `offset`, 2 = `len`) — the shape of `MemoryRegion::offset` / `::len`.
+    fn memory_region_reader(name: &str, swap_names: bool, read_field: u32) -> Module {
+        let mut module = memory_region_module(name, swap_names);
+        let region = Ty::Struct(trust_ir::StructId::new(1));
+        let sig = module.add_func_type(FuncTy {
+            params: vec![region.clone()],
+            returns: vec![Ty::Usize],
+            is_vararg: false,
+        });
+        let v = ValueId::new;
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((v(0), region));
+        block.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Usize,
+                aggregate: v(0),
+                field: read_field,
+            })
+            .with_result(v(1)),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
+        let mut function = Function::new(FuncId::new(0), "region_read", sig, block.id);
+        function.blocks.push(block);
+        module.add_function(function);
+        module
+    }
+
+    #[test]
+    fn struct_leaf_tys_admits_nested_scalars_and_refuses_everything_else() {
+        let module = memory_region_module("leaves", false);
+        assert_eq!(
+            struct_leaf_tys(&module, trust_ir::StructId::new(1), MAX_STRUCT_DEPTH),
+            Some(vec![Ty::U64, Ty::Usize, Ty::Usize]),
+            "a nested scalar wrapper flattens depth-first, in declaration order"
+        );
+
+        // Refusals, each a shape whose exact value model this lane does not establish.
+        for bad in [Ty::Unit, Ty::Ptr, Ty::Enum(EnumId::new(0)), Ty::Tuple(vec![Ty::U8])] {
+            let mut m = Module::new("bad");
+            m.add_struct(sdef_named(0, "S", vec![sfield("x", Ty::U8), sfield("y", bad.clone())]));
+            assert_eq!(
+                struct_leaf_tys(&m, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH),
+                None,
+                "field type {bad} must be refused, not approximated"
+            );
+        }
+
+        // A field-less struct carries no observable value.
+        let mut empty = Module::new("empty");
+        empty.add_struct(sdef_named(0, "Zst", Vec::new()));
+        assert_eq!(struct_leaf_tys(&empty, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH), None);
+
+        // Unresolvable id fails closed.
+        assert_eq!(struct_leaf_tys(&empty, trust_ir::StructId::new(7), MAX_STRUCT_DEPTH), None);
+
+        // The leaf cap bites before the marshalling does.
+        let mut wide = Module::new("wide");
+        wide.add_struct(sdef_named(
+            0,
+            "Wide",
+            (0..=MAX_STRUCT_LEAVES).map(|i| sfield(&format!("f{i}"), Ty::U8)).collect(),
+        ));
+        assert_eq!(struct_leaf_tys(&wide, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH), None);
+
+        // The depth cap bites too: a self-referential def cannot spin.
+        let mut deep = Module::new("deep");
+        deep.add_struct(sdef_named(0, "Rec", vec![sfield("me", Ty::Struct(trust_ir::StructId::new(0)))]));
+        assert_eq!(struct_leaf_tys(&deep, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH), None);
+    }
+
+    #[test]
+    fn struct_samples_keep_same_typed_siblings_distinguishable() {
+        let module = memory_region_module("rotation", false);
+        let samples = struct_abstract_samples(&module, trust_ir::StructId::new(1))
+            .expect("a three-leaf scalar struct samples");
+        assert!(!samples.is_empty());
+        assert!(samples.len() <= MAX_STRUCT_SAMPLES);
+        assert!(samples.iter().all(|s| s.len() == 3), "one raw per scalar leaf");
+
+        // THE property the leaf rotation exists for: `offset` and `len` are BOTH `usize`, so a
+        // plain diagonal would give them equal values in every sample and `MemoryRegion::offset`
+        // would agree with `MemoryRegion::len` vacuously. Every sample must separate them.
+        assert!(
+            samples.iter().all(|s| s[1] != s[2]),
+            "same-typed sibling leaves must differ in every sample: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn realize_struct_arg_builds_the_positional_nested_aggregate() {
+        let module = memory_region_module("realize", false);
+        let mut cursor = 0usize;
+        let value = realize_struct_arg(
+            &module,
+            trust_ir::StructId::new(1),
+            &[11, 22, 33],
+            &mut cursor,
+            MAX_STRUCT_DEPTH,
+        )
+        .expect("nested realization");
+        assert_eq!(cursor, 3, "every leaf raw is consumed exactly once");
+        assert_eq!(value.ty, Ty::Struct(trust_ir::StructId::new(1)));
+        assert_eq!(
+            value.kind,
+            InterpretValueKind::Aggregate(vec![
+                InterpretValue {
+                    ty: Ty::Struct(trust_ir::StructId::new(0)),
+                    kind: InterpretValueKind::Aggregate(vec![
+                        InterpretValue::int(Ty::U64, 11).expect("u64")
+                    ]),
+                },
+                InterpretValue::int(Ty::Usize, 22).expect("usize"),
+                InterpretValue::int(Ty::Usize, 33).expect("usize"),
+            ]),
+            "one element per DECLARED field, in declaration order, no padding lane"
+        );
+    }
+
+    #[test]
+    fn struct_param_admission_requires_field_names_not_merely_field_shape() {
+        let thir = memory_region_module("names_thir", false);
+        let straight = memory_region_module("names_oracle", false);
+        let swapped = memory_region_module("names_swapped", true);
+        let region = Ty::Struct(trust_ir::StructId::new(1));
+
+        // `tys_agree` cannot see the transposition — the field TYPES are identical.
+        assert_eq!(tys_agree(&thir, &swapped, &region, &region, TY_CMP_DEPTH), Ok(true));
+
+        assert!(struct_param_admissible(&thir, &straight, &region, &region));
+        assert!(
+            !struct_param_admissible(&thir, &swapped, &region, &region),
+            "a transposed field NAME must leave the body on its existing not-run"
+        );
+    }
+
+    #[test]
+    fn struct_param_body_is_sampled_and_agrees() {
+        let thir = memory_region_reader("agree_thir", false, 1);
+        let oracle = memory_region_reader("agree_oracle", false, 1);
+        let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::Agreed, "{:?}", report.notes);
+        assert!(
+            report.samples_checked > 0,
+            "a newly-backed body must report a REAL sample count, never a verdict without one"
+        );
+    }
+
+    #[test]
+    fn struct_param_field_index_divergence_is_caught() {
+        // The oracle reads `len` where the producer reads `offset`. Both sides pass
+        // `sig_tys_agree` (same signature) — only the SAMPLE can tell them apart, and it can
+        // only do so because the leaf rotation gave the two `usize` fields distinct values.
+        let thir = memory_region_reader("swap_thir", false, 1);
+        let oracle = memory_region_reader("swap_oracle", false, 2);
+        let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(
+            report.mode,
+            DiffMode::MirOracle,
+            "a field-index divergence must be a DIVERGENCE: {:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn struct_param_unadmissible_shape_keeps_the_verbatim_non_scalar_refusal() {
+        // A `Ty::Unit` field is refused, and the body must land back on the byte-identical
+        // reason string the census classifies by — not on a new one.
+        let mk = |name: &str| {
+            let mut module = Module::new(name);
+            module.add_struct(sdef_named(
+                0,
+                "HasUnit",
+                vec![sfield("a", Ty::U8), sfield("pad", Ty::Unit)],
+            ));
+            let sty = Ty::Struct(trust_ir::StructId::new(0));
+            let sig = module.add_func_type(FuncTy {
+                params: vec![sty.clone()],
+                returns: vec![Ty::U8],
+                is_vararg: false,
+            });
+            let v = ValueId::new;
+            let mut block = Block::new(trust_ir::BlockId::new(0));
+            block.params.push((v(0), sty));
+            block.body.push(
+                InstrNode::new(Inst::ExtractField { ty: Ty::U8, aggregate: v(0), field: 0 })
+                    .with_result(v(1)),
+            );
+            block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
+            let mut function = Function::new(FuncId::new(0), "read", sig, block.id);
+            function.blocks.push(block);
+            module.add_function(function);
+            module
+        };
+        let report = compare_entries(&mk("unit_thir"), FuncId::new(0), &mk("unit_oracle"), FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::NotRun);
+        assert_eq!(report.samples_checked, 0);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n == "non-scalar parameter type is non-interpretable (coverage-only skip)"),
+            "the refusal reason string is a census classifier key: {:?}",
+            report.notes
         );
     }
 }

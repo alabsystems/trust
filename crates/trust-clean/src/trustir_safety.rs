@@ -331,6 +331,14 @@ fn usub_underflows_ir_name(w: IrUWidth) -> String {
     format!("Trust.TrustIr.usubUnderflowsU{}", w.bits())
 }
 
+/// `Trust.TrustIr.umulOverflowsU{W}` — the unsigned-mul machine-overflow
+/// predicate. Trust (#53): the unsigned twin of the signed family, NOT of
+/// `usubUnderflows` — an unsigned multiply can leave the range at BOTH ends in
+/// the emitted form (`Or([Lt(a*b,0), Gt(a*b,MAX)])`), exactly as a signed op does.
+fn umul_overflows_ir_name(w: IrUWidth) -> String {
+    format!("Trust.TrustIr.umulOverflowsU{}", w.bits())
+}
+
 /// `Trust.TrustIr.s{add,sub,mul}OverflowsI{W}` — the signed machine-overflow predicate.
 fn signed_overflows_ir_name(op: IrSignedOp, w: IrSWidth) -> String {
     format!("Trust.TrustIr.s{}OverflowsI{}", op.tag(), w.bits())
@@ -433,6 +441,28 @@ fn signed_out_of_range_body(op: IrSignedOp, a_ref: &Expr, b_ref: &Expr, w: IrSWi
     Expr::apps(cst("Or"), [underflow, overflow])
 }
 
+/// Trust (#53): the unsigned-multiply out-of-range body — BYTE-MIRRORS
+/// [`signed_out_of_range_body`] with the unsigned bounds `(0, 2^W - 1)` in place
+/// of `(-2^(W-1), 2^(W-1) - 1)`. Deliberately the same construction rather than
+/// an "equivalent" one: the two must produce the same `Or(Int.lt .., Int.lt ..)`
+/// shape the emitter records, and a hand-rolled variant is how they drift.
+fn unsigned_mul_out_of_range_body(a_ref: &Expr, b_ref: &Expr, w: IrUWidth) -> Expr {
+    let result = || Expr::apps(cst("Int.mul"), [a_ref.clone(), b_ref.clone()]);
+    let underflow = Expr::apps(cst("Int.lt"), [result(), int_lit(0)]);
+    let overflow = Expr::apps(cst("Int.lt"), [int_lit(w.max_value()), result()]);
+    Expr::apps(cst("Or"), [underflow, overflow])
+}
+
+/// The width whose unsigned bounds are exactly `(min, max)` — the unsigned twin of
+/// `swidth_of_signed_bounds`. Requires `min == 0`, so an emitted pair that is not
+/// a genuine unsigned range matches NO width and declines.
+fn uwidth_of_unsigned_bounds(min: i128, max: i128) -> Option<IrUWidth> {
+    if min != 0 {
+        return None;
+    }
+    IrUWidth::ALL.into_iter().find(|w| w.max_value() == max)
+}
+
 /// The shift-amount-OOB body — `Int.le W n` (unsigned amount) or
 /// `Or (Int.lt n 0) (Int.le W n)` (signed amount), the EXACT `ground_prop` output
 /// for `Ge(n, Int(W))` / `Or([Lt(n,0), Ge(n,W)])` (`Ge` swaps its arguments).
@@ -471,6 +501,11 @@ fn trustir_safety_env_uncached() -> Result<Environment, String> {
         register_int2_prop(&mut env, &usub_underflows_ir_name(w), |a, b| {
             let diff = Expr::apps(cst("Int.sub"), [a.clone(), b.clone()]);
             Expr::apps(cst("Int.lt"), [diff, int_lit(0)])
+        })?;
+        // Trust (#53) — unsigned-mul OVERFLOW: the full out-of-range disjunction,
+        // the same shape the signed family uses.
+        register_int2_prop(&mut env, &umul_overflows_ir_name(w), |a, b| {
+            unsigned_mul_out_of_range_body(a, b, w)
         })?;
     }
     // Kind 4 — SIGNED add/sub/mul overflow (the full out-of-range disjunction).
@@ -523,6 +558,7 @@ pub fn pin_trustir_safety_anchor() -> AnchorVerdict {
     for w in IrUWidth::ALL {
         names.push(uadd_overflows_ir_name(w));
         names.push(usub_underflows_ir_name(w));
+        names.push(umul_overflows_ir_name(w));
     }
     for op in IrSignedOp::ALL {
         for w in IrSWidth::ALL {
@@ -1521,6 +1557,8 @@ pub enum IrSafetyVcKind {
     UAddOverflow(IrUWidth),
     /// Unsigned-sub underflow at the given width (kind 7).
     USubUnderflow(IrUWidth),
+    /// Trust (#53): unsigned-multiply overflow, `Or([Lt(a*b,0), Gt(a*b,2^W-1)])`.
+    UMulOverflow(IrUWidth),
     /// Signed add/sub/mul overflow at the given op + width (kind 4).
     SignedOverflow(IrSignedOp, IrSWidth),
     /// Signed negation overflow at the given width (kind 5).
@@ -1983,6 +2021,15 @@ fn trustir_safety_vc_adequate_kind(
                         return declined("uadd VC: no `Gt(a+b, MAX)` disjunct in the violation");
                     };
                     let F::Gt(add_t, max_f) = leaf else { unreachable!("guarded by the finder") };
+                    // Trust: umul round (2026-08-14) — the STRUCTURAL OP PIN, uadd
+                    // twin (the same op-blindness existed here for a Mul core; see
+                    // the Mul arm's note).
+                    if !matches!(&**add_t, F::Add(..)) {
+                        return declined(
+                            "uadd VC: the recorded core's operator is not `Add` — an \
+                             op-desynchronised record",
+                        );
+                    }
                     let Some((a_op, b_op)) = binop_operands(add_t) else {
                         return declined("uadd VC: operands outside the formula-aware fragment");
                     };
@@ -2187,6 +2234,80 @@ fn trustir_safety_vc_adequate_kind(
                     (
                         Some(IrSafetyVcKind::USubUnderflow(w)),
                         overflow_family_live_def_eq_ir(leaf, &[a_op, b_op], &|ops| {
+                            Expr::apps(cst(&name), [ops[0].clone(), ops[1].clone()])
+                        }),
+                    )
+                }
+                // Trust (#53, 2026-08-15) — UNSIGNED-MUL OVERFLOW. Structurally the
+                // signed arm above with unsigned bounds: the emitter records
+                // `Or([Lt(a*b, 0), Gt(a*b, 2^W-1)])`, the same disjunction shape.
+                // Every gate below is MIRRORED from that arm deliberately rather
+                // than reasoned out afresh -- a safety family that is permissive is
+                // a FALSE PROVE, not lost coverage, so the checks that stop a
+                // hostile or drifted VC must be identical, not merely equivalent.
+                BinOp::Mul if !sa && !sb => {
+                    let Some(rec) = authenticated_record(vc) else {
+                        return declined(
+                            "umul VC: no authenticated recorded obligation (unrecorded, or \
+                             reconstruct != formula — hostile/desync) — fail closed",
+                        );
+                    };
+                    let F::Or(v) = &rec.body else {
+                        return declined("umul VC: recorded body is not the `Or` form");
+                    };
+                    let [F::Lt(under_t, min_f), F::Gt(over_t, max_f)] = v.as_slice() else {
+                        return declined("umul VC: unexpected disjunct shape");
+                    };
+                    // Trust: umul round (2026-08-14) — the STRUCTURAL OP PIN. Nothing
+                    // else compares the recorded core's operator with the kind's op:
+                    // `binop_operands` is op-blind, and the kernel def-eq (the only
+                    // other defense) admits an op-desynced record at two-LITERAL
+                    // coincidence points (`2+2 = 2·2`) — a true Prop under a wrong
+                    // kind label. Pin the operator, fail-closed.
+                    if !matches!(&**under_t, F::Mul(..)) {
+                        return declined(
+                            "umul VC: the recorded core's operator is not `Mul` — an \
+                             op-desynchronised record",
+                        );
+                    }
+                    // Both disjuncts must reference the SAME computed `a*b` operands.
+                    let Some((a_op, b_op)) = binop_operands(under_t) else {
+                        return declined("umul VC: operands outside the fragment");
+                    };
+                    if binop_operands(over_t) != Some((a_op, b_op)) {
+                        return declined("umul VC: disjunct operand mismatch");
+                    }
+                    let (F::Int(min), F::Int(max)) = (&**min_f, &**max_f) else {
+                        return declined("umul VC: emitted (MIN,MAX) are not `Int` literals");
+                    };
+                    let Some(w) = uwidth_of_unsigned_bounds(*min, *max) else {
+                        return declined("umul VC: emitted (MIN,MAX) match no modeled width");
+                    };
+                    if !arith_width_agrees_with_kind(&vc.kind, w.bits()) {
+                        return declined(
+                            "umul VC: the width recovered from the emitted (MIN,MAX) is not a \
+                             width this VC's own `operand_tys` mentions",
+                        );
+                    }
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return declined(
+                                "umul VC: the recorded operand width disagrees with the emitted \
+                                 (MIN,MAX) width — a desynchronised record",
+                            );
+                        }
+                    }
+                    if !mixed_width_narrowing_is_justified(&vc.kind, w.bits(), a_op, b_op) {
+                        return declined(
+                            "umul VC: this VC's operand types have DIFFERENT widths and the \
+                             certified width is not the narrower one justified by a literal in \
+                             the wider position",
+                        );
+                    }
+                    let name = umul_overflows_ir_name(w);
+                    (
+                        Some(IrSafetyVcKind::UMulOverflow(w)),
+                        overflow_family_live_def_eq_ir(&rec.body, &[a_op, b_op], &|ops| {
                             Expr::apps(cst(&name), [ops[0].clone(), ops[1].clone()])
                         }),
                     )
@@ -2515,6 +2636,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: t(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2546,6 +2668,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2593,6 +2716,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: val(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2641,6 +2765,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: u32t(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2717,6 +2842,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: u128t(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2755,6 +2881,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2786,6 +2913,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: i(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -2856,6 +2984,7 @@ mod tests {
             "Trust.TrustIr.shiftAmountOob128",
             "Trust.TrustIr.shiftAmountOobSigned128",
             "Trust.TrustIr.usubUnderflowsU32",
+            "Trust.TrustIr.umulOverflowsU8",
         ] {
             assert!(
                 env.get_const(&Name::from_string(n)).is_some(),
@@ -2903,6 +3032,110 @@ mod tests {
         assert_eq!(verdict, RefinementVerdict::ProvenModulo3);
         assert_eq!(kind, Some(IrSafetyVcKind::UAddOverflow(IrUWidth::W32)));
         assert!(function_safety_vcs_faithful_via_trustir(&func));
+    }
+
+    /// Trust: R4 SAFETY_GAP closure (2026-08-14) — the unsigned-MUL twin, on the
+    /// synthetic emitter shape AND the two REAL corpus bodies this arm exists for
+    /// (`u8::to_ascii_{upper,lower}case`, `(bool as u8) * 32` — MirSem-fallback
+    /// until this arm; the end-to-end assertion IS the R4 lane flip).
+    #[test]
+    fn kind1_umul_overflow_adequate_modulo_3() {
+        // A CONSTANT multiplier, deliberately: the var*var mul takes the emitter's
+        // BV path (`obligation: None` — honestly deferred, no record to
+        // authenticate), while the linear const-mul takes the recorded Int path —
+        // which is exactly the real population's shape (`(bool as u8) * 32`).
+        let mut func = binop_func(BinOp::Mul, 8, false);
+        {
+            let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+                &mut func.body.blocks[0].stmts[0]
+            else {
+                unreachable!()
+            };
+            *rhs = Operand::Constant(trust_types::ConstValue::Uint(32, 8));
+        }
+        let (kind, verdict) = adequacy_of_first(&func, |k| {
+            matches!(k, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })
+        });
+        assert_eq!(verdict, RefinementVerdict::ProvenModulo3);
+        assert_eq!(kind, Some(IrSafetyVcKind::UMulOverflow(IrUWidth::W8)));
+        assert!(function_safety_vcs_faithful_via_trustir(&func));
+        // The real bodies.
+        let dir = format!(
+            "{}/fixtures/mass-harvest-2026-07-17/char-ascii/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut hit = 0;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("e").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let f: VerifiableFunction =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            if f.def_path != "core::num::<impl u8>::to_ascii_uppercase"
+                && f.def_path != "core::num::<impl u8>::to_ascii_lowercase"
+            {
+                continue;
+            }
+            hit += 1;
+            assert!(
+                function_safety_vcs_faithful_via_trustir(&f),
+                "{}: the umul arm must reflect the real body's safety VC",
+                f.def_path
+            );
+        }
+        assert_eq!(hit, 2, "both committed ascii-case bodies must be present");
+    }
+
+    /// Trust: umul round (2026-08-14) — the OP-DESYNC negatives, both directions:
+    /// a record whose core computes the WRONG operator under the kind's op must
+    /// decline at the structural op pin (previously the only defense was the
+    /// kernel def-eq, untested, with a certifying two-literal coincidence corner),
+    /// (under Trust (#53)'s full-disjunction spec there is no vacuity side
+    /// condition to test — see the note at the end).
+    #[test]
+    fn umul_op_desync_declines_both_directions() {
+        // Build the real emitted VCs once each.
+        let mul_vc = |func: &VerifiableFunction| {
+            trust_vcgen::generate_vcs(func)
+                .into_iter()
+                .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. }))
+                .expect("overflow VC")
+        };
+        let mut mul_func = binop_func(BinOp::Mul, 8, false);
+        {
+            let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+                &mut mul_func.body.blocks[0].stmts[0]
+            else {
+                unreachable!()
+            };
+            *rhs = Operand::Constant(trust_types::ConstValue::Uint(32, 8));
+        }
+        let add_func = binop_func(BinOp::Add, 32, false);
+        // (1) The ADD core relabeled `op: Mul` — the Mul arm's op pin declines.
+        let mut forged = mul_vc(&add_func);
+        let VcKind::ArithmeticOverflow { op, .. } = &mut forged.kind else { unreachable!() };
+        *op = BinOp::Mul;
+        let (_, verdict) = trustir_safety_vc_adequate_kind(&add_func, &forged);
+        assert_ne!(
+            verdict,
+            RefinementVerdict::ProvenModulo3,
+            "an Add-core record under kind Mul must decline (op desync)"
+        );
+        // (2) The MUL core relabeled `op: Add` — the uadd arm's op pin declines.
+        let mut forged = mul_vc(&mul_func);
+        let VcKind::ArithmeticOverflow { op, .. } = &mut forged.kind else { unreachable!() };
+        *op = BinOp::Add;
+        let (_, verdict) = trustir_safety_vc_adequate_kind(&mul_func, &forged);
+        assert_ne!(
+            verdict,
+            RefinementVerdict::ProvenModulo3,
+            "a Mul-core record under kind Add must decline (op desync)"
+        );
+        // (No vacuity negative here — Trust (#53)'s full-disjunction spec covers
+        // BOTH range ends, so no half is discarded and no non-negativity side
+        // condition exists to break. The uadd arm's vacuity discipline keeps its
+        // own pins in the selection tests.)
     }
 
     #[test]
@@ -3176,3 +3409,78 @@ mod tests {
         );
     }
 }
+
+
+
+
+#[cfg(test)]
+mod umul_overflow_family_tests {
+    //! Trust (#53): the unsigned-multiply overflow family's fail-closed gates.
+    //!
+    //! A safety family that is too PERMISSIVE is a false prove, not lost
+    //! coverage, so the gates get direct negative controls rather than relying on
+    //! the corpus happening to exercise them.
+
+    use super::*;
+
+    /// The bound recovery must reject anything that is not a genuine unsigned
+    /// range. `min != 0` is the load-bearing check: a signed pair like
+    /// `(-128, 127)` must NOT be mistaken for an unsigned width.
+    #[test]
+    fn unsigned_bound_recovery_rejects_non_unsigned_ranges() {
+        for w in IrUWidth::ALL {
+            assert_eq!(
+                uwidth_of_unsigned_bounds(0, w.max_value()),
+                Some(w),
+                "the genuine unsigned range for u{} must recover",
+                w.bits()
+            );
+        }
+        // A SIGNED range must match no unsigned width.
+        assert_eq!(uwidth_of_unsigned_bounds(-128, 127), None);
+        assert_eq!(uwidth_of_unsigned_bounds(-1, 255), None, "min != 0 must decline");
+        // A max that is no modeled width's bound.
+        assert_eq!(uwidth_of_unsigned_bounds(0, 254), None);
+        assert_eq!(uwidth_of_unsigned_bounds(0, 0), None);
+    }
+
+    /// The body must be EXACTLY the signed construction with unsigned bounds --
+    /// asserted structurally against a term built here, not by inspecting a Debug
+    /// rendering. If these ever diverge, the emitter's recorded body stops
+    /// matching the registered predicate and the arm silently declines.
+    #[test]
+    fn unsigned_mul_body_is_the_two_ended_disjunction() {
+        let a = int_lit(7);
+        let b = int_lit(9);
+        for w in IrUWidth::ALL {
+            let result = Expr::apps(cst("Int.mul"), [a.clone(), b.clone()]);
+            let expected = Expr::apps(cst("Or"), [
+                Expr::apps(cst("Int.lt"), [result.clone(), int_lit(0)]),
+                Expr::apps(cst("Int.lt"), [int_lit(w.max_value()), result]),
+            ]);
+            assert_eq!(
+                unsigned_mul_out_of_range_body(&a, &b, w),
+                expected,
+                "u{} body must be the two-ended out-of-range disjunction, byte-mirroring \
+                 `signed_out_of_range_body` with unsigned bounds",
+                w.bits()
+            );
+        }
+    }
+
+    /// The family must be registered for every modeled width, and the anchor audit
+    /// must cover it — an unregistered predicate would make the arm decline at
+    /// kernel time rather than at the gate, which is a confusing failure.
+    #[test]
+    fn unsigned_mul_predicate_is_registered_for_every_width() {
+        let env = trustir_safety_env().expect("safety env builds");
+        for w in IrUWidth::ALL {
+            let name = umul_overflows_ir_name(w);
+            assert!(
+                env.get_const(&Name::from_string(&name)).is_some(),
+                "{name} must be registered"
+            );
+        }
+    }
+}
+

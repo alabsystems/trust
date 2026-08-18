@@ -1,0 +1,548 @@
+// Callsite L0 replay (refutation-only): when a caller's `VcKind::Precondition`
+// obligation is REFUTED with a genuine solver witness, the compiler already
+// knows the caller can violate the callee's `#[requires]` — but the entailed
+// CALLEE-side Level-0 consequence (the bounds/overflow/div panic the requires
+// was shielding) has no obligation row of its own, so the build aborts as
+// `incomplete` instead of `refuted`. This producer builds the COMPOSED
+// refutation candidates: the callee's own L0 violation formulas, regenerated
+// WITHOUT the callee's precondition, rebound to the caller's actuals, and
+// conjoined with the caller's path condition at the call site.
+//
+// The lane is STRICTLY refutation-only and fail-closed at every seam:
+//   * A candidate is only ever solved for SAT by the DRIVER; a Proved/UNSAT/
+//     Unknown replay result appends NOTHING and discharges NOTHING — not the
+//     caller's Precondition obligation, not the callee's own rows, and never
+//     any authority registry. This producer mints no verdicts at all.
+//   * Every gate below DROPS a candidate rather than approximating it: an
+//     over-approximated SAT would be a FALSE L0 refutation of possibly-correct
+//     code (the cardinal sin's refutation-side twin).
+//
+// WHAT THE GATES ESTABLISH (exactly, no more): every free variable of an
+// emitted composed formula is either caller ENTRY state (a stable, never-
+// rewritten parameter dimension — legitimately model-rangeable) or def-pinned
+// by the formula's own conjuncts (callee side: `callee_temps_are_def_pinned`;
+// caller side: `composed_formula_is_caller_entry_grounded`). A SAT model is
+// therefore a counterexample UNDER the conjoined caller model; its ultimate
+// genuineness additionally rests on the guard/def/fact assembly capturing
+// every constraint that dominates the call site and on `generate_vcs`
+// faithfully modeling the callee's violation — properties inherited from
+// those builders, not re-established here.
+//
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Copyright 2026 Andrew Yates | License: Apache 2.0
+
+use super::*;
+
+/// σ-namespace prefix shared by [`sigma_actual_formula`]'s aliasing-opaque
+/// fallback (`__trust_sigma_opaque__<formal>`) and
+/// [`rebind_projected_actual`]'s fail-closed fresh field var
+/// (`__trust_sigma_field__<formal><suffix>`). In the PRECONDITION lane a free
+/// σ var is deliberately non-dischargeable (fail-closed toward "obligation
+/// kept"); in THIS lane a free σ var is an UNCONSTRAINED model dimension, so a
+/// SAT model over it denotes no real execution — reject the candidate instead.
+const SIGMA_FRESH_VAR_PREFIX: &str = "__trust_sigma_";
+
+/// Capture-proof namespace for the callee's OWN def-pinned temps carried
+/// inside a body VC formula (`_3 == Len(a)`-style conjuncts). rustc place
+/// names (`_N`, source idents, `.k`/`*` projections) and the σ namespaces can
+/// never spell this prefix, so a renamed callee temp cannot be captured by —
+/// or capture — any caller-side name once the caller's path facts are
+/// conjoined around it.
+const REPLAY_TEMP_VAR_PREFIX: &str = "__trust_replay__";
+
+/// Whether every non-σ free var ("callee temp") of `violation` is
+/// FUNCTIONALLY PINNED by the formula itself: a top-level `And` conjunct
+/// `Eq(temp, rhs)` (either orientation) whose `rhs` free vars resolve — via
+/// the fixpoint — to σ-domain names, constants, or already-pinned temps.
+///
+/// SOUNDNESS (the "block-defs fully conjoined" admission): a model of a
+/// conjunction containing `temp == rhs(inputs)` assigns `temp` EXACTLY the
+/// value the callee's execution computes from those inputs, so the model's
+/// input projection still denotes a real execution. Conversely a temp WITHOUT
+/// such a pin is an unconstrained model dimension — a SAT over it is an
+/// over-approximation, not a witness — so the candidate must drop. The
+/// fixpoint is drop-only: any unhandled shape (non-`And` top with temps,
+/// projected temp names, a temp pinned only under a disjunction) fails the
+/// check and loses the refutation, never mints one.
+fn callee_temps_are_def_pinned(
+    violation: &Formula,
+    temps: &FxHashSet<String>,
+    in_domain: &dyn Fn(&str) -> bool,
+) -> bool {
+    if temps.is_empty() {
+        return true;
+    }
+    // A temp is only ever pinned by a DIRECT conjunct of a flat top-level
+    // `And` — the exact shape the body-VC assemblers emit (defs and guards
+    // spliced flat beside the violation). Anything else: fail closed.
+    let Formula::And(conjuncts) = violation else {
+        return false;
+    };
+    let mut resolved: FxHashSet<String> = FxHashSet::default();
+    let rhs_grounded = |rhs: &Formula, resolved: &FxHashSet<String>| {
+        rhs.free_variables().iter().all(|v| {
+            in_domain(v)
+                || resolved.contains(v)
+                || matches!(split_projection_base(v), Some((base, _)) if in_domain(base))
+        })
+    };
+    // Monotone fixpoint (chained defs: `_4 == i < _3` after `_3 == 4`).
+    loop {
+        let mut progressed = false;
+        for conjunct in conjuncts {
+            let Formula::Eq(lhs, rhs) = conjunct else {
+                continue;
+            };
+            // Either orientation; the pinned side must be a WHOLE-name temp
+            // var (a projected temp is not a value equation for its base).
+            for (var_side, def_side) in
+                [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
+            {
+                if let Some(name) = var_side.var_name()
+                    && temps.contains(name)
+                    && !resolved.contains(name)
+                    && rhs_grounded(def_side, &resolved)
+                {
+                    resolved.insert(name.to_string());
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    temps.iter().all(|t| resolved.contains(t))
+}
+
+/// Caller-side mirror of [`callee_temps_are_def_pinned`], applied at the
+/// emission seam to the fully COMPOSED formula (violation + block/path defs +
+/// guards + facts + own preconditions, post `freshen_aliasing_opaque_occurrences`
+/// and `normalize_ssa_version_tokens`).
+///
+/// SOUNDNESS (the caller-side unconstrained-dimension gate): the driver reads a
+/// SAT model of a composed candidate as a REAL caller execution, so every free
+/// variable of the formula must denote a value a real execution can actually
+/// take. Exactly two classifications establish that:
+///   * ENTRY STATE: a caller PARAMETER — whole name, field/deref/index
+///     projection of it, or its `__slice_len` companion — that provably still
+///     holds its entry value at every body read: never statement-written, no
+///     call-dest write, `place_source_is_stable` (the exact
+///     `local_versions_collapse_to_bare` parameter standard). Entry inputs are
+///     universally quantified over real executions, so the model may range
+///     freely over them.
+///   * DEF-PINNED: functionally determined by the conjoined caller facts — a
+///     top-level `Eq` conjunct grounding the var, via the same fixpoint the
+///     callee-side gate runs, in entry state / constants / already-pinned vars.
+///     This is what admits computed actuals (`let k = i + 1; helper(a, k)`
+///     carries `k == i + 1` as a block def) and the alpha-renamed
+///     `__trust_replay__*` callee temps (pinned by their own carried defs).
+///
+/// EVERYTHING ELSE FAILS THE GATE, dropping the candidate (fail-closed, drop-
+/// only). The known hostile inhabitants, each a CONFIRMED false-refutation
+/// vector when left free:
+///   * a HAVOC'D CALL-DEST temp (`j = ext::clamp3(i); helper(a, j)` with no
+///     summary fact): `j`'s value is chosen by the unmodeled callee, not by the
+///     model — SAT at `j = 9` refutes a caller that may be perfectly safe;
+///   * a `freshen_aliasing_opaque_occurrences` `{name}__r1occ{n}` var: the
+///     freshening deliberately SPLITS a fixed-but-unknown constant into
+///     independent occurrences (sound for discharge, where it only shrinks the
+///     UNSAT set) — but as a free SAT dimension it lets the model pick a
+///     different value per occurrence of the SAME constant, weakening guard
+///     hypotheses below reality (rejected by NAME, before any pin analysis:
+///     no real caller place can be constrained through a per-occurrence alias);
+///   * a residual `X#tok` versioned read of a reassigned local, a
+///     `__trust_sigma_*` fresh var, or any name that resolves to no unique
+///     caller local — unclassifiable, hence unconstrained.
+pub(super) fn composed_formula_is_caller_entry_grounded(
+    func: &VerifiableFunction,
+    formula: &Formula,
+) -> bool {
+    let entry_stable_param = |base: &str| -> bool {
+        // Resolve the base to EXACTLY ONE declared local by the canonical
+        // emitter spelling (`place_to_var_name` owns demotion/uniqueness);
+        // ambiguity fails closed.
+        let mut named = func.body.locals.iter().filter(|decl| {
+            crate::place_to_var_name(
+                func,
+                &Place { local: decl.index, projections: Vec::new() },
+            ) == base
+        });
+        let Some(decl) = named.next() else {
+            return false;
+        };
+        if named.next().is_some() {
+            return false;
+        }
+        let local = decl.index;
+        // Parameters only: a never-written non-parameter has no defined value
+        // at all, and a written one must earn admission through a def pin.
+        (1..=func.body.arg_count).contains(&local)
+            && local_versions_collapse_to_bare(func, local)
+    };
+    let in_domain = |name: &str| -> bool {
+        if name.contains("__r1occ") {
+            return false;
+        }
+        let whole = name.strip_suffix("__slice_len").unwrap_or(name);
+        if entry_stable_param(whole) {
+            return true;
+        }
+        matches!(split_projection_base(whole), Some((base, _)) if entry_stable_param(base))
+    };
+    let mut temps: FxHashSet<String> = FxHashSet::default();
+    for name in formula.free_variables() {
+        // A per-occurrence opaque alias is unclassifiable BY CONSTRUCTION —
+        // reject by name even if some Eq conjunct would appear to pin it.
+        if name.contains("__r1occ") {
+            return false;
+        }
+        if !in_domain(&name) {
+            temps.insert(name);
+        }
+    }
+    callee_temps_are_def_pinned(formula, &temps, &in_domain)
+}
+
+/// Substitute the callee's L0 violation formula into the caller's namespace,
+/// or `None` when the result could not be a faithful witness carrier.
+///
+/// Gates (each is drop-only — rejection can only LOSE a refutation, never
+/// mint one):
+///   * `Bool(true)`/`Bool(false)` SENTINELS: a fail-close marker or
+///     reconstruction placeholder models NOTHING — "solving" it after
+///     substitution would refute (or vacuously pass) a formula about no real
+///     operation. Skip before any substitution.
+///   * RESIDUAL CALLEE LOCALS: every free var of the violation must either
+///     resolve — whole-name or via its projection BASE (`a.0` → `a`) — to a σ
+///     formal (incl. the `<formal>__slice_len` length names), or be a
+///     WHOLE-name callee temp that is DEF-PINNED by the formula's own
+///     conjuncts (`callee_temps_are_def_pinned`). Pinned temps are
+///     alpha-renamed into the reserved `__trust_replay__*` namespace so no
+///     caller-side name can capture them; anything else is rejected — an
+///     unpinned temp would range unconstrained (over-approximated SAT — not a
+///     witness of any execution). `Formula::free_variables` is binder-aware,
+///     so quantifier-bound names do not trip this gate.
+///   * σ-FRESH RESULT VARS: `sigma_actual_formula` maps an aliasing-opaque
+///     constant actual to a fresh `__trust_sigma_opaque__*` var and
+///     `rebind_projected_actual` falls back to `__trust_sigma_field__*` when a
+///     projected formal cannot be soundly reattached to the actual place.
+///     Both are deliberately-free vars (sound where the obligation must FAIL
+///     CLOSED toward "kept"), but here they are unconstrained model freedom —
+///     reject the candidate.
+pub(crate) fn replay_substituted_callee_violation(
+    violation: &Formula,
+    replacements: &[(String, Formula)],
+) -> Option<Formula> {
+    // Modeling-gap sentinels carry no operation semantics. (The whole-formula
+    // match is deliberate: a Bool literal nested under real structure is a
+    // genuine subterm, not a sentinel.)
+    if matches!(violation, Formula::Bool(_)) {
+        return None;
+    }
+    // Partition the free vars: σ-resolvable (exact formal / length name, or a
+    // projection whose BASE is one — the substitution rebinding covers exactly
+    // these shapes) versus callee temps.
+    let in_domain = |name: &str| replacements.iter().any(|(formal, _)| formal == name);
+    let mut temps: FxHashSet<String> = FxHashSet::default();
+    for name in violation.free_variables() {
+        if in_domain(&name) {
+            continue;
+        }
+        match split_projection_base(&name) {
+            Some((base, _)) if in_domain(base) => {}
+            // A PROJECTED non-σ name (`_3.0`) is not a whole-name temp the
+            // def-pin check can reason about — fail closed.
+            Some(_) => return None,
+            None => {
+                temps.insert(name);
+            }
+        }
+    }
+    if !callee_temps_are_def_pinned(violation, &temps, &in_domain) {
+        return None;
+    }
+    // Alpha-rename the pinned temps into the reserved replay namespace BEFORE
+    // σ-substitution: temps are disjoint from the σ domain by construction,
+    // and the fresh names are unspellable as caller places, so the later
+    // caller-fact conjunction cannot capture them. Renaming is semantics-
+    // preserving (pure alpha over free names occurring nowhere else); sorts
+    // are taken from each temp's own `Var` occurrence.
+    let renamed = if temps.is_empty() {
+        violation.clone()
+    } else {
+        let mut sorts: FxHashMap<String, Sort> = FxHashMap::default();
+        collect_var_sorts(violation, &mut sorts);
+        let rename: Vec<(String, Formula)> = temps
+            .iter()
+            .map(|t| {
+                let sort = sorts.get(t).cloned().unwrap_or(Sort::Int);
+                (t.clone(), Formula::var_owned(format!("{REPLAY_TEMP_VAR_PREFIX}{t}"), sort))
+            })
+            .collect();
+        substitute_summary_params(violation, &rename)
+    };
+    let substituted = substitute_summary_params(&renamed, replacements);
+    // Post-substitution: no deliberately-free σ var may remain (see the
+    // prefix doc above).
+    if substituted.free_variables().iter().any(|v| v.starts_with(SIGMA_FRESH_VAR_PREFIX)) {
+        return None;
+    }
+    Some(substituted)
+}
+
+/// First-seen sort of every `Var` node (bound or free — over-collection only
+/// affects rename-sort selection for names that ARE free temps, where the
+/// occurrences agree).
+fn collect_var_sorts(formula: &Formula, out: &mut FxHashMap<String, Sort>) {
+    if let Some(name) = formula.var_name()
+        && let Some(sort) = formula.var_sort()
+        && !out.contains_key(name)
+    {
+        out.insert(name.to_string(), sort.clone());
+    }
+    for child in formula.children() {
+        collect_var_sorts(child, out);
+    }
+}
+
+/// Refutation-only candidates for the call-site L0 replay lane: the callee's
+/// own strict-L0 violation formulas (regenerated WITHOUT its precondition),
+/// σ-rebound to the caller's actuals and conjoined with the caller's path
+/// condition at the `callee_name` call site(s) matching `call_location`.
+///
+/// Returns composed `VerificationCondition`s carrying the callee's REAL L0
+/// kind at the CALL span, stamped with the caller's function name. SAT on one
+/// of these (decided by the caller of this producer, never here) is a
+/// counterexample MODULO the fidelity of the conjoined caller model: the
+/// gates guarantee every free var of the composed formula is caller-entry
+/// state or def-pinned (`composed_formula_is_caller_entry_grounded`), and the
+/// model satisfies every CAPTURED caller-side hypothesis (path guards, block/
+/// path defs, global facts, own preconditions — the same assembly the callsite
+/// precondition lane uses). What they do NOT independently establish is that
+/// the assembly captured EVERY constraint dominating the call, nor that the
+/// regenerated callee body VC is a complete model of the violation — those are
+/// inherited from the guard/def builders and `generate_vcs` respectively.
+///
+/// Fail-closed empties (each documented at its gate): malformed caller IR,
+/// over-budget caller or callee, self-recursive call sites, a summary without
+/// an attached `extracted_body` (cross-crate callee — replay unavailable, the
+/// honest `incomplete` residual stands), and arity mismatches.
+pub fn generate_callsite_l0_replay_candidates(
+    func: &VerifiableFunction,
+    summaries: &crate::modular::SummaryDatabase,
+    callee_name: &str,
+    call_location: &SourceSpan,
+) -> Vec<VerificationCondition> {
+    // Refutation-only lane: a malformed function yields NO candidates (the
+    // precondition lane's malformed-IR VC already fails the build closed).
+    if crate::validate_function(func).is_err() {
+        return Vec::new();
+    }
+    // verifier-perf: same whole-function gate as the callsite precondition
+    // producer. DROP-ONLY — withholding replay candidates can only leave the
+    // build at its existing (already fail-closed) verdict.
+    if func_exceeds_vcgen_budget(func) {
+        return Vec::new();
+    }
+    // #5-PRE-A critical scoping: a recursive self-call's precondition is
+    // discharged against the DEFINITION-ENTRY assumption machinery; replaying
+    // the caller's own body as its "callee" would re-derive the entry
+    // obligation this scoping deliberately exempts. Never replay self-calls.
+    if callee_name == func.name || callee_name == func.def_path {
+        return Vec::new();
+    }
+    let Some(summary) = summaries.get(callee_name) else {
+        return Vec::new();
+    };
+    // The extracted body is the F6b session-local ANALYSIS INPUT (zero proof
+    // authority; see `FunctionSummary::extracted_body`). Absent — cross-crate
+    // or extraction-refused callee — replay is unavailable and the honest
+    // `incomplete` classification stands.
+    let Some(extracted_body) = summary.extracted_body.as_deref() else {
+        return Vec::new();
+    };
+    if func_exceeds_vcgen_budget(extracted_body) {
+        return Vec::new();
+    }
+
+    // Regenerate the callee's body VCs WITHOUT its contract hypotheses. The
+    // callee proved green by ASSUMING `#[requires]` at entry
+    // (`conjoin_preconditions_versioned` over `func.preconditions`); the
+    // whole point of the replay is that the refuted caller does NOT establish
+    // that assumption, and a real execution checks no requires at runtime —
+    // so every requires carrier is stripped from the analysis clone.
+    // SOUND: stripping hypotheses is the semantics of the violated contract;
+    // the composed formula below re-imposes the TRUE constraints (the
+    // caller's actuals, definitions, and path guards) instead.
+    let mut callee_without_requires = extracted_body.clone();
+    callee_without_requires.preconditions.clear();
+    callee_without_requires.spec.requires.clear();
+    callee_without_requires.contracts.retain(|c| c.kind != ContractKind::Requires);
+    let callee_vcs = generate_vcs(&callee_without_requires);
+
+    // The same per-caller assembly the callsite PRECONDITION producer builds —
+    // deliberately identical (same sanitized view, same guard/def/fact maps),
+    // because those conjuncts are exactly what makes a SAT model denote a real
+    // caller execution: path guards keep a guarded caller
+    // (`if i < 4 { helper(a, i) }`) UNSAT-safe, block/path defs pin computed
+    // actuals, global facts and the caller's own stable preconditions restrict
+    // the inputs the caller can actually be entered with.
+    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
+    let func_view = arithmetic_safe_func.as_ref();
+    let guard_paths_map = v2_build_path_guard_map(func_view);
+    let semantic_guards = build_semantic_guard_map(func_view);
+    let path_definition_map = v2_build_path_definition_map(func_view);
+    let sv = StmtVersionCtx::build(func_view);
+    let global_facts = build_global_invariant_facts(func_view);
+    let own_preconditions = stable_caller_preconditions(func_view);
+
+    let mut candidates: Vec<VerificationCondition> = Vec::new();
+    // Duplicate suppression: two callee VCs can substitute to the same
+    // composed formula (e.g. twin bounds checks over one index). Emitting the
+    // duplicate would double-count one violation in the L0 failed summary.
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+
+    for block in &func_view.body.blocks {
+        let Terminator::Call { func: block_callee, args, span, .. } = &block.terminator else {
+            continue;
+        };
+        // Exact-site match: name AND span. The driver keys its replay request
+        // off the refuted Precondition row's location, which the callsite
+        // producer stamped from this same terminator span.
+        if block_callee != callee_name || span != call_location {
+            continue;
+        }
+        // Arity mismatch: σ would be partial, leaving formals free (the
+        // precondition lane mints `SummaryArityMismatch` for this; the replay
+        // lane just declines).
+        if summary.param_names.len() != args.len() {
+            continue;
+        }
+
+        // The SAME σ as the P[σ] construction: per-formal actual rendering
+        // (stable copy-chain rooting, opaque-constant freshening) plus the
+        // `<formal>__slice_len` length replacements.
+        let mut replacements: Vec<(String, Formula)> = summary
+            .param_names
+            .iter()
+            .zip(args.iter())
+            .map(|(formal, actual)| (formal.clone(), sigma_actual_formula(func_view, formal, actual)))
+            .collect();
+        append_length_replacements(func_view, summary, args, &mut replacements);
+
+        for callee_vc in &callee_vcs {
+            // Strict-L0 kinds only: the replay claim is "the caller can drive
+            // the callee into a Level-0 SAFETY violation". L1 rows
+            // (pre/postconditions), temporal rows, and `UnsupportedMir`
+            // modeling-gap carriers (whose Bool sentinel the substitution gate
+            // would reject anyway) are not that claim.
+            if callee_vc.kind.proof_level() != trust_types::ProofLevel::L0Safety {
+                continue;
+            }
+            if matches!(callee_vc.kind, VcKind::UnsupportedMir { .. }) {
+                continue;
+            }
+            let Some(substituted) =
+                replay_substituted_callee_violation(&callee_vc.formula, &replacements)
+            else {
+                continue;
+            };
+
+            // Caller-side composition — mirrors `generate_callsite_precondition_vcs`
+            // conjunct-for-conjunct, with the σ-substituted callee VIOLATION in
+            // the structural position of ¬P[σ]. Every splice keeps the violation
+            // a DIRECT conjunct of a flat `And` (pure ∧-associativity), exactly
+            // like the precondition lane.
+            let mut formula = v2_formula_with_block_defs(func_view, block, substituted);
+
+            if let Some(path_defs) = path_definition_map.get(&block.id)
+                && !path_defs.is_empty()
+            {
+                let mut live = v2_live_path_defs(func_view, block, path_defs);
+                let term_defs: FxHashSet<String> =
+                    terminator_def_names(func_view, block).into_iter().collect();
+                if !term_defs.is_empty() {
+                    live.retain(|f| formula_survives_redefs(f, &term_defs));
+                }
+                if !live.is_empty() {
+                    match formula {
+                        Formula::And(inner) => live.extend(inner),
+                        other => live.push(other),
+                    }
+                    formula = Formula::And(live);
+                }
+            }
+
+            if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
+                formula = v2_formula_with_path_guards(func_view, &sv, block_guard_paths, formula);
+            }
+
+            if let Some(sem_guards) = semantic_guards.get(&block.id)
+                && !sem_guards.is_empty()
+            {
+                let mut conjuncts = sem_guards.clone();
+                conjuncts
+                    .extend(sem_guards.iter().filter_map(|g| bare_ssa_guard_variant(func_view, g)));
+                match formula {
+                    Formula::And(inner) => conjuncts.extend(inner),
+                    other => conjuncts.push(other),
+                }
+                formula = Formula::And(conjuncts);
+            }
+
+            if !global_facts.is_empty() {
+                let mut conjuncts = global_facts.clone();
+                match formula {
+                    Formula::And(inner) => conjuncts.extend(inner),
+                    other => conjuncts.push(other),
+                }
+                formula = Formula::And(conjuncts);
+            }
+
+            if !own_preconditions.is_empty() {
+                let mut conjuncts = own_preconditions.clone();
+                match formula {
+                    Formula::And(inner) => conjuncts.extend(inner),
+                    other => conjuncts.push(other),
+                }
+                formula = Formula::And(conjuncts);
+            }
+
+            let occ = std::cell::Cell::new(0u32);
+            let formula = freshen_aliasing_opaque_occurrences(&formula, &occ);
+            let formula = normalize_ssa_version_tokens(func_view, &formula);
+
+            // Belt-and-braces σ re-check: the caller-side conjuncts never mint
+            // σ-fresh names, but the composed formula is what the driver hands
+            // to the solver, so re-check the invariant at the emission seam.
+            if formula.free_variables().iter().any(|v| v.starts_with(SIGMA_FRESH_VAR_PREFIX)) {
+                continue;
+            }
+            // THE caller-side soundness gate: every free var of the composed
+            // formula must be entry-state or def-pinned (see
+            // `composed_formula_is_caller_entry_grounded`). Without it, a
+            // havoc'd call-dest actual or an `__r1occ` opaque alias is a free
+            // SAT dimension and a SAFE caller composes to a false refutation.
+            if !composed_formula_is_caller_entry_grounded(func_view, &formula) {
+                continue;
+            }
+
+            let dedup_key = format!("{:?}|{formula:?}", callee_vc.kind);
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+            candidates.push(VerificationCondition {
+                // The callee's REAL L0 kind — the composed row IS the entailed
+                // callee-side safety claim, surfaced at the caller's call span.
+                kind: callee_vc.kind.clone(),
+                function: func_view.name.as_str().into(),
+                location: span.clone(),
+                formula,
+                contract_metadata: None,
+                obligation: None,
+            });
+        }
+    }
+    candidates
+}

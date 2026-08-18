@@ -477,7 +477,7 @@ mod tests {
             name: def_path.rsplit("::").next().unwrap_or(def_path).to_string(),
             def_path: def_path.to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count, return_ty },
+            body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
             contracts: Vec::new(),
             preconditions: Vec::new(),
             postconditions: Vec::new(),

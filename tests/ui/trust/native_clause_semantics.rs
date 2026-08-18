@@ -33,8 +33,17 @@ pub fn constant() -> i32
 }
 
 pub fn quantified_identity(x: i32) -> i32
-    //~^ NOTE Trust verification: 1 proved, 0 failed, 1 unknown
-    //~| NOTE [unknown] UNKNOWN
+    // Re-pinned 2026-08-13 with the usize-binder fix: the quantified predicate
+    // now LOWERS TYPED (target-width UnsignedInclusive domain) instead of
+    // minting the `trust.contract/unsupported` sentinel — both rosters below
+    // are real [postcond] obligations, not parser refusals. Both stay UNKNOWN
+    // honestly: the proof backend still lacks quantified replay, and
+    // proof-grade admission now demands live native-bundle authority (the same
+    // fidelity narrowing pinned in one_leg/wrong_decrease). The July "1
+    // proved" cannot return until one of those lands; a sentinel-free UNKNOWN
+    // is this test's success criterion, per its own doc comment above.
+    //~^^^^^^^^^^ NOTE Trust verification: 0 proved, 0 failed, 2 unknown
+    //~| NOTE [postcond] UNKNOWN
     ensures forall i: usize, i == i ==> result == x
 {
     x

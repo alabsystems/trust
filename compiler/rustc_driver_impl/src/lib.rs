@@ -418,6 +418,14 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
     if !matches!(unstable.trust_cg_output_gate.as_str(), "allow-unknown" | "strict" | "off") {
         return Some("invalid callback-injected -Ztrust-cg-output-gate value");
     }
+    // Trust (F1): the backend's per-function input producer. Same closed domain
+    // as the gate mode above and validated in the same place, so a
+    // callback-injected value cannot reach the backend's own resolver — which
+    // would report it as an internal invariant violation rather than as the
+    // caller error it is.
+    if !matches!(unstable.trust_cg_frontend.as_str(), "mir" | "trust-ir") {
+        return Some("invalid callback-injected -Ztrust-cg-frontend value");
+    }
     if let Some(perturbation) = unstable.trust_sat_perturb.as_deref() {
         if !matches!(
             perturbation,
@@ -427,10 +435,17 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
                 | "enum-disc-index"
                 | "switch-map"
                 | "enum-payload"
+                | "marker-order"
+                | "marker-drop"
+                | "agg-field-order"
+                | "marker-arm"
+                | "payload-tramp"
         ) {
             return Some(
                 "invalid -Ztrust-sat-perturb value: expected enum-reshape, \
-                 enum-case-value, enum-ctor, enum-disc-index, switch-map, or enum-payload",
+                 enum-case-value, enum-ctor, enum-disc-index, switch-map, enum-payload, \
+                 marker-order, marker-drop, agg-field-order, marker-arm, or \
+                 payload-tramp",
             );
         }
         // A perturbation deliberately corrupts one lowering class so the
@@ -1446,6 +1461,14 @@ fn run_compiler_with_argfile_mode(
         };
 
     let mut sopts = config::build_session_options(&mut default_early_dcx, &matches);
+    // Trust (loud-when-off): record whether OFF was this caller's own argv
+    // spelling BEFORE the inherited `TRUST_NO_VERIFY=1` override below forces
+    // the same typed state. Only the canonical frontend may claim
+    // explicitness: a deauthorizing frontend announces its policy once at its
+    // boundary, and `TrustFrontendAuthoritySnapshot::deauthorize` clears this
+    // bit again defensively.
+    sopts.trust_verify_explicit_off = !frontend_policy.deauthorizes_official_evidence()
+        && !sopts.unstable_opts.trust_verify.is_on();
     apply_trust_verify_override(&mut sopts, trust_verify_override);
     if frontend_policy.deauthorizes_official_evidence() {
         sopts.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::Off);
@@ -1467,7 +1490,8 @@ fn run_compiler_with_argfile_mode(
             .map(|identity| acquire_direct_ir_publication(&default_early_dcx, identity));
     }
     // fully initialize ice path static once unstable options are available as context
-    let ice_file = ice_path_with_config(Some(&sopts.unstable_opts)).clone();
+    let (odir, ofile) = make_output(&matches);
+    let ice_file = ice_path_with_config(Some(&sopts.unstable_opts), odir.as_deref()).clone();
 
     if let Some(ref code) = matches.opt_str("explain") {
         handle_explain(&default_early_dcx, code, sopts.color);
@@ -1476,7 +1500,6 @@ fn run_compiler_with_argfile_mode(
 
     let input = make_input(&default_early_dcx, &matches.free);
     let has_input = input.is_some();
-    let (odir, ofile) = make_output(&matches);
 
     drop(default_early_dcx);
 
@@ -2910,10 +2933,13 @@ fn ice_default_compiler() -> &'static str {
 // Subsequent calls to either function will then return the proper ICE path as configured by
 // the environment and cli flags
 fn ice_path() -> &'static Option<PathBuf> {
-    ice_path_with_config(None)
+    ice_path_with_config(None, None)
 }
 
-fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<PathBuf> {
+fn ice_path_with_config(
+    config: Option<&UnstableOptions>,
+    out_dir: Option<&Path>,
+) -> &'static Option<PathBuf> {
     if ICE_PATH.get().is_some() && config.is_some() && cfg!(debug_assertions) {
         tracing::warn!(
             "ICE_PATH has already been initialized -- files may be emitted at unintended paths"
@@ -2937,6 +2963,9 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
             }
             None => config
                 .and_then(|unstable_opts| unstable_opts.metrics_dir.to_owned())
+                // Cargo always passes `--out-dir`, so dumps land in the target dir
+                // rather than the invocation cwd (often a checked-in workspace root).
+                .or_else(|| out_dir.map(Path::to_path_buf))
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_default(),
         };

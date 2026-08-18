@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -57,6 +59,38 @@ class ProbeClassificationTests(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertEqual(orphan, [])
         self.assertEqual(unknown, [sha])
+
+
+class SubmoduleGitDirTests(unittest.TestCase):
+    def test_linked_worktree_uses_git_resolved_modules_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            linked = Path(tmp) / "linked"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Pin Audit Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "pin-audit@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "--allow-empty", "-qm", "seed"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "-q", str(linked)],
+                check=True,
+            )
+
+            resolved = audit.submodule_git_dir(linked, "first-party/example")
+
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertTrue(resolved.is_absolute())
+            self.assertNotEqual(resolved, linked / ".git" / "modules/first-party/example")
+            self.assertIn("worktrees", resolved.parts)
 
 
 if __name__ == "__main__":

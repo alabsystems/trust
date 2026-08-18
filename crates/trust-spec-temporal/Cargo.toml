@@ -62,6 +62,15 @@ trust-cg-lower = { path = "../../first-party/trust-cg/crates/trust-cg-lower" }
 trust-cg-opt = { path = "../../first-party/trust-cg/crates/trust-cg-opt" }
 trust-cg-jit-matrix = { path = "../../first-party/trust-cg/crates/trust-cg-jit-matrix" }
 
+# `clean-tla` intentionally carries the previous published Ty revision so the
+# standalone Clean -> Ty -> Clean publication history stays acyclic.  The
+# assembled Trust program must nevertheless have one `tla-core` type universe:
+# redirect that exact Git edge to the repository-owned Ty checkout here.  The
+# compile-time sentinel in `dependency_coherence` makes omission of this patch
+# a hard type error instead of silently linking both revisions.
+[patch."https://github.com/alabsystems/ty.git"]
+tla-core = { path = "../../first-party/ty/crates/tla-core" }
+
 [patch.crates-io]
 rustc-hash = { path = "../../first-party/ty/crates/tla-hash-fx" }
 num-bigint = { path = "../../first-party/ty/crates/tla-bignum/bigint" }
@@ -69,12 +78,12 @@ num-integer = { path = "../../first-party/ty/crates/tla-bignum/integer" }
 num-traits = { path = "../../first-party/ty/crates/tla-bignum/traits" }
 
 [dependencies]
-trust-spec-temporal-macros = { path = "../trust-spec-temporal-macros" }
 # `ty certify` lane (R5 non-P1 step 2): parse the self-contained `ty.cert/v1`
 # certificate and BIND it to the generated spec bytes. The transport types are
 # local to this crate for now; a shared trust-types transport comes later.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+num-bigint = "0.4"
 # Independent certificate consumer. `clean-tla` reconstructs the theorem from
 # `spec_src`; `clean-kernel` type-checks the resulting closed proof in-process.
 # This is intentionally narrower than ty's own cert-check surface.
@@ -85,6 +94,10 @@ clean-kernel = { path = "../../first-party/clean/crates/clean-kernel" }
 # test-only helpers.
 clean-elab = { path = "../../first-party/clean/crates/clean-elab" }
 clean-parser = { path = "../../first-party/clean/crates/clean-parser" }
+# Literal TrustIR refinement is checked in Clean's single authoritative EvalIR
+# environment. This is a production dependency: both certificate production
+# and fresh replay build that exact kernel specification.
+clean-verify = { path = "../../first-party/clean/crates/clean-verify" }
 # The certificate producer and its independent re-checkers are linked into the
 # verifier.  This removes the mutable PATH/subprocess seam: safety (including
 # the explicit-fixpoint kernel lane), liveness, fairness assumptions, and
@@ -98,7 +111,11 @@ tla-core = { path = "../../first-party/ty/crates/tla-core" }
 # trust-ir/Clean source patches above because Cargo patches are not transitive;
 # otherwise trust-spec-temporal fails to compile instead of linking two semantic
 # universes.
-trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["clean-expr"] }
+trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["binary", "clean-expr"] }
+# A canonical binary is not necessarily a well-formed program. Literal
+# refinement rejects every module that fails the authoritative structural,
+# typing, SSA, arity, and terminator validator before generating Clean source.
+trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
 
 [dev-dependencies]
 tempfile = "3"

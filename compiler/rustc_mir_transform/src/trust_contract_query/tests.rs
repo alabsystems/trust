@@ -345,15 +345,54 @@ fn loop_predicate_source_bindings_are_exact_used_hir_locals_only() {
         );
 
         let synthesized = lowered_contract_text_with_domains(
-            "xs_len > 0".to_string(),
+            "xs__len > 0".to_string(),
             &[LoweredVariableDomain {
-                name: "xs_len".to_string(),
+                name: "xs__len".to_string(),
                 domain: Domain::PointerSizedInt { width: 64, signed: false },
             }],
         );
         assert!(
             exact_predicate_source_bindings(&synthesized, &[]).is_empty(),
             "a synthesized projection leaf must not acquire whole-local authority",
+        );
+
+        let collection = TrustContractPredicateKind::Typed {
+            text: Symbol::intern("xs.len() > xs[0]"),
+            proposition: TrustContractProposition::Gt(
+                Box::new(TrustContractProposition::Var {
+                    name: Symbol::intern("xs__len"),
+                    domain: Domain::PointerSizedInt { width: 64, signed: false },
+                }),
+                Box::new(TrustContractProposition::Var {
+                    name: Symbol::intern("xs[0]"),
+                    domain: Domain::MachineInt { width: 32, signed: false },
+                }),
+            ),
+        };
+        let collection_bindings = exact_predicate_source_place_bindings(
+            &collection,
+            &[LoweredSourceBinding { name: "xs".to_string(), hir_local_id: 19 }],
+        )
+        .expect("both synthetic leaves have the same exact collection root");
+        assert_eq!(
+            collection_bindings
+                .iter()
+                .map(|binding| (binding.name.as_str(), binding.hir_local_id))
+                .collect::<Vec<_>>(),
+            vec![("xs", 19)],
+        );
+        assert!(
+            exact_predicate_source_place_bindings(&collection, &[]).is_none(),
+            "one missing root must reject the complete provenance map",
+        );
+
+        assert_eq!(
+            exact_predicate_source_place_bindings(
+                &TrustContractPredicateKind::BoolLiteral { value: true },
+                &[],
+            ),
+            Some(Vec::new()),
+            "a literal proposition has a complete empty source-root map",
         );
     });
 }
@@ -691,27 +730,66 @@ fn native_function_requires_len_mints_typed_query_proposition() {
             term,
             Proposition::Gt(lhs, _)
                 if matches!(lhs.as_ref(), Proposition::Var { name, domain }
-                    if name.as_str() == "xs_len"
+                    if name.as_str() == "xs__len"
                         && *domain
                             == (Domain::PointerSizedInt { width: 64, signed: false }))
         )));
 
-        let mut colliding_domains = domains.to_vec();
-        colliding_domains.push(LoweredVariableDomain {
+        // A real parameter named `xs_len` coexists with the minted `xs__len`
+        // projection leaf: the two spellings are distinct by construction, so
+        // the clause stays typed and each leaf keeps its own identity.
+        let mut coexisting_sorts = sorts.clone();
+        coexisting_sorts.insert("xs_len".to_string(), trust_types::Sort::Int);
+        let mut coexisting_domains = domains.to_vec();
+        coexisting_domains.push(LoweredVariableDomain {
             name: "xs_len".to_string(),
             domain: Domain::PointerSizedInt { width: 64, signed: false },
         });
-        assert!(
-            typed_native_function_requires(
-                "xs.len() > 0",
-                &sorts,
-                &colliding_domains,
-                &collection_domains,
-                Some(64),
-            )
-            .is_none(),
-            "a real `xs_len` parameter must not authorize the lowered `xs.len()` leaf",
-        );
+        let coexisting = typed_native_function_requires(
+            "xs.len() > 0 && xs_len > 0",
+            &coexisting_sorts,
+            &coexisting_domains,
+            &collection_domains,
+            Some(64),
+        )
+        .expect("a parameter named `xs_len` must not block the `xs.len()` projection");
+        let Predicate::Typed { proposition, .. } = coexisting else {
+            panic!("the coexisting clause must stay structurally typed")
+        };
+        let mut leaf_names = std::collections::BTreeSet::new();
+        fn collect_leaves(
+            proposition: &rustc_middle::mir::trust_contract::TrustContractProposition,
+            names: &mut std::collections::BTreeSet<String>,
+        ) {
+            use rustc_middle::mir::trust_contract::TrustContractProposition as P;
+            match proposition {
+                P::Var { name, .. } => {
+                    names.insert(name.as_str().to_string());
+                }
+                P::Not(inner) | P::Neg(inner) => collect_leaves(inner, names),
+                P::And(terms) | P::Or(terms) => {
+                    terms.iter().for_each(|term| collect_leaves(term, names));
+                }
+                P::Implies(lhs, rhs)
+                | P::Eq(lhs, rhs)
+                | P::Lt(lhs, rhs)
+                | P::Le(lhs, rhs)
+                | P::Gt(lhs, rhs)
+                | P::Ge(lhs, rhs)
+                | P::Add(lhs, rhs)
+                | P::Sub(lhs, rhs)
+                | P::Mul(lhs, rhs)
+                | P::Div(lhs, rhs)
+                | P::Rem(lhs, rhs) => {
+                    collect_leaves(lhs, names);
+                    collect_leaves(rhs, names);
+                }
+                P::Bool(_) | P::Int(_) | P::UInt(_) => {}
+            }
+        }
+        collect_leaves(&proposition, &mut leaf_names);
+        assert!(leaf_names.contains("xs__len"), "missing projection leaf: {leaf_names:?}");
+        assert!(leaf_names.contains("xs_len"), "missing parameter leaf: {leaf_names:?}");
     });
 }
 
@@ -721,18 +799,7 @@ fn native_clause_rejects_visible_synthetic_name_aliases_before_lowering() {
         Box::new(trust_types::Sort::Int),
         Box::new(trust_types::Sort::Int),
     );
-    for reserved in [
-        "_2",
-        "old_x",
-        "xs_len",
-        "x_discr",
-        "x_value",
-        "x_sign",
-        "x_value_sign",
-        "priv_dropped",
-        "s__slice_len",
-        "__trust_constparam_0_N",
-    ] {
+    for reserved in ["_2", "old_x", "priv_dropped", "s__slice_len", "__trust_constparam_0_N"] {
         let sorts = BTreeMap::from([
             ("xs".to_string(), array.clone()),
             (reserved.to_string(), trust_types::Sort::Int),
@@ -744,6 +811,20 @@ fn native_clause_rejects_visible_synthetic_name_aliases_before_lowering() {
         assert!(
             error.contains("synthetic contract-variable namespace"),
             "unexpected error for `{reserved}`: {error}"
+        );
+    }
+    // Projection-suffixed spellings are ordinary bindings now that minted
+    // leaves live in the `__` family: a visible `xs_len` (or chained
+    // `x_value_sign`) must not block a clause that also projects `xs.len()`.
+    for ordinary in ["xs_len", "max_len", "x_discr", "x_value", "x_sign", "x_value_sign"] {
+        let sorts = BTreeMap::from([
+            ("xs".to_string(), array.clone()),
+            (ordinary.to_string(), trust_types::Sort::Int),
+        ]);
+        assert_eq!(
+            validate_native_clause_body("xs.len() == 0", TrustContractKind::LoopInvariant, &sorts),
+            Ok("xs.len() == 0".to_string()),
+            "visible `{ordinary}` must be admitted",
         );
     }
 }

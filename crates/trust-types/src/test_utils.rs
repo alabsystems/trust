@@ -50,7 +50,7 @@ pub fn make_test_function(name: &str, body: VerifiableBody) -> VerifiableFunctio
 
 /// Make a VerifiableBody with given locals and blocks (arg_count=0, return_ty=Unit).
 pub fn make_simple_body(locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> VerifiableBody {
-    VerifiableBody { locals, blocks, arg_count: 0, return_ty: Ty::Unit }
+    VerifiableBody { locals, blocks, arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() }
 }
 
 /// Make a BasicBlock.

@@ -19,6 +19,7 @@ use rustc_middle::mir::trust_contract::{
     TrustContractSourceBinding, TrustContractSubject, TrustContractSummary,
     TrustContractVerifierSort, TrustLoopId,
 };
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, TypeckResults};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol};
@@ -51,6 +52,7 @@ enum ContractPayloadContext<'a> {
         variable_domains: &'a [LoweredVariableDomain],
         collection_domains: &'a BTreeMap<String, LoweredCollectionDomain>,
         source_bindings: &'a [LoweredSourceBinding],
+        source_place_bindings: &'a [LoweredSourceBinding],
     },
 }
 
@@ -253,7 +255,12 @@ pub(crate) fn trust_contracts<'tcx>(
             clause.loop_id,
             &signature_domains,
         );
-        let (loop_variable_domains, loop_collection_domains, loop_source_bindings) =
+        let (
+            loop_variable_domains,
+            loop_collection_domains,
+            loop_source_bindings,
+            loop_source_place_bindings,
+        ) =
             visible_loop_variable_domains(
                 tcx,
                 local_def_id,
@@ -278,6 +285,7 @@ pub(crate) fn trust_contracts<'tcx>(
                 variable_domains: &loop_variable_domains,
                 collection_domains: &loop_collection_domains,
                 source_bindings: &loop_source_bindings,
+                source_place_bindings: &loop_source_place_bindings,
             },
         );
         if is_opaque_summary_predicate(&predicate.kind) {
@@ -487,7 +495,15 @@ fn lower_predicate<'tcx>(
         }
         ContractPayloadContext::Function { .. } | ContractPayloadContext::Loop { .. } => Vec::new(),
     };
-    TrustContractPredicate { ty, kind, source_bindings }
+    let source_place_bindings = match context {
+        ContractPayloadContext::Loop { source_place_bindings, .. }
+            if origin == ContractClauseOrigin::Native =>
+        {
+            exact_predicate_source_place_bindings(&kind, source_place_bindings)
+        }
+        ContractPayloadContext::Function { .. } | ContractPayloadContext::Loop { .. } => None,
+    };
+    TrustContractPredicate { ty, kind, source_bindings, source_place_bindings }
 }
 
 /// Parse and type-check a supported first-class native clause at the earliest
@@ -529,7 +545,7 @@ fn lower_native_clause(
     // validation above. When its lowered Formula fits the query vocabulary,
     // retain that structural tree instead of forcing E4/E5 or a function
     // measure back through an opaque string. In particular, `xs.len()` lowers
-    // to `xs_len`; `native_clause_variable_domains` supplies the exact
+    // to `xs__len`; `native_clause_variable_domains` supplies the exact
     // pointer-sized domain while visible loop locals retain their HIR-derived
     // primitive widths and signedness.
     if let Some(predicate) = typed_native_clause_with_collection_domains(
@@ -615,10 +631,9 @@ fn typed_native_function_requires(
 /// Extend scalar signature domains with exact synthetic projection domains
 /// introduced by native source lowering. This is deliberately a closed lane:
 /// collection `.len()` and one canonical literal index are representable in the
-/// query proposition vocabulary. Only an exact, unshadowed collection parameter
+/// query proposition vocabulary. Only an exact, unshadowed visible collection
 /// descriptor authorizes either synthetic leaf, and a fixed-array literal must
-/// be in range. Unknown or loop-local projections return None and keep the
-/// clause Opaque.
+/// be in range. Unknown projections return None and keep the clause Opaque.
 // `Formula::free_variables` is a set, but its iteration order cannot affect
 // this query: the names are sorted immediately before any domain decision or
 // output is made.
@@ -639,25 +654,21 @@ fn native_clause_variable_domains(
         .collect();
     for name in free_variables {
         if domains.iter().any(|variable| variable.name == name) {
-            // `xs.len()` and a real scalar parameter named `xs_len` collapse
-            // to the same parser leaf. Never let the scalar's signature domain
-            // authorize that ambiguous projection identity; keep the clause
-            // opaque so every downstream proof lane fails closed.
-            if name.strip_suffix("_len").is_some_and(|base| {
-                matches!(source_sorts.get(base), Some(trust_types::Sort::Array(..)))
-            }) {
-                return None;
-            }
+            // A signature domain owns this leaf. The parser mints projection
+            // leaves inside the reserved `__` family (`xs.len()` -> `xs__len`),
+            // and the parameter gate rejects `__` binding spellings, so a
+            // scalar parameter such as `xs_len` can no longer collapse onto a
+            // projection leaf and needs no ambiguity refusal here.
             continue;
         }
-        if let Some(base) = name.strip_suffix("_len") {
+        if let Some(base) = name.strip_suffix("__len") {
             if !matches!(source_sorts.get(base), Some(trust_types::Sort::Array(..))) {
                 return None;
             }
             // A source sort proves only that some visible HIR binding with
             // this spelling is a collection. The descriptor is minted only
-            // for the exact unshadowed parameter collection that downstream
-            // MIR can rebind without guessing source identity.
+            // for an exact unshadowed HIR binding whose identity is carried
+            // separately to downstream MIR reconstruction.
             collection_domains.get(base)?;
             domains.push(LoweredVariableDomain {
                 name,
@@ -697,10 +708,10 @@ fn native_clause_variable_domains(
 
 /// Recover the base and index of exactly one canonical nonnegative literal
 /// collection projection (`xs[0]`). Source validation proves the visible base
-/// has Array sort; the parameter descriptor checked by the caller supplies
+/// has Array sort; the exact-binding descriptor checked by the caller supplies
 /// source identity, exact element domain, and any fixed-array bound. Keeping
 /// those authorities separate prevents an arbitrary parser variable or a
-/// shadowing loop local from borrowing a parameter collection's identity.
+/// shadowing local from borrowing another collection's identity.
 fn canonical_literal_collection_projection(name: &str) -> Option<(&str, u128)> {
     let without_close = name.strip_suffix(']')?;
     let (base, index) = without_close.rsplit_once('[')?;
@@ -786,7 +797,7 @@ fn validate_native_clause_body(
     // (including dereferences and quantifier binders), recursively checks
     // operand sorts, and enforces the clause's top-level sort. Do not repeat
     // scope checking after lowering: projections such as `xs.len()` deliberately
-    // become synthetic solver leaves such as `xs_len`, which are not source
+    // become synthetic solver leaves such as `xs__len`, which are not source
     // bindings and would be rejected spuriously here.
     Ok(validated)
 }
@@ -847,9 +858,6 @@ fn reject_unrepresentable_contract_parameter_names<'tcx>(
                         ),
                         trust_types::SourceContractSyntheticNameCollision::OldValue => format!(
                             "parameter `{name}` collides with the source-contract synthetic pre-state namespace"
-                        ),
-                        trust_types::SourceContractSyntheticNameCollision::Projection => format!(
-                            "parameter `{name}` collides with the source-contract synthetic projection namespace"
                         ),
                         trust_types::SourceContractSyntheticNameCollision::PositionalPlace => {
                             format!(
@@ -1345,6 +1353,30 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
             }
             ExprKind::Unary(UnOp::Deref, inner) => self.lower_deref_expr(expr, inner),
             ExprKind::Binary(op, lhs, rhs) => {
+                // A tuple payload bind may be a numeric ADT whose value itself
+                // is deliberately not encoded as a scalar. Preserve only the
+                // ordering/equality atom between two recognized Ok-payload
+                // bindings. The resulting model terms remain free unless the
+                // VC layer finds the body's dominating, type-matched comparison
+                // witness, so every unsupported path still fails closed.
+                if matches!(
+                    op.node,
+                    BinOpKind::Lt
+                        | BinOpKind::Le
+                        | BinOpKind::Gt
+                        | BinOpKind::Ge
+                        | BinOpKind::Eq
+                        | BinOpKind::Ne
+                ) && let (Some(a), Some(b)) =
+                    (self.ok_payload_binding_text(lhs), self.ok_payload_binding_text(rhs))
+                {
+                    let op_text = lower_bin_op(op.node)?;
+                    return lowered_synthetic_expr(
+                        format!("({a}) {op_text} ({b})"),
+                        LoweredExprTy::Bool,
+                        TrustContractPropositionDomain::MathematicalInt,
+                    );
+                }
                 let lhs = self.lower_expr_text(lhs)?;
                 let rhs = self.lower_expr_text(rhs)?;
                 lower_binary_expr_text(op.node, lhs, rhs)
@@ -1412,17 +1444,17 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
             // rational `c` extracted from an `Ok` payload by a recognized
             // `matches!` arm — see the `Match` arm below). Lowers to the text
             // `<recv>.is_positive()` (resp. `.is_negative()` / `.is_zero()`), which
-            // the spec parser models with the synthetic sign var `<recv>_sign` and
-            // the trichotomy `_sign > 0` / `_sign < 0` / `_sign == 0`. The set is
+            // the spec parser models with the synthetic sign var `<recv>__sign` and
+            // the trichotomy `__sign > 0` / `__sign < 0` / `__sign == 0`. The set is
             // CLOSED: any other method REJECTS (returns None) — never a guess, so a
             // method we do not exactly model can never silently weaken the VC.
             //
             // SEMANTICS (the predicate text emitted, read by spec_parse):
-            //   recv.is_positive() ↦ "<recv>.is_positive()"  ⟹  <recv>_sign > 0
-            //   recv.is_negative() ↦ "<recv>.is_negative()"  ⟹  <recv>_sign < 0
-            //   recv.is_zero()     ↦ "<recv>.is_zero()"      ⟹  <recv>_sign == 0
+            //   recv.is_positive() ↦ "<recv>.is_positive()"  ⟹  <recv>__sign > 0
+            //   recv.is_negative() ↦ "<recv>.is_negative()"  ⟹  <recv>__sign < 0
+            //   recv.is_zero()     ↦ "<recv>.is_zero()"      ⟹  <recv>__sign == 0
             // The receiver must itself lower (to a value-typed term); the result is
-            // a Bool. The synthetic `_sign` term is a free variable until the VC
+            // a Bool. The synthetic `__sign` term is a free variable until the VC
             // layer links it to the receiver's value, so the predicate is
             // fail-closed (can only fail to prove, never vacuously prove).
             ExprKind::MethodCall(segment, receiver, args, _) => {
@@ -1436,9 +1468,9 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                 // Trust: the `Option` accessors on the ensures RESULT binding —
                 // `is_none()`/`is_some()` (the discriminant predicates) and
                 // `unwrap()` (the payload value). The crate-side spec parser models
-                // `result.is_none()` as `_0_discr == 0`, `result.is_some()` as
-                // `_0_discr != 0`, and `result.unwrap()` as the payload term
-                // `_0_value` (`map_var_name("result") == "_0"`), which the vcgen
+                // `result.is_none()` as `_0__discr == 0`, `result.is_some()` as
+                // `_0__discr != 0`, and `result.unwrap()` as the payload term
+                // `_0__value` (`map_var_name("result") == "_0"`), which the vcgen
                 // contract lane grounds to the body's in-body `Some`/`None`
                 // construction (`enum_return_grounded_model_vars` + the discr/value
                 // return pin). This lets an `Option`-returning function carry a live
@@ -1447,9 +1479,9 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                 // unsupported contract expression. Gated to the EXACT result binding
                 // of `Option` type (diagnostic item, not a name match — see
                 // `receiver_is_result_option`), and for `unwrap` an INTEGER payload
-                // (matching the `Sort::Int` the spec parser mints for `_0_value`);
+                // (matching the `Sort::Int` the spec parser mints for `_0__value`);
                 // anything else falls through to the sign allow-list / rejects.
-                // SOUND: `_0_discr`/`_0_value` are free until the VC layer pins them
+                // SOUND: `_0__discr`/`_0__value` are free until the VC layer pins them
                 // to the genuine constructed value, so an unpinnable predicate can
                 // only FAIL to prove, never vacuously prove.
                 match method.as_str() {
@@ -1477,7 +1509,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                     // `matches!(r, Ok(c) if c.entailment.premises.len() != ..)`).
                     // The crate-side spec parser ALREADY models these
                     // (`spec_parse::map_method_call`: `.len()` -> the synthetic
-                    // Int var `<base>_len`; `.is_empty()` -> `<base>_len == 0`),
+                    // Int var `<base>__len`; `.is_empty()` -> `<base>__len == 0`),
                     // so the lowering emits `<recv>.len()` verbatim.
                     //
                     // TWO closed gates, both fail-closed (return None -> the whole
@@ -1488,7 +1520,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                     //    inherent, PURE length accessor (inherent methods win over
                     //    any trait method of the same name), so two occurrences of
                     //    the same receiver text denote the SAME value and the one
-                    //    minted `<base>_len` var models it exactly. A user type's
+                    //    minted `<base>__len` var models it exactly. A user type's
                     //    `len` has no such guarantee (an impure/nondeterministic
                     //    `len` under one shared var could vacuously prove
                     //    `x.len() == x.len()` while the runtime check fails).
@@ -1498,21 +1530,21 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                     //    pat-binding substitution plus at least one projection —
                     //    see `collect_ok_pattern_bindings` /
                     //    `lower_projection_base`). The spec parser then mints
-                    //    `_0_value.<seg>…_len`, whose FIRST path segment keeps the
-                    //    `_value` marker, so `is_spec_model_var` classifies it as
+                    //    `_0__value.<seg>…__len`, whose FIRST path segment keeps the
+                    //    `__value` marker, so `is_spec_model_var` classifies it as
                     //    a SPEC-MODEL term and an ungroundable predicate routes to
                     //    the fail-closed Unknown (SpecModelUngrounded). Any OTHER
                     //    base would mint a NON-model free var — a parameter `xs`
-                    //    gives `xs_len`, the bare `result` gives `_0_len`, and
+                    //    gives `xs__len`, the bare `result` gives `_0__len`, and
                     //    even the BARE payload `result.unwrap()` gives
-                    //    `_0_value_len` (one undivided segment ending `_len`, NOT
-                    //    `_value` — pinned NOT spec-model by trust-vcgen's
+                    //    `_0__value__len` (one undivided segment ending `__len`, NOT
+                    //    `__value` — pinned NOT spec-model by trust-vcgen's
                     //    name-shape test) — and the postcondition would become a
                     //    refutable VC satisfiable by havoc: reported Failed with
                     //    a fabricated counterexample. Rejecting here keeps every
                     //    such shape fail-closed (SpecEnsuresUnparseable).
                     //
-                    // SOUND: the minted `_0_value…_len` term is free until the VC
+                    // SOUND: the minted `_0__value…_len` term is free until the VC
                     // layer pins it to a genuine body length, so the predicate can
                     // only FAIL to prove, never vacuously prove.
                     m @ ("len" | "is_empty") => {
@@ -1544,14 +1576,31 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                     m @ ("is_positive" | "is_negative" | "is_zero") => m,
                     _ => return None,
                 };
-                let recv = self.lower_expr_text(receiver)?;
-                // The receiver of a sign predicate is a number, so it must have
-                // lowered to a value-typed term (Int), never a Bool.
-                if recv.ty != LoweredExprTy::Int {
-                    return None;
-                }
+                // The receiver of a sign predicate is EITHER a value-typed (Int)
+                // term, OR an Ok-payload PATTERN BINDING of a numeric type that is
+                // itself non-scalar — e.g. `c` of type `Rat`/`&Rat` in
+                // `matches!(r, Ok(c) if c.is_positive())` (ny-cert selfcheck). For
+                // the binding case the substituted payload term (`result.unwrap()`
+                // / `…__trust_ok_i`) carries the sign; the crate spec parser + vcgen
+                // sign-witness grounding (generate.rs b62 F4 — the payload type's OWN
+                // inherent `is_positive`/`is_negative`/`is_zero` on the return place)
+                // model `<payload>.is_positive()` via the synthetic `<payload>_sign`
+                // var. SOUND: that var is FREE until the VC layer grounds it to the
+                // payload's real sign, so an ungroundable payload can only FAIL to
+                // prove, never vacuously prove (fail-closed) — identical discipline
+                // to the Int path, which the `recv.ty != Int` gate would otherwise
+                // reject because `&Rat`/`Rat` is not scalar-lowerable.
+                let recv_text = if let Some(text) = self.ok_payload_binding_text(receiver) {
+                    text
+                } else {
+                    let recv = self.lower_expr_text(receiver)?;
+                    if recv.ty != LoweredExprTy::Int {
+                        return None;
+                    }
+                    recv.text
+                };
                 lowered_synthetic_expr(
-                    format!("{}.{}()", recv.text, method_str),
+                    format!("{recv_text}.{method_str}()"),
                     LoweredExprTy::Bool,
                     TrustContractPropositionDomain::MathematicalInt,
                 )
@@ -1584,7 +1633,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
     /// We lower it to the SEMANTIC EQUIVALENT boolean text
     ///   `(<result>.is_ok()) && (<guard, with <bind> substituted to the Ok value>)`
     /// where `<result>` is the result binding (lowered to `result`). The spec
-    /// parser models `result.is_ok()` as `_0_discr != 0` and the substituted bind
+    /// parser models `result.is_ok()` as `_0__discr != 0` and the substituted bind
     /// as the Ok payload term(s).
     ///
     /// SOUNDNESS — why this is the exact semantic equivalent (and how it composes
@@ -1674,7 +1723,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
     ///   - single bind `Ok(c)`         -> `c` ↦ `<result>.unwrap()`
     ///   - tuple  bind `Ok((d, c))`     -> `d` ↦ `<result>.unwrap().__trust_ok_0`,
     ///                                     `c` ↦ `<result>.unwrap().__trust_ok_1`
-    /// `<result>.unwrap()` is the spec parser's Ok-payload term (`_0_value`); the
+    /// `<result>.unwrap()` is the spec parser's Ok-payload term (`_0__value`); the
     /// positional `__trust_ok_i` projections give the spec parser DISTINCT, STABLE
     /// field vars for the tuple components (each bind -> a distinct free var; the
     /// same bind -> the same var throughout the guard). These payload terms are
@@ -1824,9 +1873,9 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
         // This is the same boolean as the match wrapper —
         //   `match r { Ok(c) => G, Err(_) => true }` ≡ `r is Ok ⟹ G`
         //   ≡ `¬(r.is_ok() ∧ ¬G)` — but crucially keeps `result.is_ok()` in the
-        // POSITIVE `is_ok` position (a single `_0_discr` disequality) instead of
+        // POSITIVE `is_ok` position (a single `_0__discr` disequality) instead of
         // the negated `!(result.is_ok())` that lowers to a DOUBLE-negated
-        // discriminant `Not(Not(Eq(_0_discr, 0)))`. The negated form left the
+        // discriminant `Not(Not(Eq(_0__discr, 0)))`. The negated form left the
         // native typed-CHC lane unable to ground the return discriminant and the
         // postcondition VC came back satisfiable (unknown); the positive
         // `is_ok`/single-negation form grounds and PROVES exactly as the
@@ -1942,12 +1991,12 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                         // Within the guard the binding denotes the corresponding
                         // payload component of the matched scrutinee, so its
                         // projections must lower rooted at `result.unwrap()`
-                        // (-> the spec parser's `_0_value…` terms, classified
+                        // (-> the spec parser's `_0__value…` terms, classified
                         // SPEC-MODEL by `is_spec_model_var` and routed to the
                         // fail-closed SpecModelUngrounded when ungroundable).
                         // Without the substitution the guard minted a FREE var
                         // named after the source binding (`c.0.1` — probe P6),
-                        // which is NOT spec-model-shaped: once `_0_discr` grounds
+                        // which is NOT spec-model-shaped: once `_0__discr` grounds
                         // (Result-return grounding), such a predicate would reach
                         // a refutable VC whose havoc'd `c.*` terms false-FAIL it.
                         // Checked BEFORE the result-binding arm, mirroring
@@ -2133,12 +2182,12 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
         // `Ok(c) if c.entailment.premises.len() != …` / `Ok(c) => …`) is exempt
         // for the SAME reason as the result binding: its substituted text is the
         // Ok-payload term `result.unwrap()…`, which already denotes the return
-        // value's OWNED `Ok` payload (`_0_value…`). Under match ergonomics the
+        // value's OWNED `Ok` payload (`_0__value…`). Under match ergonomics the
         // closure sees `r: &Result`, so the binding is `&Payload` and a field
         // projection off it records a builtin deref — but that deref is an
         // artifact of the by-reference closure parameter, NOT of the owned
         // returned value the spec term names. Emitting a `(*…)` marker here would
-        // desync the contract text from the `_0_value…_len` name the len-witness
+        // desync the contract text from the `_0__value…_len` name the len-witness
         // grounding pins from the owned MIR construction (a bug main's marker
         // pass introduced over b62, which projected the payload binding without a
         // marker). Only an all-builtin-deref adjustment list reaches this point
@@ -2172,6 +2221,36 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
             text = format!("(*{text})");
         }
         Some(text)
+    }
+
+    /// If `expr` is a bare path to an Ok-payload PATTERN BINDING (collected by
+    /// `collect_ok_pattern_bindings` for a recognized `matches!(r, Ok(<bind>) if …)`
+    /// arm), return its substituted payload text (`result.unwrap()` for `Ok(c)`, or
+    /// `result.unwrap().__trust_ok_i` for a tuple component). Else None. Used by the
+    /// sign-predicate arm to accept a numeric-but-non-scalar payload receiver (e.g. a
+    /// `Rat` `c` in `Ok(c) if c.is_positive()`) whose value-typed lowering would
+    /// otherwise reject at the `recv.ty != Int` gate. Peels the value-transparent
+    /// `Type`/`DropTemps`/`Use` wrappers first (mirrors `lower_expr_text`).
+    fn ok_payload_binding_text(&self, expr: &'tcx Expr<'tcx>) -> Option<String> {
+        let mut e = expr;
+        loop {
+            match &e.kind {
+                ExprKind::Type(inner, _)
+                | ExprKind::DropTemps(inner)
+                | ExprKind::Use(inner, _) => e = inner,
+                ExprKind::Path(QPath::Resolved(None, path)) => {
+                    let Res::Local(local_id) = path.res else {
+                        return None;
+                    };
+                    return self
+                        .pat_bindings
+                        .iter()
+                        .find(|(id, _)| *id == local_id)
+                        .map(|(_, text)| text.clone());
+                }
+                _ => return None,
+            }
+        }
     }
 
     fn lower_path_expr(&self, expr: &'tcx Expr<'tcx>, qpath: &QPath<'tcx>) -> Option<LoweredExpr> {
@@ -2296,7 +2375,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                     // that would emit `*c` VERBATIM, minting the free
                     // NON-spec-model var `c*` (the P6 free-var class), which
                     // becomes a refutable havoc'd VC — false-FAILED — once
-                    // `_0_discr` grounds via the Result-return grounding.
+                    // `_0__discr` grounds via the Result-return grounding.
                     if let Some((_, text)) =
                         self.pat_bindings.iter().find(|(id, _)| *id == local_id)
                     {
@@ -2558,6 +2637,88 @@ struct LoweredSourceBinding {
     hir_local_id: u32,
 }
 
+/// Recover a complete, canonical source-root map for a native loop
+/// proposition. Synthetic collection leaves (`xs__len`, `xs[0]`) are rebound
+/// to the exact `xs` HIR binding. Any unmatched leaf rejects the whole map;
+/// partial provenance must never authorize a proof lane.
+fn exact_predicate_source_place_bindings(
+    kind: &TrustContractPredicateKind,
+    candidates: &[LoweredSourceBinding],
+) -> Option<Vec<TrustContractSourceBinding>> {
+    fn collect_names(proposition: &TrustContractProposition, names: &mut BTreeSet<String>) {
+        use TrustContractProposition as Proposition;
+        match proposition {
+            Proposition::Var { name, .. } => {
+                names.insert(name.to_string());
+            }
+            Proposition::Not(inner) | Proposition::Neg(inner) => collect_names(inner, names),
+            Proposition::And(terms) | Proposition::Or(terms) => {
+                for term in terms {
+                    collect_names(term, names);
+                }
+            }
+            Proposition::Implies(lhs, rhs)
+            | Proposition::Eq(lhs, rhs)
+            | Proposition::Lt(lhs, rhs)
+            | Proposition::Le(lhs, rhs)
+            | Proposition::Gt(lhs, rhs)
+            | Proposition::Ge(lhs, rhs)
+            | Proposition::Add(lhs, rhs)
+            | Proposition::Sub(lhs, rhs)
+            | Proposition::Mul(lhs, rhs)
+            | Proposition::Div(lhs, rhs)
+            | Proposition::Rem(lhs, rhs) => {
+                collect_names(lhs, names);
+                collect_names(rhs, names);
+            }
+            Proposition::Bool(_) | Proposition::Int(_) | Proposition::UInt(_) => {}
+        }
+    }
+
+    let proposition = match kind {
+        TrustContractPredicateKind::Typed { proposition, .. } => proposition,
+        // A literal has no free source roots, so the complete exact map is
+        // the empty map rather than the fail-closed "unknown" state.
+        TrustContractPredicateKind::BoolLiteral { .. } => return Some(Vec::new()),
+        TrustContractPredicateKind::Opaque { .. }
+        | TrustContractPredicateKind::MirLocal { .. }
+        | TrustContractPredicateKind::Unsupported { .. } => return None,
+    };
+    let mut used = BTreeSet::new();
+    collect_names(proposition, &mut used);
+    let candidates = candidates
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding))
+        .collect::<BTreeMap<_, _>>();
+    let mut roots = BTreeMap::<String, u32>::new();
+    for leaf in used {
+        let root = if candidates.contains_key(leaf.as_str()) {
+            leaf.as_str()
+        } else if let Some(base) = leaf.strip_suffix("__len") {
+            base
+        } else if let Some((base, _)) = canonical_literal_collection_projection(&leaf) {
+            base
+        } else {
+            return None;
+        };
+        let binding = candidates.get(root)?;
+        if let Some(previous) = roots.insert(binding.name.clone(), binding.hir_local_id)
+            && previous != binding.hir_local_id
+        {
+            return None;
+        }
+    }
+    Some(
+        roots
+            .into_iter()
+            .map(|(name, hir_local_id)| TrustContractSourceBinding {
+                name: Symbol::intern(&name),
+                hir_local_id,
+            })
+            .collect(),
+    )
+}
+
 /// Retain only exact source bindings actually used by this structural
 /// proposition. Missing candidates are intentional: synthesized/projection
 /// leaves remain statically meaningful but can never be rebound to a whole MIR
@@ -2699,6 +2860,34 @@ fn collection_element_domain_from_ty<'tcx>(
     ))
 }
 
+/// Render an opaque aggregate's *sort name*.
+///
+/// This string is verifier DATA (a `Sort::Datatype` name that participates in
+/// sort identity and in the typed-proposition digest), never diagnostic prose.
+/// It must therefore be produced with `with_no_trimmed_paths!`, for two
+/// independent reasons:
+///
+/// 1. SOUNDNESS OF THE NAME. A trimmed path is the shortest spelling that
+///    happens to be unambiguous *in this crate's* diagnostic namespace. It is
+///    context-dependent and non-injective across compilations, so two distinct
+///    types can render to the same `Sort::Datatype` name. Sort identity must not
+///    depend on what else the crate imports. This matches the policy already
+///    stated on `trust_mir_extract::safe_def_path_str`, which every other Trust
+///    identity string goes through.
+/// 2. NO ICE WITH VERIFICATION OFF. Displaying a `DefId`-bearing type consults
+///    the `trimmed_def_paths` query, which arms
+///    `DiagCtxt::set_must_produce_diag`: rustc then asserts at drop that a
+///    diagnostic really was emitted. `trust_check_clean_islands` runs the
+///    `trust_contracts` query unconditionally — including under
+///    `-Ztrust-verify=off`, where the contract is deliberately *not checked* and
+///    so nothing is ever emitted. Requesting a trimmed path here made every
+///    contract-bearing crate ICE with `` `trimmed_def_paths` called, diagnostics
+///    were expected but none were emitted `` in the compatibility lane. See
+///    `tests/ui/trust/contract_verify_off_no_ice.rs`.
+fn opaque_sort_name(ty: Ty<'_>) -> String {
+    with_no_trimmed_paths!(format!("{ty}"))
+}
+
 /// Source-level sort used to elaborate native E4/E5 clauses. Scalars retain
 /// their logical Bool/Int sort, while arrays and slices retain their exact
 /// element sort for indexing and collection accessors. Other aggregates stay
@@ -2711,16 +2900,19 @@ fn loop_source_sort_from_ty(ty: Ty<'_>) -> Option<trust_types::Sort> {
         ty::Array(element, _) | ty::Slice(element) => Some(trust_types::Sort::Array(
             Box::new(trust_types::Sort::Int),
             Box::new(loop_source_sort_from_ty(*element).unwrap_or_else(|| {
-                trust_types::Sort::Datatype { name: format!("{element}"), constructors: Vec::new() }
+                trust_types::Sort::Datatype {
+                    name: opaque_sort_name(*element),
+                    constructors: Vec::new(),
+                }
             })),
         )),
         ty::Str => Some(trust_types::Sort::Array(
             Box::new(trust_types::Sort::Int),
             Box::new(trust_types::Sort::Int),
         )),
-        ty::Adt(..) | ty::Tuple(..) | ty::Param(..) | ty::Alias(..) => {
-            Some(trust_types::Sort::Datatype { name: format!("{ty}"), constructors: Vec::new() })
-        }
+        ty::Adt(..) | ty::Tuple(..) | ty::Param(..) | ty::Alias(..) => Some(
+            trust_types::Sort::Datatype { name: opaque_sort_name(ty), constructors: Vec::new() },
+        ),
         _ => None,
     }
 }
@@ -2992,10 +3184,12 @@ fn visible_loop_variable_domains<'tcx>(
     Vec<LoweredVariableDomain>,
     BTreeMap<String, LoweredCollectionDomain>,
     Vec<LoweredSourceBinding>,
+    Vec<LoweredSourceBinding>,
 ) {
     struct BindingDomains {
         scalar: Option<(LoweredVariableDomain, Option<LoweredSourceBinding>)>,
         collection: Option<(String, LoweredCollectionDomain)>,
+        source_place: Option<LoweredSourceBinding>,
     }
 
     fn binding_domain<'tcx>(
@@ -3003,15 +3197,8 @@ fn visible_loop_variable_domains<'tcx>(
         name: String,
         ty: Ty<'tcx>,
         hir_local_id: u32,
-        collection_parameter: bool,
     ) -> BindingDomains {
-        // Static E4 collection models are rooted in function arguments.
-        // A loop-local collection (including a same-named shadow) may be
-        // source-valid, but cannot receive structural proof authority until
-        // its exact HIR binding is transported to the corresponding MIR place.
-        let collection = collection_parameter
-            .then(|| collection_element_domain_from_ty(tcx, name.clone(), ty))
-            .flatten();
+        let collection = collection_element_domain_from_ty(tcx, name.clone(), ty);
         let (name, scalar_ty, is_whole_scalar) = match ty.kind() {
             ty::Ref(_, inner, _) | ty::RawPtr(inner, _) => (format!("{name}*"), *inner, false),
             _ => (name, ty, true),
@@ -3021,7 +3208,13 @@ fn visible_loop_variable_domains<'tcx>(
                 is_whole_scalar.then(|| LoweredSourceBinding { name: name.clone(), hir_local_id });
             (LoweredVariableDomain { name, domain }, source_binding)
         });
-        BindingDomains { scalar, collection }
+        let source_place_name = scalar
+            .as_ref()
+            .map(|(domain, _)| domain.name.clone())
+            .or_else(|| collection.as_ref().map(|(name, _)| name.clone()));
+        let source_place = source_place_name
+            .map(|name| LoweredSourceBinding { name, hir_local_id });
+        BindingDomains { scalar, collection, source_place }
     }
 
     struct Collector<'a, 'tcx> {
@@ -3057,7 +3250,6 @@ fn visible_loop_variable_domains<'tcx>(
                         rust_name.clone(),
                         self.typeck_results.pat_ty(pat),
                         canonical_id.local_id.as_u32(),
-                        exact_unique_parameter,
                     ))
                 };
                 use std::collections::btree_map::Entry;
@@ -3098,8 +3290,10 @@ fn visible_loop_variable_domains<'tcx>(
     let mut domains = Vec::new();
     let mut collection_domains = BTreeMap::new();
     let mut source_bindings = Vec::new();
+    let mut source_place_bindings = Vec::new();
     for (_, _, binding) in collector.bindings.into_values() {
         let Some(binding) = binding else { continue };
+        source_place_bindings.extend(binding.source_place);
         if let Some((domain, source_binding)) = binding.scalar {
             domains.push(domain);
             source_bindings.extend(source_binding);
@@ -3145,6 +3339,7 @@ fn visible_loop_variable_domains<'tcx>(
             domains.push(domain.clone());
             if let Some(binding) = signature_source_bindings.get(&domain.name) {
                 source_bindings.push(binding.clone());
+                source_place_bindings.push(binding.clone());
             }
         }
     }
@@ -3153,13 +3348,20 @@ fn visible_loop_variable_domains<'tcx>(
         if !visible_rust_names.contains(rust_name)
             && unique_parameter_hir_local_ids.contains_key(rust_name)
         {
-            collection_domains.entry(name).or_insert(domain);
+            collection_domains.entry(name.clone()).or_insert(domain);
+            if let Some(hir_local_id) = unique_parameter_hir_local_ids.get(rust_name) {
+                source_place_bindings.push(LoweredSourceBinding {
+                    name,
+                    hir_local_id: *hir_local_id,
+                });
+            }
         }
     }
     (
         canonical_variable_domains(domains).unwrap_or_default(),
         collection_domains,
         canonical_source_bindings(source_bindings).unwrap_or_default(),
+        canonical_source_bindings(source_place_bindings).unwrap_or_default(),
     )
 }
 

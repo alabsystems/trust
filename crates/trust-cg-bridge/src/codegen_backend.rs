@@ -47,9 +47,12 @@ use std::any::Any;
 use std::path::PathBuf;
 
 use trust_cg_ir::{AArch64Opcode, BlockId as MachBlockId, MachFunction, MachOperand};
-use trust_cg_lower::function::{
-    BasicBlock as LirBasicBlock, Function as LirFunction, Signature as LirSignature,
-};
+// Trust: the element type of the PUBLIC `CompiledModule::lir_functions` field.
+// It was reachable only through this crate's private import, so an out-of-crate
+// caller could receive a `CompiledModule` but never name its contents or build
+// one. The trust-ir codegen frontend in `rustc_codegen_trust_cg` does both.
+pub use trust_cg_lower::function::Function as LirFunction;
+use trust_cg_lower::function::{BasicBlock as LirBasicBlock, Signature as LirSignature};
 use trust_cg_lower::instructions::{Block, Instruction as LirInstruction, Opcode, Value};
 use trust_cg_lower::types::Type as LirType;
 use trust_types::VerifiableFunction;
@@ -120,6 +123,38 @@ pub struct TargetConfig {
     pub has_reliable_f128_math: bool,
 }
 
+/// How one function's DEFINING symbol binds at link time.
+///
+/// This is the producer-facing narrowing of rustc's `Linkage`: only the two
+/// shapes trust-cg can actually emit appear here, so an unsupported linkage is
+/// refused at the mono-item gate rather than silently downgraded.
+///
+/// It is deliberately NOT a field on [`VerifiableFunction`]: linkage does not
+/// change a function's semantics or its emitted instruction bytes (it is a
+/// symbol-table attribute), so folding it into the verified IR would invalidate
+/// every proof-cache identity for a link-only change. It travels as a vector
+/// parallel to the function list instead — the same shape the codegen pipeline
+/// already uses for per-function frame layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FunctionLinkage {
+    /// A strong, externally visible definition. Callers in other objects may
+    /// resolve it.
+    #[default]
+    External,
+    /// A definition private to the object that contains it. SOUND ONLY when
+    /// every call to this function is emitted into that same object.
+    Internal,
+}
+
+impl FunctionLinkage {
+    fn symbol_binding(self) -> trust_cg_codegen::pipeline::FunctionSymbolBinding {
+        match self {
+            Self::External => trust_cg_codegen::pipeline::FunctionSymbolBinding::Global,
+            Self::Internal => trust_cg_codegen::pipeline::FunctionSymbolBinding::Local,
+        }
+    }
+}
+
 /// Crate-level information, mirrors `rustc_codegen_ssa::CrateInfo`.
 ///
 /// Simplified for Trust's needs: target policy lives on the backend instance,
@@ -130,6 +165,12 @@ pub struct CrateInfo {
     pub crate_name: String,
     /// Functions to compile (extracted from MIR).
     pub functions: Vec<VerifiableFunction>,
+    /// Per-function link-time symbol binding, 1:1 with `functions`.
+    ///
+    /// EMPTY means "every function is [`FunctionLinkage::External`]" — the
+    /// historical contract every non-rustc caller relies on. A non-empty vector
+    /// of the wrong length is a caller bug and fails closed at emission.
+    pub linkage: Vec<FunctionLinkage>,
 }
 
 /// A single compiled module (one codegen unit).
@@ -151,6 +192,12 @@ pub struct CompiledModule {
     /// and refuse a Refuted (miscompiled) function. `None` when no sources were
     /// captured (e.g. legacy/test construction paths).
     pub source_functions: Option<Vec<VerifiableFunction>>,
+    /// Per-function link-time symbol binding, 1:1 with `lir_functions`.
+    ///
+    /// EMPTY means "every function is [`FunctionLinkage::External`]". Filtered
+    /// in lockstep with `lir_functions` / `source_functions` when a function
+    /// fails to lower, so the three vectors stay index-aligned.
+    pub linkage: Vec<FunctionLinkage>,
 }
 
 /// Collection of all compiled modules for a crate.
@@ -300,6 +347,18 @@ pub struct EmittedObject {
     pub source_name: String,
     /// Serialized object file bytes.
     pub bytes: Vec<u8>,
+}
+
+/// The single object artifact emitted for one whole compiled module.
+#[derive(Debug, Clone)]
+pub struct EmittedModuleObject {
+    /// Stable artifact name used for the object file path (the module name).
+    pub artifact_name: String,
+    /// Serialized object file bytes.
+    pub bytes: Vec<u8>,
+    /// Where each function's machine code landed inside the emitted text
+    /// section, in emission order.
+    pub text_extents: Vec<trust_cg_codegen::pipeline::TextFunctionExtent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -825,11 +884,67 @@ impl TrustCgCodegenBackend {
             .collect()
     }
 
+    /// Emit ONE object file for a whole compiled module (codegen unit).
+    ///
+    /// This is the emission shape an `Internal`-linkage mono-item REQUIRES. A
+    /// local definition is only reachable from inside its own object, so the
+    /// one-object-per-FUNCTION split (see [`Self::emit_module_objects`]) makes
+    /// every intra-CGU call to a local callee an unresolvable direct call. rustc
+    /// assigns linkage at CGU granularity — it promotes a symbol to `External`
+    /// exactly when it is needed across CGUs — so its `Internal` marking is
+    /// correct precisely when the CGU is the object boundary.
+    ///
+    /// Also returns each function's `__text` extent inside the merged object, so
+    /// a caller that verified those functions in isolation can discharge the
+    /// obligation that their exact bytes were carried in unchanged.
+    pub fn emit_module_object(
+        &self,
+        module: &CompiledModule,
+    ) -> Result<EmittedModuleObject, CodegenBackendError> {
+        if module.lir_functions.is_empty() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "compiled module `{}` has no functions; refusing objectless output",
+                    module.name
+                ),
+            });
+        }
+        if !module.linkage.is_empty() && module.linkage.len() != module.lir_functions.len() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "compiled module `{}` carries {} linkage entries for {} functions; \
+                     refusing to bind symbols against a mis-indexed vector",
+                    module.name,
+                    module.linkage.len(),
+                    module.lir_functions.len()
+                ),
+            });
+        }
+
+        let bindings = module
+            .linkage
+            .iter()
+            .map(|linkage| linkage.symbol_binding())
+            .collect::<Vec<_>>();
+        let emission = self.emit_target_module(&module.lir_functions, &bindings)?;
+        let bytes = Self::require_non_empty_object(emission.object, &module.name)?;
+        Ok(EmittedModuleObject {
+            artifact_name: module.name.clone(),
+            bytes,
+            text_extents: emission.text_extents,
+        })
+    }
+
     /// Emit the object files required for one compiled module.
     ///
     /// Single-function modules produce a single artifact named after the module.
     /// Multi-function modules are split into one object per function with stable
     /// artifact names derived from the module name and function index.
+    ///
+    /// NOTE: this split cannot represent an `Internal`-linkage definition (a
+    /// local symbol in its own object is unreachable from its caller's object).
+    /// Production emission goes through [`Self::emit_module_object`]; this entry
+    /// point remains for callers that genuinely want per-function artifacts.
     pub fn emit_module_objects(
         &self,
         module: &CompiledModule,
@@ -959,6 +1074,7 @@ impl TrustCgCodegenBackend {
             // VerifiableFunctions, so there is nothing for the output gate to
             // verify: None.
             source_functions: None,
+            linkage: Vec::new(),
         })
     }
 
@@ -1134,11 +1250,47 @@ impl TrustCgCodegenBackend {
         &self,
         functions: &[LirFunction],
     ) -> Result<Vec<u8>, CodegenBackendError> {
+        self.emit_target_module(functions, &[]).map(|emission| emission.object)
+    }
+
+    /// [`Self::emit_target_object`] plus per-function symbol bindings and the
+    /// emitted `__text` layout.
+    ///
+    /// `bindings` is 1:1 with `functions`; EMPTY means every definition is
+    /// exported (the historical behavior of every other emission entry point).
+    fn emit_target_module(
+        &self,
+        functions: &[LirFunction],
+        bindings: &[trust_cg_codegen::pipeline::FunctionSymbolBinding],
+    ) -> Result<trust_cg_codegen::pipeline::ModuleEmission, CodegenBackendError> {
         // x86-64 has its OWN backend (`trust_cg_codegen::x86_64::X86Pipeline`); the
         // generic pipeline below is AArch64-only and would silently emit AArch64
         // bytes for an x86 target. Route x86 through its real backend.
         if self.target_arch == TrustCgTargetArch::X86_64 {
-            return self.emit_x86_object(functions);
+            // The x86-64 emitters still hardcode a global binding for every
+            // function definition and derive relocation symbol indices from
+            // insertion order, so a local definition there would either be
+            // exported anyway (wrong) or shift indices under the writer's
+            // locals-first partition (worse). Fail closed until that path
+            // carries the flag too.
+            if bindings
+                .iter()
+                .any(|binding| *binding != trust_cg_codegen::pipeline::FunctionSymbolBinding::Global)
+            {
+                return Err(CodegenBackendError::EmitFailed {
+                    reason: "the x86-64 object emitters do not yet carry per-function symbol \
+                             bindings; refusing to emit an Internal-linkage definition as an \
+                             exported symbol"
+                        .to_string(),
+                });
+            }
+            // No layout report from the x86 pipeline yet. The merge obligation's
+            // PRIMARY check reads offsets back from the shipped object's own
+            // symbol table and still runs; only the redundant
+            // emitter-report-vs-object cross-check is unavailable here.
+            return self.emit_x86_object(functions).map(|object| {
+                trust_cg_codegen::pipeline::ModuleEmission { object, text_extents: Vec::new() }
+            });
         }
         let pipeline = self.trust_cg_pipeline();
 
@@ -1160,7 +1312,7 @@ impl TrustCgCodegenBackend {
         }
 
         let globals = collect_trust_location_globals(functions);
-        pipeline.compile_module_with_globals(&prepared, &globals).map_err(|e| {
+        pipeline.compile_module_emission(&prepared, &globals, &[], bindings).map_err(|e| {
             CodegenBackendError::Pipeline {
                 func_name: functions
                     .first()
@@ -1326,6 +1478,7 @@ impl TrustCgCodegenBackend {
             function_count,
             // Synthesized allocator shim — no source IR to verify.
             source_functions: None,
+            linkage: Vec::new(),
         }))
     }
 
@@ -1500,11 +1653,28 @@ impl RustcCodegenBackend for TrustCgCodegenBackend {
         // pushed here ONLY when its lowering succeeded (failures are skipped on
         // both sides), so `source_functions[i]` produced `lir_functions[i]`.
         let mut source_functions = Vec::with_capacity(crate_info.functions.len());
+        // Linkage is filtered in lockstep with the two vectors above so all
+        // three stay index-aligned. An empty input vector means "all External".
+        let mut linkage = Vec::with_capacity(crate_info.functions.len());
+        if !crate_info.linkage.is_empty() && crate_info.linkage.len() != crate_info.functions.len()
+        {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "crate `{}` carries {} linkage entries for {} functions; refusing to bind \
+                     symbols against a mis-indexed vector",
+                    crate_info.crate_name,
+                    crate_info.linkage.len(),
+                    crate_info.functions.len()
+                ),
+            });
+        }
 
-        for func in &crate_info.functions {
+        for (index, func) in crate_info.functions.iter().enumerate() {
             match self.lower_function(func) {
                 Ok(lir) => {
                     source_functions.push(func.clone());
+                    linkage
+                        .push(crate_info.linkage.get(index).copied().unwrap_or_default());
                     lir_functions.push(lir);
                 }
                 Err(e) => failures.push((func.name.clone(), e.to_string())),
@@ -1518,6 +1688,7 @@ impl RustcCodegenBackend for TrustCgCodegenBackend {
             object_path: None,
             function_count,
             source_functions: Some(source_functions),
+            linkage,
         });
 
         Ok(Box::new(OngoingCodegen {
@@ -1636,6 +1807,7 @@ mod tests {
                 }],
                 arg_count: 2,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1666,6 +1838,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: Ty::i64(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1754,6 +1927,7 @@ mod tests {
             lir_functions: vec![caller, callee],
             object_path: None,
             source_functions: None,
+            linkage: Vec::new(),
         }
     }
 
@@ -2154,7 +2328,7 @@ mod tests {
     #[test]
     fn test_codegen_crate_single_function() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test_crate".to_string(), functions: vec![make_add()] };
+        let info = CrateInfo { crate_name: "test_crate".to_string(), functions: vec![make_add()], linkage: Vec::new() };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen_crate should succeed");
 
@@ -2173,6 +2347,7 @@ mod tests {
         let info = CrateInfo {
             crate_name: "multi".to_string(),
             functions: vec![make_add(), make_identity()],
+            linkage: Vec::new(),
         };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen_crate should succeed");
@@ -2186,7 +2361,7 @@ mod tests {
     #[test]
     fn test_codegen_crate_empty() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "empty".to_string(), functions: vec![] };
+        let info = CrateInfo { crate_name: "empty".to_string(), functions: vec![], linkage: Vec::new() };
 
         let ongoing = backend.codegen_crate(&info).expect("empty crate should succeed");
 
@@ -2198,7 +2373,7 @@ mod tests {
     #[test]
     fn test_join_codegen_success() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()] };
+        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()], linkage: Vec::new() };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
 
@@ -2221,6 +2396,7 @@ mod tests {
             object_path: None,
             function_count: 0,
             source_functions: None,
+            linkage: Vec::new(),
         };
 
         let err = backend
@@ -2242,6 +2418,7 @@ mod tests {
             object_path: None,
             function_count: 0,
             source_functions: None,
+            linkage: Vec::new(),
         };
 
         let err = backend
@@ -2257,7 +2434,7 @@ mod tests {
     #[test]
     fn test_join_codegen_preserves_attached_allocator_module() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()] };
+        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()], linkage: Vec::new() };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
 
@@ -2583,6 +2760,7 @@ mod tests {
             object_path: None,
             function_count: 1,
             source_functions: None,
+            linkage: Vec::new(),
         };
 
         let emitted = backend
@@ -2615,7 +2793,7 @@ mod tests {
     #[test]
     fn test_join_codegen_preserves_attached_allocator_module_spec() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()] };
+        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()], linkage: Vec::new() };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
         let mut ongoing = backend.codegen_crate(&info).expect("codegen should succeed");
@@ -2673,6 +2851,7 @@ mod tests {
         let info = CrateInfo {
             crate_name: "pipeline_test".to_string(),
             functions: vec![make_add(), make_identity()],
+            linkage: Vec::new(),
         };
         let outputs = OutputFilenames {
             out_dir: PathBuf::from("/tmp"),
@@ -2700,6 +2879,7 @@ mod tests {
                 object_path: None,
                 function_count: 0,
                 source_functions: None,
+                linkage: Vec::new(),
             }],
             allocator_module: None,
         };
@@ -2740,7 +2920,7 @@ mod tests {
     #[test]
     fn test_codegen_produces_valid_lir_blocks() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "lir_check".to_string(), functions: vec![make_add()] };
+        let info = CrateInfo { crate_name: "lir_check".to_string(), functions: vec![make_add()], linkage: Vec::new() };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen should succeed");
         let ongoing_ref = ongoing.downcast_ref::<OngoingCodegen>().expect("downcast");
@@ -2914,6 +3094,7 @@ mod tests {
             object_path: None,
             function_count: 2,
             source_functions: None,
+            linkage: Vec::new(),
         };
 
         let objects =
@@ -2971,7 +3152,7 @@ mod tests {
             name: format!("chain_{n}"),
             def_path: format!("test::chain_{n}"),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i64() },
+            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i64(), datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -3106,7 +3287,7 @@ mod tests {
             name: "switch_fn".to_string(),
             def_path: "test::switch_fn".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32() },
+            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32(), datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -3194,7 +3375,7 @@ mod tests {
             name: "loop_fn".to_string(),
             def_path: "test::loop_fn".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32() },
+            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32(), datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -3294,6 +3475,7 @@ mod tests {
                     object_path: None,
                     function_count: 3,
                     source_functions: None,
+                    linkage: Vec::new(),
                 },
                 CompiledModule {
                     name: "m2".to_string(),
@@ -3301,6 +3483,7 @@ mod tests {
                     object_path: None,
                     function_count: 2,
                     source_functions: None,
+                    linkage: Vec::new(),
                 },
             ],
             allocator_module: Some(CompiledModule {
@@ -3309,6 +3492,7 @@ mod tests {
                 object_path: None,
                 function_count: 1,
                 source_functions: None,
+                linkage: Vec::new(),
             }),
             allocator_module_spec: Some(AllocatorModuleSpec {
                 module_name: "alloc.spec".to_string(),

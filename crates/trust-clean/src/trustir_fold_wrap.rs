@@ -231,6 +231,22 @@ fn body_has_unsupported(func: &VerifiableFunction) -> bool {
     })
 }
 
+/// Every call absorbed by the fold-wrapper model must use the ordinary Rust
+/// ABI surface represented by the model. Foreign, unsafe-signature, and atomic
+/// calls are different semantic edges and therefore fail closed even when the
+/// callee spelling and surrounding CFG match a known driver fingerprint.
+fn call_abi_is_modeled(terminator: &Terminator) -> bool {
+    matches!(
+        terminator,
+        Terminator::Call {
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            ..
+        }
+    )
+}
+
 // ===========================================================================
 // Driver fingerprints — `fold_opt_or_clone`, its closure, `Folder::new`
 // ===========================================================================
@@ -268,6 +284,9 @@ fn match_fold_opt_or_clone(func: &VerifiableFunction) -> R<()> {
     let Terminator::Call { func: callee, args, dest, target: Some(t0), .. } = &b0.terminator else {
         return Err(driver_drift(m, "bb0 does not call fold_expr_opt"));
     };
+    if !call_abi_is_modeled(&b0.terminator) {
+        return Err(driver_drift(m, "bb0 call uses an unsupported ABI"));
+    }
     if callee != GEN_FOLD_EXPR_OPT {
         return Err(driver_drift(m, format!("bb0 calls {callee}")));
     }
@@ -301,6 +320,9 @@ fn match_fold_opt_or_clone(func: &VerifiableFunction) -> R<()> {
     else {
         return Err(driver_drift(m, "bb1 does not call unwrap_or_else"));
     };
+    if !call_abi_is_modeled(&b1.terminator) {
+        return Err(driver_drift(m, "bb1 call uses an unsupported ABI"));
+    }
     if callee1 != OPTION_UNWRAP_OR_ELSE {
         return Err(driver_drift(m, format!("bb1 calls {callee1}")));
     }
@@ -343,6 +365,9 @@ fn match_fold_opt_or_clone_closure(func: &VerifiableFunction) -> R<()> {
     let Terminator::Call { func: callee, args, dest, target: Some(t), .. } = &b0.terminator else {
         return Err(driver_drift(m, "closure bb0 does not call clone"));
     };
+    if !call_abi_is_modeled(&b0.terminator) {
+        return Err(driver_drift(m, "closure clone uses an unsupported ABI"));
+    }
     if callee != CLONE_CLONE && callee != EXPR_CLONE {
         return Err(driver_drift(m, format!("closure calls {callee}")));
     }
@@ -372,6 +397,9 @@ fn match_folder_ctor(func: &VerifiableFunction) -> R<(String, Vec<LaunchFieldSrc
     let Terminator::Call { func: callee, args, dest, target: Some(t), .. } = &b0.terminator else {
         return Err(driver_drift(m, "ctor bb0 does not call the map ctor"));
     };
+    if !call_abi_is_modeled(&b0.terminator) {
+        return Err(driver_drift(m, "map ctor uses an unsupported ABI"));
+    }
     // `HashMap::<K, V>::new` — the fresh empty memo (P-OPT-STD).
     if !(callee.starts_with("std::collections::HashMap::") && callee.ends_with("::new")) {
         return Err(driver_drift(m, format!("ctor calls {callee}, not HashMap::new")));
@@ -525,6 +553,11 @@ pub fn sem_fold_launch_wrapper_of(
         else {
             return Err(FoldWrapDecline::GuardShape("clone arm terminator".into()));
         };
+        if !call_abi_is_modeled(&cb.terminator) {
+            return Err(FoldWrapDecline::GuardShape(
+                "clone arm uses an unsupported ABI".into(),
+            ));
+        }
         if cc != CLONE_CLONE && cc != EXPR_CLONE {
             return Err(FoldWrapDecline::GuardShape(format!("clone arm calls {cc}")));
         }
@@ -557,6 +590,9 @@ pub fn sem_fold_launch_wrapper_of(
     else {
         return Err(launch_err("memo/ctor block terminator is not a call"));
     };
+    if !call_abi_is_modeled(&acq.terminator) {
+        return Err(launch_err("memo/ctor call uses an unsupported ABI"));
+    }
     if acallee == TOTAL_CLONE {
         // `FoldMemo::default()` — the derived-total sentinel, zero args, dest
         // type pinned to FoldMemo.
@@ -711,6 +747,9 @@ pub fn sem_fold_launch_wrapper_of(
     else {
         return Err(launch_err("launch block terminator is not the driver call"));
     };
+    if !call_abi_is_modeled(&lb.terminator) {
+        return Err(launch_err("driver call uses an unsupported ABI"));
+    }
     if lcallee != FOLD_OPT_OR_CLONE {
         return Err(launch_err(format!("launch block calls {lcallee}")));
     }
@@ -900,12 +939,23 @@ pub fn sem_adt_delegate_of(
             return Err(FoldWrapDecline::DelegateShape(format!("statements in bb{}", b.id.0)));
         }
         match &b.terminator {
-            Terminator::Call { func: c, args, dest, target, atomic, is_foreign, .. } => {
+            Terminator::Call {
+                func: c,
+                args,
+                dest,
+                target,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                ..
+            } => {
                 if call.is_some() {
                     return Err(FoldWrapDecline::DelegateShape("second call".into()));
                 }
-                if *is_foreign || atomic.is_some() {
-                    return Err(FoldWrapDecline::DelegateShape("foreign/atomic callee".into()));
+                if *is_foreign || *is_unsafe_sig || atomic.is_some() {
+                    return Err(FoldWrapDecline::DelegateShape(
+                        "foreign, unsafe-signature, or atomic callee".into(),
+                    ));
                 }
                 call = Some((c, args, dest, *target));
             }
@@ -955,11 +1005,11 @@ pub fn sem_adt_delegate_of(
         .position(|k| k == key)
         .and_then(|i| u64::try_from(i).ok())
         .ok_or_else(|| FoldWrapDecline::CalleeUnresolved("registry index".into()))?;
-    if fact.arg_count != args.len() {
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) {
         return Err(FoldWrapDecline::CalleeMismatch(format!(
-            "arity: call passes {}, registry declares {}",
+            "signature: call passes {} actuals, registry declares {} typed formals",
             args.len(),
-            fact.arg_count
+            fact.param_tys.len()
         )));
     }
     // The callee's precondition must be KNOWN EMPTY (these wrappers declare

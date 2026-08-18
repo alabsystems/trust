@@ -158,8 +158,9 @@ fn check_contracts_attr(cx: &EarlyContext<'_>, attr: &Attribute, item: &AttrItem
         "legacy contracts attribute; Trust supports first-class signature clauses",
         |diag| {
             // The predicate text moves into the signature, but legacy `ensures`
-            // closure forms (`|ret| ..`) need a manual rewrite to the output
-            // record + primes notation, so this is a sketch, not a fix.
+            // closure forms (`|ret| ..`) need a manual rewrite against the
+            // native semantics (a one-state EXIT evaluation — see the note
+            // below), so this is a sketch, not a fix.
             diag.span_suggestion(
                 attr.span,
                 "move the predicate into the signature",
@@ -167,8 +168,17 @@ fn check_contracts_attr(cx: &EarlyContext<'_>, attr: &Attribute, item: &AttrItem
                 Applicability::HasPlaceholders,
             );
             if has_old_call {
+                // Do NOT point at primes here: `x'` is reserved grammar the
+                // compiler rejects ("primed post-state identifier has no
+                // verified MIR state binding"), and a native `ensures` is
+                // evaluated purely in the EXIT state — unprimed names are the
+                // post-state, and the entry state has no spelling at all yet.
+                // A predicate that needs `old()` therefore cannot be migrated
+                // until the carrier grows an entry/post-state environment.
                 diag.note(
-                    "Trust has no `old()`: the entry state is the default; primes notation (`x'`) reads the post-state",
+                    "Trust has no `old()`: a native `ensures` is evaluated in the exit state \
+                     (unprimed names read the post-state), and the entry state currently has \
+                     no native spelling — this predicate cannot be migrated yet",
                 );
             }
         },

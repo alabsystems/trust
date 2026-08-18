@@ -1501,6 +1501,7 @@ mod tests {
                     .collect(),
                 blocks,
                 arg_count,
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),

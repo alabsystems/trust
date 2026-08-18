@@ -92,6 +92,28 @@ fn all_bodies() -> DumpBodies {
     m
 }
 
+fn call_count(func: &VerifiableFunction) -> usize {
+    func.body
+        .blocks
+        .iter()
+        .filter(|block| matches!(block.terminator, trust_types::Terminator::Call { .. }))
+        .count()
+}
+
+fn mark_nth_call_unsafe(func: &mut VerifiableFunction, wanted: usize) {
+    let mut seen = 0;
+    for block in &mut func.body.blocks {
+        if let trust_types::Terminator::Call { is_unsafe_sig, .. } = &mut block.terminator {
+            if seen == wanted {
+                *is_unsafe_sig = true;
+                return;
+            }
+            seen += 1;
+        }
+    }
+    panic!("fixture has no call #{wanted}");
+}
+
 const SUBST_FVAR: &str = "expr__subst__<impl expr__Expr>__subst_fvar";
 const LIFT: &str = "expr__subst__<impl expr__Expr>__lift";
 const LIFT_AT: &str = "expr__subst__<impl expr__Expr>__lift_at";
@@ -183,6 +205,51 @@ fn instantiate_at_launch_recognizes() {
     assert!(l.fold.depth.is_some(), "Instantiator is the depth family");
 }
 
+/// Every call absorbed by the launch and driver fingerprints must use the
+/// ordinary modeled ABI. An unsafe-signature bit on any otherwise-identical
+/// edge is enough to decline; it must never be ignored because the callee name
+/// and surrounding CFG still look familiar.
+#[test]
+fn launch_and_driver_calls_reject_unsafe_signatures() {
+    let bodies = all_bodies();
+    for row in [SUBST_FVAR, LIFT_AT, ABSTRACT_FVAR_AT, INSTANTIATE_AT] {
+        let original = load(row);
+        for call_index in 0..call_count(&original) {
+            let mut doctored = original.clone();
+            mark_nth_call_unsafe(&mut doctored, call_index);
+            let decline = sem_fold_launch_wrapper_of(&doctored, &bodies)
+                .expect_err("an unsafe-signature launch edge must decline");
+            assert!(
+                matches!(
+                    decline,
+                    FoldWrapDecline::LaunchShape(_) | FoldWrapDecline::GuardShape(_)
+                ),
+                "{row} call #{call_index}: {decline:?}"
+            );
+        }
+    }
+
+    for (driver_file, launch_row) in [
+        ("expr__Expr__fold_opt_or_clone", SUBST_FVAR),
+        ("expr__Expr__fold_opt_or_clone__{closure#0}", SUBST_FVAR),
+        ("expr__subst__Abstractor__new", ABSTRACT_FVAR_AT),
+    ] {
+        let driver = load(driver_file);
+        for call_index in 0..call_count(&driver) {
+            let mut doctored_driver = driver.clone();
+            mark_nth_call_unsafe(&mut doctored_driver, call_index);
+            let mut doctored_bodies = all_bodies();
+            doctored_bodies.insert(driver.def_path.clone(), doctored_driver);
+            let decline = sem_fold_launch_wrapper_of(&load(launch_row), &doctored_bodies)
+                .expect_err("an unsafe-signature driver edge must decline");
+            assert!(
+                matches!(decline, FoldWrapDecline::DriverDrift(_)),
+                "{driver_file} call #{call_index}: {decline:?}"
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // Production-gate flips — launch wrappers (registry-free, option (b))
 // ===========================================================================
@@ -260,9 +327,24 @@ fn delegate_rechecks_recognizable_callee_semantics_at_composition_point() {
     let mut registry = BTreeMap::new();
     let mut surface_fact = CalleeFact::of_certified(&hostage);
     // Model an adversarial/stale registry snapshot that satisfies the delegate
-    // recognizer's shallow arity pin.  The composition gate must still inspect
-    // the current sibling body and re-run its semantic launch certificate.
-    surface_fact.arg_count = 3;
+    // recognizer's complete call-signature pin. The composition gate must still
+    // inspect the current sibling body and re-run its semantic launch certificate.
+    let (args, dest) = delegate
+        .body
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            trust_types::Terminator::Call { args, dest, .. } => Some((args, dest)),
+            _ => None,
+        })
+        .expect("delegate call");
+    surface_fact.arg_count = args.len();
+    surface_fact.param_tys = args
+        .iter()
+        .map(|arg| trust_vcgen::operand_ty(&delegate, arg).expect("typed delegate actual"))
+        .collect();
+    assert!(dest.projections.is_empty(), "delegate destination is bare");
+    surface_fact.return_ty = delegate.body.locals[dest.local].ty.clone();
     registry.insert(hostage.def_path.clone(), surface_fact);
     let surface = sem_adt_delegate_of(&delegate, &registry);
     assert!(
@@ -512,6 +594,40 @@ fn arity_mismatch_declines_callee_mismatch() {
     reg.insert(callee_func.def_path.clone(), fact);
     let d = sem_adt_delegate_of(&func, &reg).unwrap_err();
     assert_eq!(d.name(), "fold_wrap::callee_mismatch", "{d:?}");
+}
+
+/// The registry must match the entire certified signature, not merely arity.
+#[test]
+fn parameter_and_return_type_mismatches_decline_callee_mismatch() {
+    let func = load(LIFT);
+    let callee_func = load(LIFT_AT);
+    for mutate in ["parameter", "return"] {
+        let mut fact = CalleeFact::of_certified(&callee_func);
+        match mutate {
+            "parameter" => fact.param_tys[0] = trust_types::Ty::Bool,
+            "return" => fact.return_ty = trust_types::Ty::Bool,
+            _ => unreachable!(),
+        }
+        let mut reg = BTreeMap::new();
+        reg.insert(callee_func.def_path.clone(), fact);
+        let d = sem_adt_delegate_of(&func, &reg).unwrap_err();
+        assert_eq!(d.name(), "fold_wrap::callee_mismatch", "{mutate}: {d:?}");
+    }
+}
+
+#[test]
+fn unsafe_signature_delegate_declines_shape() {
+    let mut func = load(LIFT);
+    let callee_func = load(LIFT_AT);
+    for block in &mut func.body.blocks {
+        if let trust_types::Terminator::Call { is_unsafe_sig, .. } = &mut block.terminator {
+            *is_unsafe_sig = true;
+        }
+    }
+    let mut reg = BTreeMap::new();
+    reg.insert(callee_func.def_path.clone(), CalleeFact::of_certified(&callee_func));
+    let d = sem_adt_delegate_of(&func, &reg).unwrap_err();
+    assert_eq!(d.name(), "fold_wrap::delegate_shape", "{d:?}");
 }
 
 /// MEMO-FRESHNESS probe: doctor `subst_fvar` to COPY (not MOVE) a reused memo

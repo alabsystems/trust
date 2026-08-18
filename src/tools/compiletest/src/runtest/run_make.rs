@@ -6,7 +6,7 @@ use build_helper::fs::{ignore_not_found, recursive_remove};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use super::{ProcRes, TestCx, disable_error_reporting};
-use crate::common::{TRUST_VANILLA_RUSTC_FLAG, TestSuite};
+use crate::common::{TRUST_VANILLA_ANNOUNCED_ENV, TRUST_VANILLA_RUSTC_FLAG, TestSuite};
 use crate::util::{ArgFileCommand, copy_dir_all, dylib_env_var};
 
 const TRUST_VANILLA_REAL_RUSTC_ENV: &str = "__COMPILETEST_TRUST_VANILLA_REAL_RUSTC";
@@ -200,7 +200,13 @@ impl TestCx<'_> {
             .env("RUSTC", &recipe_rustc)
             // Provide which LLVM components are available (e.g. which LLVM components are provided
             // through a specific CI runner).
-            .env("LLVM_COMPONENTS", &self.config.llvm_components);
+            .env("LLVM_COMPONENTS", &self.config.llvm_components)
+            // Trust (loud-when-off): run-make is a managed harness lane; its
+            // vanilla wrapper and any per-recipe `-Ztrust-verify=off` compile
+            // are announced policy, so quiet the compiler's once-per-crate
+            // vanilla note. A recipe that wants to observe the note removes
+            // this variable from its own command.
+            .env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
 
         if self.config.trust_vanilla() {
             cmd.env(TRUST_VANILLA_REAL_RUSTC_ENV, &self.config.rustc_path);

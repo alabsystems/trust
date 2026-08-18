@@ -38,6 +38,8 @@ thread_local! {
     static REDUCED_QUERIES: Cell<bool> = const { Cell::new(false) };
     static NO_VISIBLE_PATH: Cell<bool> = const { Cell::new(false) };
     static NO_VISIBLE_PATH_IF_DOC_HIDDEN: Cell<bool> = const { Cell::new(false) };
+    // Trust: see `with_def_path_disambiguators`.
+    static DEF_PATH_DISAMBIGUATORS: Cell<bool> = const { Cell::new(false) };
     static RTN_MODE: Cell<RtnMode> = const { Cell::new(RtnMode::ForDiagnostic) };
 }
 
@@ -122,6 +124,52 @@ define_helper!(
     fn with_no_visible_paths(NoVisibleGuard, NO_VISIBLE_PATH);
     /// Prevent selection of visible paths if the paths are through a doc hidden path.
     fn with_no_visible_paths_if_doc_hidden(NoVisibleIfDocHiddenGuard, NO_VISIBLE_PATH_IF_DOC_HIDDEN);
+    /// Trust (SOUNDNESS — the many-to-one call key): a NARROWING of Trust's
+    /// def-path identity space. It removes three MEASURED collision classes; it
+    /// does NOT make the rendering injective, and nothing downstream may assume
+    /// that it does (see the residual list on `direct_call_def_path`).
+    ///
+    /// Trust uses `def_path_str` as a semantic routing IDENTITY (callee keys,
+    /// contract-summary keys, panic-freedom discharge sets), which needs a
+    /// discrimination that diagnostic text does not owe it. Two renderings are
+    /// restored here, both through `DisambiguatedDefPathData::as_sym` — the same
+    /// function `-Zverbose-internals` and `DefPath::to_string_no_crate_verbose`
+    /// go through, so the spellings (`S#1`, `{extern#0}`) cannot drift apart:
+    ///
+    /// 1. the `DisambiguatedDefPathData` disambiguator on named segments, so two
+    ///    block-scoped `struct S` in one function stop both rendering
+    ///    `krate::f::S` (their two DIFFERENT `write_fmt` callees shared a key).
+    ///    Read that literally — it separates same-named siblings IN ONE
+    ///    NAMESPACE, because the counter is keyed on `(parent, DefPathData)` and
+    ///    `TypeNs(sym)`/`ValueNs(sym)` are different variants. A `fn S` and a
+    ///    `struct S` under one parent are therefore both `#0` and both still
+    ///    render `S`: MEASURED OPEN, unchanged by this guard, and recorded as
+    ///    residual 7 on `trust_mir_extract::direct_call_def_path`;
+    /// 2. the `{{extern}}` segment itself, which is otherwise dropped
+    ///    UNCONDITIONALLY — a drop that merges an `extern` block's imports into
+    ///    the block's GRANDPARENT namespace, where a same-named ordinary item
+    ///    can already live. Unlike (1) this is not a same-parent sibling
+    ///    ambiguity, so the disambiguator cannot express it and the segment is
+    ///    kept on EVERY foreign path (MEASURED: a may-unwind `extern "C-unwind"`
+    ///    import and a local `fn` of the same name in two blocks of one function
+    ///    rendered one string, and the FFI call was bound to the local body).
+    ///
+    /// (1) moves a spelling ONLY where an earlier sibling shares the same
+    /// `(parent, DefPathData)`, and the `ty::ParamTy` marker fires only on a
+    /// primitive-spelled parameter — so those two move nothing that was already
+    /// unambiguous. That is also the bound on what (1) can REACH, not just on
+    /// what it disturbs. (2) is NOT like that and must not be described as if it
+    /// were: it moves EVERY path that traverses an `extern` block, including
+    /// `core`/`alloc`/`std` ones (`core::ffi::c_str::strlen`,
+    /// `core::num::imp::libm::*`, `alloc::alloc::__rust_alloc_error_handler`).
+    /// That is a lost-recovery direction, so it was ENUMERATED, not argued: see
+    /// the census and the two falsified guard tests recorded on
+    /// `trust_mir_extract::safe_def_path_str`.
+    ///
+    /// A third class is closed at the `ty::ParamTy` print arm below: a type
+    /// PARAMETER named after a primitive (`fn go<u8: Tr>`). See it for why that
+    /// one is exactly the primitives and no wider.
+    fn with_def_path_disambiguators(DefPathDisambiguatorGuard, DEF_PATH_DISAMBIGUATORS);
 );
 
 #[must_use]
@@ -2434,8 +2482,58 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
     ) -> Result<(), PrintError> {
         print_prefix(self)?;
 
+        // Trust: `def_path_str` is an IDENTITY for the verifier, so the
+        // disambiguator that separates two same-named siblings OF ONE
+        // `DefPathData` VARIANT must survive. Cross-variant siblings (`fn S` vs
+        // `struct S`) are counted separately and are both `#0`, so this does not
+        // reach them — see `with_def_path_disambiguators`.
+        let verbose = self.should_print_verbose() || with_def_path_disambiguators();
+
         // Skip `::{{extern}}` blocks and `::{{constructor}}` on tuple/unit structs.
-        if let DefPathData::ForeignMod | DefPathData::Ctor = disambiguated_data.data {
+        //
+        // The skip is a DISPLAY choice, and for diagnostics it is the right one:
+        // an `extern` block introduces no namespace in the source language, so
+        // `extern "C" { fn boom(); }` makes `boom` spelled `krate::f::boom` —
+        // exactly what the user wrote. Trust keeps that spelling everywhere
+        // except its own identity seam.
+        //
+        // Trust (SOUNDNESS): dropping the segment does not merely SHORTEN the
+        // path, it MERGES the extern block's children into the block's
+        // GRANDPARENT namespace — and rustc's disambiguator cannot compensate,
+        // because disambiguators count siblings under one `(parent,
+        // DefPathData)` and the merged items have DIFFERENT parents. A foreign
+        // import and an ordinary item of the same name under one function then
+        // render ONE string (MEASURED: a bodyless may-unwind `extern "C-unwind"
+        // { fn boom; }` and a local `fn boom` in two blocks of one `fn go` both
+        // render `krate::go::boom`, and `trust_ir_bridge`'s `known_functions`
+        // bind sent the FFI call to the local body — an `[overflow:add]` row
+        // that FAILS with a counterexample was reported PROVED instead).
+        //
+        // The hazard is the MERGE, so it is present on EVERY drop, not only
+        // where a second extern block exists: gating on `disambiguator != 0`
+        // closes the alias at `{{extern}}#1` and leaves it open at `#0`, the
+        // common case (one extern block). Under the identity seam the segment is
+        // therefore always rendered, spelled `{extern#N}`.
+        //
+        // `{{constructor}}` is the OTHER unconditionally-dropped segment and is
+        // deliberately NOT changed here — a recorded residual, not a safe case.
+        // It merges the same way (MEASURED: a block-scoped `struct S(u32)` and a
+        // block-scoped `fn S` in two blocks of one function both render
+        // `krate::go::S`), but MEASURED it does not reach a callee key in the
+        // direct-construction shape — `S(x)` lowers to an `Aggregate`, not a
+        // `Call`, so the only extracted callee is the local `fn`, and the probe
+        // shows NO obligation differential on either compiler. A REIFIED ctor
+        // does reach a key, inside an `FnDef` type in a turbofish
+        // (`apply::<fn(u32) -> krate::go::S {krate::go::S}>`); that has not been
+        // driven to a false proof. It stays as it is because moving it moves
+        // EVERY tuple/unit-struct and enum-variant ctor spelling, including
+        // `core::option::Option::Some`, and that blast radius is not measured by
+        // this change's evidence. See the residual list on `safe_def_path_str`.
+        let keep_foreign_mod_segment =
+            with_def_path_disambiguators() && disambiguated_data.data == DefPathData::ForeignMod;
+        if !keep_foreign_mod_segment
+            && let DefPathData::ForeignMod | DefPathData::Ctor = disambiguated_data.data
+        {
             return Ok(());
         }
 
@@ -2450,7 +2548,6 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
             }
         }
 
-        let verbose = self.should_print_verbose();
         write!(self, "{}", disambiguated_data.as_sym(verbose))?;
 
         self.empty_path = false;
@@ -3396,7 +3493,30 @@ define_print_and_forward_display! {
     }
 
     ty::ParamTy {
-        write!(p, "{}", self.name)?;
+        // Trust (SOUNDNESS): a type PARAMETER renders as its bare NAME, and the
+        // only CONCRETE types that also render as a bare name — under the seam's
+        // `no_trimmed`/`no_visible`/`resolve_crate_name` stack every ADT is
+        // crate-qualified — are the primitives. So a parameter named after one
+        // makes an UNRESOLVABLE dispatch render exactly a bundled body's def
+        // path, and `trust_ir_bridge`'s `known_functions` lookup binds the
+        // generic call to that proved body (MEASURED: `fn go<u8: Tr>(x: &u8,
+        // v: &Prim)` reported panic-free for EVERY `T: Tr`).
+        //
+        // `hir::PrimTy::from_name` is rustc's own "this identifier names a
+        // primitive type" predicate — the same rule that lets the parameter
+        // shadow the primitive — so the marked set is exactly the colliding set
+        // and no other spelling moves. `#` is not identifier-spellable, so no
+        // source type can impersonate the marked form.
+        //
+        // This does NOT make param rendering injective: two parameters named `T`
+        // in two DIFFERENT generic scopes still render one string, and
+        // `ty::ParamTy` carries only `{index, name}` — no owner — so that class
+        // cannot be separated here. It is MEASURED open; see the residual list
+        // on `direct_call_def_path`.
+        match with_def_path_disambiguators() && hir::PrimTy::from_name(self.name).is_some() {
+            true => write!(p, "{}#ty_param", self.name)?,
+            false => write!(p, "{}", self.name)?,
+        }
     }
 
     ty::ParamConst {

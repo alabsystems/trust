@@ -86,6 +86,7 @@ fn checked_countdown(guard_op: BinOp, step: u128) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -151,6 +152,60 @@ fn checked_unsigned_unit_decrement_under_positive_otherwise_guard_is_exact() {
         matches!(&vc.kind, VcKind::NonTermination { context, measure }
             if context == "loop-decreases" && measure == "n")
     }));
+}
+
+#[test]
+fn contextual_signed_literal_retains_the_declared_i128_checked_domain() {
+    let mut func = checked_countdown(BinOp::Gt, 1);
+    func.body.locals[1].ty = Ty::i128();
+    func.body.locals[3].ty = Ty::Tuple(vec![Ty::i128(), Ty::Bool]);
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, guard_rhs), .. } =
+        &mut func.body.blocks[1].stmts[0]
+    else {
+        unreachable!()
+    };
+    *guard_rhs = Operand::Constant(ConstValue::Int(0));
+    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, update_rhs), .. } =
+        &mut func.body.blocks[2].stmts[0]
+    else {
+        unreachable!()
+    };
+    // Portable MIR erases the width of this contextual signed literal.  Its
+    // value is nevertheless exactly representable in the declared i128 LHS
+    // domain and the checked tuple independently preserves that domain.
+    *update_rhs = Operand::Constant(ConstValue::Int(1));
+
+    assert!(
+        bind_compiler_loop_contracts(
+            &mut func,
+            &[
+                loop_spec(LoopContractKind::Invariant, "n >= 0"),
+                loop_spec(LoopContractKind::Decreases, "n"),
+            ],
+        )
+        .is_empty()
+    );
+    let (all, unsupported) = loop_unknowns(&func);
+    assert!(
+        unsupported.is_empty(),
+        "an in-range contextual literal must inherit the exact i128 checked domain: \
+         {unsupported:#?}",
+    );
+    assert!(all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })));
+    assert!(all.iter().any(|vc| {
+        matches!(&vc.kind, VcKind::NonTermination { context, measure }
+            if context == "loop-decreases" && measure == "n")
+    }));
+    let mut exact_i128_subtraction = false;
+    for vc in &all {
+        vc.formula.visit(&mut |formula| {
+            exact_i128_subtraction |= matches!(formula, Formula::BvSub(_, _, 128));
+        });
+    }
+    assert!(
+        exact_i128_subtraction,
+        "the accepted checked update must retain an exact 128-bit subtraction: {all:#?}",
+    );
 }
 
 #[test]
@@ -281,6 +336,79 @@ fn checked_update_shape_mismatches_fail_closed() {
     };
     *rhs = Operand::Constant(ConstValue::Uint(1, 16));
     cases.push(("mismatched-operand-types", mismatched_operand_types));
+
+    let mut out_of_range_contextual_literal = checked_countdown(BinOp::Gt, 1);
+    out_of_range_contextual_literal.body.locals[1].ty = Ty::i8();
+    out_of_range_contextual_literal.body.locals[3].ty = Ty::Tuple(vec![Ty::i8(), Ty::Bool]);
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, guard_rhs), .. } =
+        &mut out_of_range_contextual_literal.body.blocks[1].stmts[0]
+    else {
+        unreachable!()
+    };
+    *guard_rhs = Operand::Constant(ConstValue::Int(0));
+    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, update_rhs), .. } =
+        &mut out_of_range_contextual_literal.body.blocks[2].stmts[0]
+    else {
+        unreachable!()
+    };
+    *update_rhs = Operand::Constant(ConstValue::Int(128));
+    cases.push(("out-of-range-contextual-literal", out_of_range_contextual_literal));
+
+    let mut negative_contextual_unsigned_literal = checked_countdown(BinOp::Gt, 1);
+    negative_contextual_unsigned_literal.body.locals[1].ty = Ty::u8();
+    negative_contextual_unsigned_literal.body.locals[3].ty = Ty::Tuple(vec![Ty::u8(), Ty::Bool]);
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, guard_rhs), .. } =
+        &mut negative_contextual_unsigned_literal.body.blocks[1].stmts[0]
+    else {
+        unreachable!()
+    };
+    *guard_rhs = Operand::Constant(ConstValue::Int(0));
+    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, update_rhs), .. } =
+        &mut negative_contextual_unsigned_literal.body.blocks[2].stmts[0]
+    else {
+        unreachable!()
+    };
+    *update_rhs = Operand::Constant(ConstValue::Int(-1));
+    cases.push(("negative-contextual-unsigned-literal", negative_contextual_unsigned_literal));
+
+    let mut wrong_width_u128_literal = checked_countdown(BinOp::Gt, 1);
+    wrong_width_u128_literal.body.locals[1].ty = Ty::u128();
+    wrong_width_u128_literal.body.locals[3].ty = Ty::Tuple(vec![Ty::u128(), Ty::Bool]);
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, guard_rhs), .. } =
+        &mut wrong_width_u128_literal.body.blocks[1].stmts[0]
+    else {
+        unreachable!()
+    };
+    *guard_rhs = Operand::Constant(ConstValue::Uint(0, 128));
+    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, update_rhs), .. } =
+        &mut wrong_width_u128_literal.body.blocks[2].stmts[0]
+    else {
+        unreachable!()
+    };
+    *update_rhs = Operand::Constant(ConstValue::Uint(1, 64));
+    cases.push(("wrong-width-u128-literal", wrong_width_u128_literal));
+
+    let mut typed_i64_rhs_for_i128 = checked_countdown(BinOp::Gt, 1);
+    typed_i64_rhs_for_i128.body.locals[1].ty = Ty::i128();
+    typed_i64_rhs_for_i128.body.locals[3].ty = Ty::Tuple(vec![Ty::i128(), Ty::Bool]);
+    typed_i64_rhs_for_i128.body.locals.push(LocalDecl {
+        index: 4,
+        ty: Ty::i64(),
+        name: Some("step_i64".to_string()),
+    });
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, guard_rhs), .. } =
+        &mut typed_i64_rhs_for_i128.body.blocks[1].stmts[0]
+    else {
+        unreachable!()
+    };
+    *guard_rhs = Operand::Constant(ConstValue::Int(0));
+    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, update_rhs), .. } =
+        &mut typed_i64_rhs_for_i128.body.blocks[2].stmts[0]
+    else {
+        unreachable!()
+    };
+    *update_rhs = Operand::Copy(Place::local(4));
+    cases.push(("typed-i64-rhs-for-i128", typed_i64_rhs_for_i128));
 
     let mut second_checked_definition = checked_countdown(BinOp::Gt, 1);
     let duplicate_checked = second_checked_definition.body.blocks[2].stmts[0].clone();

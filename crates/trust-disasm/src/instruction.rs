@@ -97,6 +97,24 @@ impl Instruction {
 
     /// Number of operands.
     #[must_use]
+    /// Build an instruction WITHOUT decoding one — tests only.
+    ///
+    /// An `Instruction` normally cannot be constructed outside this crate, and
+    /// that is deliberate: one that did not come from the decoder is not a fact
+    /// about any bytes. This escape hatch exists so a consumer crate can test a
+    /// semantics-side guard ON ITS OWN, rather than have its test silently
+    /// carried by the decoder rejecting the shape first — which is how a
+    /// `width - immr` underflow came to be protected only by the ordering of a
+    /// check in another crate.
+    #[cfg(feature = "test-construct")]
+    pub fn for_test(opcode: Opcode, operands: Vec<Operand>) -> Self {
+        let mut insn = Self::new(0x1000, 0, opcode, ControlFlow::Fallthrough);
+        for op in operands {
+            insn.push_operand(op);
+        }
+        insn
+    }
+
     pub fn operand_count(&self) -> usize {
         self.operand_count as usize
     }
@@ -161,6 +179,7 @@ impl Instruction {
                 | Opcode::Ldrsh
                 | Opcode::Ldrsw
                 | Opcode::Ldp
+                | Opcode::Ldpsw
                 | Opcode::Ldxr
                 | Opcode::Ldar
                 | Opcode::Ldaxr

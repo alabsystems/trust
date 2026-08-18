@@ -66,6 +66,7 @@ fn call_func(args: Vec<Operand>, extra_stmt: Option<Statement>) -> VerifiableFun
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

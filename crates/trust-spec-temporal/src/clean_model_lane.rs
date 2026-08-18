@@ -1,8 +1,8 @@
 //! Kernel-elaborated Clean finite-model definitions routed to ty.
 //!
-//! This lane replaces the owner-ratified operational domain of the scalar
-//! data-model fragment of `trust_model!` without introducing a second, hand-maintained
-//! semantic object. `R5_TEMPORAL_PARITY_BLOCKERS` is empty. Mechanically, the
+//! This lane replaced the owner-ratified operational domain of the retired
+//! scalar macro DSL without introducing a second, hand-maintained semantic
+//! object. `R5_TEMPORAL_PARITY_BLOCKERS` is empty. Mechanically, the
 //! model-item cap survives only as a 65_536-element
 //! decode-cost guard and the expression-depth cap only as a 65_536-level
 //! decode-cost guard over fully iterative expression walks — neither is a
@@ -982,6 +982,42 @@ impl<'environment> Decoder<'environment> {
     }
 }
 
+/// Decode one named full finite model from an already-elaborated environment.
+///
+/// Composition lanes use this after adding other independently certified
+/// theories.  Re-decoding the complete value (rather than comparing only the
+/// named declaration's raw body) detects context-sensitive helper definitions
+/// whose own bodies resolved differently in the larger environment.
+pub(crate) fn decode_clean_finite_model_from_environment(
+    environment: &Environment,
+    model_definition: &str,
+) -> Result<CleanFiniteModel, CleanScalarModelError> {
+    let declaration =
+        environment.get_const(&Name::from_string(model_definition)).ok_or_else(|| {
+            CleanScalarModelError::Definition(format!("missing `{model_definition}`"))
+        })?;
+    if declaration.kind != ConstantKind::Definition {
+        return Err(CleanScalarModelError::Definition(format!(
+            "`{model_definition}` is {:?}, not a definition",
+            declaration.kind
+        )));
+    }
+    let value = declaration.value.as_ref().ok_or_else(|| {
+        CleanScalarModelError::Definition(format!("`{model_definition}` has no value"))
+    })?;
+    let decoder = Decoder::new(environment);
+    let normalized_type = decoder.whnf(&declaration.type_);
+    match normalized_type.kind() {
+        ExprKind::Const(name, _) if name.to_string() == FINITE_MODEL_TYPE => {}
+        other => {
+            return Err(CleanScalarModelError::Definition(format!(
+                "`{model_definition}` must have type `{FINITE_MODEL_TYPE}`, got {other:?}"
+            )));
+        }
+    }
+    decoder.finite_model(value)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScalarSort {
     Int,
@@ -1423,6 +1459,89 @@ impl CleanFiniteModel {
     pub fn to_model(&self) -> Result<Model<String>, CleanScalarModelError> {
         self.scalar.to_model_with_function_vars(&self.function_variables)
     }
+}
+
+/// Exact equality for decoded finite models without recursive expression
+/// equality.  `CleanScalarExpr` admits the audited 65,536-level depth cap, so
+/// its derived `PartialEq` is a convenience API and is unsafe at an admission
+/// boundary.  This comparator keeps all expression work on an explicit heap
+/// stack while retaining structural (not merely rendered-text) identity.
+pub(crate) fn clean_finite_models_equal_stack_safe(
+    left: &CleanFiniteModel,
+    right: &CleanFiniteModel,
+) -> bool {
+    fn expressions_equal(left: &CleanScalarExpr, right: &CleanScalarExpr) -> bool {
+        use CleanScalarExpr as E;
+
+        let mut pending = vec![(left, right)];
+        while let Some((left, right)) = pending.pop() {
+            match (left, right) {
+                (E::Int(left), E::Int(right)) if left == right => {}
+                (E::Var(left), E::Var(right)) if left == right => {}
+                (E::ConstRef(left), E::ConstRef(right)) if left == right => {}
+                (E::Bool(left), E::Bool(right)) if left == right => {}
+                (E::Add(la, lb), E::Add(ra, rb))
+                | (E::Sub(la, lb), E::Sub(ra, rb))
+                | (E::Gt(la, lb), E::Gt(ra, rb))
+                | (E::Le(la, lb), E::Le(ra, rb))
+                | (E::Eq(la, lb), E::Eq(ra, rb))
+                | (E::Neq(la, lb), E::Neq(ra, rb))
+                | (E::Or(la, lb), E::Or(ra, rb))
+                | (E::And(la, lb), E::And(ra, rb))
+                | (E::Iff(la, lb), E::Iff(ra, rb)) => {
+                    pending.push((la, ra));
+                    pending.push((lb, rb));
+                }
+                (E::If(lc, lt, le), E::If(rc, rt, re)) => {
+                    pending.push((lc, rc));
+                    pending.push((lt, rt));
+                    pending.push((le, re));
+                }
+                (E::Forall(ln, ll, lh, lb), E::Forall(rn, rl, rh, rb))
+                | (E::Comprehension(ln, ll, lh, lb), E::Comprehension(rn, rl, rh, rb))
+                    if ln == rn =>
+                {
+                    pending.push((ll, rl));
+                    pending.push((lh, rh));
+                    pending.push((lb, rb));
+                }
+                (E::FnAccess(ln, li), E::FnAccess(rn, ri)) if ln == rn => {
+                    pending.push((li, ri));
+                }
+                (E::Except(ln, li, lv), E::Except(rn, ri, rv)) if ln == rn => {
+                    pending.push((li, ri));
+                    pending.push((lv, rv));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    let function_variables_equal = left.function_variables == right.function_variables;
+    let left = &left.scalar;
+    let right = &right.scalar;
+    left.name == right.name
+        && left.constants == right.constants
+        && left.variables == right.variables
+        && function_variables_equal
+        && left.actions.len() == right.actions.len()
+        && left.actions.iter().zip(&right.actions).all(|(left, right)| {
+            left.name == right.name
+                && match (&left.guard, &right.guard) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => expressions_equal(left, right),
+                    _ => false,
+                }
+                && left.updates.len() == right.updates.len()
+                && left.updates.iter().zip(&right.updates).all(|(left, right)| {
+                    left.var == right.var && expressions_equal(&left.value, &right.value)
+                })
+        })
+        && left.invariants.len() == right.invariants.len()
+        && left.invariants.iter().zip(&right.invariants).all(|(left, right)| {
+            left.name == right.name && expressions_equal(&left.value, &right.value)
+        })
 }
 
 /// Freshly elaborate and decode one fully qualified Clean `ScalarModel` definition.
@@ -1922,7 +2041,7 @@ fn applied_model_binding_in_environment(
     let claim_value = claim.value.as_ref().ok_or_else(|| {
         CleanScalarModelError::Definition(format!("`{claim_definition}` has no value"))
     })?;
-    let checker = TypeChecker::with_mode(&environment, environment.mode());
+    let checker = TypeChecker::with_mode(environment, environment.mode());
     let (expected_model_type, canonical_operator) = match kind {
         AppliedModelKind::Scalar => {
             (SCALAR_MODEL_TYPE, "Trust.Temporal.FiniteModel.ScalarModel.safetyClaim")
@@ -2417,164 +2536,309 @@ pub fn recheck_proved_bound_clean_finite_model_with_ty(
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // differential vectors deliberately exercise the legacy macro twin
 mod tests {
     use super::*;
     use crate::recheck_bound_clean_kernel;
 
-    // This pair is intentionally redundant test input: one legacy macro value
-    // and one user-authored Clean value describe the same machine.  Keeping all
-    // grammar forms in one differential fixture makes bounded-subset parity a
-    // byte oracle over the actual public generators, not a hand-written claim.
-    #[allow(deprecated)]
-    fn legacy_macro_grammar_parity_model() -> Model {
-        crate::trust_model! {
-            MacroGrammarParity {
-                const Buggy = 0;
-                const Limit = 5;
-                const Bias = 1;
-                var x = 0;
-                var y = 1;
-                action Advance when (((x + 1) <= (Limit - Bias))) {
-                    x = x + 1;
-                    y = if x > 0 {
-                        if Buggy == 0 { y + Bias } else { y - 1 }
-                    } else if Limit > 0 {
-                        1
-                    } else {
-                        0
-                    };
-                }
-                action Reset {
-                    x = 0;
-                    y = Limit;
-                }
-                invariant Bounded: x <= Limit;
-                invariant PositiveY: y > 0;
-                invariant ConditionalBool:
-                    if Buggy == 0 { x <= Limit } else { x > Limit };
-            }
+    const R5_EVAL_INVERSION_PROBE: &str = r#"
+namespace R5EvalProbe
+
+open Trust.Temporal.FiniteModel
+
+def Model : ScalarModel :=
+  ScalarModel.mk "Probe"
+    [Constant.mk "Buggy" 0]
+    [StateVar.mk "x" 0]
+    []
+    []
+
+def X : ScalarExpr := ScalarExpr.var "x"
+def Zero : ScalarExpr := ScalarExpr.int 0
+def Guard : ScalarExpr := ScalarExpr.le X Zero
+
+theorem noMemberNil {alpha : Type} {value : alpha}
+    (member : Member value []) : False :=
+  @Member.rec alpha value
+    (fun list _ =>
+      match list with
+      | [] => False
+      | _ :: _ => True)
+    (fun _ => True.intro)
+    (fun _ _ _ _ => True.intro)
+    [] member
+
+theorem xIsNotY : ¬ ("x" = "y") := by decide
+
+theorem guardView (state : State)
+    (evaluation : Evaluates Model.asModel [] state Guard (Value.bool true)) :
+    MacroEvaluationView Model.asModel [] state Guard (Value.bool true) :=
+  macroEvaluationViewOfEvaluates Model.asModel [] state Guard
+    (Value.bool true) evaluation
+
+end R5EvalProbe
+"#;
+
+    #[test]
+    fn r5_eval_inversion_probe() {
+        on_finite_kernel_stack(|| {
+            let environment = finite_environment(R5_EVAL_INVERSION_PROBE)
+                .expect("the relational evaluator inversion probe must elaborate");
+            crate::clean_surface::checked_theorem(&environment, "R5EvalProbe.guardView")
+                .expect("the inversion probe must stay constructive and kernel checked");
+            crate::clean_surface::checked_theorem(&environment, "R5EvalProbe.xIsNotY")
+                .expect("literal String inequality must stay constructive and kernel checked");
+            Ok(())
+        })
+        .expect("the isolated inversion probe must complete");
+    }
+
+    // This pair is intentionally redundant test input: one explicit Rust model
+    // value and one user-authored Clean value describe the same machine. Keeping
+    // every scalar expression/action form in one differential fixture makes the
+    // data-to-TY renderer a byte oracle without retaining the retired macro DSL.
+    fn rust_model_grammar_parity_model() -> Model {
+        Model {
+            name: "MacroGrammarParity",
+            consts: vec![("Buggy", 0), ("Limit", 5), ("Bias", 1)],
+            vars: vec![StateVar { name: "x", init: 0 }, StateVar { name: "y", init: 1 }],
+            fn_vars: vec![],
+            actions: vec![
+                Action {
+                    name: "Advance",
+                    guard: Some(crate::le(
+                        crate::add(crate::var("x"), crate::int(1)),
+                        crate::sub(crate::cst("Limit"), crate::cst("Bias")),
+                    )),
+                    updates: vec![
+                        Update { var: "x", expr: crate::add(crate::var("x"), crate::int(1)) },
+                        Update {
+                            var: "y",
+                            expr: crate::if_(
+                                crate::gt(crate::var("x"), crate::int(0)),
+                                crate::if_(
+                                    crate::eq(crate::cst("Buggy"), crate::int(0)),
+                                    crate::add(crate::var("y"), crate::cst("Bias")),
+                                    crate::sub(crate::var("y"), crate::int(1)),
+                                ),
+                                crate::if_(
+                                    crate::gt(crate::cst("Limit"), crate::int(0)),
+                                    crate::int(1),
+                                    crate::int(0),
+                                ),
+                            ),
+                        },
+                    ],
+                },
+                Action {
+                    name: "Reset",
+                    guard: None,
+                    updates: vec![
+                        Update { var: "x", expr: crate::int(0) },
+                        Update { var: "y", expr: crate::cst("Limit") },
+                    ],
+                },
+            ],
+            invariants: vec![
+                Invariant {
+                    name: "Bounded",
+                    expr: crate::le(crate::var("x"), crate::cst("Limit")),
+                },
+                Invariant { name: "PositiveY", expr: crate::gt(crate::var("y"), crate::int(0)) },
+                Invariant {
+                    name: "ConditionalBool",
+                    expr: crate::if_(
+                        crate::eq(crate::cst("Buggy"), crate::int(0)),
+                        crate::le(crate::var("x"), crate::cst("Limit")),
+                        crate::gt(crate::var("x"), crate::cst("Limit")),
+                    ),
+                },
+            ],
         }
     }
 
-    #[allow(deprecated)]
-    fn legacy_unchanged_parity_model() -> Model {
-        crate::trust_model! {
-            UnchangedParity {
-                const Buggy = 0;
-                var x = 0;
-                var y = 1;
-                action AdvanceX { x = x + 1; }
-                action Stutter { }
-                invariant Safe: Buggy <= x;
-            }
+    fn rust_unchanged_parity_model() -> Model {
+        Model {
+            name: "UnchangedParity",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }, StateVar { name: "y", init: 1 }],
+            fn_vars: vec![],
+            actions: vec![
+                Action {
+                    name: "AdvanceX",
+                    guard: None,
+                    updates: vec![Update {
+                        var: "x",
+                        expr: crate::add(crate::var("x"), crate::int(1)),
+                    }],
+                },
+                Action { name: "Stutter", guard: None, updates: vec![] },
+            ],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::le(crate::cst("Buggy"), crate::var("x")),
+            }],
         }
     }
 
-    #[allow(deprecated)]
     fn complete_authority_model() -> Model {
-        crate::trust_model! {
-            CompleteAuthority {
-                const Buggy = 0;
-                var x = 0;
-                action Step when (x <= 2) {
-                    x = x + 1;
-                }
-                invariant Safe: Buggy <= x;
-            }
+        Model {
+            name: "CompleteAuthority",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: Some(crate::le(crate::var("x"), crate::int(2))),
+                updates: vec![Update {
+                    var: "x",
+                    expr: crate::add(crate::var("x"), crate::int(1)),
+                }],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::le(crate::cst("Buggy"), crate::var("x")),
+            }],
         }
     }
 
-    // The legacy parser constructs these malformed values.  They are compile
-    // vectors, not models the migration surface promises to preserve.
-    #[allow(deprecated)]
-    fn legacy_macro_accepts_missing_model_sections() -> (Model, Model, Model) {
-        let no_variables = crate::trust_model! {
-            LegacyNoVariables {
-                const Buggy = 0;
-                action Step { }
-                invariant DialOff: Buggy == 0;
-            }
+    fn malformed_models_with_missing_sections() -> (Model, Model, Model) {
+        let no_variables = Model {
+            name: "NoVariables",
+            consts: vec![("Buggy", 0)],
+            vars: vec![],
+            fn_vars: vec![],
+            actions: vec![Action { name: "Step", guard: None, updates: vec![] }],
+            invariants: vec![Invariant {
+                name: "DialOff",
+                expr: crate::eq(crate::cst("Buggy"), crate::int(0)),
+            }],
         };
-        let no_actions = crate::trust_model! {
-            LegacyNoActions {
-                const Buggy = 0;
-                var x = 0;
-                invariant Safe: x == 0;
-            }
+        let no_actions = Model {
+            name: "NoActions",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("x"), crate::int(0)),
+            }],
         };
-        let no_invariants = crate::trust_model! {
-            LegacyNoInvariants {
-                const Buggy = 0;
-                var x = 0;
-                action Step { x = 0; }
-            }
+        let no_invariants = Model {
+            name: "NoInvariants",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update { var: "x", expr: crate::int(0) }],
+            }],
+            invariants: vec![],
         };
         (no_variables, no_actions, no_invariants)
     }
 
-    #[allow(deprecated)]
-    fn legacy_macro_accepts_duplicate_and_reserved_names() -> (Model, Model, Model) {
-        let duplicate = crate::trust_model! {
-            LegacyDuplicateNames {
-                const Buggy = 0;
-                var x = 0;
-                var x = 1;
-                action Step { x = 0; }
-                invariant Safe: x == 0;
-            }
+    fn malformed_models_with_duplicate_and_reserved_names() -> (Model, Model, Model) {
+        let duplicate = Model {
+            name: "DuplicateNames",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }, StateVar { name: "x", init: 1 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update { var: "x", expr: crate::int(0) }],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("x"), crate::int(0)),
+            }],
         };
-        let reserved = crate::trust_model! {
-            LegacyReservedName {
-                const Buggy = 0;
-                var Init = 0;
-                action Step { Init = 0; }
-                invariant Safe: Init == 0;
-            }
+        let reserved = Model {
+            name: "ReservedName",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "Init", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update { var: "Init", expr: crate::int(0) }],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("Init"), crate::int(0)),
+            }],
         };
-        let tla_keyword = crate::trust_model! {
-            LegacyTlaKeywordName {
-                const Buggy = 0;
-                var TRUE = 0;
-                action Step { TRUE = 0; }
-                invariant Safe: TRUE == 0;
-            }
+        let tla_keyword = Model {
+            name: "TlaKeywordName",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "TRUE", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update { var: "TRUE", expr: crate::int(0) }],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("TRUE"), crate::int(0)),
+            }],
         };
         (duplicate, reserved, tla_keyword)
     }
 
-    #[allow(deprecated)]
-    fn legacy_macro_accepts_leading_underscore_name() -> Model {
-        crate::trust_model! {
-            LegacyLeadingUnderscore {
-                const Buggy = 0;
-                var _x = 0;
-                action Step { _x = 0; }
-                invariant Safe: _x == 0;
-            }
+    fn malformed_model_with_leading_underscore_name() -> Model {
+        Model {
+            name: "LeadingUnderscore",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "_x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update { var: "_x", expr: crate::int(0) }],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("_x"), crate::int(0)),
+            }],
         }
     }
 
-    #[allow(deprecated)]
-    fn legacy_macro_accepts_unknown_and_duplicate_updates() -> (Model, Model) {
-        let unknown = crate::trust_model! {
-            LegacyUnknownUpdate {
-                const Buggy = 0;
-                var x = 0;
-                action Step { missing = 0; }
-                invariant Safe: x == 0;
-            }
+    fn malformed_models_with_unknown_and_duplicate_updates() -> (Model, Model) {
+        let unknown = Model {
+            name: "UnknownUpdate",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![Update { var: "missing", expr: crate::int(0) }],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("x"), crate::int(0)),
+            }],
         };
-        let duplicate = crate::trust_model! {
-            LegacyDuplicateUpdate {
-                const Buggy = 0;
-                var x = 0;
-                action Step {
-                    x = 0;
-                    x = 1;
-                }
-                invariant Safe: x == 0;
-            }
+        let duplicate = Model {
+            name: "DuplicateUpdate",
+            consts: vec![("Buggy", 0)],
+            vars: vec![StateVar { name: "x", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Step",
+                guard: None,
+                updates: vec![
+                    Update { var: "x", expr: crate::int(0) },
+                    Update { var: "x", expr: crate::int(1) },
+                ],
+            }],
+            invariants: vec![Invariant {
+                name: "Safe",
+                expr: crate::eq(crate::var("x"), crate::int(0)),
+            }],
         };
         (unknown, duplicate)
     }
@@ -2999,8 +3263,8 @@ end InhabitedFunctionExample
     }
 
     #[test]
-    fn decoded_clean_model_matches_every_macro_grammar_form_in_a_valid_model() {
-        let legacy = legacy_macro_grammar_parity_model();
+    fn decoded_clean_model_matches_every_scalar_expression_form() {
+        let rust_model = rust_model_grammar_parity_model();
         let (_, decoded) = extract_clean_scalar_model(
             MACRO_GRAMMAR_PARITY_SOURCE,
             "MigrationExample.MacroGrammarParity",
@@ -3010,12 +3274,12 @@ end InhabitedFunctionExample
 
         assert_eq!(
             clean.to_tla().as_bytes(),
-            legacy.to_tla().as_bytes(),
+            rust_model.to_tla().as_bytes(),
             "generated TLA+ must remain byte-for-byte identical"
         );
         assert_eq!(
             clean.to_cfg().as_bytes(),
-            legacy.to_cfg().as_bytes(),
+            rust_model.to_cfg().as_bytes(),
             "generated ty config must remain byte-for-byte identical"
         );
 
@@ -3362,8 +3626,8 @@ end InhabitedFunctionExample
     }
 
     #[test]
-    fn decoded_clean_partial_and_empty_updates_match_macro_unchanged_bytes() {
-        let legacy = legacy_unchanged_parity_model();
+    fn decoded_clean_partial_and_empty_updates_match_rust_model_bytes() {
+        let rust_model = rust_unchanged_parity_model();
         let (_, decoded) = extract_clean_scalar_model(
             UNCHANGED_PARITY_SOURCE,
             "UnchangedMigration.UnchangedParity",
@@ -3377,11 +3641,11 @@ end InhabitedFunctionExample
         let clean = decoded.to_model().expect("the decoded UNCHANGED model must validate");
 
         let clean_tla = clean.to_tla();
-        let legacy_tla = legacy.to_tla();
+        let rust_tla = rust_model.to_tla();
         assert_eq!(
             clean_tla.as_bytes(),
-            legacy_tla.as_bytes(),
-            "Clean and trust_model! must emit byte-identical UNCHANGED actions"
+            rust_tla.as_bytes(),
+            "Clean and the explicit Rust model must emit byte-identical UNCHANGED actions"
         );
         assert_eq!(
             clean_tla.as_bytes(),
@@ -3390,11 +3654,11 @@ end InhabitedFunctionExample
         );
 
         let clean_cfg = clean.to_cfg();
-        let legacy_cfg = legacy.to_cfg();
+        let rust_cfg = rust_model.to_cfg();
         assert_eq!(
             clean_cfg.as_bytes(),
-            legacy_cfg.as_bytes(),
-            "Clean and trust_model! must emit byte-identical ty configs"
+            rust_cfg.as_bytes(),
+            "Clean and the explicit Rust model must emit byte-identical ty configs"
         );
         assert_eq!(
             clean_cfg.as_bytes(),
@@ -3446,7 +3710,7 @@ end InhabitedFunctionExample
 
     #[test]
     fn production_reset_cannot_invalidate_a_guarded_preparse_transaction() {
-        let model = legacy_macro_grammar_parity_model();
+        let model = rust_model_grammar_parity_model();
         let _ty_transaction = crate::in_process_ty_transaction_lock();
         let spec_src = model.to_tla();
         let config_src = model.to_replay_cfg_with(&[("Buggy", 1)]);
@@ -3479,12 +3743,12 @@ end InhabitedFunctionExample
     }
 
     #[test]
-    fn clean_rejects_macro_accepted_models_with_missing_required_sections() {
-        let (legacy_no_variables, legacy_no_actions, legacy_no_invariants) =
-            legacy_macro_accepts_missing_model_sections();
-        assert!(legacy_no_variables.vars.is_empty());
-        assert!(legacy_no_actions.actions.is_empty());
-        assert!(legacy_no_invariants.invariants.is_empty());
+    fn clean_rejects_models_with_missing_required_sections() {
+        let (no_variables_model, no_actions_model, no_invariants_model) =
+            malformed_models_with_missing_sections();
+        assert!(no_variables_model.vars.is_empty());
+        assert!(no_actions_model.actions.is_empty());
+        assert!(no_invariants_model.invariants.is_empty());
 
         let mut no_variables = valid_clean_fixture("CleanNoVariables");
         no_variables.variables.clear();
@@ -3500,12 +3764,12 @@ end InhabitedFunctionExample
     }
 
     #[test]
-    fn clean_rejects_macro_accepted_duplicate_and_reserved_names() {
-        let (legacy_duplicate, legacy_reserved, legacy_tla_keyword) =
-            legacy_macro_accepts_duplicate_and_reserved_names();
-        assert_eq!(legacy_duplicate.vars.iter().filter(|var| var.name == "x").count(), 2);
-        assert!(legacy_reserved.vars.iter().any(|var| var.name == "Init"));
-        assert!(legacy_tla_keyword.vars.iter().any(|var| var.name == "TRUE"));
+    fn clean_rejects_duplicate_and_reserved_names() {
+        let (duplicate_model, reserved_model, tla_keyword_model) =
+            malformed_models_with_duplicate_and_reserved_names();
+        assert_eq!(duplicate_model.vars.iter().filter(|var| var.name == "x").count(), 2);
+        assert!(reserved_model.vars.iter().any(|var| var.name == "Init"));
+        assert!(tla_keyword_model.vars.iter().any(|var| var.name == "TRUE"));
 
         let mut duplicate = valid_clean_fixture("CleanDuplicateNames");
         duplicate.variables.push(CleanScalarStateVar { name: "x".to_owned(), init: 1 });
@@ -3526,9 +3790,9 @@ end InhabitedFunctionExample
     }
 
     #[test]
-    fn clean_rejects_macro_accepted_leading_underscore_name() {
-        let legacy = legacy_macro_accepts_leading_underscore_name();
-        assert!(legacy.vars.iter().any(|variable| variable.name == "_x"));
+    fn clean_rejects_leading_underscore_name() {
+        let malformed = malformed_model_with_leading_underscore_name();
+        assert!(malformed.vars.iter().any(|variable| variable.name == "_x"));
 
         let mut clean = valid_clean_fixture("CleanLeadingUnderscore");
         clean.variables[0].name = "_x".to_owned();
@@ -3540,19 +3804,13 @@ end InhabitedFunctionExample
         assert_definition_error(clean, "variable `_x` is not a supported TLA+ identifier");
     }
 
-    /// Differential guard for the ratified parity target (owner ruling
-    /// 2026-07-20): identifier grammar is SHARED, not Clean-only. The macro can
-    /// still CONSTRUCT a model with a leading-underscore or over-`MAX_NAME_BYTES`
-    /// name, but the legacy lane's own certification preflight rejects it —
-    /// macro-CERTIFIABLE, not merely macro-constructible, is the parity domain,
-    /// so these rejections are anti-injection enforcement, not an
-    /// admission-domain parity gap.
+    /// Public Rust `Model` values remain untrusted input after the authoring
+    /// macro is gone. The shared certification preflight must reject identifier
+    /// injection attempts before any backend sees them.
     #[test]
-    fn legacy_lane_rejects_underscore_and_oversized_names_at_certification() {
-        // Leading underscore: macro-constructible ...
-        let underscore = legacy_macro_accepts_leading_underscore_name();
+    fn rust_model_lane_rejects_underscore_and_oversized_names_at_certification() {
+        let underscore = malformed_model_with_leading_underscore_name();
         assert!(underscore.vars.iter().any(|variable| variable.name == "_x"));
-        // ... but the shared preflight declines it before any backend runs ...
         let error = crate::validate_model_for_certification(&underscore).unwrap_err();
         assert!(
             matches!(
@@ -3560,9 +3818,8 @@ end InhabitedFunctionExample
                 TyCertifyError::Setup(ref detail)
                     if detail.contains("variable `_x` is not a supported TLA+ identifier")
             ),
-            "legacy preflight must reject the leading-underscore name: {error:?}"
+            "shared preflight must reject the leading-underscore name: {error:?}"
         );
-        // ... and the full certification entry point fails closed, never Proved.
         let outcome = certify_model(&underscore);
         assert!(matches!(
             &outcome.verdict,
@@ -3571,12 +3828,11 @@ end InhabitedFunctionExample
         ));
         assert_eq!(outcome.non_vacuity, None);
 
-        // Over-MAX_NAME_BYTES name: the macro grammar accepts any Rust
-        // identifier length, so this too is legacy-constructible; certification
-        // rejects it in the same shared preflight.
+        // Direct constructors can carry arbitrarily long names; certification
+        // rejects them at the same boundary.
         let long_name: &'static str = Box::leak("A".repeat(MAX_NAME_BYTES + 1).into_boxed_str());
         assert!(long_name.len() > MAX_NAME_BYTES);
-        let mut oversized = legacy_macro_grammar_parity_model();
+        let mut oversized = rust_model_grammar_parity_model();
         oversized.name = long_name;
         let error = crate::validate_model_for_certification(&oversized).unwrap_err();
         assert!(
@@ -3586,7 +3842,7 @@ end InhabitedFunctionExample
                     if detail.contains("not a supported TLA+ identifier")
                         && detail.contains("max 128 bytes")
             ),
-            "legacy preflight must reject the over-cap name: {error:?}"
+            "shared preflight must reject the over-cap name: {error:?}"
         );
         let outcome = certify_model(&oversized);
         assert!(matches!(
@@ -3642,11 +3898,11 @@ end InhabitedFunctionExample
     }
 
     #[test]
-    fn clean_rejects_macro_accepted_unknown_and_duplicate_updates() {
-        let (legacy_unknown, legacy_duplicate) =
-            legacy_macro_accepts_unknown_and_duplicate_updates();
-        assert_eq!(legacy_unknown.actions[0].updates[0].var, "missing");
-        assert_eq!(legacy_duplicate.actions[0].updates.len(), 2);
+    fn clean_rejects_unknown_and_duplicate_updates() {
+        let (unknown_model, duplicate_model) =
+            malformed_models_with_unknown_and_duplicate_updates();
+        assert_eq!(unknown_model.actions[0].updates[0].var, "missing");
+        assert_eq!(duplicate_model.actions[0].updates.len(), 2);
 
         let mut unknown = valid_clean_fixture("CleanUnknownUpdate");
         unknown.actions[0].updates[0].var = "missing".to_owned();
@@ -3985,11 +4241,9 @@ end InhabitedFunctionExample
         source
     }
 
-    /// The legacy-lane twin of [`deep_update_clean_source`]: the same machine
-    /// authored directly in the legacy carrier. The nesting is beyond what a
-    /// literal `trust_model!` invocation could practically spell, so the value
-    /// is built programmatically — it is the exact `Model<&'static str>` type
-    /// every `trust_model!` expansion produces.
+    /// The Rust-data twin of [`deep_update_clean_source`]. The nesting is built
+    /// programmatically so the iterative renderer is tested far beyond normal
+    /// source depth.
     fn legacy_deep_update_twin(name: &'static str, nodes: usize) -> Model {
         let mut deep = Expr::Add(Box::new(Expr::Var("x")), Box::new(Expr::Int(1)));
         for _ in 1..nodes {
@@ -4291,5 +4545,35 @@ end InhabitedFunctionExample
             "the old budget must be crossed mid-loop (crossed at {crossing})"
         );
         assert_eq!(certified_sentinels, 3, "all three sentinel certifications must run");
+    }
+
+    #[test]
+    fn composed_model_equality_is_stack_safe_at_the_admission_depth() {
+        fn model_with_deep_update(leaf: i64) -> CleanFiniteModel {
+            let mut value = CleanScalarExpr::Int(leaf);
+            for _ in 0..MAX_EXPR_DEPTH {
+                value = CleanScalarExpr::Add(Box::new(value), Box::new(CleanScalarExpr::Int(0)));
+            }
+            CleanFiniteModel {
+                scalar: CleanScalarModel {
+                    name: "DeepParity".to_owned(),
+                    constants: Vec::new(),
+                    variables: vec![CleanScalarStateVar { name: "x".to_owned(), init: 0 }],
+                    actions: vec![CleanScalarAction {
+                        name: "Step".to_owned(),
+                        guard: None,
+                        updates: vec![CleanScalarUpdate { var: "x".to_owned(), value }],
+                    }],
+                    invariants: Vec::new(),
+                },
+                function_variables: Vec::new(),
+            }
+        }
+
+        let left = model_with_deep_update(7);
+        let same = model_with_deep_update(7);
+        let different = model_with_deep_update(8);
+        assert!(clean_finite_models_equal_stack_safe(&left, &same));
+        assert!(!clean_finite_models_equal_stack_safe(&left, &different));
     }
 }

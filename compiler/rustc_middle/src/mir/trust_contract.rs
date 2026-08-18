@@ -246,6 +246,18 @@ pub struct TrustContractPredicate<'tcx> {
     /// rebind a certified executable loop monitor to the same source binding
     /// after MIR lowering without consulting optional debug names.
     pub source_bindings: Vec<TrustContractSourceBinding>,
+
+    /// Complete compiler-owned source-place identities for every free source
+    /// binding used by a native loop proposition. `Some` means every
+    /// proposition leaf was rebound exactly; collection length/index leaves
+    /// are folded back to their owning collection binding. `None` is the
+    /// fail-closed state for an unsupported/partial binding map.
+    ///
+    /// Unlike `source_bindings`, this is semantic provenance for the
+    /// TrustIR->MIR E4/E5 lane. It includes non-scalar collection roots and
+    /// explicit-deref roots, and must never be consumed as an executable
+    /// monitor's scalar-local allow-list.
+    pub source_place_bindings: Option<Vec<TrustContractSourceBinding>>,
 }
 
 /// Exact binding identity for one whole scalar leaf in a native loop

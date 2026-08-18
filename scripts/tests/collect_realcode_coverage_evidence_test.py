@@ -162,10 +162,10 @@ class Fixture:
             session = next((arg.split("=", 1)[1] for arg in sys.argv
                             if arg.startswith("-Ztrust-verify-session=")), "")
             dump_arg = next((arg for arg in sys.argv if arg.startswith("-Ztrust-dump=mir-only:")), None)
-            dump_only = "-Ztrust-dump=mir-only:<dir>" in sys.argv
+            dump_only = dump_arg is not None
             functions = ["realcode::alpha", "realcode::beta"]
             if dump_arg is not None:
-                dump = pathlib.Path(dump_arg.split("=", 1)[1])
+                dump = pathlib.Path(dump_arg.split(":", 1)[1])
                 dump.mkdir(parents=True, exist_ok=True)
                 for index, function in enumerate(functions):
                     if MODE == "missing_dump" and index == 1:

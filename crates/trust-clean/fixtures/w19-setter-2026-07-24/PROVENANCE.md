@@ -1,4 +1,13 @@
-# W19 mutators inc-1 fixture — &mut-self field setters (2026-07-24)
+# W19 mutators inc-1 fixture — &mut-self field setters (2026-07-24; REGENERATED 2026-08-13)
+
+> **REGENERATED 2026-08-13** with the stage1 trustc built from HEAD at the pinned
+> siblings (`TRUST_SKIP_PREFLIGHT=1 python3 x.py build`, then
+> `trustc --crate-type lib -Ztrust-policy=advisory -Ztrust-dump=mir-only:<dir> main.rs`
+> — the recipe below, unchanged). The ORIGINAL 2026-07-24 dumps predated the
+> `adt_kind` extractor stamp and therefore declined every stamp-gated recognizer
+> fail-closed (G-STRUCT-KIND, FS1); the regenerated dumps carry
+> `adt_kind: Some(Struct)` on the receiver Adt. Dump FILENAMES changed (the hash is
+> content-keyed). Shapes are byte-equivalent modulo the stamp and spans.
 
 > The dump flags were spelled `-Ztrust-dump-mir` / `-Ztrust-dump-only` when
 > these bytes were produced; they are one `-Ztrust-dump=<what>:<dir>` option now.

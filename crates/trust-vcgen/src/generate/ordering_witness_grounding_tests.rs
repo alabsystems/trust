@@ -16,9 +16,9 @@ use trust_types::{
 
 use super::{generate_v2_contract_vcs_impl, parse_ok_pair_model_var, parse_sign_model_var};
 
-const OK0: &str = "_0_value.__trust_ok_0";
-const OK1: &str = "_0_value.__trust_ok_1";
-const SIGN: &str = "_0_value_sign";
+const OK0: &str = "_0__value.__trust_ok_0";
+const OK1: &str = "_0__value.__trust_ok_1";
+const SIGN: &str = "_0__value__sign";
 
 fn i64_ty() -> Ty {
     Ty::Int { width: 64, signed: true }
@@ -70,7 +70,7 @@ fn func_with(
         name: "ord_pair".to_string(),
         def_path: "test::ord_pair".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty: ret_ty },
+        body: VerifiableBody { locals, blocks, arg_count, return_ty: ret_ty, datatype_defs: Default::default() },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
             span: SourceSpan::default(),
@@ -139,7 +139,7 @@ fn err_aggregate(op: Operand) -> Rvalue {
 /// obligation is duplicated per guard path by the v2 per-path machinery,
 /// so the pins are asserted by SHAPE anywhere in the tree — every
 /// asserted pin shape (`Le`/`Ge`/`Not(Eq)` over the model vars,
-/// `_0_discr == 1`) is one the negated postcondition itself cannot
+/// `_0__discr == 1`) is one the negated postcondition itself cannot
 /// contain, so a match can only be a lane-emitted pin.
 fn subformula_has(formula: &Formula, pred: &dyn Fn(&Formula) -> bool) -> bool {
     let mut found = false;
@@ -155,12 +155,12 @@ fn var_is(f: &Formula, name: &str) -> bool {
     matches!(f, Formula::Var(n, _) if n == name)
 }
 
-/// The lane's parser-convention Ok pin `_0_discr == 1` — an atom only the
+/// The lane's parser-convention Ok pin `_0__discr == 1` — an atom only the
 /// pin loop mints (the lowered `is_ok` postcondition atoms compare to 0).
 fn has_ok_discr_pin(f: &Formula) -> bool {
     subformula_has(f, &|f| {
         matches!(f, Formula::Eq(l, r)
-            if var_is(l, "_0_discr") && matches!(&**r, Formula::Int(1)))
+            if var_is(l, "_0__discr") && matches!(&**r, Formula::Int(1)))
     })
 }
 
@@ -190,7 +190,7 @@ fn ok_path_vc(
 ) -> &trust_types::VerificationCondition {
     vcs.iter()
         .find(|vc| has_ok_discr_pin(&vc.formula))
-        .unwrap_or_else(|| panic!("the Ok path VC pins _0_discr == 1: {vcs:#?}"))
+        .unwrap_or_else(|| panic!("the Ok path VC pins _0__discr == 1: {vcs:#?}"))
 }
 
 const GT_PAIR_ENSURES: &str = "!((result.is_ok()) && \
@@ -606,19 +606,19 @@ fn ok_pair_and_sign_model_var_parsers_are_strict() {
     assert_eq!((v.name.as_str(), v.index), (OK0, 0));
     // Versioned copies parse to the BASE name.
     assert_eq!(
-        parse_ok_pair_model_var("_0_value.__trust_ok_1#s1_0").map(|v| v.index),
+        parse_ok_pair_model_var("_0__value.__trust_ok_1#s1_0").map(|v| v.index),
         Some(1)
     );
     // Trailing projections, non-numeric indices, other bases: fail closed.
-    assert!(parse_ok_pair_model_var("_0_value.__trust_ok_0.1").is_none());
-    assert!(parse_ok_pair_model_var("_0_value.__trust_ok_").is_none());
-    assert!(parse_ok_pair_model_var("_0_value.0").is_none());
+    assert!(parse_ok_pair_model_var("_0__value.__trust_ok_0.1").is_none());
+    assert!(parse_ok_pair_model_var("_0__value.__trust_ok_").is_none());
+    assert!(parse_ok_pair_model_var("_0__value.0").is_none());
     assert!(parse_ok_pair_model_var("x.__trust_ok_0").is_none());
-    assert_eq!(parse_sign_model_var("_0_value_sign").as_deref(), Some(SIGN));
-    assert_eq!(parse_sign_model_var("_0_value_sign#s2_1").as_deref(), Some(SIGN));
+    assert_eq!(parse_sign_model_var("_0__value__sign").as_deref(), Some(SIGN));
+    assert_eq!(parse_sign_model_var("_0__value__sign#s2_1").as_deref(), Some(SIGN));
     assert!(parse_sign_model_var("c_sign").is_none());
-    assert!(parse_sign_model_var("_0_value_sign.0").is_none());
-    assert!(parse_sign_model_var("_0_value").is_none());
+    assert!(parse_sign_model_var("_0__value__sign.0").is_none());
+    assert!(parse_sign_model_var("_0__value").is_none());
 }
 
 #[test]
@@ -642,7 +642,7 @@ fn guarded_pair_wrapper_grounds_ordering_atom_on_guard_bool() {
     assert_eq!(
         vcs.iter().filter(|vc| has_ok_discr_pin(&vc.formula)).count(),
         1,
-        "exactly the Ok path pins _0_discr == 1 (the Err paths pin 0): {vcs:#?}"
+        "exactly the Ok path pins _0__discr == 1 (the Err paths pin 0): {vcs:#?}"
     );
     // The Le pin must ride ONLY the Ok path: an Err path carries no
     // ordering fact (the payload terms have no denotation there).
@@ -655,6 +655,41 @@ fn guarded_pair_wrapper_grounds_ordering_atom_on_guard_bool() {
                 vc.formula
             );
         }
+    }
+}
+
+#[test]
+fn monomorphized_partial_ord_callee_grounds_ordering_atom() {
+    let func = pair_wrapper_fn(
+        "gt::<__trust_args@0123456789abcdef0123456789abcdef>",
+        true,
+        false,
+        GT_PAIR_ENSURES,
+    );
+    assert!(ungrounded_details(&func).is_empty(), "the exact extractor tag is identity-only");
+    let vcs = postcondition_vcs(&func);
+    let ok_vc = ok_path_vc(&vcs);
+    assert!(
+        subformula_has(&ok_vc.formula, &|f| matches!(f, Formula::Le(l, r)
+            if var_is(l, OK0) && var_is(r, OK1))),
+        "the tagged PartialOrd::gt guard must pin ok_0 <= ok_1: {:#?}",
+        ok_vc.formula
+    );
+}
+
+#[test]
+fn malformed_partial_ord_suffix_stays_fail_closed() {
+    for suffix in [
+        "gt::<__trust_args@not-hex>",
+        "gt::<other_args@0123456789abcdef0123456789abcdef>",
+        "gt::<__trust_args@0123456789abcdef0123456789abcdef>::extra",
+    ] {
+        let func = pair_wrapper_fn(suffix, true, false, GT_PAIR_ENSURES);
+        assert!(
+            postcondition_vcs(&func).is_empty(),
+            "non-canonical suffix {suffix:?} must not gain witness authority"
+        );
+        assert_eq!(ungrounded_details(&func).len(), 1, "{suffix:?} must fail closed");
     }
 }
 
@@ -738,7 +773,7 @@ fn unguarded_comparison_stays_fail_closed() {
     // may genuinely violate the ordering, so nothing may be pinned. The
     // pair stays uncredited: no refutable Postcondition VC, one
     // SpecModelUngrounded row naming both pair terms (and not the
-    // groundable `_0_discr`).
+    // groundable `_0__discr`).
     let func = pair_wrapper_fn("gt", false, false, GT_PAIR_ENSURES);
     assert!(
         postcondition_vcs(&func).is_empty(),
@@ -747,7 +782,7 @@ fn unguarded_comparison_stays_fail_closed() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(
-        details[0].contains(OK0) && details[0].contains(OK1) && !details[0].contains("_0_discr"),
+        details[0].contains(OK0) && details[0].contains(OK1) && !details[0].contains("_0__discr"),
         "both pair terms fail closed: {}",
         details[0]
     );
@@ -780,7 +815,7 @@ fn discreteness_shaped_contracts_stay_fail_closed() {
     // discreteness (`x > 0 ⟹ x >= 1`). The coverage gates refuse them:
     // fail-closed Unknown, never a (dis)provable VC.
     let discr_ok = Formula::Not(Box::new(Formula::Eq(
-        Box::new(Formula::var_owned("_0_discr".into(), Sort::Int)),
+        Box::new(Formula::var_owned("_0__discr".into(), Sort::Int)),
         Box::new(Formula::Int(0)),
     )));
     let mut func = pair_wrapper_fn("gt", true, false, GT_PAIR_ENSURES);

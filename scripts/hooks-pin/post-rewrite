@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Advisory: announce submodule pin drift after `git pull --rebase` / `git rebase`.
+#
+# This is the hook that matters most in this constellation — the standing
+# instruction is "pull --rebase before pushing", so rebase is HOW pins arrive and
+# HOW worktrees get left behind. Never blocks, never mutates.
+#
+# Body is shared with the full hooks directory (scripts/hooks/) so there is one
+# implementation, not two that can disagree.
+
+# post-rewrite is fed the rewritten-commit list on stdin. Drain it so the writer
+# never sees EPIPE, then report.
+cat >/dev/null 2>&1 || true
+
+NOTICE="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/_submodule_drift_notice.sh"
+[ -f "$NOTICE" ] || exit 0
+exec bash "$NOTICE"

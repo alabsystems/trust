@@ -648,6 +648,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         }
     }
 
@@ -723,6 +724,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         }
     }
 
@@ -832,6 +834,7 @@ mod tests {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         // Slice from bb1, stmt 0 (_0 = _3)
@@ -869,6 +872,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let target = Location { block: 0, stmt_index: 0 };
@@ -909,6 +913,7 @@ mod tests {
             ],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let graph = DependencyGraph::build(&body);
@@ -953,6 +958,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let target = Location { block: 1, stmt_index: 0 };
@@ -1344,6 +1350,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         // Slice from the terminator location
@@ -1396,6 +1403,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let target = Location { block: 0, stmt_index: 3 };
@@ -1457,6 +1465,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let target = Location { block: 3, stmt_index: 0 };
@@ -1529,6 +1538,7 @@ mod tests {
             ],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let graph = DependencyGraph::build(&body);

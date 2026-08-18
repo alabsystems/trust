@@ -137,7 +137,7 @@ fn involves_modeled_datatype(func: &VerifiableFunction) -> bool {
 fn param_binders(func: &VerifiableFunction) -> Vec<(String, Sort)> {
     (1..=func.body.arg_count)
         .filter_map(|i| {
-            let sort = functional_sort_for_ty(local_ty(func, i)?);
+            let sort = functional_sort_for_ty_in(func, local_ty(func, i)?);
             Some((crate::place_to_var_name(func, &Place::local(i)), sort))
         })
         .collect()
@@ -153,6 +153,18 @@ fn param_binders(func: &VerifiableFunction) -> Vec<(String, Sort)> {
 /// and constructor arguments.
 fn functional_sort_for_ty(ty: &Ty) -> Sort {
     Sort::from_ty(ty)
+}
+
+/// [`functional_sort_for_ty`] at a DEFINITIONAL position — a local's or
+/// parameter's own declared type (R0).
+///
+/// Identical lowering, except that a BARE `Ty::Datatype { variants: [] }` marker
+/// this body's explicit table defines gets its full constructor list instead of
+/// an empty by-name reference. Datatype-typed FIELDS keep the by-name spelling:
+/// that is the standard natively-recursive SMT-LIB encoding, and inlining there
+/// would not terminate on a self-recursive type.
+fn functional_sort_for_ty_in(func: &VerifiableFunction, ty: &Ty) -> Sort {
+    trust_types::sort_from_ty_with_defs(ty, &func.body.datatype_defs)
 }
 
 fn functional_sorts_compatible(actual: &Sort, expected: &Sort) -> bool {
@@ -210,9 +222,15 @@ fn walk(
             let Some(matched) = discriminant_place(&state, discr) else {
                 return;
             };
-            let Some(dt_ty) = local_ty(func, matched.local) else {
+            // R0: the matched local's own datatype is an outermost position and is
+            // spelled bare under markers-everywhere. Inline definition first, then
+            // this body's explicit table; an undefined marker is left alone and the
+            // `Ty::Datatype` name read below still declines exactly as before.
+            let Some(dt_ty) = local_ty(func, matched.local).map(|ty| crate::resolved_ty(func, ty))
+            else {
                 return;
             };
+            let dt_ty: &Ty = &dt_ty;
             let Some(matched_term) = resolve_place(func, &state, &matched) else {
                 return;
             };
@@ -260,7 +278,7 @@ fn apply_stmt(func: &VerifiableFunction, state: &mut WalkState, stmt: &Statement
             let Some(dest_ty) = local_ty(func, place.local) else {
                 return;
             };
-            let expected = functional_sort_for_ty(dest_ty);
+            let expected = functional_sort_for_ty_in(func, dest_ty);
             if let Some(term) = resolve_operand(func, state, op, &expected) {
                 state.store.insert(place.local, term);
             }
@@ -292,7 +310,8 @@ fn aggregate_to_ctor(
     variant: usize,
     ops: &[Operand],
 ) -> Option<Formula> {
-    let dest_ty = local_ty(func, dest_local)?;
+    // R0: the destination local's own datatype — outermost, therefore bare.
+    let dest_ty = &*crate::resolved_ty(func, local_ty(func, dest_local)?);
     let Ty::Datatype { variants, .. } = dest_ty else {
         return None;
     };
@@ -345,7 +364,9 @@ fn resolve_place(func: &VerifiableFunction, state: &WalkState, place: &Place) ->
     // Base term for the projected-from local.
     let mut term =
         state.store.get(&place.local).cloned().or_else(|| param_var(func, place.local))?;
-    let mut base_ty = local_ty(func, place.local)?.clone();
+    // R0: resolve at every assignment of the walk accumulator so a chain through a
+    // recursive child keeps typing. Shallow per step, so it terminates.
+    let mut base_ty = crate::resolved_ty(func, local_ty(func, place.local)?).into_owned();
     let mut pending_variant: Option<usize> = None;
 
     for proj in &place.projections {
@@ -372,7 +393,7 @@ fn resolve_place(func: &VerifiableFunction, state: &WalkState, place: &Place) ->
                     field_sort: functional_sort_for_ty(fty),
                     arg: Box::new(term),
                 };
-                base_ty = fty.clone();
+                base_ty = crate::resolved_ty(func, fty).into_owned();
             }
             _ => return None,
         }
@@ -386,7 +407,7 @@ fn param_var(func: &VerifiableFunction, local: usize) -> Option<Formula> {
     if local == 0 || local > func.body.arg_count {
         return None;
     }
-    let sort = functional_sort_for_ty(local_ty(func, local)?);
+    let sort = functional_sort_for_ty_in(func, local_ty(func, local)?);
     Some(Formula::var_owned(crate::place_to_var_name(func, &Place::local(local)), sort))
 }
 
@@ -596,6 +617,7 @@ mod tests {
             }],
             arg_count: 2,
             return_ty: expr_dt(),
+            datatype_defs: Default::default(),
         };
         func("infer_sort_arm", body)
     }
@@ -716,6 +738,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: exprkind_dt(),
+            datatype_defs: Default::default(),
         };
         func("classify_sort", body)
     }
@@ -776,6 +799,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         };
         let f = func("identity_usize", body);
         assert!(

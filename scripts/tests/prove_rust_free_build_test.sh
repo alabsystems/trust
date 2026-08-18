@@ -5,7 +5,18 @@ set -euo pipefail
 REPO_ROOT=$(cd -P "${BASH_SOURCE[0]%/*}/../.." && pwd -P)
 SCRIPT="$REPO_ROOT/scripts/prove_rust_free_build.sh"
 HELPER="$REPO_ROOT/scripts/off_stock_rust_audit.py"
-PYTHON=$(type -P python3)
+PYTHON=
+for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    PYTHON=$(type -P "$candidate" || true)
+    if [ -n "$PYTHON" ] && [ -x "$PYTHON" ]; then
+        break
+    fi
+    PYTHON=
+done
+[ -n "$PYTHON" ] || {
+    printf 'prove_rust_free_build_test: Python 3 is required\n' >&2
+    exit 1
+}
 ENV_BIN=$(type -P env)
 TRUE_BIN=$(type -P true)
 BASH_BIN=$(type -P bash)

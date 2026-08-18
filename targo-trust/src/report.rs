@@ -2904,6 +2904,15 @@ fn parse_exact_legacy_vc_kind(kind: &str, description: &str) -> Option<VcKind> {
         s if s.starts_with("assumption:") => {
             Some(VcKind::UnsupportedMir { kind: s.to_string(), detail: description.to_string() })
         }
+        // Trust (coroutine resume-state contract): the published exported-
+        // contract row. Same rationale as the assumption arm above — it is
+        // conditional evidence, not a runtime-checked obligation, and folding
+        // it to `Assertion` would give it a runtime fallback nothing enforces.
+        // `UnsupportedMir` has no runtime fallback, so the row can never be
+        // relabeled `RuntimeChecked`.
+        s if s == trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND => {
+            Some(VcKind::UnsupportedMir { kind: s.to_string(), detail: description.to_string() })
+        }
         _ => None,
     }
 }
@@ -2959,8 +2968,17 @@ fn terminal_result_line(result: &VerificationResult) -> String {
     // ASSUMED so the terminal never displays it as UNKNOWN (or, for a defective
     // row, as PROVED). Display-only: the wire `VerificationOutcome` is
     // untouched, and the partition still counts a defective row as unknown.
-    let label =
-        if result.kind.starts_with("assumption:") { "ASSUMED" } else { result.outcome.label() };
+    let label = if result.kind.starts_with("assumption:") {
+        "ASSUMED"
+    } else if result.kind == trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND {
+        // A published exported contract (verified-modulo-callers), not a solver
+        // outcome — render it as such rather than UNKNOWN (or, for a defective
+        // row, PROVED). Display-only, like ASSUMED above: the partition still
+        // counts a defective row as unknown.
+        "CONTRACT"
+    } else {
+        result.outcome.label()
+    };
     format!(
         "  [{}] [{}] {}{}",
         label,
@@ -7863,6 +7881,41 @@ mod tests {
     // runtime; folding it to Assertion gave it a runtime fallback so
     // RuntimeCheckPolicy::Auto relabeled it RuntimeChecked in report.json (a
     // live lie on async-coroutine libs). It must stay Unknown/Inconclusive.
+    // Trust (coroutine resume-state contract): same laundering guard as the
+    // assumption rows below — the published contract row has nothing enforced
+    // at runtime and carries no proof, so it must never be relabeled
+    // RuntimeChecked (or, defectively, Proved) in report.json.
+    #[test]
+    fn coroutine_resume_contract_row_never_renders_as_runtime_checked() {
+        let contract = VerificationResult {
+            function: "crate::tick::{closure#0}".into(),
+            kind: trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND.into(),
+            message: trust_types::assumption::coroutine_resume_contract_row_description(&[0]),
+            outcome: VerificationOutcome::Unknown,
+            backend: trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_SOLVER.into(),
+            time_ms: Some(0),
+            location: None,
+            counterexample: None,
+            reason: Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON.into()),
+            raw_line: String::new(),
+        };
+        let report = report_with_results_and_diagnostics(vec![contract], Vec::new());
+        let trust_report = report.to_trust_report();
+
+        assert_eq!(
+            trust_report.summary.total_runtime_checked, 0,
+            "a published contract row must not be counted as runtime-checked"
+        );
+        assert_ne!(trust_report.summary.verdict, trust_types::CrateVerdict::RuntimeChecked);
+        assert!(
+            !matches!(
+                trust_report.functions[0].obligations[0].outcome,
+                ObligationOutcome::Proved { .. }
+            ),
+            "a published contract row must never surface as a proved obligation"
+        );
+    }
+
     #[test]
     fn assumption_row_never_renders_as_runtime_checked() {
         let assumption = VerificationResult {

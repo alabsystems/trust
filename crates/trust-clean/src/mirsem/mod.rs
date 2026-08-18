@@ -3036,6 +3036,13 @@ pub struct CalleeFact {
     /// must match exactly (fail-closed on any mismatch: a spread/vararg/ABI
     /// mismatch is an unmodeled shape).
     pub arg_count: usize,
+    /// Exact compiler-extracted formal parameter types, in declaration order.
+    /// Call composition must match every actual operand against this vector;
+    /// arity alone cannot rule out an ill-typed or stale synthetic call edge.
+    pub param_tys: Vec<trust_types::Ty>,
+    /// Exact compiler-extracted return type. The call destination must have
+    /// this type; a matching argument vector alone is not a valid call edge.
+    pub return_ty: trust_types::Ty,
     /// Trust: call-requires establishment — the callee's `#[requires]`
     /// precondition as parsed conjuncts over its FORMAL PARAMETER NAMES.
     ///
@@ -3123,8 +3130,37 @@ impl CalleeFact {
         let param_names = (1..=func.body.arg_count)
             .map(|i| func.body.locals.get(i).and_then(|l| l.name.clone()))
             .collect();
-        CalleeFact { arg_count: func.body.arg_count, requires, param_names }
+        let param_tys = (1..=func.body.arg_count)
+            .filter_map(|i| func.body.locals.get(i).map(|l| l.ty.clone()))
+            .collect();
+        CalleeFact {
+            arg_count: func.body.arg_count,
+            param_tys,
+            return_ty: func.body.return_ty.clone(),
+            requires,
+            param_names,
+        }
     }
+}
+
+/// Require a certified call edge to preserve the compiler's complete signature:
+/// exact formal parameter types and exact return/destination type. Every modeled
+/// call-composition lane uses this single gate. Missing local/type metadata
+/// declines; no coercion is guessed after MIR construction, where coercions have
+/// already been made explicit.
+pub(crate) fn callee_signature_matches(
+    func: &trust_types::VerifiableFunction,
+    args: &[trust_types::Operand],
+    dest: &trust_types::Place,
+    fact: &CalleeFact,
+) -> bool {
+    fact.arg_count == args.len()
+        && fact.param_tys.len() == args.len()
+        && crate::assignment_types::place_type(&func.body, dest).as_ref() == Some(&fact.return_ty)
+        && args
+            .iter()
+            .zip(&fact.param_tys)
+            .all(|(actual, formal)| trust_vcgen::operand_ty(func, actual).as_ref() == Some(formal))
 }
 
 /// The recognized CALL-RETURN shape: the caller's `_0` (directly, or via a
@@ -3259,12 +3295,15 @@ impl PureTotalIntrinsic {
         // `std::intrinsics::bswap::<u64>` / `intrinsics::ctpop::<u8>` unmarked
         // must decline).
         //
-        // The ARITY-2 SATURATING intrinsics were added later and the extractor
-        // does NOT stamp them: a real `T::saturating_{add,sub}` body calls the
-        // intrinsic with the LEGACY `[core|std]::intrinsics::saturating_{add,sub}`
-        // def-path, UNMARKED (exactly what the committed num corpus dumps carry —
-        // `std::intrinsics::saturating_add::<i32>`). Requiring the marker for
-        // these would decline every real saturating call (a capability loss).
+        // The ARITY-2 SATURATING intrinsics arrive in BOTH spellings: newer
+        // extractor output stamps them (11 of the 15 corpus saturating dumps are
+        // `@trust-rustc-intrinsic::…::saturating_{add,sub}::<T>`), while the
+        // mass-harvest-era dumps carry the LEGACY unmarked
+        // `[core|std]::intrinsics::saturating_{add,sub}` def-path (4 of 15 —
+        // measured 2026-08-11; an earlier version of this comment claimed the
+        // extractor NEVER stamps them, which is stale against the newer dumps).
+        // Requiring the marker would decline the legacy four (a capability loss);
+        // both lanes below therefore admit the pair.
         //
         // Hence: the MARKED lane admits ANY modeled intrinsic; the UNMARKED
         // legacy lane admits ONLY the saturating pair. This preserves the
@@ -3388,11 +3427,17 @@ impl PinnedTotalMethod {
             return None;
         }
         let impl_segment = callee.split("::").find(|segment| segment.starts_with("<impl "))?;
-        let receiver = impl_segment
-            .trim_start_matches("<impl ")
-            .trim_end_matches('>')
-            .split_whitespace()
-            .next()?;
+        let impl_body = impl_segment.trim_start_matches("<impl ").trim_end_matches('>');
+        // Trust: G4 (2026-08-03) — a TRAIT-IMPL spelling is NOT the primitive inherent
+        // method. `<impl u32 as SomeTrait>::count_ones` would otherwise pass, because
+        // `split_whitespace().next()` reads `u32` and stops before the ` as `. The
+        // pinned-total claim is about the PRIMITIVE inherent `count_ones` whose body is
+        // the certified `ctpop` shape; an arbitrary trait impl of the same name has an
+        // arbitrary body and no such guarantee. Fail closed on any ` as ` clause.
+        if impl_body.split_whitespace().any(|word| word == "as") {
+            return None;
+        }
+        let receiver = impl_body.split_whitespace().next()?;
         match receiver {
             "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64"
             | "i128" | "isize" => Some(Self::CountOnes),
@@ -3429,6 +3474,41 @@ impl PinnedTotalCallable {
         match self {
             Self::Intrinsic(intrinsic) => intrinsic.synthetic_callee_id(),
             Self::Method(PinnedTotalMethod::CountOnes) => 5,
+        }
+    }
+
+    /// Trust: G2 (2026-08-03) — whether this callable is TOTAL and carries NO
+    /// precondition, so a call site has nothing to establish.
+    ///
+    /// WHY THIS EXISTS. The trust-ir call lane's clause (d) requires the callee's
+    /// `#[requires]` to be ESTABLISHED at the call site, and it looks the callee up in
+    /// the certified-callee registry to find it. A pinned-total callable is not IN that
+    /// registry — it is admitted precisely because it needs no entry — so clause (d)
+    /// would fail closed and the whole registry-free lane would be unreachable.
+    ///
+    /// Skipping clause (d) is sound ONLY because this set is closed, tiny, and
+    /// hand-audited: every member is a compiler-marked pure total bit/saturating
+    /// intrinsic, or the primitive inherent `count_ones` whose body IS that intrinsic
+    /// shape. None of them has a `#[requires]`, and none can panic or be partial — that
+    /// is the whole membership criterion (`PureTotalIntrinsic::classify` explicitly
+    /// declines `cttz_nonzero`/`ctlz_nonzero`/`unchecked_*`/`transmute` for exactly
+    /// this reason). It returns a constant `true` rather than being elided so that the
+    /// obligation is NAMED at the call site: anything added to these enums that is not
+    /// total-and-precondition-free must return `false` here, and the reviewer is forced
+    /// to look.
+    #[must_use]
+    pub fn is_total_without_precondition(self) -> bool {
+        match self {
+            Self::Intrinsic(
+                PureTotalIntrinsic::Ctpop
+                | PureTotalIntrinsic::Cttz
+                | PureTotalIntrinsic::Ctlz
+                | PureTotalIntrinsic::Bswap
+                | PureTotalIntrinsic::Bitreverse
+                | PureTotalIntrinsic::SaturatingAdd
+                | PureTotalIntrinsic::SaturatingSub,
+            )
+            | Self::Method(PinnedTotalMethod::CountOnes) => true,
         }
     }
 }

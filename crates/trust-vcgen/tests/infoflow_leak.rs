@@ -26,7 +26,7 @@ fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Ver
         name: name.to_string(),
         def_path: format!("synthetic::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Unit },
+        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Unit, datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],

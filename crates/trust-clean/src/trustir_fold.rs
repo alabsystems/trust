@@ -187,8 +187,8 @@ use clean_kernel::{
     InductiveType, Level, Name, TypeChecker,
 };
 use trust_types::{
-    AggregateKind, AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Operand, Place,
-    Projection, Rvalue, Statement, Terminator, Ty, UnOp, VerifiableFunction,
+    AggregateKind, AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, DatatypeDefs, Operand,
+    Place, Projection, Rvalue, Statement, Terminator, Ty, UnOp, VerifiableFunction,
 };
 
 use crate::trustir_anchor::{RefinementVerdict, cst, int_lit, int_ty};
@@ -199,6 +199,69 @@ use crate::trustir_anchor::{RefinementVerdict, cst, int_lit, int_ty};
 /// empty map simply means the stack_safe idiom can never be resolved (those
 /// shapes decline `stack_safe_drift` — fail-closed, never wrong).
 pub type DumpBodies = BTreeMap<String, VerifiableFunction>;
+
+/// The sibling dump body a `Terminator::Call` callee names, tolerating the
+/// callee's INSTANTIATION.
+///
+/// # The asymmetry this bridges
+///
+/// [`DumpBodies`] is keyed by a dump's `def_path`, which
+/// `trust_mir_extract::extract_function_with_purpose` stamps with the args-FREE
+/// `safe_def_path_str(def_id)`. A callee is stamped by `func_operand_name` with
+/// `safe_def_path_str_with_args(def_id, args)` plus the fixed-format
+/// `::<__trust_args@…>` disambiguator, so ONE generic body is named by AS MANY
+/// distinct callee strings as it has call-site instantiations. Exact lookup can
+/// never join them.
+///
+/// # Order, and what each tier means
+///
+/// 1. EXACT. Unchanged behaviour, and the only tier a `TRUST_DUMP_MONO` dump
+///    ever needs: that lane overwrites `def_path` with `exact_def_path_str_with_args`,
+///    i.e. byte-identical to the call-site spelling, so a per-monomorphisation
+///    dump matches its own call site exactly and is never reached by tier 2.
+/// 2. The key derived by [`crate::def_path_pins::instantiated_callee_body_key`]
+///    — the callee with its generic-argument disambiguator and its one trailing
+///    turbofish removed by exact-format parsing. Consulted ONLY after tier 1
+///    misses, so a mono dump always wins over the generic body.
+///
+/// `None` if neither hits. There is no third, fuzzy tier: no prefix, no suffix,
+/// no "unique shorthand". A callee that does not parse, or whose derived key is
+/// not in the map, declines exactly as it does today.
+///
+/// # Why the MANY-TO-ONE join is sound
+///
+/// Two distinct callees reach one body only when they are two INSTANTIATIONS of
+/// one generic item, and then that body is the item's single
+/// pre-monomorphisation MIR — the very body rustc substitutes into for each
+/// instantiation. Every fact this crate's recognizers read out of a body
+/// fetched here is therefore instantiation-INVARIANT: block/statement structure,
+/// callee `DefId`s, literal constants, and place/local indices are all preserved
+/// by generic substitution ([`stack_safe_body_matches`] reads exactly those).
+/// Every instantiation-DEPENDENT fact the proof needs — which closure is passed,
+/// what that closure captures, which function it recurses into — is re-derived
+/// from the CALLER's own MIR and never from this body.
+///
+/// The derivation cannot cross to a different item:
+/// * `def_path_str_with_args(D, A)` renders `def_path_str(D)` followed by D's
+///   OWN arguments as one trailing group whenever D's parents are non-generic
+///   (`default_print_def_path` passes `parent_args` back into `print_def_path`),
+///   so the derived key is D's own args-free path.
+/// * when a parent IS generic the two renderings differ in a MIDDLE turbofish
+///   (`Vec::<Name>::push` against `Vec::<T, A>::push`), the derived key matches
+///   no dump, and the join declines. Fail-closed, not fuzzy.
+/// * when two crates share a name — the exact condition under which the
+///   producer appends `__trust_args` at all — a callee outside the local crate
+///   additionally carries `disambiguate_direct_call_path`'s
+///   `__trust_crate@{stable_crate_id}::` PREFIX, which the derivation retains
+///   and no dump `def_path` carries. Such a callee therefore misses rather than
+///   joining a same-named crate's body.
+#[must_use]
+pub fn sibling_body<'a>(bodies: &'a DumpBodies, callee: &str) -> Option<&'a VerifiableFunction> {
+    if let Some(exact) = bodies.get(callee) {
+        return Some(exact);
+    }
+    bodies.get(crate::def_path_pins::instantiated_callee_body_key(callee)?)
+}
 
 fn bd() -> BinderData {
     BinderData::from(BinderInfo::Default)
@@ -529,37 +592,40 @@ impl FoldDecline {
 // Pins
 // ===========================================================================
 
-/// The pinned Arc-deref callee def-path (P-ARC-DEREF; see the module doc).
-const ARC_DEREF_CALLEE: &str = "std::ops::Deref::deref";
-/// The pinned `std::sync::Arc` def-path.
-const ARC_NAME: &str = "std::sync::Arc";
+// EVERY def-path pin below is a TABLE of the two renderings one item has under
+// the extractor's pre- and post-2026-07-13 identity policy, not a single string
+// — see `crate::def_path_pins` for the drift, the evidence, and the argument
+// that admitting both renderings does not widen what a pin admits.
+
+/// The pinned `std::sync::Arc` def-path (both renderings).
+const ARC_NAMES: [&str; 2] = crate::def_path_pins::ARC;
 
 /// Field-position pins for the Arc pointee walk (P-ARC-DEREF).
 const ARC_PTR_FIELD: &str = "ptr";
-const NONNULL_NAME: &str = "std::ptr::NonNull";
+const NONNULL_NAMES: [&str; 2] = crate::def_path_pins::NON_NULL;
 const NONNULL_POINTER_FIELD: &str = "pointer";
 const ARCINNER_DATA_FIELD: &str = "data";
 
-/// The pinned accumulator container + insert op (rung B, design §4). The
-/// def-path spelling is read off the real dumps (both the fixture corpus and
-/// clean-kernel's own `collect_constants_into_impl` dump carry exactly this
-/// generic-parameter rendering).
-const HASHSET_NAME: &str = "std::collections::HashSet";
-const HASHSET_INSERT_CALLEE: &str = "std::collections::HashSet::<T, S, A>::insert";
+/// The pinned accumulator container (rung B, design §4), both renderings.
+const HASHSET_NAMES: [&str; 2] = crate::def_path_pins::HASH_SET;
+/// The canonical spelling used in decline DETAIL text (the message names the
+/// pin, and a pin with two renderings still has one canonical name).
+const HASHSET_NAME: &str = HASHSET_NAMES[0];
 
 /// P-STACK pins: `stack_safe`'s body must be exactly
 /// `stacker::maybe_grow(32768, 1048576, f)` (clean-kernel `expr/mod.rs:53-68`).
-const STACKER_MAYBE_GROW: &str = "stacker::maybe_grow";
+/// The callee spelling itself is pinned by
+/// [`crate::def_path_pins::is_stacker_maybe_grow_callee`].
 const STACK_SAFE_RED_ZONE: u128 = 32 * 1024;
 const STACK_SAFE_GROWTH: u128 = 1024 * 1024;
 
-/// The pinned `std::boxed::Box` def-path (rung G, P-BOX-DEREF).
-const BOX_NAME: &str = "std::boxed::Box";
+/// The pinned `std::boxed::Box` def-path (rung G, P-BOX-DEREF), both renderings.
+const BOX_NAMES: [&str; 2] = crate::def_path_pins::BOX;
 /// Field-position pins for the Box pointee walk (P-BOX-DEREF; measured on the
 /// real published-crate dumps —
 /// tests/fold_crate_lambda_calculus.rs::box_field_lowering_chain):
 /// `Box."0" → Unique."pointer" → NonNull."pointer" → RawPtr → pointee`.
-const UNIQUE_NAME: &str = "std::ptr::Unique";
+const UNIQUE_NAMES: [&str; 2] = crate::def_path_pins::UNIQUE;
 const BOX_UNIQUE_FIELD: &str = "0";
 const UNIQUE_NONNULL_FIELD: &str = "pointer";
 /// The pinned message of the compiler's inline NULL ub-check assert — the
@@ -571,28 +637,68 @@ const BOX_NULL_ASSERT_MSG: &str = "null reference constructed";
 /// (`alloc::sync::ArcInner` in the fixture dumps, `smallvec::alloc::sync::
 /// ArcInner` in the clean-kernel extract — both observed on real dumps), so
 /// the pin accepts exactly the `alloc::sync::ArcInner` suffix on a `::`
-/// boundary.
+/// boundary. The turbofish is split off FIRST (`crate::def_path_pins::
+/// instantiation_head`), because an instantiated cut point carries its
+/// arguments in the name — the suffix test is over the generic HEAD, never
+/// over an argument list.
 fn is_arcinner_name(name: &str) -> bool {
-    name == "alloc::sync::ArcInner" || name.ends_with("::alloc::sync::ArcInner")
+    crate::def_path_pins::instantiation_head(name).is_some_and(|head| {
+        head == "alloc::sync::ArcInner" || head.ends_with("::alloc::sync::ArcInner")
+    })
+}
+
+/// One node of a pointer-family walk, with a canonical cut point resolved
+/// through the body's EXPLICIT definition table (R0, consumer half).
+///
+/// `ty` unchanged unless it is a BARE marker (`Ty::Datatype { variants: [] }`)
+/// that `defs` defines, in which case the table's own definition, BORROWED —
+/// the recursive roots this table exists for are the fattest types in the
+/// model, and every step of these walks only reads a field list, so nothing is
+/// ever cloned.
+///
+/// FAIL-CLOSED by construction, because every failure mode returns `ty`
+/// untouched and every caller immediately destructures it as a `Ty::Adt`: a
+/// bare marker the table does not define stays a `Ty::Datatype` and the
+/// destructure declines exactly as it did before the table existed. The ONLY
+/// thing consulted is the table — a by-name search of the body is fail-OPEN
+/// (`compact_oversized_field` emits the identical bare shape for a SIZE BOUND
+/// rather than a back-edge) and is forbidden; see
+/// `trust_types::resolve_datatype_marker`.
+fn walk_node<'a>(defs: &'a DatatypeDefs, ty: &'a Ty) -> &'a Ty {
+    trust_types::datatype_marker_definition(defs, ty).unwrap_or(ty)
 }
 
 /// Resolve the pointee type of a lowered `std::sync::Arc<..>` through the
 /// pinned `ptr → NonNull → pointer → RawPtr → ArcInner → data` field path
 /// (exactly the shape the real dumps carry). `None` (fail-closed) for anything
 /// off-shape.
-pub(crate) fn arc_pointee_ty(ty: &Ty) -> Option<&Ty> {
-    let Ty::Adt { name, fields, .. } = ty else { return None };
-    if name != ARC_NAME {
+///
+/// `defs` is the OWNING body's `datatype_defs` (R0): any node on the walk may
+/// be a bare canonical-cut-point marker, and `Arc` itself is the node that
+/// actually gets cut on real code — `canonical_cut_key` ranks by the erased def
+/// path's `::` segment count and `alloc::sync::Arc` (2) ties any enum declared
+/// one module deep, with `alloc::` winning the tie. Passing an empty table is
+/// exactly the pre-R0 behaviour.
+///
+/// The RETURNED pointee is deliberately NOT resolved: it is the type as the
+/// dump spells it, and every caller either compares its NAME (which a marker
+/// carries) or resolves it against its own body's table.
+pub(crate) fn arc_pointee_ty<'a>(defs: &'a DatatypeDefs, ty: &'a Ty) -> Option<&'a Ty> {
+    let Ty::Adt { name, fields, .. } = walk_node(defs, ty) else { return None };
+    if !crate::def_path_pins::is_instantiation_of(name, &ARC_NAMES) {
         return None;
     }
     let (_, nonnull) = fields.iter().find(|(n, _)| n == ARC_PTR_FIELD)?;
-    let Ty::Adt { name: nn_name, fields: nn_fields, .. } = nonnull else { return None };
-    if nn_name != NONNULL_NAME {
+    let Ty::Adt { name: nn_name, fields: nn_fields, .. } = walk_node(defs, nonnull) else {
+        return None;
+    };
+    if !crate::def_path_pins::is_instantiation_of(nn_name, &NONNULL_NAMES) {
         return None;
     }
     let (_, rawptr) = nn_fields.iter().find(|(n, _)| n == NONNULL_POINTER_FIELD)?;
     let Ty::RawPtr { pointee, .. } = rawptr else { return None };
-    let Ty::Adt { name: inner_name, fields: inner_fields, .. } = pointee.as_ref() else {
+    let Ty::Adt { name: inner_name, fields: inner_fields, .. } = walk_node(defs, pointee.as_ref())
+    else {
         return None;
     };
     if !is_arcinner_name(inner_name) {
@@ -606,20 +712,25 @@ pub(crate) fn arc_pointee_ty(ty: &Ty) -> Option<&Ty> {
 /// pinned `"0" → Unique → "pointer" → NonNull → "pointer" → RawPtr` field path
 /// (rung G, P-BOX-DEREF item G1a — exactly the shape the real published-crate
 /// dumps carry). A SIBLING of [`arc_pointee_ty`], never a relaxation of it:
-/// `None` (fail-closed) for anything off-shape.
-pub(crate) fn box_pointee_ty(ty: &Ty) -> Option<&Ty> {
-    let Ty::Adt { name, fields, .. } = ty else { return None };
-    if name != BOX_NAME {
+/// `None` (fail-closed) for anything off-shape. `defs` carries the same R0
+/// contract as [`arc_pointee_ty`]'s.
+pub(crate) fn box_pointee_ty<'a>(defs: &'a DatatypeDefs, ty: &'a Ty) -> Option<&'a Ty> {
+    let Ty::Adt { name, fields, .. } = walk_node(defs, ty) else { return None };
+    if !crate::def_path_pins::is_instantiation_of(name, &BOX_NAMES) {
         return None;
     }
     let (_, unique) = fields.iter().find(|(n, _)| n == BOX_UNIQUE_FIELD)?;
-    let Ty::Adt { name: u_name, fields: u_fields, .. } = unique else { return None };
-    if u_name != UNIQUE_NAME {
+    let Ty::Adt { name: u_name, fields: u_fields, .. } = walk_node(defs, unique) else {
+        return None;
+    };
+    if !crate::def_path_pins::is_instantiation_of(u_name, &UNIQUE_NAMES) {
         return None;
     }
     let (_, nonnull) = u_fields.iter().find(|(n, _)| n == UNIQUE_NONNULL_FIELD)?;
-    let Ty::Adt { name: nn_name, fields: nn_fields, .. } = nonnull else { return None };
-    if nn_name != NONNULL_NAME {
+    let Ty::Adt { name: nn_name, fields: nn_fields, .. } = walk_node(defs, nonnull) else {
+        return None;
+    };
+    if !crate::def_path_pins::is_instantiation_of(nn_name, &NONNULL_NAMES) {
         return None;
     }
     let (_, rawptr) = nn_fields.iter().find(|(n, _)| n == NONNULL_POINTER_FIELD)?;
@@ -640,8 +751,8 @@ pub(crate) fn ty_names_enum(ty: &Ty, enum_name: &str) -> bool {
 /// Whether `ty` is a pinned `Box` over the folded enum — `Some(false)` for the
 /// single child `Box<enum>` (G1), `Some(true)` for the boxed recursive PAIR
 /// `Box<(enum, enum)>` (G2), `None` for everything else (fail-closed).
-fn box_recursive_form(ty: &Ty, enum_name: &str) -> Option<bool> {
-    match box_pointee_ty(ty)? {
+fn box_recursive_form(defs: &DatatypeDefs, ty: &Ty, enum_name: &str) -> Option<bool> {
+    match box_pointee_ty(defs, ty)? {
         p if ty_names_enum(p, enum_name) => Some(false),
         Ty::Tuple(elems)
             if elems.len() == 2 && elems.iter().all(|e| ty_names_enum(e, enum_name)) =>
@@ -682,8 +793,18 @@ enum AbsVal {
     Int(FoldExpr),
     /// A resolved `Bool`-sorted value (rung B).
     Bool(FoldExpr),
-    /// A `CheckedBinaryOp` result pair: `.0` = the value, `.1` = the overflow flag.
+    /// A `CheckedBinaryOp` result pair: `.0` = the value, `.1` = the overflow flag —
+    /// UNASSERTED: the overflow flag has not been consumed by its assert on this
+    /// path, so the `.0` component WRAPS and carries NO `Int` reading (Trust:
+    /// WRAP-vs-INT, RETURN LANE, 2026-08-15 — the old `.0` unwrap read this state
+    /// directly, on the disproved "the overflow obligation is the safety pillar's
+    /// separate burden" premise; an assert-less checked op emits ZERO safety VCs).
     CheckedPair(FoldExpr),
+    /// The pair AFTER its overflow assert ran on THIS path (`Assert(!pair.1,
+    /// Overflow(op))` admitted by the terminator arm): `.0` = the value, now with
+    /// the licensed `Int` reading — path-sensitive by construction, the fold's
+    /// form of the mutator walks' `checked_asserted` order gate.
+    CheckedPairAsserted(FoldExpr),
     /// A copy of the scrutinee reference itself (the parameter).
     ParamRef,
     /// The accumulator parameter, or a re-borrow of it (rung B).
@@ -791,7 +912,15 @@ pub fn sem_structural_fold_shape_of_with_bodies(
             "parameter is not an immutable reference".to_string(),
         ));
     };
-    let Ty::Adt { name: enum_name, variants, .. } = inner.as_ref() else {
+    // R0: under markers-everywhere the ROOT parameter's pointee is spelled as a
+    // bare `Ty::Datatype` marker too, so widen it through the body's EXPLICIT
+    // out-of-band table before destructuring. `resolved_datatype` is the identity
+    // on an inline `Ty::Adt` and on a marker the table does not define, so a
+    // fixture that already destructured keeps its exact result; only a body whose
+    // producer wrote the definition down can newly succeed here. Never a by-name
+    // search of the body — that design is fail-open and was withdrawn.
+    let param_pointee = body.resolved_datatype(inner.as_ref());
+    let Ty::Adt { name: enum_name, variants, .. } = param_pointee.as_ref() else {
         return Err(FoldDecline::ParamShapeUnsupported(
             "parameter pointee is not a modeled enum".to_string(),
         ));
@@ -826,7 +955,7 @@ pub fn sem_structural_fold_shape_of_with_bodies(
                     "accumulator pointee is not the pinned container".to_string(),
                 ));
             };
-            if name != HASHSET_NAME {
+            if !crate::def_path_pins::is(name, &HASHSET_NAMES) {
                 return Err(FoldDecline::ParamShapeUnsupported(format!(
                     "accumulator container {name} is not the pinned {HASHSET_NAME}"
                 )));
@@ -839,7 +968,8 @@ pub fn sem_structural_fold_shape_of_with_bodies(
     // (4) Field classification from the dump's own type info: Int payload,
     // pinned Arc<enum> / Box<enum> / Box<(enum, enum)> recursive child (rung
     // G items G1a + G2), or (rung B) an OPAQUE atom whose every read declines.
-    let plans: Vec<VariantPlan> = variants.iter().map(|v| VariantPlan::of(v, enum_name)).collect();
+    let plans: Vec<VariantPlan> =
+        variants.iter().map(|v| VariantPlan::of(&body.datatype_defs, v, enum_name)).collect();
 
     // (5) Global fail-closed scans: no parameter (folded / accumulator /
     // threaded depth) is ever written; no raw borrow anywhere; for value
@@ -1073,14 +1203,14 @@ struct VariantPlan {
     slots: Vec<FoldFieldKind>,
 }
 
-fn classify_mir_field(fty: &Ty, enum_name: &str) -> MirFieldShape {
+fn classify_mir_field(defs: &DatatypeDefs, fty: &Ty, enum_name: &str) -> MirFieldShape {
     if matches!(fty, Ty::Int { .. }) {
         return MirFieldShape::Int;
     }
-    if arc_pointee_ty(fty).is_some_and(|p| ty_names_enum(p, enum_name)) {
+    if arc_pointee_ty(defs, fty).is_some_and(|p| ty_names_enum(p, enum_name)) {
         return MirFieldShape::ArcRec;
     }
-    match box_recursive_form(fty, enum_name) {
+    match box_recursive_form(defs, fty, enum_name) {
         Some(false) => MirFieldShape::BoxRec,
         Some(true) => MirFieldShape::BoxRecPair,
         None => MirFieldShape::Opaque,
@@ -1088,11 +1218,11 @@ fn classify_mir_field(fty: &Ty, enum_name: &str) -> MirFieldShape {
 }
 
 impl VariantPlan {
-    fn of(v: &trust_types::VariantDef, enum_name: &str) -> VariantPlan {
+    fn of(defs: &DatatypeDefs, v: &trust_types::VariantDef, enum_name: &str) -> VariantPlan {
         let mut mir = Vec::with_capacity(v.fields.len());
         let mut slots = Vec::new();
         for (_, fty) in &v.fields {
-            let shape = classify_mir_field(fty, enum_name);
+            let shape = classify_mir_field(defs, fty, enum_name);
             mir.push(MirField { shape, slot: slots.len() });
             match shape {
                 MirFieldShape::Int => slots.push(FoldFieldKind::PayloadInt),
@@ -1559,7 +1689,7 @@ fn walk_from(
                             FoldSort::Acc => unreachable!("acc_arg is Some for Acc"),
                         }
                     }
-                } else if *callee == ARC_DEREF_CALLEE {
+                } else if crate::def_path_pins::is_arc_deref_callee(callee) {
                     // Pinned Arc-deref idiom (P-ARC-DEREF).
                     let [Operand::Copy(p) | Operand::Move(p)] = args.as_slice() else {
                         return Err(FoldDecline::UnsupportedArmStatement(
@@ -1579,9 +1709,18 @@ fn walk_from(
                     // The argument's declared type must be `&std::sync::Arc<..>`
                     // and the destination's `&<enum>` (both from the dump's own
                     // local declarations).
+                    // R0: resolve through the table and split the turbofish head,
+                    // exactly as `arc_pointee_ty` does. `classify_mir_field` ->
+                    // `MirFieldShape::ArcRec` -> `AbsVal::ArcFieldRef` is consumed
+                    // right here, so if this pin stays narrower than the walk that
+                    // produced the value the two disagree: the classifier accepts a
+                    // marker or an instantiated `Arc<..>` and then this gate rejects
+                    // the very same local.
                     let arg_ok = body.locals.get(p.local).is_some_and(|l| {
                         matches!(&l.ty, Ty::Ref { mutable: false, inner }
-                            if matches!(inner.as_ref(), Ty::Adt { name, .. } if name == ARC_NAME))
+                            if matches!(walk_node(&body.datatype_defs, inner.as_ref()),
+                                Ty::Adt { name, .. }
+                                if crate::def_path_pins::is_instantiation_of(name, &ARC_NAMES)))
                     });
                     let dest_ok = body.locals.get(dest.local).is_some_and(|l| {
                         matches!(&l.ty, Ty::Ref { mutable: false, inner }
@@ -1595,7 +1734,9 @@ fn walk_from(
                         ));
                     }
                     AbsVal::SubtermRef(f)
-                } else if ctx.sort == FoldSort::Acc && *callee == HASHSET_INSERT_CALLEE {
+                } else if ctx.sort == FoldSort::Acc
+                    && crate::def_path_pins::is_hashset_insert_callee(callee)
+                {
                     // Rung B: the pinned insert op (design §4 rule ii — the
                     // bool result must be DISCARDED; the global never-read set
                     // is the fail-closed witness).
@@ -1712,6 +1853,13 @@ fn walk_from(
                     return Err(FoldDecline::UnsupportedArmTerminator(
                         "assert not the checked-op overflow flag".to_string(),
                     ));
+                }
+                // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — the assert is
+                // exactly what LICENSES the `.0` reading on this path: upgrade
+                // the pair state so the `Field(0)` resolver can tell an asserted
+                // pair from a wrapping one.
+                if let Some(AbsVal::CheckedPair(e)) = st.map.get(&p.local).cloned() {
+                    st.map.insert(p.local, AbsVal::CheckedPairAsserted(e));
                 }
                 cur = *target;
             }
@@ -1869,7 +2017,16 @@ fn resolve_operand(
                     ))),
                 },
                 [Projection::Field(0)] => match map.get(&p.local) {
-                    Some(AbsVal::CheckedPair(e)) => Ok(AbsVal::Int(e.clone())),
+                    // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — only the
+                    // ASSERTED pair's `.0` carries the `Int` reading; the
+                    // unasserted pair's `.0` WRAPS and declines by name.
+                    Some(AbsVal::CheckedPairAsserted(e)) => Ok(AbsVal::Int(e.clone())),
+                    Some(AbsVal::CheckedPair(_)) => Err(FoldDecline::UnsupportedArmStatement(
+                        format!(
+                            "field 0 of UNASSERTED checked pair _{} — the wrap trap",
+                            p.local
+                        ),
+                    )),
                     _ => Err(FoldDecline::UnsupportedArmStatement(format!(
                         "field projection of unmodeled local _{}",
                         p.local
@@ -2110,10 +2267,13 @@ fn box_ubcheck_structure(
     // Declared types: `_a: &Box<pointee>`, `_b: Box<pointee>` — both the
     // pinned Box walk over the folded enum (single or pair form).
     let a_form = body.locals.get(a).and_then(|l| match &l.ty {
-        Ty::Ref { mutable: false, inner } => box_recursive_form(inner, enum_name),
+        Ty::Ref { mutable: false, inner } => {
+            box_recursive_form(&body.datatype_defs, inner, enum_name)
+        }
         _ => None,
     });
-    let b_form = body.locals.get(b).and_then(|l| box_recursive_form(&l.ty, enum_name));
+    let b_form =
+        body.locals.get(b).and_then(|l| box_recursive_form(&body.datatype_defs, &l.ty, enum_name));
     let (Some(pair_a), Some(pair)) = (a_form, b_form) else {
         return Err("copied local is not a pinned Box over the folded enum".to_string());
     };
@@ -2453,7 +2613,17 @@ pub(crate) fn stack_safe_body_matches(func: &VerifiableFunction) -> bool {
     let Terminator::Call { func: callee, args, dest, target, .. } = &b0.terminator else {
         return false;
     };
-    if callee != STACKER_MAYBE_GROW || dest.local != 0 || !dest.projections.is_empty() {
+    // The trampoline's own callee is INSTANTIATED in the dump
+    // (`stacker::maybe_grow::<R, impl FnOnce() -> R>::<__trust_args@…>`), while
+    // the pin names the item. Strip the producer's two decorations by their
+    // exact format and match the item EXACTLY: which `R`/`F` this call was
+    // instantiated at is not what P-STACK is about — `maybe_grow(r, s, f) = f()`
+    // holds at every instantiation — and the two red-zone/growth literals and
+    // the forwarding shape below are still pinned byte-exactly.
+    if !crate::def_path_pins::is_stacker_maybe_grow_callee(callee)
+        || dest.local != 0
+        || !dest.projections.is_empty()
+    {
         return false;
     }
     let Some(t) = target else { return false };
@@ -2512,7 +2682,7 @@ fn closure_deref_call_target<'a>(
     let Terminator::Call { func: callee, args, dest, target, .. } = &b0.terminator else {
         return Err("bb0 does not end in a call".to_string());
     };
-    if callee != ARC_DEREF_CALLEE {
+    if !crate::def_path_pins::is_arc_deref_callee(callee) {
         return Err(format!("bb0 calls {callee}, not the pinned Arc deref"));
     }
     let [Operand::Copy(p) | Operand::Move(p)] = args.as_slice() else {
@@ -2521,10 +2691,15 @@ fn closure_deref_call_target<'a>(
     if p.local != u || !p.projections.is_empty() {
         return Err("deref arg is not the captured upvar".to_string());
     }
-    // P-ARC-DEREF type pins on the closure's own declared locals.
+    // P-ARC-DEREF type pins on the closure's own declared locals. Resolved
+    // through the table and turbofish-tolerant for the same reason as the arm
+    // walk's copy of this pin: a cut point can land on `Arc` itself, and its
+    // marker name then carries the instantiation.
     let arg_ok = body.locals.get(u).is_some_and(|l| {
         matches!(&l.ty, Ty::Ref { mutable: false, inner }
-            if matches!(inner.as_ref(), Ty::Adt { name, .. } if name == ARC_NAME))
+            if matches!(walk_node(&body.datatype_defs, inner.as_ref()),
+                Ty::Adt { name, .. }
+                if crate::def_path_pins::is_instantiation_of(name, &ARC_NAMES)))
     });
     let dest_ok = body.locals.get(dest.local).is_some_and(
         |l| matches!(&l.ty, Ty::Ref { mutable: false, inner } if ty_names_enum(inner, enum_name)),
@@ -2580,7 +2755,7 @@ fn try_stack_safe_recursion(
     let Some(AbsVal::ClosureVal { name, caps }) = map.get(&p.local) else { return None };
     // From here on every failure is a NAMED decline (the shape claims to be
     // the trampoline; drift must not silently poison-and-pass).
-    let Some(tramp) = ctx.bodies.get(callee) else {
+    let Some(tramp) = sibling_body(ctx.bodies, callee) else {
         return Some(Err(FoldDecline::StackSafeDrift(format!(
             "no sibling dump body for trampoline callee {callee}"
         ))));
@@ -2725,7 +2900,7 @@ pub fn sem_stack_safe_wrapper_of(
             "wrapper does not return the trampoline result directly".to_string(),
         ));
     }
-    let Some(tramp) = bodies.get(callee) else {
+    let Some(tramp) = sibling_body(bodies, callee) else {
         return Err(FoldDecline::StackSafeDrift(format!(
             "no sibling dump body for trampoline callee {callee}"
         )));
@@ -3428,6 +3603,275 @@ pub(crate) use probe_arm_rhs as debug_arm_rhs_for_test;
 // Tests — kernel witness + forgery probes (the recognizer is pinned against
 // REAL MIR by tests/structural_fold_corpus.rs and tests/level_fold_corpus.rs)
 // ===========================================================================
+
+#[cfg(test)]
+mod pointer_family_walk_tests {
+    use trust_types::insert_datatype_def;
+
+    use super::*;
+
+    const LEVEL: &str = "extract_foldmemo::level::Level";
+    /// The name an INSTANTIATED canonical cut point on `Arc` actually carries
+    /// (`canonical_cut_key` ranks by the erased path's `::` segment count, and
+    /// `alloc::sync::Arc` (2) ties `extract_foldmemo::level::Level` (2) with
+    /// `alloc::` winning the instantiated-path tie-break).
+    const ARC_OF_LEVEL: &str = "alloc::sync::Arc<extract_foldmemo::level::Level>";
+    const ARCINNER_OF_LEVEL: &str = "alloc::sync::ArcInner<extract_foldmemo::level::Level>";
+    const BOX_OF_LEVEL: &str = "alloc::boxed::Box<extract_foldmemo::level::Level>";
+    const UNIQUE_OF_LEVEL: &str = "core::ptr::unique::Unique<extract_foldmemo::level::Level>";
+    const NONNULL_OF_LEVEL: &str = "core::ptr::non_null::NonNull<extract_foldmemo::level::Level>";
+
+    /// A bare canonical-cut-point marker: `Ty::Datatype { name, variants: [] }`.
+    fn marker(name: &str) -> Ty {
+        Ty::Datatype { name: name.to_string(), variants: Vec::new() }
+    }
+
+    fn i64_ty() -> Ty {
+        Ty::Int { width: 64, signed: true }
+    }
+
+    /// The recursive enum the Arc/Box points at, as a real definition.
+    fn level_def() -> Ty {
+        Ty::adt_enum(
+            LEVEL,
+            vec![trust_types::VariantDef {
+                name: "Zero".to_string(),
+                discriminant: 0,
+                fields: vec![("0".to_string(), i64_ty())],
+            }],
+        )
+    }
+
+    fn raw_ptr(pointee: Ty) -> Ty {
+        Ty::RawPtr { mutable: false, pointee: Box::new(pointee) }
+    }
+
+    /// `NonNull<T> { pointer: *const inner }`, under `name`.
+    fn nonnull(name: &str, inner: Ty) -> Ty {
+        Ty::adt(name, vec![(NONNULL_POINTER_FIELD.to_string(), raw_ptr(inner))])
+    }
+
+    /// The full lowered `Arc<Level>` shape: `Arc."ptr" -> NonNull."pointer" ->
+    /// RawPtr -> ArcInner."data"`, with each node NAMED as caller chooses so a
+    /// test can swap one node for a marker.
+    fn arc_shape(arc_name: &str, nonnull_name: &str, arcinner_name: &str, data: Ty) -> Ty {
+        let arcinner = Ty::adt(
+            arcinner_name,
+            vec![("strong".to_string(), i64_ty()), (ARCINNER_DATA_FIELD.to_string(), data)],
+        );
+        Ty::adt(arc_name, vec![(ARC_PTR_FIELD.to_string(), nonnull(nonnull_name, arcinner))])
+    }
+
+    /// The full lowered `Box<Level>` shape: `Box."0" -> Unique."pointer" ->
+    /// NonNull."pointer" -> RawPtr -> pointee`.
+    fn box_shape(box_name: &str, unique_name: &str, nonnull_name: &str, pointee: Ty) -> Ty {
+        let inner_nonnull = nonnull(nonnull_name, pointee);
+        let unique = Ty::adt(unique_name, vec![(UNIQUE_NONNULL_FIELD.to_string(), inner_nonnull)]);
+        Ty::adt(box_name, vec![(BOX_UNIQUE_FIELD.to_string(), unique)])
+    }
+
+    /// A table holding exactly `def`, keyed by `def`'s own name.
+    fn table(def: Ty) -> DatatypeDefs {
+        let mut defs = DatatypeDefs::new();
+        assert!(insert_datatype_def(&mut defs, def), "definition must be recordable");
+        defs
+    }
+
+    /// R0 consumer half: the ROOT `Arc` node is the canonical cut point, so
+    /// every occurrence is a bare marker and the one real definition lives in
+    /// `datatype_defs`. With the table the walk resolves it; with the table
+    /// stripped the SAME type declines. That second half is the never-by-name
+    /// guard: nothing but the explicit table may bind a marker.
+    #[test]
+    fn arc_walk_resolves_a_marker_root_only_through_the_explicit_table() {
+        let defs = table(arc_shape(ARC_OF_LEVEL, NONNULL_OF_LEVEL, ARCINNER_OF_LEVEL, level_def()));
+        let occurrence = marker(ARC_OF_LEVEL);
+
+        let pointee = arc_pointee_ty(&defs, &occurrence).expect("marker root resolves");
+        assert!(ty_names_enum(pointee, LEVEL), "resolved pointee is the folded enum");
+
+        assert!(
+            arc_pointee_ty(&DatatypeDefs::new(), &occurrence).is_none(),
+            "with no table entry the marker must decline — a by-name search of the body is \
+             fail-open and forbidden",
+        );
+    }
+
+    /// A marker at an INTERIOR node of the Arc walk (the `NonNull`, the
+    /// `ArcInner`) resolves the same way, and declines without the entry.
+    #[test]
+    fn arc_walk_resolves_a_marker_at_every_interior_node() {
+        // `NonNull` is the cut point; the Arc node itself is inline.
+        let nn_def = nonnull(
+            NONNULL_OF_LEVEL,
+            Ty::adt(ARCINNER_OF_LEVEL, vec![(ARCINNER_DATA_FIELD.to_string(), marker(LEVEL))]),
+        );
+        let arc_over_nn_marker =
+            Ty::adt(ARC_OF_LEVEL, vec![(ARC_PTR_FIELD.to_string(), marker(NONNULL_OF_LEVEL))]);
+        let defs = table(nn_def);
+        assert!(
+            arc_pointee_ty(&defs, &arc_over_nn_marker).is_some_and(|p| ty_names_enum(p, LEVEL)),
+            "an interior NonNull marker resolves through the table",
+        );
+        assert!(
+            arc_pointee_ty(&DatatypeDefs::new(), &arc_over_nn_marker).is_none(),
+            "interior marker with no entry declines",
+        );
+
+        // `ArcInner` is the cut point.
+        let inner_def =
+            Ty::adt(ARCINNER_OF_LEVEL, vec![(ARCINNER_DATA_FIELD.to_string(), marker(LEVEL))]);
+        let arc_over_inner_marker = Ty::adt(
+            ARC_OF_LEVEL,
+            vec![(ARC_PTR_FIELD.to_string(), nonnull(NONNULL_OF_LEVEL, marker(ARCINNER_OF_LEVEL)))],
+        );
+        let defs = table(inner_def);
+        assert!(
+            arc_pointee_ty(&defs, &arc_over_inner_marker).is_some_and(|p| ty_names_enum(p, LEVEL)),
+            "an interior ArcInner marker resolves through the table",
+        );
+        assert!(
+            arc_pointee_ty(&DatatypeDefs::new(), &arc_over_inner_marker).is_none(),
+            "interior ArcInner marker with no entry declines",
+        );
+    }
+
+    /// The Box walk carries the identical contract (rung G, P-BOX-DEREF).
+    #[test]
+    fn box_walk_resolves_a_marker_root_only_through_the_explicit_table() {
+        let defs = table(box_shape(BOX_OF_LEVEL, UNIQUE_OF_LEVEL, NONNULL_OF_LEVEL, marker(LEVEL)));
+        let occurrence = marker(BOX_OF_LEVEL);
+
+        assert!(
+            box_pointee_ty(&defs, &occurrence).is_some_and(|p| ty_names_enum(p, LEVEL)),
+            "marker root resolves",
+        );
+        assert!(
+            box_pointee_ty(&DatatypeDefs::new(), &occurrence).is_none(),
+            "with no table entry the marker must decline",
+        );
+        // And at the interior `Unique` node.
+        let box_over_unique_marker =
+            Ty::adt(BOX_OF_LEVEL, vec![(BOX_UNIQUE_FIELD.to_string(), marker(UNIQUE_OF_LEVEL))]);
+        let unique_defs = table(Ty::adt(
+            UNIQUE_OF_LEVEL,
+            vec![(UNIQUE_NONNULL_FIELD.to_string(), nonnull(NONNULL_OF_LEVEL, marker(LEVEL)))],
+        ));
+        assert!(
+            box_pointee_ty(&unique_defs, &box_over_unique_marker)
+                .is_some_and(|p| ty_names_enum(p, LEVEL)),
+            "an interior Unique marker resolves through the table",
+        );
+        assert!(
+            box_pointee_ty(&DatatypeDefs::new(), &box_over_unique_marker).is_none(),
+            "interior Unique marker with no entry declines",
+        );
+    }
+
+    /// A table that defines a DIFFERENT name, an entry that is itself vacuous,
+    /// and an entry that is off-shape all decline. Resolution may only ever
+    /// turn a decline into an accept for the exact name asked about.
+    #[test]
+    fn unresolvable_or_wrong_table_entries_still_decline() {
+        let occurrence = marker(ARC_OF_LEVEL);
+
+        // Right shape, WRONG name — the table binds nothing for this marker.
+        let other = table(arc_shape(
+            "alloc::sync::Arc<extract_foldmemo::name::Name>",
+            NONNULL_OF_LEVEL,
+            ARCINNER_OF_LEVEL,
+            marker(LEVEL),
+        ));
+        assert!(arc_pointee_ty(&other, &occurrence).is_none(), "a different name binds nothing");
+
+        // Right name, entry is not the pinned Arc layout.
+        let off_shape = table(Ty::adt(ARC_OF_LEVEL, vec![("nope".to_string(), Ty::Unit)]));
+        assert!(
+            arc_pointee_ty(&off_shape, &occurrence).is_none(),
+            "an off-shape definition still fails the pinned field walk",
+        );
+
+        // A vacuous entry defines nothing — `insert_datatype_def` refuses it,
+        // and a hand-built table carrying one is inert on READ as well.
+        let mut vacuous = DatatypeDefs::new();
+        assert!(
+            !insert_datatype_def(&mut vacuous, marker(ARC_OF_LEVEL)),
+            "a bare marker is not a definition",
+        );
+        vacuous.insert(ARC_OF_LEVEL.to_string(), marker(ARC_OF_LEVEL));
+        assert!(
+            arc_pointee_ty(&vacuous, &occurrence).is_none(),
+            "a vacuous entry would resolve the marker to itself and must be inert",
+        );
+
+        // A table entry whose value disagrees with its key is inert too.
+        let mut disagreeing = DatatypeDefs::new();
+        disagreeing.insert(
+            ARC_OF_LEVEL.to_string(),
+            arc_shape("mycrate::NotArc", NONNULL_OF_LEVEL, ARCINNER_OF_LEVEL, marker(LEVEL)),
+        );
+        assert!(
+            arc_pointee_ty(&disagreeing, &occurrence).is_none(),
+            "key/value disagreement is inert on read",
+        );
+    }
+
+    /// An INLINE definition still wins and is unaffected by the table — the
+    /// resolution is strictly additive over the pre-R0 answer, including the
+    /// generics-free spellings every shipped fixture carries.
+    #[test]
+    fn inline_shapes_are_unchanged_with_and_without_a_table() {
+        for (arc_name, nn_name, inner_name) in [
+            ("alloc::sync::Arc", "core::ptr::non_null::NonNull", "alloc::sync::ArcInner"),
+            ("std::sync::Arc", "std::ptr::NonNull", "smallvec::alloc::sync::ArcInner"),
+            (ARC_OF_LEVEL, NONNULL_OF_LEVEL, ARCINNER_OF_LEVEL),
+        ] {
+            let inline = arc_shape(arc_name, nn_name, inner_name, marker(LEVEL));
+            for defs in [DatatypeDefs::new(), table(level_def())] {
+                assert!(
+                    arc_pointee_ty(&defs, &inline).is_some_and(|p| ty_names_enum(p, LEVEL)),
+                    "{arc_name}: an inline Arc shape resolves with or without a table",
+                );
+            }
+        }
+        // A non-pinned container is still declined under every table.
+        let impostor = arc_shape(
+            "mycrate::sync::Arc",
+            "core::ptr::non_null::NonNull",
+            "alloc::sync::ArcInner",
+            marker(LEVEL),
+        );
+        assert!(arc_pointee_ty(&table(level_def()), &impostor).is_none());
+        assert!(arc_pointee_ty(&DatatypeDefs::new(), &impostor).is_none());
+    }
+
+    /// The turbofish tolerance is a HEAD split against the closed pin table,
+    /// never a prefix/suffix/contains: `alloc::sync::Arc2<T>` and
+    /// `mycrate::alloc::sync::Arc<T>` are different items and must decline.
+    #[test]
+    fn instantiated_pins_split_the_head_and_never_widen_the_table() {
+        for wrong_arc in [
+            "alloc::sync::Arc2<extract_foldmemo::level::Level>",
+            "mycrate::alloc::sync::Arc<extract_foldmemo::level::Level>",
+            "alloc::rc::Rc<extract_foldmemo::level::Level>",
+            // Unbalanced turbofish: not a spelling the extractor emits.
+            "alloc::sync::Arc<extract_foldmemo::level::Level",
+        ] {
+            let ty = arc_shape(wrong_arc, NONNULL_OF_LEVEL, ARCINNER_OF_LEVEL, marker(LEVEL));
+            assert!(
+                arc_pointee_ty(&DatatypeDefs::new(), &ty).is_none(),
+                "{wrong_arc} must not satisfy the Arc pin",
+            );
+        }
+        // `is_arcinner_name`'s documented `::`-boundary suffix is taken over
+        // the generic HEAD, so a crate-prefixed instantiated ArcInner is
+        // admitted while a lookalike is not.
+        assert!(is_arcinner_name("smallvec::alloc::sync::ArcInner<T>"));
+        assert!(is_arcinner_name("alloc::sync::ArcInner"));
+        assert!(!is_arcinner_name("mycrate::alloc::sync::ArcInner2<T>"));
+        assert!(!is_arcinner_name("alloc::sync::ArcInnerX"));
+    }
+}
 
 #[cfg(test)]
 mod tests {

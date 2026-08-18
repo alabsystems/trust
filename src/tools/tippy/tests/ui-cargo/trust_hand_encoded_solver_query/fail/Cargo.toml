@@ -1,0 +1,6 @@
+[package]
+name = "trust_hand_encoded_solver_query"
+version = "0.1.0"
+publish = false
+
+[workspace]

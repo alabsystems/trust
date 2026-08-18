@@ -320,6 +320,22 @@ pub(super) fn sem_return_of_mir(
                     }
                     return None; // a field projection we do not model ⇒ fail closed
                 }
+                // Trust: TRANSPARENT-UNWRAP leg (2026-08-18) — the MULTI-HOP
+                // by-value field-chain return (`_0 := Copy(_1.0.0); Return` — the
+                // spelling the extractor's transparent-unwrap transmute leg emits
+                // for `NonZero::<u8>::get`-class bodies). Delegates to
+                // `sem_field_read_operand`'s multi-hop arm, which carries the
+                // type-chase (every intermediate hop a variantless single-field
+                // struct, terminal scalar) and the full entry-time-value gates.
+                // The SINGLE-hop non-checked case above stays fail-closed exactly
+                // as before — this fallback fires only for len >= 2 all-Field
+                // paths, so no previously-declined shape widens silently.
+                if p.projections.len() >= 2
+                    && p.projections.iter().all(|pr| matches!(pr, Projection::Field(_)))
+                {
+                    let ret = sem_field_read_operand(body, op, param_index)?;
+                    return Some(SemReturn { stmts, ret });
+                }
             }
             let ret = sem_operand_of_mir(body, op, param_index)?;
             Some(SemReturn { stmts, ret })
@@ -328,7 +344,25 @@ pub(super) fn sem_return_of_mir(
         // arithmetic — SSA-TEMP return. The prefix `stmts` already contains the
         // modeled `Assign(0, R)`; the returned operand is the temp `Var 0` (the
         // return-place index, matching the `set` index `exec` writes).
-        Rvalue::BinaryOp(..) | Rvalue::CheckedBinaryOp(..) => {
+        //
+        // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — `CheckedBinaryOp` is
+        // deliberately NOT in this arm any more. A direct `_0 := CheckedBinaryOp`
+        // is the WHOLE-TUPLE return (`overflowing_add`'s exact body): `_0` is
+        // `(wrapped_value, overflow_flag)`, and the old shared arm modeled it as
+        // the bare SCALAR unbounded `Int.<op>` — the flag erased, the tuple shape
+        // erased, and the `.0` component read WITHOUT wrap semantics while the
+        // machine wraps (u8: `overflowing_add(200,100)` returns `(44, true)`; the
+        // certificate said `300`). No axis backstops it: an assert-less checked op
+        // emits ZERO safety VCs (the vcgen statement scan matches only UNCHECKED
+        // `BinaryOp`; the assert lane needs the Assert this body lacks), so the
+        // witness's safety axis was vacuously green. The unchecked `BinaryOp` arm
+        // is different — its Int reading is backstopped by the ArithmeticOverflow
+        // VC the statement scan DOES emit, which the ff bar requires discharged.
+        // An honest whole-pair claim (`.0 = wrap_W(a∘b) ∧ .1 ↔ overflow_W(a,b)`)
+        // is a PAIR-shaped certificate family that does not exist yet — decline,
+        // never approximate. (The measured cost: the two `overflowing_add` corpus
+        // rows RETRACT from the MirSem lane's count.)
+        Rvalue::BinaryOp(..) => {
             // Confirm the assignment's rvalue is in the modeled fragment (else fail-closed).
             sem_rvalue_of_mir_at_site(body, last_to_0, param_index, Some(last_to_0_site))?;
             Some(SemReturn { stmts, ret: SemOperand::Var(0) })
@@ -469,6 +503,56 @@ pub(super) fn sem_return_of_mir(
 /// `_0 := _5.0` where `_5 := CheckedAdd(a, b)`). Mirrors
 /// `clean_ground::resolve_local_field`'s `CheckedBinaryOp` arm. `None` (fail-closed)
 /// when the local is not a checked-arith field over modeled operands.
+/// Trust: WRAP-vs-INT, RETURN LANE (2026-08-15; tightened same-round) — whether the
+/// `Int.<op>` reading of the checked pair `local`'s `.0` component is LICENSED by
+/// the discharged-overflow spine. The requirement is the mutator walks'
+/// `checked_asserted` discipline, transplanted to every read-side consumer:
+///
+///   the block that DEFINES `local := CheckedBinaryOp(op, ..)` must itself
+///   TERMINATE in `Assert(cond: local.1, expected: false, msg: Overflow(op))`.
+///
+/// SAME-BLOCK, deliberately — not body-wide existence: rustc's lowering emits the
+/// def and its assert in one block, the overflow-VC backstop
+/// (`v2_build_overflow_vc`) scans exactly the assert's own block for the checked
+/// statement, and a body-wide match would license a `.0` read on a path that
+/// never runs the assert (the adversarial round's separated-blocks attack). The
+/// history, for the reviewer: the old guard comment claimed the overflow safety
+/// VC was a separately-REQUIRED axis, but an assert-less `CheckedBinaryOp` emits
+/// ZERO safety VCs (the vcgen statement scan matches only unchecked `BinaryOp`;
+/// the assert lane needs the Assert), so the axis was vacuous and the unbounded
+/// reading of a WRAPPING `.0` had no licensing anywhere — `overflowing_add`'s
+/// whole-pair return certified as bare `Int.add` (u8: machine `(44, true)` at
+/// `200+100`, certificate `300`). Every consumer of a checked pair's value must
+/// call this gate; the conflated `BinaryOp | CheckedBinaryOp` lift arms alone are
+/// never a license.
+pub(crate) fn checked_pair_int_reading_licensed(
+    body: &trust_types::VerifiableBody,
+    local: usize,
+    op: trust_types::BinOp,
+) -> bool {
+    body.blocks.iter().any(|blk| {
+        let defines_here = blk.stmts.iter().any(|st| {
+            matches!(
+                st,
+                trust_types::Statement::Assign { place, rvalue: trust_types::Rvalue::CheckedBinaryOp(sop, _, _), .. }
+                    if place.local == local && place.projections.is_empty() && *sop == op
+            )
+        });
+        defines_here
+            && matches!(
+                &blk.terminator,
+                trust_types::Terminator::Assert {
+                    cond: trust_types::Operand::Copy(cp) | trust_types::Operand::Move(cp),
+                    expected: false,
+                    msg: trust_types::AssertMessage::Overflow(msg_op),
+                    ..
+                } if cp.local == local
+                    && cp.projections.as_slice() == [trust_types::Projection::Field(1)]
+                    && *msg_op == op
+            )
+    })
+}
+
 pub(super) fn resolve_checked_field_rvalue(
     body: &trust_types::VerifiableBody,
     local: usize,
@@ -503,6 +587,11 @@ pub(super) fn resolve_checked_field_rvalue(
         })?
     };
     let Rvalue::CheckedBinaryOp(op, a, b) = rvalue else { return None };
+    // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — the shared licensing gate;
+    // see [`checked_pair_int_reading_licensed`] for the full soundness note.
+    if !checked_pair_int_reading_licensed(body, local, *op) {
+        return None; // an unasserted checked pair — `.0` wraps; decline the Int reading.
+    }
     // Trust: W6 increment-3 (CAPTURING closures, 2026-07-18) —
     // resolve each operand through [`resolve_cast_source_operand`]
     // (bare leaf FIRST, then a struct-FIELD read, then ONE level of
@@ -629,7 +718,15 @@ pub(super) fn arm_value_rvalue_for(
                 resolve_index_operand(body, idx_local, arm.id, Some(use_statement), param_index)?;
             Some(SemRvalue::Use(SemOperand::Index(Box::new(slice), Box::new(idx))))
         }
-        // Direct modeled `Use`/`BinaryOp`/`CheckedBinaryOp` (field 0 grounds like BinaryOp).
+        // Trust: WRAP-vs-INT, RETURN LANE (2026-08-15) — an arm writing the
+        // convergence local from a bare `CheckedBinaryOp` is the WHOLE-PAIR value
+        // (the guarded twin of `overflowing_add`'s direct return): the old
+        // catch-all delegated it to the conflated lift arm, which modeled the
+        // pair as the bare scalar unbounded `Int.<op>` — flag erased, wrap
+        // ignored. Decline; a checked-arith GUARDED arm joins only when an
+        // assert-spine-aware arm resolution exists.
+        Rvalue::CheckedBinaryOp(..) => None,
+        // Direct modeled `Use`/`BinaryOp` (the checked form is declined above).
         _ => sem_rvalue_of_mir_at_site(body, rv, param_index, Some((arm.id, Some(use_statement)))),
     }
 }
@@ -715,9 +812,10 @@ pub(super) fn goto_chase(
 /// writer discipline, [`sem_call_return_of_mir`]'s steps 5/12, RE-RUN here
 /// per-arm), with NOTHING ELSE in `blk` writing `join_local`, resolving to a
 /// certified callee (steps 6/7) with a matching arity and every actual arg a
-/// modeled scalar operand (steps 8/9). No dest-type / whole-function return-spine
-/// checks here — those are the CALLER's job via the shared `join_local` recovery
-/// and the merged join-landing check in [`sem_nested_branch_of_mir`]. Returns
+/// modeled scalar operand (steps 8/9). The call destination type is checked
+/// here against the certified callee's return type; whole-function return-spine
+/// checks remain the CALLER's job via the shared `join_local` recovery and the
+/// merged join-landing check in [`sem_nested_branch_of_mir`]. Returns
 /// `(SemCallReturn, live_target)` — the caller still verifies `live_target`
 /// reaches the tree's shared join via a Goto-only, sole-writer-respecting path
 /// ([`goto_chase`]).
@@ -756,7 +854,7 @@ pub(super) fn sem_call_arm_of_mir(
     if resolved == func.def_path || *callee_str == func.def_path {
         return None; // self-recursion fails closed.
     }
-    if fact.arg_count != args.len() || args.is_empty() {
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) || args.is_empty() {
         return None; // arity + at-least-one-arg.
     }
     let mut sem_args = Vec::with_capacity(args.len());
@@ -816,6 +914,60 @@ pub(crate) fn unique_return_block(
 /// bare `_0 := Use(_t)` copy from a non-parameter temp. Other value statements
 /// in the join are deliberately rejected: in particular, `_t := forged; _0 :=
 /// Use(_t); Return` must not inherit the arm value that the recognizer modeled.
+/// Trust (#49): a Return block `_0 := BitOr(Move(a), Move(b))` — the boolean
+/// join the OR-chain lane is built on. `BitAnd`, an arithmetic op, a non-move
+/// operand, a projected place, a parameter or `_0` operand, equal operands, a
+/// second assignment, or any other rvalue all decline; each has a mutation in
+/// `tests/bitor_join_forgery_corpus.rs`.
+pub(super) fn guarded_return_bitor_join(
+    body: &trust_types::VerifiableBody,
+    ret: &trust_types::BasicBlock,
+) -> Option<(usize, usize)> {
+    use trust_types::{BinOp, Operand, Rvalue, Statement};
+    let mut join = None;
+    for statement in &ret.stmts {
+        match statement {
+            Statement::Assign { place, rvalue, .. } => {
+                if join.is_some() || place.local != 0 || !place.projections.is_empty() {
+                    return None;
+                }
+                let Rvalue::BinaryOp(BinOp::BitOr, a, b) = rvalue else { return None };
+                let (Operand::Copy(pa) | Operand::Move(pa)) = a else { return None };
+                let (Operand::Copy(pb) | Operand::Move(pb)) = b else { return None };
+                for p in [pa, pb] {
+                    if !p.projections.is_empty()
+                        || p.local == 0
+                        || (1..=body.arg_count).contains(&p.local)
+                        || body.locals.get(p.local).is_none()
+                    {
+                        return None;
+                    }
+                }
+                if pa.local == pb.local {
+                    return None;
+                }
+                join = Some((pa.local, pb.local));
+            }
+            Statement::StorageLive(_) | Statement::StorageDead(_)
+            | Statement::PlaceMention(_) | Statement::Retag { .. }
+            | Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => {}
+            _ => return None,
+        }
+    }
+    join
+}
+
+/// Trust (#49): a BOOLEAN LITERAL arm value. The OR substitution is sound
+/// exactly because `a | b` on bools is `if a then true else b`; a non-literal
+/// arm has no such rewriting.
+pub(super) fn sem_bool_literal_of_rvalue(rv: &SemRvalue) -> Option<bool> {
+    match rv {
+        SemRvalue::Use(SemOperand::Const(0)) => Some(false),
+        SemRvalue::Use(SemOperand::Const(1)) => Some(true),
+        _ => None,
+    }
+}
+
 pub(super) fn guarded_return_join_local(
     body: &trust_types::VerifiableBody,
     ret: &trust_types::BasicBlock,
@@ -1888,3 +2040,907 @@ pub(super) fn sem_cf_return_of_mir(
 
     Some(SemCfReturn { cond, then_rv, else_rv })
 }
+
+// ---------------------------------------------------------------------------
+// Trust (#49): the OR-CHAIN lane.
+//
+// `is_ascii_hexdigit` is `is_ascii_digit() | matches!(*self, b'A'..=b'F' | b'a'..=b'f')`,
+// and that `|` survives to MIR as a LEFT-NESTED OR SPINE over a CHAIN of
+// regions. Measured, all six BitOr rows in the ascii corpus share one shape:
+//
+//   bb0 .. bb3   region 1 -> value _3, arms bb1/bb2, join bb4
+//   bb4 .. bb7   region 2 -> value _6, arms bb5/bb6, join bb8
+//   bb8          `_2 := BitOr(_3, _6)` — statement 0 of region 2's join, which
+//                is also region 3's entry
+//   bb9 .. bb11  region 3 -> value _9, arms bb9/bb10, join bb12
+//   bb12         `_0 := BitOr(_2, _9); Return`
+//
+// So the spine is `((v1 | v2) | v3)`, every combiner sits at the head of the
+// next region's entry block, and every arm leaf is a literal bool.
+//
+// WHY A SEPARATE LANE. The pre-existing recognizer is built on "one value, one
+// join" — 65 mapped sites assume it. Editing it in place is how three earlier
+// attempts failed. This lane walks the SAME real blocks with per-region bounds
+// and never touches `sem_nested_branch_of_mir`, so the legacy path stays
+// byte-identical by construction rather than by inspection.
+//
+// SOUNDNESS. For booleans `a | b` IS `if a then true else b`, so OR-ing two
+// trees whose leaves are boolean literals is a SUBSTITUTION: the left tree with
+// every `Leaf(false)` replaced by the right tree. Every premise of that
+// rewriting is a gate below, and each has a mutation in
+// `tests/bitor_join_forgery_corpus.rs`.
+//
+// It also does NOT synthesise sub-bodies. A tempting shortcut is to build a
+// small `VerifiableBody` per region and reuse the existing recognizer; that is
+// unsound, because the kernel would then certify a body that does not exist and
+// the bridge to the real function is an undischarged obligation. The walk below
+// reads the real blocks.
+
+/// One region of the OR chain: where it starts, where it converges, and the
+/// local it settles.
+#[derive(Debug, Clone)]
+pub(super) struct OrRegion {
+    entry: trust_types::BlockId,
+    join: trust_types::BlockId,
+    value_local: usize,
+    arms: Vec<trust_types::BlockId>,
+}
+
+/// The left-nested OR spine rooted at `_0`, as `[v1, v2, .., vn]`.
+///
+/// Walks top-down: `_0 := BitOr(c, vn)` where `c` is itself single-written by a
+/// `BitOr` is an internal node, so recurse LEFT; a local with two or more writes
+/// is a region value and terminates the spine. Declines right-nesting, `BitAnd`,
+/// projections, `_0`/parameter operands, and any combiner written more than once.
+pub(super) fn guarded_return_or_spine(
+    body: &trust_types::VerifiableBody,
+    ret: &trust_types::BasicBlock,
+) -> Option<Vec<usize>> {
+    let (mut left, right) = guarded_return_bitor_join(body, ret)?;
+    let mut values = vec![right];
+    for _ in 0..=body.blocks.len() {
+        let writes: Vec<&trust_types::Rvalue> = body
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .filter_map(|s| match s {
+                trust_types::Statement::Assign { place, rvalue, .. }
+                    if place.local == left && place.projections.is_empty() =>
+                {
+                    Some(rvalue)
+                }
+                _ => None,
+            })
+            .collect();
+        match writes.as_slice() {
+            // An internal spine node: exactly one write, and it is a BitOr.
+            [trust_types::Rvalue::BinaryOp(trust_types::BinOp::BitOr, a, b)] => {
+                let (trust_types::Operand::Copy(pa) | trust_types::Operand::Move(pa)) = a else {
+                    return None;
+                };
+                let (trust_types::Operand::Copy(pb) | trust_types::Operand::Move(pb)) = b else {
+                    return None;
+                };
+                for p in [pa, pb] {
+                    if !p.projections.is_empty()
+                        || p.local == 0
+                        || (1..=body.arg_count).contains(&p.local)
+                    {
+                        return None;
+                    }
+                }
+                if pa.local == pb.local || values.contains(&pb.local) {
+                    return None;
+                }
+                values.push(pb.local);
+                left = pa.local;
+            }
+            // A region value: two or more writes (the arms). Spine ends here.
+            _ if writes.len() >= 2 => {
+                if values.contains(&left) {
+                    return None;
+                }
+                values.push(left);
+                values.reverse(); // collected right-to-left
+                return (values.len() >= 2).then_some(values);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Derive one region per spine value: its arms, its join, and its entry.
+///
+/// Every arm of `v_k` must `Goto` the SAME block (that is `v_k`'s join), the
+/// first region starts at the body entry, and each subsequent region starts at
+/// the previous region's join — which is exactly where the measured MIR puts the
+/// combiner. The last region's join must be the Return block.
+pub(super) fn or_chain_regions(
+    body: &trust_types::VerifiableBody,
+    ret: &trust_types::BasicBlock,
+    values: &[usize],
+) -> Option<Vec<OrRegion>> {
+    use trust_types::{Statement, Terminator};
+    let mut regions: Vec<OrRegion> = Vec::with_capacity(values.len());
+    let mut entry = trust_types::BlockId(0);
+    for (index, value_local) in values.iter().copied().enumerate() {
+        let arms: Vec<&trust_types::BasicBlock> = body
+            .blocks
+            .iter()
+            .filter(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(s, Statement::Assign { place, .. }
+                        if place.local == value_local && place.projections.is_empty())
+                })
+            })
+            .collect();
+        if arms.len() < 2 {
+            return None;
+        }
+        let mut join: Option<trust_types::BlockId> = None;
+        for arm in &arms {
+            let Terminator::Goto(target) = arm.terminator else { return None };
+            match join {
+                None => join = Some(target),
+                Some(existing) if existing == target => {}
+                Some(_) => return None, // arms of one region disagree — decline.
+            }
+        }
+        let join = join?;
+        // Whole-body: the value is written by its arms and nowhere else.
+        if !local_has_only_guarded_writes(body, value_local, arms.len(), 0) {
+            return None;
+        }
+        let is_last = index + 1 == values.len();
+        if is_last != (join == ret.id) {
+            return None; // only the last region may converge on the Return.
+        }
+        regions.push(OrRegion {
+            entry,
+            join,
+            value_local,
+            arms: arms.iter().map(|b| b.id).collect(),
+        });
+        entry = join; // the next region begins where this one converged.
+    }
+    Some(regions)
+}
+
+/// `a | b` on booleans is `if a then true else b`, so OR-ing two literal-leaved
+/// trees is a substitution. Anything that is not a boolean-literal leaf declines
+/// — the rewriting has no meaning there.
+pub(super) fn sem_or_substitute(
+    left: &SemBranchTree,
+    right: &SemBranchTree,
+    fuel: usize,
+) -> Option<SemBranchTree> {
+    if fuel == 0 {
+        return None;
+    }
+    match left {
+        SemBranchTree::Leaf(rv) => match sem_bool_literal_of_rvalue(rv) {
+            Some(true) => Some(left.clone()),
+            Some(false) => Some(right.clone()),
+            None => None,
+        },
+        SemBranchTree::CallLeaf(_) => None,
+        SemBranchTree::Node(cond, then_, else_) => Some(SemBranchTree::Node(
+            cond.clone(),
+            Box::new(sem_or_substitute(then_, right, fuel - 1)?),
+            Box::new(sem_or_substitute(else_, right, fuel - 1)?),
+        )),
+    }
+}
+
+/// Trust (#53): the SHORT-CIRCUIT arm condition — `_v := Ne(<bool temp>, false)`,
+/// which is how MIR spells the second conjunct of a short-circuit `&&` landing on
+/// a convergence local.
+///
+/// `Ne(b, false)` on a `Ty::Bool` operand is the IDENTITY on the 0/1 carrier, so
+/// the arm's value IS the inner condition, read out of that temp's REAL defining
+/// comparison. Nothing is invented — this is a lift, not a synthesis.
+///
+/// WHY NOT `switch_leaf`. The region walk's own resolver is
+/// `dominating_switch_discriminant_rvalue`, which COUNTS `SwitchInt` uses of the
+/// local and declines when there are none. The inner temp here is consumed by a
+/// `Ne`, never by a switch, so that resolver returns `None` — measured, not
+/// assumed. This uses [`unique_local_definition_dominating`] against the ARM's
+/// real use site instead, which is the same dominance discipline every other
+/// temp-chase in this file applies.
+///
+/// FAIL-CLOSED on every departure, and the Bool gate is the one that matters:
+/// `x != 0` on an INTEGER operand is a GENUINE comparison, not a bool
+/// normalization, and collapsing it to "x is true" would be a mis-lift neither
+/// the kernel nor a self-relating refinement could catch. A non-`Ne` op, a
+/// non-false right operand, a projected or non-`Bool` left operand, a
+/// multiply-assigned or non-dominating inner temp, a non-comparison inner rvalue,
+/// and an unresolvable inner operand all decline.
+fn or_arm_short_circuit_condition(
+    body: &trust_types::VerifiableBody,
+    arm: &trust_types::BasicBlock,
+    value_local: usize,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<SemCond> {
+    use trust_types::{BinOp, ConstValue, Operand, Rvalue, Ty};
+    // The arm's LAST assignment to the convergence local is the value it settles,
+    // matching `arm_value_rvalue_for`'s own selection, and its index is the USE
+    // SITE the inner temp must be resolved against.
+    let (use_statement, rv) =
+        arm.stmts.iter().enumerate().rev().find_map(|(statement_index, statement)| {
+            crate::assignment_types::assigned_local_rvalue(body, statement, value_local)
+                .map(|rvalue| (statement_index, rvalue))
+        })?;
+    let Rvalue::BinaryOp(outer_op, a, b) = rv else { return None };
+    // THE BOOL-NORMALIZATION FORM, tried first: `Ne(<bool temp>, false)`, which is
+    // the identity on the 0/1 carrier, so the value IS the inner comparison.
+    let normalized = matches!(outer_op, BinOp::Ne)
+        && matches!(
+            b,
+            Operand::Constant(ConstValue::Bool(false))
+                | Operand::Constant(ConstValue::Int(0))
+                | Operand::Constant(ConstValue::Uint(0, _))
+        )
+        && matches!(a, Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty()
+            && matches!(body.locals.get(p.local).map(|l| &l.ty), Some(Ty::Bool)));
+    let (definition_block, definition_statement, cmp_op, ca, cb) = if normalized {
+        // THE gate: this branch is reachable ONLY when the left operand is
+        // `Ty::Bool`. An integer `x != 0` is a GENUINE comparison and falls to the
+        // direct arm below, where it stays one.
+        let (Operand::Copy(p) | Operand::Move(p)) = a else { return None };
+        let (definition_block, definition_statement, inner) =
+            unique_local_definition_dominating(body, p.local, arm.id, Some(use_statement))?;
+        let Rvalue::BinaryOp(cmp_op, ca, cb) = inner else { return None };
+        (definition_block, definition_statement, cmp_op, ca, cb)
+    } else {
+        // THE DIRECT FORM: the arm settles the flag with the comparison itself
+        // (`_6 := Le(_2, 90)`), which is how a short-circuit `&&`'s SECOND
+        // conjunct lands when nothing normalizes it. Resolved at the ARM's own
+        // use site.
+        (arm.id, use_statement, outer_op, a, b)
+    };
+    // Same `SemCond` construction as the region walk's `switch_leaf` BinaryOp arm;
+    // only the RESOLVER differs, for the reason in the doc above.
+    Some(SemCond {
+        op: sem_cmpop_of_mir(cmp_op)?,
+        a: sem_guard_operand_of_mir(
+            body,
+            ca,
+            param_index,
+            Some((definition_block, Some(definition_statement))),
+        )?,
+        b: sem_guard_operand_of_mir(
+            body,
+            cb,
+            param_index,
+            Some((definition_block, Some(definition_statement))),
+        )?,
+    })
+}
+
+/// Build the branch tree for ONE region, walking the REAL blocks between its
+/// entry and its join. Never synthesises a body — see the lane's header for why
+/// that shortcut is unsound.
+fn sem_or_region_tree(
+    body: &trust_types::VerifiableBody,
+    region: &OrRegion,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+    switch_leaf: &dyn Fn(&trust_types::Operand, u128) -> Option<SemCond>,
+    start: trust_types::BlockId,
+    fuel: usize,
+) -> Option<SemBranchTree> {
+    use trust_types::Terminator;
+    if fuel == 0 {
+        return None;
+    }
+    let mut cur = start;
+    for _ in 0..=body.blocks.len() {
+        // The region's join is its ONLY exit; reaching it means this path never
+        // settled the value, which is not a shape this lane models.
+        if cur == region.join {
+            return None;
+        }
+        if region.arms.contains(&cur) {
+            let arm = body.blocks.iter().find(|b| b.id == cur)?;
+            // Trust (#53, 2026-08-14) — SHORT-CIRCUIT ARM. Tried BEFORE the literal
+            // path below, because an arm carrying a second conjunct is not a literal
+            // and would otherwise decline the whole body.
+            //
+            // `is_ascii_hexdigit`'s arms assign `true`/`false`, which is why it
+            // certifies. `is_ascii_punctuation`'s regions are each a short-circuit
+            // `&&`, so the taken arm carries the range's SECOND half:
+            //
+            //   bb1  _4 := false          // literal — the existing path
+            //   bb2  _6 := Le(c, 47)
+            //        _4 := Ne(_6, 0)      // NOT a literal — this path
+            //
+            // The lift is `if <inner> { true } else { false }`, which keeps the
+            // literal leaves the OR substitution rewrites on, so `sem_or_substitute`
+            // is untouched. Reading the inner condition out of the REAL defining
+            // comparison is a lift, not a synthesis: nothing is invented, the arm's
+            // own `_6` is resolved.
+            if let Some(cond) =
+                or_arm_short_circuit_condition(body, arm, region.value_local, param_index)
+            {
+                return Some(SemBranchTree::Node(
+                    SemCondTree::Leaf(cond),
+                    Box::new(SemBranchTree::Leaf(SemRvalue::Use(SemOperand::Const(1)))),
+                    Box::new(SemBranchTree::Leaf(SemRvalue::Use(SemOperand::Const(0)))),
+                ));
+            }
+            let rv = arm_value_rvalue_for(body, arm, region.value_local, param_index)?;
+            // Every leaf of every region must be a boolean literal: that is the
+            // premise the OR substitution rewrites on.
+            sem_bool_literal_of_rvalue(&rv)?;
+            return Some(SemBranchTree::Leaf(rv));
+        }
+        let block = body.blocks.iter().find(|b| b.id == cur)?;
+        match &block.terminator {
+            Terminator::Goto(t) => cur = *t,
+            Terminator::Assert { target, .. } => cur = *target,
+            Terminator::SwitchInt { discr, targets, otherwise, .. } => {
+                let [(zero_val, false_target)] = targets.as_slice() else { return None };
+                if *zero_val != 0 {
+                    return None;
+                }
+                let leaf = switch_leaf(discr, 0)?;
+                let then_tree = sem_or_region_tree(
+                    body, region, param_index, switch_leaf, *otherwise, fuel - 1,
+                )?;
+                let else_tree = sem_or_region_tree(
+                    body, region, param_index, switch_leaf, *false_target, fuel - 1,
+                )?;
+                return Some(SemBranchTree::Node(
+                    SemCondTree::Leaf(leaf),
+                    Box::new(then_tree),
+                    Box::new(else_tree),
+                ));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Trust (#49): the OR-CHAIN recognizer. Returns the folded tree for a body
+/// whose Return block is a left-nested OR spine over a chain of regions.
+///
+/// Fail-closed at every step, and each gate has a mutation in the forgery
+/// battery: the spine must be left-nested `BitOr` over distinct non-parameter
+/// temps; every region must have at least two arms converging on one join; each
+/// region's value must be written only by its arms; only the last region may
+/// converge on the Return; every leaf must be a boolean literal; and each
+/// region must contain at least one decision (a region that is a bare leaf is
+/// not a guarded return).
+pub(super) fn sem_or_chain_of_mir(
+    func: &trust_types::VerifiableFunction,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<SemBranchTree> {
+    use trust_types::{Operand, Rvalue};
+    trust_vcgen::validate_function(func).ok()?;
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return None;
+    }
+    let ret_block = unique_return_block(body)?;
+    let values = guarded_return_or_spine(body, ret_block)?;
+    let regions = or_chain_regions(body, ret_block, &values)?;
+
+    let switch_leaf = |discr: &Operand, tag: u128| -> Option<SemCond> {
+        or_switch_cond(body, param_index, discr, tag)
+    };
+
+    let mut folded: Option<SemBranchTree> = None;
+    for region in &regions {
+        let tree = sem_or_region_tree(
+            body, region, param_index, &switch_leaf, region.entry, body.blocks.len() + 1,
+        )?;
+        // A region with no decision is not a guarded return — same rule the
+        // single-join lane applies to the whole body, applied per region.
+        if matches!(tree, SemBranchTree::Leaf(_)) {
+            return None;
+        }
+        folded = Some(match folded {
+            None => tree,
+            // Fold in the MIR's own left-nested association. The node cap keeps
+            // the multiplicative substitution bounded.
+            Some(acc) => sem_or_substitute(&acc, &tree, 512)?,
+        });
+    }
+    folded
+}
+
+
+
+/// Trust (#53): the OR-chain region walk's switch-discriminant resolver, factored
+/// out of `sem_or_chain_of_mir`'s closure so the bool-join lane below shares ONE
+/// definition rather than a transcription of it.
+fn or_switch_cond(
+    body: &trust_types::VerifiableBody,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+    discr: &trust_types::Operand,
+    tag: u128,
+) -> Option<SemCond> {
+    use trust_types::{Operand, Rvalue};
+    let (Operand::Copy(dp) | Operand::Move(dp)) = discr else { return None };
+    if !dp.projections.is_empty() {
+        return None;
+    }
+    let (definition_block, definition_statement, cmp_rvalue) =
+        dominating_switch_discriminant_rvalue(body, dp.local)?;
+    match cmp_rvalue {
+        Rvalue::BinaryOp(cmp_op, ca, cb) => Some(SemCond {
+            op: sem_cmpop_of_mir(cmp_op)?,
+            a: sem_guard_operand_of_mir(
+                body,
+                ca,
+                param_index,
+                Some((definition_block, Some(definition_statement))),
+            )?,
+            b: sem_guard_operand_of_mir(
+                body,
+                cb,
+                param_index,
+                Some((definition_block, Some(definition_statement))),
+            )?,
+        }),
+        _ => {
+            let _ = tag;
+            None
+        }
+    }
+}
+
+/// The recognized tail of a BOOL-JOIN body: `_a := Cast(_j, uN)`,
+/// `_b := Mul(_a, K)`, `_0 := op(v, _b)`.
+struct BoolJoinTail {
+    /// The Bool convergence local the arms settle.
+    join_local: usize,
+    /// The scalar operand the final op combines with the scaled flag.
+    value: SemOperand,
+    /// The final binary op (`BitOr` for `to_ascii_lowercase`, `BitXor` for
+    /// `to_ascii_uppercase`).
+    op: SemBinOp,
+    /// The multiplier `K`.
+    scale: i128,
+}
+
+/// Trust (#53, 2026-08-14) — the BRANCHLESS ASCII CASE-CONVERSION tail.
+///
+/// `to_ascii_lowercase` / `to_ascii_uppercase` lower to a bool convergence temp
+/// scaled into a mask:
+///
+/// ```text
+/// bb0  _2 := (*_1); _5 := Le(65, _2); SwitchInt -> bb2 / bb3
+/// bb2  _6 := false                       -> bb1
+/// bb3  _6 := Le(_2, 90)                  -> bb1
+/// bb1  _4 := Cast(_6, u8); _3 := Mul(_4, 32); _0 := BitOr(_2, _3); Return
+/// ```
+///
+/// i.e. `c | ((65 <= c <= 90) as u8) * 32`. Recognizes exactly that tail and
+/// returns its parts; the caller lifts the branch and folds the tail per arm.
+///
+/// FAIL-CLOSED: the three statements must be adjacent in the return block in this
+/// order, the cast source must be a BOOL local (a cast of an integer is a real
+/// conversion, not a flag widening), the cast destination an UNSIGNED int (a
+/// signed one would make the 0/1 story a sign question), the multiplier a
+/// non-negative literal, and the final op one of the two mask combinators
+/// actually observed. Anything else declines.
+fn bool_join_tail_of_return(
+    body: &trust_types::VerifiableBody,
+    ret: &trust_types::BasicBlock,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<BoolJoinTail> {
+    use trust_types::{BinOp, ConstValue, Operand, Rvalue, Statement, Ty};
+
+    // Collect the return block's assignments in order, ignoring storage markers.
+    let mut assigns: Vec<(usize, usize, &Rvalue)> = Vec::new();
+    for (statement_index, statement) in ret.stmts.iter().enumerate() {
+        match statement {
+            Statement::Assign { place, rvalue, .. } => {
+                if !place.projections.is_empty() {
+                    return None;
+                }
+                assigns.push((statement_index, place.local, rvalue));
+            }
+            Statement::StorageLive(_) | Statement::StorageDead(_) => {}
+            _ => return None,
+        }
+    }
+    let [(_, cast_local, cast_rv), (_, mul_local, mul_rv), (ret_index, ret_local, ret_rv)] =
+        assigns.as_slice()
+    else {
+        return None;
+    };
+    if *ret_local != 0 {
+        return None;
+    }
+
+    // `_a := Cast(_j, uN)` — the flag widened to the value's carrier.
+    let Rvalue::Cast(cast_src, cast_ty) = cast_rv else { return None };
+    let Ty::Int { signed: false, .. } = cast_ty else { return None };
+    let (Operand::Copy(jp) | Operand::Move(jp)) = cast_src else { return None };
+    if !jp.projections.is_empty() {
+        return None;
+    }
+    if !matches!(body.locals.get(jp.local).map(|l| &l.ty), Some(Ty::Bool)) {
+        return None; // a cast of an INTEGER is a conversion, not a flag widening.
+    }
+
+    // `_b := Mul(_a, K)` — the flag scaled to the mask.
+    let Rvalue::BinaryOp(BinOp::Mul, ma, mb) = mul_rv else { return None };
+    let (Operand::Copy(mp) | Operand::Move(mp)) = ma else { return None };
+    if mp.local != *cast_local || !mp.projections.is_empty() {
+        return None;
+    }
+    let scale = match mb {
+        Operand::Constant(ConstValue::Uint(k, _)) => i128::try_from(*k).ok()?,
+        Operand::Constant(ConstValue::Int(k)) if *k >= 0 => *k,
+        _ => return None,
+    };
+
+    // `_0 := op(v, _b)` — the mask applied.
+    let Rvalue::BinaryOp(bop, va, vb) = ret_rv else { return None };
+    let op = match bop {
+        BinOp::BitOr => SemBinOp::BitOr,
+        BinOp::BitXor => SemBinOp::BitXor,
+        _ => return None, // only the two mask combinators actually observed.
+    };
+    let (Operand::Copy(bp) | Operand::Move(bp)) = vb else { return None };
+    if bp.local != *mul_local || !bp.projections.is_empty() {
+        return None;
+    }
+    // `sem_guard_operand_of_mir`, NOT `sem_operand_of_mir`: the combined value is
+    // typically a TEMP holding the deref'd reference parameter (`_2 := (*_1)`),
+    // which the bare parameter resolver declines. The guard resolver is the one
+    // every other temp-chase in this file uses, and it is given the REAL use site
+    // so its dominance check is exact.
+    let value =
+        sem_guard_operand_of_mir(body, va, param_index, Some((ret.id, Some(*ret_index))))?;
+
+    Some(BoolJoinTail { join_local: jp.local, value, op, scale })
+}
+
+/// Trust (#53): the BOOL-JOIN lane — a short-circuit `&&` settling a Bool
+/// convergence temp that then feeds a deterministic tail.
+///
+/// The branch itself is lifted by the EXISTING [`sem_or_region_tree`], which
+/// already yields `Leaf(Const 0/1)` for exactly this arm shape (including the
+/// short-circuit arms landed alongside this). Only the LEAVES are then rewritten:
+/// the arm's known flag value is substituted into the shared tail and folded,
+/// `Cast(true, uN) = 1` so `Mul(1, K) = K`, and `Cast(false, uN) = 0` so
+/// `Mul(0, K) = 0`.
+///
+/// **This is lifting, not synthesis.** Nothing is invented: the tail is read from
+/// the body, it is SHARED by both arms, and each leaf is that same tail evaluated
+/// at the arm's own settled value. It is the discipline the #49 or-chain lane
+/// already uses when it substitutes a tree into a `Leaf(false)` position.
+pub(super) fn sem_bool_join_tail_of_mir(
+    func: &trust_types::VerifiableFunction,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<SemBranchTree> {
+    use trust_types::{Operand, Statement, Terminator};
+    trust_vcgen::validate_function(func).ok()?;
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return None;
+    }
+    let ret = unique_return_block(body)?;
+    let tail = bool_join_tail_of_return(body, ret, param_index)?;
+
+    // The arms: every block that jumps straight to the return block and settles
+    // the join local. At least two, or there is no decision to lift.
+    let mut arms: Vec<trust_types::BlockId> = Vec::new();
+    for block in &body.blocks {
+        if !matches!(&block.terminator, Terminator::Goto(t) if *t == ret.id) {
+            continue;
+        }
+        let settles = block.stmts.iter().any(|statement| {
+            matches!(statement, Statement::Assign { place, .. }
+                if place.local == tail.join_local && place.projections.is_empty())
+        });
+        if settles {
+            arms.push(block.id);
+        }
+    }
+    if arms.len() < 2 {
+        return None;
+    }
+
+    let region = OrRegion {
+        entry: trust_types::BlockId(0),
+        join: ret.id,
+        value_local: tail.join_local,
+        arms,
+    };
+    let switch_leaf =
+        |discr: &Operand, tag: u128| -> Option<SemCond> { or_switch_cond(body, param_index, discr, tag) };
+    let flag_tree = sem_or_region_tree(
+        body,
+        &region,
+        param_index,
+        &switch_leaf,
+        region.entry,
+        body.blocks.len() + 1,
+    )?;
+    if matches!(flag_tree, SemBranchTree::Leaf(_)) {
+        return None; // no decision — not a guarded shape.
+    }
+    bool_join_fold_leaves(&flag_tree, &tail, body.blocks.len() + 1)
+}
+
+/// Rewrite each `Leaf(Const 0/1)` of the flag tree into the tail evaluated at that
+/// flag value. Declines on any leaf that is not a boolean literal, so a tree the
+/// region walk built for some other shape can never be silently reinterpreted.
+fn bool_join_fold_leaves(
+    tree: &SemBranchTree,
+    tail: &BoolJoinTail,
+    fuel: usize,
+) -> Option<SemBranchTree> {
+    if fuel == 0 {
+        return None;
+    }
+    match tree {
+        SemBranchTree::Leaf(rv) => {
+            let flag = sem_bool_literal_of_rvalue(rv)?;
+            // Cast(flag, uN) is 1 or 0, so Mul(_, K) is K or 0.
+            let masked = if flag { tail.scale } else { 0 };
+            Some(SemBranchTree::Leaf(SemRvalue::Bin(
+                tail.op,
+                tail.value.clone(),
+                SemOperand::Const(masked),
+            )))
+        }
+        SemBranchTree::Node(cond, then_, else_) => Some(SemBranchTree::Node(
+            cond.clone(),
+            Box::new(bool_join_fold_leaves(then_, tail, fuel - 1)?),
+            Box::new(bool_join_fold_leaves(else_, tail, fuel - 1)?),
+        )),
+        SemBranchTree::CallLeaf(_) => None,
+    }
+}
+
+
+
+/// Trust (#53, 2026-08-15): a fold tail at a given position — the generalization
+/// of [`bool_join_tail_of_return`] that does NOT require the fold to write `_0`.
+///
+/// Returns the tail plus the local it writes, so a CHAIN of folds can be walked:
+/// `eq_ignore_ascii_case` folds once into an intermediate `_3` and again into
+/// `_4` before comparing the two.
+fn bool_join_fold_at(
+    body: &trust_types::VerifiableBody,
+    block_id: trust_types::BlockId,
+    assigns: &[(usize, usize, &trust_types::Rvalue)],
+    start: usize,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<(BoolJoinTail, usize)> {
+    use trust_types::{BinOp, ConstValue, Operand, Rvalue, Ty};
+    let [(_, cast_local, cast_rv), (_, mul_local, mul_rv), (fold_index, fold_local, fold_rv)] =
+        assigns.get(start..start + 3)?
+    else {
+        return None;
+    };
+    let Rvalue::Cast(cast_src, cast_ty) = cast_rv else { return None };
+    let Ty::Int { signed: false, .. } = cast_ty else { return None };
+    let (Operand::Copy(jp) | Operand::Move(jp)) = cast_src else { return None };
+    if !jp.projections.is_empty()
+        || !matches!(body.locals.get(jp.local).map(|l| &l.ty), Some(Ty::Bool))
+    {
+        return None;
+    }
+    let Rvalue::BinaryOp(BinOp::Mul, ma, mb) = mul_rv else { return None };
+    let (Operand::Copy(mp) | Operand::Move(mp)) = ma else { return None };
+    if mp.local != *cast_local || !mp.projections.is_empty() {
+        return None;
+    }
+    let scale = match mb {
+        Operand::Constant(ConstValue::Uint(k, _)) => i128::try_from(*k).ok()?,
+        Operand::Constant(ConstValue::Int(k)) if *k >= 0 => *k,
+        _ => return None,
+    };
+    let Rvalue::BinaryOp(bop, va, vb) = fold_rv else { return None };
+    let op = match bop {
+        BinOp::BitOr => SemBinOp::BitOr,
+        BinOp::BitXor => SemBinOp::BitXor,
+        _ => return None,
+    };
+    let (Operand::Copy(bp) | Operand::Move(bp)) = vb else { return None };
+    if bp.local != *mul_local || !bp.projections.is_empty() {
+        return None;
+    }
+    let value =
+        sem_guard_operand_of_mir(body, va, param_index, Some((block_id, Some(*fold_index))))?;
+    Some((BoolJoinTail { join_local: jp.local, value, op, scale }, *fold_local))
+}
+
+/// Collect a block's assignments as `(statement_index, local, rvalue)`, declining
+/// on any statement that is neither an assignment nor a storage marker.
+fn block_assignments(
+    block: &trust_types::BasicBlock,
+) -> Option<Vec<(usize, usize, &trust_types::Rvalue)>> {
+    use trust_types::Statement;
+    let mut out = Vec::new();
+    for (index, statement) in block.stmts.iter().enumerate() {
+        match statement {
+            Statement::Assign { place, rvalue, .. } => {
+                if !place.projections.is_empty() {
+                    return None;
+                }
+                out.push((index, place.local, rvalue));
+            }
+            Statement::StorageLive(_) | Statement::StorageDead(_) => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Trust (#53): the BOOL-JOIN CHAIN — two folds compared, `eq_ignore_ascii_case`.
+///
+/// ```text
+/// bb0  _5 := (*_1); _8 := Le(65,_5)              SwitchInt -> bb2 / bb3
+/// bb2  _9 := false            bb3  _9 := Le(_5,90)          -> bb1
+/// bb1  <FOLD 1 -> _3>;  _10 := (*_2); _13 := Le(65,_10)     SwitchInt -> bb5 / bb6
+/// bb5  _14 := false           bb6  _14 := Le(_10,90)        -> bb4
+/// bb4  <FOLD 2 -> _4>;  _0 := Eq(_3, _4)                    Return
+/// ```
+///
+/// Both regions are lifted by the EXISTING [`sem_or_region_tree`] and folded by
+/// the EXISTING [`bool_join_fold_leaves`]; this only COMPOSES them, pairing each
+/// leaf of region 1 with the whole of region 2's folded tree under the final
+/// comparison. That composition is the same substitution discipline
+/// [`sem_or_substitute`] already applies — no new walker, no synthesis.
+pub(super) fn sem_bool_join_chain_of_mir(
+    func: &trust_types::VerifiableFunction,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<SemBranchTree> {
+    use trust_types::{Operand, Rvalue, Statement, Terminator};
+    trust_vcgen::validate_function(func).ok()?;
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return None;
+    }
+    let ret = unique_return_block(body)?;
+    let ret_assigns = block_assignments(ret)?;
+    // The return block is FOLD 2 followed by the comparison of the two folds.
+    if ret_assigns.len() != 4 {
+        return None;
+    }
+    let (tail2, fold2_local) = bool_join_fold_at(body, ret.id, &ret_assigns, 0, param_index)?;
+    let (_, cmp_local, cmp_rv) = ret_assigns[3];
+    if cmp_local != 0 {
+        return None;
+    }
+    let Rvalue::BinaryOp(cmp_op, ca, cb) = cmp_rv else { return None };
+    let op = sem_cmpop_of_mir(cmp_op)?;
+    let (Operand::Copy(p1) | Operand::Move(p1)) = ca else { return None };
+    let (Operand::Copy(p2) | Operand::Move(p2)) = cb else { return None };
+    if !p1.projections.is_empty() || !p2.projections.is_empty() || p2.local != fold2_local {
+        return None;
+    }
+    let fold1_local = p1.local;
+
+    // Region 2's arms jump straight to the return block and settle its flag; its
+    // ENTRY is the block whose SwitchInt reaches them (that block also carries
+    // FOLD 1).
+    let arms2 = join_arms_for(body, ret.id, tail2.join_local);
+    if arms2.len() < 2 {
+        return None;
+    }
+    let entry2 = switch_entry_for(body, &arms2)?;
+    let entry2_assigns = block_assignments(body.blocks.iter().find(|b| b.id == entry2)?)?;
+    // FOLD 1 sits at the START of that block and must write the comparison's LHS.
+    let (tail1, fold1_written) = bool_join_fold_at(body, entry2, &entry2_assigns, 0, param_index)?;
+    if fold1_written != fold1_local {
+        return None;
+    }
+    let arms1 = join_arms_for(body, entry2, tail1.join_local);
+    if arms1.len() < 2 {
+        return None;
+    }
+
+    let region1 =
+        OrRegion { entry: trust_types::BlockId(0), join: entry2, value_local: tail1.join_local, arms: arms1 };
+    let region2 =
+        OrRegion { entry: entry2, join: ret.id, value_local: tail2.join_local, arms: arms2 };
+    let switch_leaf =
+        |discr: &Operand, tag: u128| -> Option<SemCond> { or_switch_cond(body, param_index, discr, tag) };
+    let fuel = body.blocks.len() + 1;
+    let tree1 = sem_or_region_tree(body, &region1, param_index, &switch_leaf, region1.entry, fuel)?;
+    let tree2 = sem_or_region_tree(body, &region2, param_index, &switch_leaf, region2.entry, fuel)?;
+    if matches!(tree1, SemBranchTree::Leaf(_)) || matches!(tree2, SemBranchTree::Leaf(_)) {
+        return None;
+    }
+    let folded1 = bool_join_fold_leaves(&tree1, &tail1, fuel)?;
+    let folded2 = bool_join_fold_leaves(&tree2, &tail2, fuel)?;
+    // Pair every leaf of region 1 with the WHOLE of region 2 under the comparison.
+    bool_join_pair_leaves(&folded1, &folded2, op, fuel)
+}
+
+/// Blocks that jump straight to `join` and settle `value_local`.
+fn join_arms_for(
+    body: &trust_types::VerifiableBody,
+    join: trust_types::BlockId,
+    value_local: usize,
+) -> Vec<trust_types::BlockId> {
+    use trust_types::{Statement, Terminator};
+    body.blocks
+        .iter()
+        .filter(|block| matches!(&block.terminator, Terminator::Goto(t) if *t == join))
+        .filter(|block| {
+            block.stmts.iter().any(|statement| {
+                matches!(statement, Statement::Assign { place, .. }
+                    if place.local == value_local && place.projections.is_empty())
+            })
+        })
+        .map(|block| block.id)
+        .collect()
+}
+
+/// The unique block whose `SwitchInt` reaches one of `arms` — the region's entry.
+fn switch_entry_for(
+    body: &trust_types::VerifiableBody,
+    arms: &[trust_types::BlockId],
+) -> Option<trust_types::BlockId> {
+    use trust_types::Terminator;
+    let mut found = None;
+    for block in &body.blocks {
+        let Terminator::SwitchInt { targets, otherwise, .. } = &block.terminator else { continue };
+        let reaches = targets.iter().any(|(_, t)| arms.contains(t)) || arms.contains(otherwise);
+        if reaches {
+            if found.is_some() {
+                return None; // ambiguous — fail closed.
+            }
+            found = Some(block.id);
+        }
+    }
+    found
+}
+
+/// Replace each leaf of `left` with `right`'s tree, comparing the two leaf values.
+fn bool_join_pair_leaves(
+    left: &SemBranchTree,
+    right: &SemBranchTree,
+    op: SemCmpOp,
+    fuel: usize,
+) -> Option<SemBranchTree> {
+    if fuel == 0 {
+        return None;
+    }
+    match left {
+        SemBranchTree::Leaf(lv) => bool_join_compare_leaves(right, lv, op, fuel - 1),
+        SemBranchTree::Node(cond, then_, else_) => Some(SemBranchTree::Node(
+            cond.clone(),
+            Box::new(bool_join_pair_leaves(then_, right, op, fuel - 1)?),
+            Box::new(bool_join_pair_leaves(else_, right, op, fuel - 1)?),
+        )),
+        SemBranchTree::CallLeaf(_) => None,
+    }
+}
+
+/// Rewrite each leaf of `right` into `Cmp(op, lv, <that leaf>)`.
+fn bool_join_compare_leaves(
+    right: &SemBranchTree,
+    lv: &SemRvalue,
+    op: SemCmpOp,
+    fuel: usize,
+) -> Option<SemBranchTree> {
+    if fuel == 0 {
+        return None;
+    }
+    match right {
+        SemBranchTree::Leaf(rv) => Some(SemBranchTree::Leaf(SemRvalue::Cmp(
+            op,
+            Box::new(lv.clone()),
+            Box::new(rv.clone()),
+        ))),
+        SemBranchTree::Node(cond, then_, else_) => Some(SemBranchTree::Node(
+            cond.clone(),
+            Box::new(bool_join_compare_leaves(then_, lv, op, fuel - 1)?),
+            Box::new(bool_join_compare_leaves(else_, lv, op, fuel - 1)?),
+        )),
+        SemBranchTree::CallLeaf(_) => None,
+    }
+}
+

@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "THE RECORDED RESULT of the native invariant check, EXHAUSTIVE over the whole",
+    "2^32 AArch64 encoding space. Rewritten only by `./run.sh --accept`.",
+    "",
+    "RE-DERIVE, DO NOT CITE. Everything needed to reproduce this is in this file:",
+    "the population is the entire space (no sampling, no seed), the cost is",
+    "`elapsed_s` below at `workers` workers, and `./run.sh` is the command.",
+    "A number that can only be quoted is a number that stops being true quietly.",
+    "",
+    "THE BASELINE IS ZERO AND MUST STAY ZERO. Each violation would be a word the",
+    "model accepts and the CPU refuses — a potential false Proven. `--accept` will",
+    "happily record a nonzero one; do not let it.",
+    "",
+    "THIS IS A FAULT-CLASS RESULT ONLY. It says the CPU RUNS every word the gate",
+    "admits. It does NOT say the CPU does what was certified — that is",
+    "../native-semantic, whose baseline is not zero.",
+    "",
+    "WHICH NUMBERS ARE EXACT. `scanned`, `candidates` and `violations` are exact and",
+    "reproducible: the population is the whole space and the antecedent is a pure",
+    "function of the word. The `outcomes` split is NOT — `TIMEOUT` is a wall-clock",
+    "judgement, so a loaded machine moves words from EXECUTED/ESCAPED into it.",
+    "Measured across two exhaustive runs: candidates identical to the word",
+    "(956,047,373 both times), violations 0 both times, TIMEOUT 77,723 -> 83,852 with",
+    "other work running. The gate compares `violations` alone, for exactly this",
+    "reason; the outcome split is context, not a checked quantity.",
+    "",
+    "HOST-RELATIVE. One Apple aarch64 part at EL0, no SVE/SME/PAC/MTE. See the",
+    "BLIND SPOTS header in src/main.rs, which is normative."
+  ],
+  "derived": {
+    "command": "./run.sh --accept",
+    "tier": "full (exhaustive, all 2^32 words)",
+    "date": "2026-08-10",
+    "host": "aarch64 macOS"
+  },
+  "mode": "gated",
+  "elapsed_s": 3011.0,
+  "workers": 12,
+  "scanned": 4294967296,
+  "candidates": 956047373,
+  "violations": 0,
+  "attribution_errors": 0,
+  "outcomes": {
+    "EXECUTED": 748218926,
+    "MEMFAULT": 1777713,
+    "ESCAPED": 205966882,
+    "TIMEOUT": 83852
+  },
+  "violations_by_decoder_fn": {}
+}

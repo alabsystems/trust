@@ -24,6 +24,34 @@ use std::path::Path;
 use trust_clean::prove_dump_dir;
 
 #[test]
+fn from_signed_rows_match_authenticated_source_corpus() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let selected = manifest.join("fixtures/from-signed-corpus");
+    let source = manifest.join("fixtures/census-rung2-2026-07-07/cast");
+    let mut compared = 0;
+
+    for entry in std::fs::read_dir(&selected).expect("read selected fixture directory") {
+        let path = entry.expect("read selected fixture entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let filename = path.file_name().and_then(|name| name.to_str()).expect("UTF-8 fixture name");
+        let source_name = format!("lib__{}", filename.replacen("From<", "lib__From<", 1));
+        let source_path = source.join(source_name);
+        assert_eq!(
+            std::fs::read(&path).expect("read selected fixture"),
+            std::fs::read(&source_path).expect("read authenticated source fixture"),
+            "selected row {} drifted from authenticated source {}",
+            path.display(),
+            source_path.display()
+        );
+        compared += 1;
+    }
+
+    assert_eq!(compared, 28, "expected all 28 selected rows to be provenance-checked");
+}
+
+#[test]
 fn from_signed_fallible_impls_are_fully_faithful_real_mir() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/from-signed-corpus");
     if !dir.exists() {
@@ -64,5 +92,8 @@ fn from_signed_fallible_impls_are_fully_faithful_real_mir() {
          lane (no MirSem lane exists for an ADT-typed return) — got {}",
         sc.fully_faithful_via_trustir
     );
-    assert_eq!(sc.fully_faithful_mirsem_fallback, 0, "no MirSem lane exists for an ADT-typed return");
+    assert_eq!(
+        sc.fully_faithful_mirsem_fallback, 0,
+        "no MirSem lane exists for an ADT-typed return"
+    );
 }

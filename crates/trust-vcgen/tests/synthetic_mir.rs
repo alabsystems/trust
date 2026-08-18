@@ -33,7 +33,7 @@ fn make_func(
         name: name.to_string(),
         def_path: format!("synthetic::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty },
+        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -2574,6 +2574,158 @@ fn test_synthetic_native_signed_div_overflow_formula() {
             )
         }),
         "signed div overflow VC should use the direct INT_MIN / -1 formula, got {:?}",
+        vc.formula
+    );
+}
+
+/// SOUNDNESS REGRESSION (false proof, 2026-08): an `Assert{Overflow(Div)}` must bind
+/// its operands from the division it GUARDS — which rustc places in the assert's
+/// TARGET block — never from an unrelated `Div` that happens to sit in the assert's
+/// own block. Real rustc emits exactly this shape whenever a source-level divisor
+/// guard lets the zero-assert fold away and the blocks merge:
+///
+///   bb2: _4 = Div(copy _1, const 2_i64);   // unrelated: `n / 2`
+///        assert(!move _8, "… / … overflow", copy _2, copy _3) -> bb3;
+///   bb3: _5 = Div(copy _2, copy _3);       // the guarded `m / e`
+///
+/// Binding the block-local division produced a VC carrying the constant-false
+/// conjunct `4 == -1` — UNSAT, hence PROVED — but stamped with the GUARDED division's
+/// span. That falsely-proved row is the unique same-span `ArithmeticOverflow` sibling,
+/// so it subsumes and then ELIDES the `mir_assert::Overflow(Div)` twin standing over a
+/// genuine `MIN / -1` panic.
+#[test]
+fn test_synthetic_div_overflow_binds_guarded_division_not_a_block_local_one() {
+    let span = SourceSpan::default();
+    let func = make_func(
+        "div_overflow_operand_binding",
+        vec![
+            LocalDecl { index: 0, ty: Ty::i32(), name: None },
+            LocalDecl { index: 1, ty: Ty::i32(), name: Some("x".into()) },
+            LocalDecl { index: 2, ty: Ty::i32(), name: Some("y".into()) },
+            LocalDecl { index: 3, ty: Ty::Bool, name: Some("divzero".into()) },
+            LocalDecl { index: 4, ty: Ty::Bool, name: Some("is_neg_one".into()) },
+            LocalDecl { index: 5, ty: Ty::Bool, name: Some("is_min".into()) },
+            LocalDecl { index: 6, ty: Ty::Bool, name: Some("overflow".into()) },
+            LocalDecl { index: 7, ty: Ty::i32(), name: Some("unrelated".into()) },
+        ],
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(3),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Int(0)),
+                    ),
+                    span: span.clone(),
+                }],
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
+                    cond: Operand::Move(Place::local(3)),
+                    expected: false,
+                    msg: AssertMessage::DivisionByZero,
+                    target: BlockId(1),
+                    span: span.clone(),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                stmts: vec![
+                    // The decoy: an unrelated `x / 4` whose own asserts were folded away,
+                    // sitting BEFORE the guard condition in the assert's own block.
+                    Statement::Assign {
+                        place: Place::local(7),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Div,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Int(4)),
+                        ),
+                        span: span.clone(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(4),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Eq,
+                            Operand::Copy(Place::local(2)),
+                            Operand::Constant(ConstValue::Int(-1)),
+                        ),
+                        span: span.clone(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(5),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Eq,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Int(-(1i128 << 31))),
+                        ),
+                        span: span.clone(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(6),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::BitAnd,
+                            Operand::Move(Place::local(4)),
+                            Operand::Move(Place::local(5)),
+                        ),
+                        span: span.clone(),
+                    },
+                ],
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
+                    cond: Operand::Move(Place::local(6)),
+                    expected: false,
+                    msg: AssertMessage::Overflow(BinOp::Div),
+                    target: BlockId(2),
+                    span: span.clone(),
+                },
+            },
+            BasicBlock {
+                id: BlockId(2),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Div,
+                        Operand::Copy(Place::local(1)),
+                        Operand::Copy(Place::local(2)),
+                    ),
+                    span: span.clone(),
+                }],
+                terminator: Terminator::Return,
+            },
+        ],
+        2,
+    );
+
+    let vcs = generate_vcs(&func);
+    let Some(vc) =
+        vcs.iter().find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Div, .. }))
+    else {
+        // Fail-closed (no VC at all) is acceptable; a MIS-BOUND VC is not.
+        return;
+    };
+
+    // The divisor conjunct must be about the GUARDED divisor `y`, never the decoy's `4`.
+    assert!(
+        formula_contains(&vc.formula, &|f| {
+            matches!(f, Formula::Eq(lhs, rhs)
+                if lhs.var_name() == Some("y") && matches!(rhs.as_ref(), Formula::Int(-1)))
+        }),
+        "Div overflow VC must bind the GUARDED divisor `y`, got {:?}",
+        vc.formula
+    );
+    // The decoy's constant divisor must never become the overflow test's `== -1`
+    // conjunct. That is the exact defect signature: binding `rhs = const 4` yields
+    // the constant-false `4 == -1`, which makes the whole VC UNSAT and so "PROVED".
+    // (`Int(4)` legitimately appears elsewhere, in the block-defs fact
+    // `unrelated == Div(x, 4)` — that is context, not a binding.)
+    assert!(
+        !formula_contains(&vc.formula, &|f| {
+            matches!(f, Formula::Eq(lhs, rhs)
+                if matches!(lhs.as_ref(), Formula::Int(4))
+                    && matches!(rhs.as_ref(), Formula::Int(-1)))
+        }),
+        "Div overflow VC must not carry the decoy's constant-false `4 == -1`, got {:?}",
         vc.formula
     );
 }

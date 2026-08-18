@@ -1,17 +1,19 @@
 // rung-F u32-bound (docs/design/2026-07-10-structural-fold-lane.md §1 last
-// bullet): a u32-measure recursive function's RAW `NonTermination` VC must be
-// refutable in the existing vc_refute lane — kernel-checked modulo the 3
-// foundational axioms — with NO gate-policy change and NO reliance on the
-// downstream `augment_with_type_bounds` re-derivation. The bound conjoined at
-// VC assembly (`trust-vcgen/src/termination.rs::recursion_measure_bindings`)
-// is the type tautology `measure >= 0` for an UNSIGNED measure parameter;
-// this file pins:
+// bullet): a u32-measure function's exact checked-arithmetic `NonTermination`
+// VC must be refutable in the existing vc_refute lane — kernel-checked modulo
+// the 3 foundational axioms — with NO gate-policy change and NO reliance on
+// the downstream `augment_with_type_bounds` re-derivation. The bound conjoined
+// at VC assembly is the type tautology `measure >= 0` for an UNSIGNED measure
+// parameter. Raw fixed-width arithmetic is deliberately outside this lane:
+// reinterpreting a wrapping step as mathematical Int can false-prove
+// termination. This file pins:
 //
-//   1. the terminating u32 shape (`f(n) -> f(n - 1)`) REFUTES modulo 3;
-//   2. the SIGNED control (`i32` measure, no precondition) stays OPEN — a
+//   1. the checked terminating u32 shape (`f(n) -> f(n - 1)`) REFUTES modulo 3;
+//   2. raw fixed-width recursion DECLINES rather than importing wrapping math;
+//   3. the SIGNED control (`i32` measure, no precondition) stays OPEN — a
 //      fabricated `n >= 0` there would be a gate-weakening false-prove
-//      (`f(-1) -> f(-2) -> ...` genuinely never terminates);
-//   3. the genuinely NON-decreasing u32 recursion (`f(n) -> f(n)`) stays
+//      (`f(n) -> f(-1) -> f(-1)` genuinely never terminates);
+//   4. the genuinely NON-decreasing u32 recursion (`f(n) -> f(n)`) stays
 //      OPEN — the bound must never mask a real non-termination witness.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -81,7 +83,7 @@ fn recursive_u32_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         is_foreign: false,
-                        func: "factorial".to_string(),
+                        func: "test::factorial".to_string(),
                         args: vec![Operand::Copy(Place::local(3))],
                         dest: Place::local(4),
                         target: Some(BlockId(3)),
@@ -113,6 +115,7 @@ fn recursive_u32_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -121,21 +124,45 @@ fn recursive_u32_function() -> VerifiableFunction {
     }
 }
 
-/// The SIGNED control: identical shape over `i32` (no precondition).
-fn recursive_i32_function() -> VerifiableFunction {
+/// The SIGNED control: exact recursion to the constant `-1` (no precondition).
+fn recursive_i32_constant_function() -> VerifiableFunction {
     let mut func = recursive_u32_function();
-    func.name = "factorial_i".to_string();
-    func.def_path = "test::factorial_i".to_string();
+    func.name = "recur_minus_one".to_string();
+    func.def_path = "test::recur_minus_one".to_string();
     for idx in [0usize, 1, 3, 4, 5] {
         func.body.locals[idx].ty = Ty::i32();
     }
     func.body.return_ty = Ty::i32();
-    for block in &mut func.body.blocks {
-        if let Terminator::Call { func: callee, .. } = &mut block.terminator {
-            *callee = "factorial_i".to_string();
-        }
-    }
+    func.body.blocks[2].stmts.clear();
+    let Terminator::Call { func: callee, args, .. } = &mut func.body.blocks[2].terminator else {
+        panic!("fixture call block must end in Call");
+    };
+    *callee = "test::recur_minus_one".to_string();
+    *args = vec![Operand::Constant(ConstValue::Int(-1))];
     func
+}
+
+#[test]
+fn raw_u32_decreasing_recursion_emits_no_nontermination_vc() {
+    let vcs = nontermination_vcs(&recursive_u32_function());
+    assert!(
+        vcs.is_empty(),
+        "raw fixed-width n - 1 must not be reinterpreted as mathematical Int: {vcs:?}"
+    );
+}
+
+#[test]
+fn i32_constant_recursion_nontermination_vc_stays_open() {
+    // Without a fabricated signed lower bound, n = -1 witnesses the real
+    // self-cycle `f(-1) -> f(-1)`. Injecting `n >= 0` would make this exact
+    // violation formula refute and would therefore be a false proof.
+    let vc = the_nontermination_vc(&recursive_i32_constant_function());
+    assert_eq!(
+        check_refute_vc(&vc.formula),
+        None,
+        "signed measure with no precondition must stay open; formula: {:?}",
+        vc.formula
+    );
 }
 
 /// Genuinely non-decreasing u32 recursion: `fn spin_same(n: u32) { spin_same(n) }`.
@@ -156,7 +183,7 @@ fn recursive_same_arg_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         is_foreign: false,
-                        func: "spin_same".to_string(),
+                        func: "test::spin_same".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -169,6 +196,7 @@ fn recursive_same_arg_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -193,36 +221,6 @@ fn the_nontermination_vc(func: &VerifiableFunction) -> VerificationCondition {
         .collect();
     assert_eq!(vcs.len(), 1, "fixture must yield exactly one NonTermination VC");
     vcs.pop().unwrap()
-}
-
-#[test]
-fn u32_decreasing_recursion_nontermination_vc_refutes_modulo_3() {
-    // RAW VC: And([n >= 0, _3 = n - 1, Or([_3 >= n, n < 0])]).
-    //  - case `_3 >= n`: n - 1 >= n — linear contradiction;
-    //  - case `n < 0`: contradicts the conjoined u32 type bound n >= 0.
-    // Both branches close → kernel proof of False modulo exactly 3 axioms.
-    let vc = the_nontermination_vc(&recursive_u32_function());
-    assert_eq!(
-        check_refute_vc(&vc.formula),
-        Some(RefuteOutcome::RefutedModulo3),
-        "u32 f(n) -> f(n-1): the RAW NonTermination VC must be kernel-refutable; formula: {:?}",
-        vc.formula
-    );
-}
-
-#[test]
-fn i32_decreasing_recursion_nontermination_vc_stays_open() {
-    // SIGNED control: without a `n >= 0` precondition the descent
-    // `f(-1) -> f(-2) -> ...` is real; the VC is genuinely SAT and must
-    // stay undischarged. If this ever "refutes", an out-of-type bound
-    // leaked onto a signed measure — a false-prove.
-    let vc = the_nontermination_vc(&recursive_i32_function());
-    assert_eq!(
-        check_refute_vc(&vc.formula),
-        None,
-        "i32 measure with no precondition must stay open; formula: {:?}",
-        vc.formula
-    );
 }
 
 #[test]
@@ -319,7 +317,7 @@ fn recursive_checked_sub_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         is_foreign: false,
-                        func: "rec_cs".to_string(),
+                        func: "test::rec_cs".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
                         dest: Place::local(0),
                         target: Some(BlockId(4)),
@@ -332,6 +330,7 @@ fn recursive_checked_sub_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -358,7 +357,7 @@ fn u32_checked_sub_recursion_nontermination_vc_refutes_modulo_3() {
 fn u32_checked_sub_two_preds_nontermination_vc_stays_open() {
     // A second in-edge into the call block bypasses the overflow Assert, so
     // the success-edge fact is not path-valid — the resolver must decline
-    // and the VC must stay open (fail-closed, no false-prove).
+    // and the remaining free-temp VC must stay open (fail-closed, no false-prove).
     let mut func = recursive_checked_sub_function();
     func.body.blocks[1].terminator = Terminator::Goto(BlockId(3));
     let vc = the_nontermination_vc(&func);
@@ -371,14 +370,13 @@ fn u32_checked_sub_two_preds_nontermination_vc_stays_open() {
 }
 
 // --- LOOP-lane twins (rung-F loop-lane u32-bound parity; the gap NOTED in
-// a82a7c83e4): the raw LOOP NonTermination VC had the same missing unsigned
-// type bound — countdown u32 emitted Or([n - 1 >= n, n < 0]), SAT at the
-// out-of-type point n = -1 — and the same cross-block checked-decrement
-// blindness. Same three-way honesty split as the recursion tests above:
-// terminating-u32 REFUTES modulo 3; signed control and genuinely
-// non-decreasing loop STAY OPEN. The checked-decrement blindness is now
-// CLOSED: the recursion lane's checked-chain resolution is ported to the
-// loop lane (`termination.rs::resolve_loop_checked_step_chain`) with
+// a82a7c83e4): the old raw LOOP lane reinterpreted fixed-width subtraction as
+// mathematical Int, which was unsound in the presence of wraparound. Raw
+// arithmetic now DECLINES. The exact checked-decrement lane retains the honest
+// three-way split: terminating-u32 REFUTES modulo 3; signed measures decline;
+// and a genuinely non-decreasing exact loop stays OPEN. The checked-decrement
+// blindness is CLOSED: the recursion lane's checked-chain resolution is ported
+// to the loop lane (`termination.rs::resolve_loop_checked_step_chain`) with
 // loop-specific fail-closed guards — Assert-pred INSIDE this loop's
 // body_blocks (an outside pred is a loop-INVARIANT step: a fabricated
 // per-iteration decrease), step block != function entry block, two-pred /
@@ -439,6 +437,7 @@ fn countdown_loop_u32_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -456,20 +455,16 @@ fn countdown_loop_i32_function() -> VerifiableFunction {
     func
 }
 
-/// Genuinely non-decreasing u32 loop: `while n > 0 { n = n + 1 }` — in the
-/// unbounded value model this never terminates (machine wrap-around is the
-/// Overflow VC's jurisdiction, exactly as in the recursion twins).
-fn count_up_loop_u32_function() -> VerifiableFunction {
+/// Genuinely non-decreasing u32 loop: `while n > 0 { n = n }`. The identity
+/// step is exact in both the machine and mathematical-Int carriers, so the
+/// inferred lane must emit an obligation and leave its real witness open.
+fn same_value_loop_u32_function() -> VerifiableFunction {
     let mut func = countdown_loop_u32_function();
-    func.name = "count_up_forever".to_string();
-    func.def_path = "test::count_up_forever".to_string();
+    func.name = "same_value_forever".to_string();
+    func.def_path = "test::same_value_forever".to_string();
     func.body.blocks[1].stmts[0] = Statement::Assign {
         place: Place::local(1),
-        rvalue: Rvalue::BinaryOp(
-            BinOp::Add,
-            Operand::Copy(Place::local(1)),
-            Operand::Constant(ConstValue::Uint(1, 32)),
-        ),
+        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
         span: SourceSpan::default(),
     };
     func
@@ -558,6 +553,7 @@ fn countdown_loop_checked_sub_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -567,17 +563,11 @@ fn countdown_loop_checked_sub_function() -> VerifiableFunction {
 }
 
 #[test]
-fn u32_countdown_loop_nontermination_vc_refutes_modulo_3() {
-    // RAW VC: And([n >= 0, Or([n - 1 >= n, n < 0])]).
-    //  - case `n - 1 >= n`: linear contradiction;
-    //  - case `n < 0`: contradicts the conjoined u32 type bound n >= 0.
-    // Both branches close → kernel proof of False modulo exactly 3 axioms.
-    let vc = the_nontermination_vc(&countdown_loop_u32_function());
-    assert_eq!(
-        check_refute_vc(&vc.formula),
-        Some(RefuteOutcome::RefutedModulo3),
-        "u32 countdown loop: the RAW NonTermination VC must be kernel-refutable; formula: {:?}",
-        vc.formula
+fn raw_u32_countdown_loop_emits_no_nontermination_vc() {
+    let vcs = nontermination_vcs(&countdown_loop_u32_function());
+    assert!(
+        vcs.is_empty(),
+        "raw fixed-width n = n - 1 must not be reinterpreted as mathematical Int: {vcs:?}"
     );
 }
 
@@ -601,10 +591,10 @@ fn i32_countdown_loop_emits_no_nontermination_vc() {
 
 #[test]
 fn non_decreasing_u32_loop_nontermination_vc_stays_open() {
-    // `while n > 0 { n = n + 1 }`: the `measure_after >= measure_before`
-    // disjunct is `n + 1 >= n`, true at every n >= 0 — a real
+    // `while n > 0 { n = n }`: the `measure_after >= measure_before`
+    // disjunct is `n >= n`, true at every n >= 0 — a real
     // non-termination witness the type bound must never mask.
-    let vc = the_nontermination_vc(&count_up_loop_u32_function());
+    let vc = the_nontermination_vc(&same_value_loop_u32_function());
     assert_eq!(
         check_refute_vc(&vc.formula),
         None,
@@ -742,6 +732,7 @@ fn countdown_loop_checked_sub_preheader_function() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

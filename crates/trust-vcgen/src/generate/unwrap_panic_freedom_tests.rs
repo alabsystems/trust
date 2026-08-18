@@ -93,7 +93,7 @@ fn func_of(
         name: "unwrap_fixture".into(),
         def_path: "test::unwrap_fixture".into(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty: Ty::u64() },
+        body: VerifiableBody { locals, blocks, arg_count, return_ty: Ty::u64(), datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],

@@ -127,6 +127,12 @@ pub mod in_process_ay_backend;
 // opts back in). Same gate as its sole consumer.
 #[cfg(feature = "ay-backend")]
 mod ay_log;
+// Trust: the Trust -> ay symbol-namespace map. Every user-derived VC variable
+// symbol is namespaced before it reaches ay, so a Rust local spelled like an ay
+// builtin (`fp`, `default`, `select`, …) can never trip ay's reserved-symbol
+// rejection — which surfaced as a compiler ICE. Same gate as its consumer.
+#[cfg(feature = "ay-backend")]
+mod ay_symbol_namespace;
 // N-version Alethe cross-check: independent Carcara re-check of ay UNSAT proofs,
 // wired into the live in-process ay gate when both `ay-backend` and
 // `carcara-crosscheck` are enabled (Carcara pulls in GMP via `rug`).

@@ -474,7 +474,7 @@ mod tests {
         blocks: Vec<BasicBlock>,
         arg_count: usize,
     ) -> VerifiableBody {
-        VerifiableBody { locals, blocks, arg_count, return_ty: Ty::Unit }
+        VerifiableBody { locals, blocks, arg_count, return_ty: Ty::Unit, datatype_defs: Default::default() }
     }
 
     fn local(index: usize, ty: Ty, name: Option<&str>) -> LocalDecl {

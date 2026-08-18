@@ -88,3 +88,8 @@ rustc-std-workspace-std = { path = 'rustc-std-workspace-std' }
 
 # See comments in `library/windows-sys/Cargo.toml` for why this is patched
 windows-sys = { path = 'windows-sys' }
+
+# memchr is first-party (crates/trust-memchr). This workspace resolves memchr
+# independently of the root one — it reaches it only through `object`, which
+# forwards `rustc-dep-of-std` — so it needs its own patch entry.
+memchr = { path = '../crates/trust-memchr' }

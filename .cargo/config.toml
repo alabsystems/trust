@@ -18,6 +18,12 @@
 #   `scripts/check_all.sh`). Do not "unify" these: the bootstrap disable is a
 #   self-build stability fix, not a workspace-wide policy.
 
+[build]
+# Spark shares its 128 GiB UMA pool with the GPU and desktop. Keep raw Cargo
+# invocations from fanning out across all 20 CPUs; callers can still select a
+# smaller limit for especially heavy bridge or proof builds.
+jobs = 4
+
 [env]
 # trust_vcgen was dropped from this allowlist: its `#![feature(contracts_internals)]`
 # + `#![feature(register_tool)]` gates were removed at the root (see

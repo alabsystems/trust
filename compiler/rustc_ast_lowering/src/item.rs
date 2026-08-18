@@ -247,12 +247,23 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 let ident = self.lower_ident(*ident);
                 hir::ItemKind::ExternCrate(*orig_name, ident)
             }
-            // Trust: a Clean island lowers to a span-only HIR marker — no
-            // body owner (nothing to codegen or resolve). The verify pass
-            // recovers the island text through the source map and hands it
-            // to the Clean parser + kernel (two-language design E10).
-            ItemKind::CleanIsland(content_span) => {
-                hir::ItemKind::CleanIsland { content_span: self.lower_span(*content_span) }
+            // Trust: a Clean island lowers to an inert HIR marker — no body
+            // owner, nothing to codegen or resolve. The Clean parse already
+            // happened in `rustc_parse` (ruling v7/D1); lowering just carries
+            // the syntax payload across so the verify pass can elaborate and
+            // kernel-check it without re-reading the source map.
+            //
+            // Declaration spans are lowered like any other span. `content_span`
+            // stays the anchor for Clean's island-relative diagnostics.
+            ItemKind::CleanIsland(island) => {
+                let decls = self.arena.alloc_from_iter(island.decls.iter().map(|decl| {
+                    ast::CleanIslandDecl { span: self.lower_span(decl.span), ..*decl }
+                }));
+                hir::ItemKind::CleanIsland {
+                    content_span: self.lower_span(island.content_span),
+                    text: island.text,
+                    decls,
+                }
             }
             ItemKind::Use(use_tree) => {
                 // Start with an empty prefix.

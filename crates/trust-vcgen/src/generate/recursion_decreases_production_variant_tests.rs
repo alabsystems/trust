@@ -52,6 +52,7 @@ fn two_recursive_calls_with_decreases() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Decreases,

@@ -4111,6 +4111,170 @@ impl Guard {
     }
 }
 
+/// Trust: which Clean surface command a [`CleanIslandDecl`] came from.
+///
+/// One variant per `clean_parser::SurfaceDecl` variant. The mirror is
+/// deliberate and total: the conversion in `rustc_parse` matches `SurfaceDecl`
+/// exhaustively, so if Clean grows a surface command the compiler stops
+/// building instead of silently classifying it as something else.
+///
+/// This is a *classification*, not a proposition. Seeing `Theorem` here means
+/// the Clean parser recognised the `theorem` command's syntax — it does NOT
+/// mean anything was elaborated, registered, or kernel-checked.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
+pub enum CleanDeclKind {
+    Def,
+    Theorem,
+    Axiom,
+    Opaque,
+    Inductive,
+    Coinductive,
+    Codata,
+    Codef,
+    Structure,
+    Class,
+    Instance,
+    Example,
+    Import,
+    Namespace,
+    Section,
+    UniverseDecl,
+    Variable,
+    Open,
+    Export,
+    DerivingInstance,
+    Check,
+    Eval,
+    Print,
+    Mutual,
+    Syntax,
+    DeclareSyntaxCat,
+    Macro,
+    MacroRules,
+    Notation,
+    Elab,
+    /// A parser-recovery placeholder. `rustc_parse` uses the strict Clean file
+    /// parser, which rejects recovery outright, so this should be unreachable
+    /// from a successful island parse; it exists so the mirror stays total.
+    RawDecl,
+    Attribute,
+    SetOption,
+    DeclareAesopRuleSets,
+    LibraryNote,
+}
+
+impl CleanDeclKind {
+    /// The Clean surface keyword this declaration was introduced by.
+    pub fn descr(self) -> &'static str {
+        match self {
+            CleanDeclKind::Def => "def",
+            CleanDeclKind::Theorem => "theorem",
+            CleanDeclKind::Axiom => "axiom",
+            CleanDeclKind::Opaque => "opaque",
+            CleanDeclKind::Inductive => "inductive",
+            CleanDeclKind::Coinductive => "coinductive",
+            CleanDeclKind::Codata => "codata",
+            CleanDeclKind::Codef => "codef",
+            CleanDeclKind::Structure => "structure",
+            CleanDeclKind::Class => "class",
+            CleanDeclKind::Instance => "instance",
+            CleanDeclKind::Example => "example",
+            CleanDeclKind::Import => "import",
+            CleanDeclKind::Namespace => "namespace",
+            CleanDeclKind::Section => "section",
+            CleanDeclKind::UniverseDecl => "universe",
+            CleanDeclKind::Variable => "variable",
+            CleanDeclKind::Open => "open",
+            CleanDeclKind::Export => "export",
+            CleanDeclKind::DerivingInstance => "deriving instance",
+            CleanDeclKind::Check => "#check",
+            CleanDeclKind::Eval => "#eval",
+            CleanDeclKind::Print => "#print",
+            CleanDeclKind::Mutual => "mutual",
+            CleanDeclKind::Syntax => "syntax",
+            CleanDeclKind::DeclareSyntaxCat => "declare_syntax_cat",
+            CleanDeclKind::Macro => "macro",
+            CleanDeclKind::MacroRules => "macro_rules",
+            CleanDeclKind::Notation => "notation",
+            CleanDeclKind::Elab => "elab",
+            CleanDeclKind::RawDecl => "unrecognised declaration",
+            CleanDeclKind::Attribute => "attribute",
+            CleanDeclKind::SetOption => "set_option",
+            CleanDeclKind::DeclareAesopRuleSets => "declare_aesop_rule_sets",
+            CleanDeclKind::LibraryNote => "library_note",
+        }
+    }
+
+    /// Whether this command introduces a name into the Clean environment.
+    ///
+    /// Advisory only — it says what the *syntax* would introduce if it were
+    /// elaborated, never that it was.
+    pub fn introduces_name(self) -> bool {
+        matches!(
+            self,
+            CleanDeclKind::Def
+                | CleanDeclKind::Theorem
+                | CleanDeclKind::Axiom
+                | CleanDeclKind::Opaque
+                | CleanDeclKind::Inductive
+                | CleanDeclKind::Coinductive
+                | CleanDeclKind::Codata
+                | CleanDeclKind::Codef
+                | CleanDeclKind::Structure
+                | CleanDeclKind::Class
+                | CleanDeclKind::Instance
+        )
+    }
+}
+
+/// Trust: one declaration recognised by the real Clean parser inside a
+/// `clean { … }` island (ruling v7/D1).
+///
+/// **This is syntax, not authority.** Its presence records only that
+/// `clean_parser` accepted the declaration's surface form during rustc's parse.
+/// Elaboration, environment registration and CIC kernel re-checking happen
+/// later, in the verify pass, in authored order, with the existing
+/// `trust_import_*` deferral and taint semantics — all unchanged. Nothing may
+/// read this payload as evidence that the kernel saw anything.
+///
+/// The full Clean term structure is deliberately *not* mirrored here: the
+/// elaborator re-parses the island text (which the island also carries) with
+/// the tactic-pattern table it owns, and that parse — not this one — is what
+/// feeds the kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Debug, StableHash)]
+pub struct CleanIslandDecl {
+    pub kind: CleanDeclKind,
+    /// The declared name, already interned. `sym::empty` for the commands that
+    /// declare no name (`open`, `#eval`, `section` without a name, …).
+    pub name: Symbol,
+    /// The declaration's extent, in **rustc** coordinates: the Clean parser's
+    /// island-relative byte offsets remapped onto the island's `content_span`.
+    /// Diagnostics built from this land inside the island.
+    pub span: Span,
+}
+
+/// Trust: the payload of an [`ItemKind::CleanIsland`] — the real parse of a
+/// `clean { … }` island, performed by `clean_parser` at rustc parse time
+/// (ruling v7/D1; v3(4) "a true parser island … not a macro").
+///
+/// A Clean *parse* error is reported as an ordinary rustc parse-time
+/// diagnostic spanned inside the island. A parse SUCCESS means only that: it
+/// never implies kernel authority.
+#[derive(Clone, Encodable, Decodable, Debug)]
+pub struct CleanIsland {
+    /// Span of the island body (everything between the braces). Load-bearing:
+    /// the verify pass remaps Clean's island-relative diagnostic offsets onto
+    /// it, and `decls[_].span` is derived from it.
+    pub content_span: Span,
+    /// The island body text exactly as written, interned at parse time. The
+    /// verify pass consumes this instead of re-reading the source map, so the
+    /// bytes the Clean parser saw and the bytes the elaborator sees are the
+    /// same bytes by construction.
+    pub text: Symbol,
+    /// The declarations `clean_parser` recognised, in source order.
+    pub decls: ThinVec<CleanIslandDecl>,
+}
+
 // Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum ItemKind {
@@ -4151,13 +4315,14 @@ pub enum ItemKind {
     ForeignMod(ForeignMod),
     /// Module-level inline assembly (from `global_asm!()`).
     GlobalAsm(Box<InlineAsm>),
-    /// Trust: a `clean { … }` PARSER ISLAND (two-language design E10) — Clean
-    /// (Lean) declarations embedded in a Rust file. The payload is the island
-    /// body's SPAN only: the text is verifier vocabulary, never name-resolved,
-    /// def-collected, type-checked, or code-generated by rustc; the verify
-    /// pass recovers it through the source map, parses it with the real Clean
-    /// parser, and kernel-checks the declarations (rejects fail the build).
-    CleanIsland(Span),
+    /// Trust: a `clean { … }` PARSER ISLAND (two-language design E10, ruling
+    /// v7/D1) — Clean (Lean) declarations embedded in a Rust file, parsed by
+    /// the real Clean parser at rustc parse time. See [`CleanIsland`]: the
+    /// payload is SYNTAX ONLY and carries no proof authority whatsoever. The
+    /// declarations are never name-resolved, def-collected, type-checked, or
+    /// code-generated by rustc; elaboration and CIC kernel checking stay in
+    /// the verify pass, unchanged.
+    CleanIsland(Box<CleanIsland>),
     /// A type alias (`type`).
     ///
     /// E.g., `type Foo = Bar<u8>;`.

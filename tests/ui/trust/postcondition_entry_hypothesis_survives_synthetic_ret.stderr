@@ -1,0 +1,21 @@
+
+=== Trust Verification Report (postcondition_entry_hypothesis_survives_synthetic_ret) ===
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 3 obligation(s)
+  --> $DIR/postcondition_entry_hypothesis_survives_synthetic_ret.rs:31:1
+   |
+LL | pub fn needs_the_hypothesis(n: i32) -> i32 { n }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 3 obligation(s)
+  --> $DIR/postcondition_entry_hypothesis_survives_synthetic_ret.rs:37:1
+   |
+LL | pub fn provable_without_the_hypothesis(n: i32) -> i32 { n }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+

@@ -813,6 +813,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let analysis = check_borrow_safety(&body);
@@ -847,6 +848,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         };
 
         let analysis = check_borrow_safety(&body);
@@ -888,6 +890,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let analysis = check_borrow_safety(&body);
@@ -917,6 +920,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let analysis = check_borrow_safety(&body);
@@ -947,6 +951,7 @@ mod tests {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let analysis = check_borrow_safety(&body);
@@ -969,6 +974,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let sets = compute_borrow_sets(&body);
@@ -1001,6 +1007,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let sets = compute_borrow_sets(&body);
@@ -1041,6 +1048,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let sets = compute_borrow_sets(&body);

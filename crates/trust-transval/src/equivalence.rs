@@ -142,7 +142,7 @@ mod tests {
             name: name.to_string(),
             def_path: format!("test::{name}"),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count, return_ty: Ty::i32() },
+            body: VerifiableBody { locals, blocks, arg_count, return_ty: Ty::i32(), datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],

@@ -8,7 +8,7 @@
 
 clean {
     def bad : Nat := True
-    //~^ ERROR Clean island declaration rejected
+    //~^ ERROR `bad` did not elaborate: Type mismatch: expected Nat, got Prop
 }
 
 fn main() {}

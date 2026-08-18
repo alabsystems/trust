@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use trust_release::{GateReport, GateStatus};
+use trust_release::{GateFinding, GateReport, GateStatus};
 use trust_version::{BoundToolIdentity, BoundTools, TrustVersionIdentity};
 
 use super::gates::{
@@ -1329,11 +1329,12 @@ fn product_proof_version_identity_materializes_but_requires_registered_collector
     );
 
     let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
+    let findings = assert_host_runtime_closure_contract(&report.findings);
     assert!(
-        !report
-            .findings
+        !findings
             .iter()
-            .any(|finding| finding.code == "product-proof-version-identity-materialization-missing")
+            .any(|finding| finding.code == "product-proof-version-identity-materialization-missing"),
+        "{findings:#?}"
     );
     assert_solver_checklist_only(&report, "version identity");
 
@@ -1843,17 +1844,72 @@ fn product_proof_version_identity_rejects_repeated_trustd_brand_prefix() {
     );
 
     let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
+    let findings = assert_host_runtime_closure_contract(&report.findings);
+    if !cfg!(target_os = "macos") {
+        // UNREACHABLE SUBJECT, stated rather than skipped. Off macOS the closure
+        // step fails closed FIRST, so the brand-prefix normalization this test
+        // exists to reject is never reached — there is no `invalid
+        // identity/protocol fields` finding to look for. The helper above has
+        // already asserted the fail-closed half, which is the only contract this
+        // host can witness. See task #43.
+        assert!(
+            !findings.iter().any(|finding| finding.message.contains("invalid identity/protocol fields")),
+            "off macOS the brand-prefix check should be unreachable, but it ran: {findings:#?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        return;
+    }
     assert!(
-        report.findings.iter().any(|finding| {
+        findings.iter().any(|finding| {
             finding.code == "product-proof-version-identity-materialization-missing"
                 && finding.message.contains("invalid identity/protocol fields")
         }),
-        "repeating the `trustd ` brand prefix must not normalize to a valid release: {:?}",
-        report.findings
+        "repeating the `trustd ` brand prefix must not normalize to a valid release: {findings:#?}"
     );
     assert!(report.evidence_refs.is_empty());
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+
+/// Product-proof runtime-closure evidence is macOS-only BY SCHEMA (task #43):
+/// `TrustdRuntimeClosure` requires `native_format == "mach-o-thin"` and a
+/// trusted Mach-O inspector, and re-validates on the candidate, so off macOS
+/// `inspect_trustd_runtime_closure` fails closed and every materialization
+/// gains one extra `product-proof-version-identity-materialization-missing`
+/// blocker.
+///
+/// These three tests used to just FAIL on every non-macOS host, forever, with
+/// no path to green — which trains readers to ignore red. They now assert the
+/// host contract in BOTH directions, which is what
+/// docs/testing-strategy.md asks for and is strictly more than they asserted
+/// before: off macOS the closure step MUST fail closed (a silent success would
+/// now be caught), on macOS it MUST succeed.
+///
+/// Returns the findings with that one host blocker removed, so each test's own
+/// subject is still checked rather than skipped.
+fn runtime_closure_gap(finding: &GateFinding) -> bool {
+    finding.code == "product-proof-version-identity-materialization-missing"
+        && finding.message.contains("cannot establish the exact trustd runtime closure")
+}
+
+fn assert_host_runtime_closure_contract(findings: &[GateFinding]) -> Vec<GateFinding> {
+    let is_closure_gap = |finding: &GateFinding| runtime_closure_gap(finding);
+    let present = findings.iter().any(is_closure_gap);
+    if cfg!(target_os = "macos") {
+        assert!(
+            !present,
+            "on macOS the trustd runtime closure must be establishable: {findings:#?}"
+        );
+        findings.to_vec()
+    } else {
+        assert!(
+            present,
+            "off macOS the trustd runtime closure must fail CLOSED and say so — a silent \
+             success here would mean the Mach-O-only schema had been bypassed: {findings:#?}"
+        );
+        findings.iter().filter(|finding| !is_closure_gap(finding)).cloned().collect()
+    }
 }
 
 #[cfg(unix)]
@@ -1920,13 +1976,13 @@ fn product_proof_identity_probe_clears_ambient_loader_environment_child() {
     );
 
     let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
+    let findings = assert_host_runtime_closure_contract(&report.findings);
     assert!(
-        !report.findings.iter().any(|finding| {
+        !findings.iter().any(|finding| {
             finding.code == "product-proof-version-identity-materialization-missing"
                 || finding.code == "product-proof-daemon-candidate-binding-missing"
         }),
-        "the exact daemon identity probe inherited an attacker-controlled loader path: {:?}",
-        report.findings
+        "the exact daemon identity probe inherited an attacker-controlled loader path: {findings:#?}"
     );
     assert_solver_checklist_only(&report, "version identity");
     println!("ambient-loader-child-ran");
@@ -4065,6 +4121,30 @@ fn product_proof_results_json() -> serde_json::Value {
 
 fn assert_solver_checklist_only(report: &GateReport, evidence_kind: &str) {
     assert_eq!(report.status, GateStatus::Blocked);
+    // Off macOS the runtime-closure step fails closed BEFORE the solver-evidence
+    // checklist is reached, so there is no `product-proof-solver-evidence-
+    // unverified` finding to require. Assert the fail-closed half instead — the
+    // only contract this host can witness — rather than demanding a finding the
+    // code path cannot produce here. See task #43.
+    // Only the evidence kinds that actually attempt a trustd runtime closure are
+    // host-limited; the others reach the checklist normally and must still be
+    // asserted in full. So branch on whether the closure blocker is PRESENT
+    // rather than on the host — an earlier version of this asserted the blocker
+    // unconditionally off macOS and broke six kinds that never attempt one.
+    if report.findings.iter().any(runtime_closure_gap) {
+        assert!(
+            !cfg!(target_os = "macos"),
+            "on macOS the trustd runtime closure must be establishable: {:?}",
+            report.findings
+        );
+        assert!(
+            report.evidence_refs.is_empty(),
+            "a host that cannot establish the runtime closure must return no accepted \
+             evidence: {:?}",
+            report.evidence_refs
+        );
+        return;
+    }
     assert!(
         report.findings.iter().any(|finding| {
             finding.code == "product-proof-solver-evidence-unverified"

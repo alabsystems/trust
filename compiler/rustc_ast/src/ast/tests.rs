@@ -45,10 +45,10 @@ fn restores_all_seven_interleaved_lanes_with_equal_spans() {
     contract.clause_order.extend(expected);
 
     let ordered = contract.ordered_clause_refs().unwrap();
-    assert_eq!(ordered.iter().map(|clause| clause.marker).collect::<Vec<_>>(), expected);
+    assert_eq!(ordered.iter().map(|clause| clause.marker()).collect::<Vec<_>>(), expected);
     for clause in ordered {
         assert!(matches!(
-            (clause.marker.lane, clause.clause),
+            (clause.marker().lane, clause.clause()),
             (Typed, FnContractClauseRef::Typed(_))
                 | (Opaque, FnContractClauseRef::Opaque(_))
                 | (Native, FnContractClauseRef::Native(_))
@@ -77,10 +77,10 @@ fn accepts_repeated_lane_indices_and_legacy_singleton() {
     ));
     let ordered = native_contract.ordered_clause_refs().unwrap();
     assert!(
-        matches!(ordered[0].clause, FnContractClauseRef::Native(clause) if clause.predicate == first)
+        matches!(ordered[0].clause(), FnContractClauseRef::Native(clause) if clause.predicate == first)
     );
     assert!(
-        matches!(ordered[1].clause, FnContractClauseRef::Native(clause) if clause.predicate == second)
+        matches!(ordered[1].clause(), FnContractClauseRef::Native(clause) if clause.predicate == second)
     );
 
     let mut legacy =
@@ -91,9 +91,10 @@ fn accepts_repeated_lane_indices_and_legacy_singleton() {
         FnContractClauseLane::Typed,
         0,
     ));
+    let legacy_ordered = legacy.ordered_clause_refs().unwrap();
     assert!(matches!(
-        legacy.ordered_clause_refs().unwrap().as_slice(),
-        [OrderedFnContractClauseRef { clause: FnContractClauseRef::Typed(_), .. }]
+        legacy_ordered.as_slice(),
+        [only] if matches!(only.clause(), FnContractClauseRef::Typed(_))
     ));
 }
 

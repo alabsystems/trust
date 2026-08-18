@@ -64,13 +64,26 @@ where
     // `obligation_id`, and `total_obligations` are distinct keys whose fragments
     // cannot match, because the byte after `obligation` here is `"` and theirs
     // is `s`/`_`.
+    // Trust (R0 carrier): `VerifiableBody::datatype_defs` obeys the SAME rule,
+    // with belt AND braces. Its empty table is exactly the pre-carrier semantics
+    // ("no out-of-band datatype definitions"), which is what the back-fill
+    // re-states at every pre-existing construction site, so it must not perturb
+    // shipped pins; a NON-empty table IS hash-visible and stays in identity.
+    // Unlike the six members above, it already carries `skip_serializing_if`, so
+    // an empty table never reaches this string in the first place and this strip
+    // is normally inert. It is kept because the six drift incidents all began
+    // with someone believing `#[serde(default)]` alone was enough: if a future
+    // edit drops the `skip_serializing_if`, this line keeps audited pins still.
+    // `datatype_defs` is the only member of that name in this model and JSON
+    // string contents cannot forge the fragment (embedded quotes are escaped).
     Ok(json
         .replace(",\"faithful_enum_repr\":null", "")
         .replace(",\"layout\":null", "")
         .replace(",\"enum_layout\":null", "")
         .replace(",\"adt_kind\":null", "")
         .replace(",\"args\":null", "")
-        .replace(",\"obligation\":null", ""))
+        .replace(",\"obligation\":null", "")
+        .replace(",\"datatype_defs\":{}", ""))
 }
 
 /// Canonical JSON hash material, as bytes, for any Trust model value.
@@ -460,6 +473,229 @@ impl VerifiableFunction {
     }
 }
 
+/// The variant list of a modeled datatype: `[(ctor_name, [(field_name, field_ty)])]`.
+///
+/// Structurally IDENTICAL to `Ty::Datatype::variants` on purpose: an entry of
+/// [`DatatypeDefs`] can be re-inlined into a `Ty::Datatype` with no conversion,
+/// so a resolved marker reconstructs exactly the `Ty` an inline definition would
+/// have been.
+pub type DatatypeVariants = Vec<(String, Vec<(String, Ty)>)>;
+
+/// Out-of-band datatype definition table: datatype NAME -> its FULL definitional
+/// `Ty`.
+///
+/// WIDENED (was `BTreeMap<String, DatatypeVariants>`). The narrow value could
+/// hold only `Ty::Datatype::variants`, and a census over all 2330 shipped
+/// fixture JSONs found 7855 definitional `Ty::Adt` against ZERO definitional
+/// `Ty::Datatype` — because `lower_adt_as_datatype` is def-path gated to
+/// clean-kernel's `Level`/`Expr`/`ExprKind` and EVERY other recursive ADT
+/// (`Tree`, `TaggedTree`, `level::Level` as the shipped dumps actually spell it)
+/// lowers through `lower_enum_adt` to a `Ty::Adt`. Moving such a definition into
+/// a variant-list-only value DROPS, with nowhere to put them, `VariantDef::
+/// discriminant` (139 shipped ADTs carry NON-index discriminants, e.g.
+/// `Ordering` = [255,0,1] and this lane's own `tag_xor` = [10,20,30]), the flat
+/// `__tag`/`__v{v}_{f}` view all 7855 carry, and `disc_index_safe` /
+/// `faithful_enum_repr` / `layout` / `enum_layout` / `adt_kind` / `args`.
+/// Fabricating a discriminant would be a WRONG fact, not a lossy one —
+/// `reflect.rs` mints kernel witnesses from that field.
+///
+/// WHY THE KEY STILL CANNOT DISAGREE WITH ITS ENTRY. The narrow value made that
+/// STRUCTURALLY impossible (there was no name in the value to disagree with).
+/// A `Ty` has a name, so the property is preserved by VALIDATION AT BOTH ENDS
+/// instead:
+///
+///   * on INSERT, [`insert_datatype_def`] derives the key FROM the value's own
+///     name — a caller cannot supply a key at all — and refuses a value that
+///     carries no name or no structure;
+///   * on READ, [`datatype_definition`] re-checks `definitional_datatype_name
+///     (entry) == Some(key)` and declines otherwise, so a table that arrived by
+///     DESERIALIZATION (which the insert path never saw) is inert exactly where
+///     it disagrees.
+///
+/// The read-side check is the stronger half and is why validation is not merely
+/// a restatement of the insert-side one: this table is wire material, so an
+/// entry can reach a consumer without ever passing through `insert_datatype_def`.
+///
+/// `BTreeMap`, not `HashMap`: this table is inside hashed proof material, so its
+/// serialization order must be a function of its contents. A `HashMap` would
+/// serialize in an arbitrary order and make one body hash several ways.
+pub type DatatypeDefs = BTreeMap<String, Ty>;
+
+/// The name a DEFINITIONAL `Ty` carries — the only two shapes a datatype
+/// definition can take in this model.
+///
+/// This is the function the key/value agreement rule is stated in terms of; see
+/// [`DatatypeDefs`]. Every other `Ty` shape (a scalar, a tuple, a reference…)
+/// carries no nominal identity and therefore can never be a definition.
+#[must_use]
+pub fn definitional_datatype_name(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Adt { name, .. } | Ty::Datatype { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `ty` carries STRUCTURE, i.e. is a definition rather than a bare
+/// marker.
+///
+/// The widened analogue of the narrow carrier's "an empty entry defines
+/// nothing" rule. A `Ty::Datatype` with no variants IS the bare marker, so
+/// storing one would "resolve" a marker to itself; a `Ty::Adt` with neither
+/// fields nor variants is the same vacuity one shape over. Both decline.
+#[must_use]
+pub fn is_datatype_definition(ty: &Ty) -> bool {
+    match ty {
+        Ty::Adt { fields, variants, .. } => !fields.is_empty() || !variants.is_empty(),
+        Ty::Datatype { variants, .. } => !variants.is_empty(),
+        _ => false,
+    }
+}
+
+/// Record `def` in `defs` under ITS OWN name. Returns whether it was recorded.
+///
+/// THE KEY IS DERIVED, NEVER SUPPLIED — that is the whole point, and it is what
+/// replaces the narrow value type's structural guarantee that an entry cannot
+/// disagree with its key. There is deliberately no `(key, value)` insert.
+///
+/// FAIL-CLOSED on every disagreement: a value with no nominal name, a value with
+/// no structure, and a SECOND, DIFFERENT definition of a name already present
+/// (which would mean the name does not identify a type) are all refused, and the
+/// conflicting case additionally REMOVES the existing entry so neither of two
+/// disagreeing definitions can be served. An absent entry is exactly the
+/// pre-carrier meaning: the marker declines.
+pub fn insert_datatype_def(defs: &mut DatatypeDefs, def: Ty) -> bool {
+    let Some(name) = definitional_datatype_name(&def) else { return false };
+    if !is_datatype_definition(&def) {
+        return false;
+    }
+    let name = name.to_string();
+    match defs.get(&name) {
+        Some(existing) if *existing == def => true,
+        Some(_) => {
+            defs.remove(&name);
+            false
+        }
+        None => {
+            defs.insert(name, def);
+            true
+        }
+    }
+}
+
+/// The VALIDATED definition `defs` records for `name`, or `None`.
+///
+/// The read half of the key/value agreement rule (see [`DatatypeDefs`]): an
+/// entry is served only when it names itself `name` and carries structure. A
+/// deserialized table whose entry disagrees with its key is inert here rather
+/// than authoritative — declining is the pre-carrier behaviour, so this can only
+/// lose an answer, never invent one.
+#[must_use]
+pub fn datatype_definition<'a>(defs: &'a DatatypeDefs, name: &str) -> Option<&'a Ty> {
+    let def = defs.get(name)?;
+    (definitional_datatype_name(def) == Some(name) && is_datatype_definition(def)).then_some(def)
+}
+
+/// The name of a BARE datatype marker — the by-name spelling that carries no
+/// structure at all.
+///
+/// `Some(name)` exactly when `ty` is `Ty::Datatype { name, variants: [] }`.
+/// A `Ty::Datatype` that carries its own INLINE definition returns `None`, and
+/// that is the whole reason this predicate exists: it is what makes table
+/// resolution strictly ADDITIVE. Every consumer in the tree already declines a
+/// bare marker (each one guards on `!variants.is_empty()`, `variants.get(v)`,
+/// or `variants.len() == 1`, all of which fail on an empty list), so widening
+/// ONLY this shape can turn a decline into an accept and can never change an
+/// answer the consumer already gave.
+#[must_use]
+pub fn bare_datatype_marker_name(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Datatype { name, variants } if variants.is_empty() => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Resolve a bare datatype marker through an EXPLICIT definition table.
+///
+/// FAIL-CLOSED, and this is the property the whole R0 design rests on. The ONLY
+/// thing consulted is `defs`: a key lookup on the marker's own name. There is no
+/// fallback, no body-wide scan, and no search for a same-name definitional
+/// occurrence elsewhere in the body.
+///
+/// That last exclusion is not stylistic — a by-name search was BUILT, worked,
+/// and was WITHDRAWN because it is fail-OPEN. Three unrelated producers emit the
+/// identical bare shape and two of them spell GENERICS-ERASED names (the legacy
+/// back-edge guard `recursive_datatype_ref`, and `compact_oversized_field`,
+/// which is a size bound and not a back-edge at all), so a compacted `Big<u8>`
+/// would bind to a declared `Big<i32>` and a body would type-check into the
+/// wrong structure. An explicit table cannot do that: an entry is a deliberate
+/// assertion by the producer, it is hash-visible (see
+/// [`VerifiableBody::datatype_defs`]), and `Big<u8>` and `Big<i32>` are
+/// different entries with different content hashes.
+///
+/// Returns `None` — i.e. DECLINE, exactly as before the table existed — when
+/// `ty` is not a bare marker, when the table has no entry for that name, when
+/// the entry names something else, or when the entry itself carries no
+/// structure (a vacuous entry defines nothing; accepting it would reconstruct
+/// the very marker we were asked to resolve).
+///
+/// SHALLOW BY DESIGN — exactly one level. Markers nested inside the returned
+/// definition stay bare and are resolved on demand by whichever consumer walks
+/// into them. Expanding transitively would not terminate on a self-recursive
+/// datatype, which is the case this table exists to serve.
+#[must_use]
+pub fn resolve_datatype_marker(defs: &DatatypeDefs, ty: &Ty) -> Option<Ty> {
+    datatype_marker_definition(defs, ty).cloned()
+}
+
+/// The full definition a bare marker resolves to, BORROWED from the table.
+///
+/// Same fail-closed contract as [`resolve_datatype_marker`] — this is the
+/// primitive that one is built on — but it hands back the table's own entry
+/// instead of cloning it. A consumer that only needs to COUNT variants or index
+/// one field should use this: cloning to read `variants.len()` would deep-copy
+/// the whole definition, and the recursive roots this table exists for are the
+/// fattest types in the model (the shipped structural-fold fixture carries an
+/// 8079-byte one).
+#[must_use]
+pub fn datatype_marker_definition<'a>(defs: &'a DatatypeDefs, ty: &Ty) -> Option<&'a Ty> {
+    datatype_definition(defs, bare_datatype_marker_name(ty)?)
+}
+
+/// The variant list a bare marker resolves to, when — and only when — the
+/// recorded definition is itself a `Ty::Datatype`.
+///
+/// NARROW ON PURPOSE after the widening. A cut point's definition is usually a
+/// `Ty::Adt` (whose variants are `VariantDef`s carrying discriminants, a shape
+/// this return type cannot express), and silently projecting one into a
+/// `DatatypeVariants` would drop exactly the discriminants the widening exists
+/// to keep. A consumer that can handle both shapes must use
+/// [`datatype_marker_definition`] and match; this spelling remains only for the
+/// `Ty::Datatype`-definition lane (`Sort` constructor lists for the Lever A
+/// `Level`/`Expr`/`ExprKind` cluster).
+#[must_use]
+pub fn datatype_marker_variants<'a>(
+    defs: &'a DatatypeDefs,
+    ty: &Ty,
+) -> Option<&'a DatatypeVariants> {
+    match datatype_marker_definition(defs, ty)? {
+        Ty::Datatype { variants, .. } => Some(variants),
+        _ => None,
+    }
+}
+
+/// `ty` itself, unless it is a bare marker this table defines — in which case
+/// the reconstructed full definition.
+///
+/// This is the spelling consumers should use: it encodes the mandated ADDITIVE
+/// ORDER (inline definition first, table second) in one place instead of at
+/// every call site. For every `ty` that is not a bare marker it returns
+/// `Cow::Borrowed(ty)` — the same value, not a copy — so a consumer that already
+/// had an answer keeps it.
+#[must_use]
+pub fn resolved_datatype<'a>(defs: &DatatypeDefs, ty: &'a Ty) -> std::borrow::Cow<'a, Ty> {
+    resolve_datatype_marker(defs, ty).map_or(std::borrow::Cow::Borrowed(ty), std::borrow::Cow::Owned)
+}
+
 /// MIR body simplified for verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifiableBody {
@@ -467,9 +703,64 @@ pub struct VerifiableBody {
     pub blocks: Vec<BasicBlock>,
     pub arg_count: usize,
     pub return_ty: Ty,
+    /// Out-of-band definitions of the datatypes this body's types name (R0).
+    ///
+    /// `Ty::Datatype` has two spellings for one rustc type: a FULL definition
+    /// (non-empty `variants`) and a bare by-name marker (`variants: []`). Which
+    /// one is emitted depends on the position in the `convert_ty` walk, so ONE
+    /// rustc type can yield several UNEQUAL `Ty` values in a single body and
+    /// strict structural type equality then rejects a well-typed body. Carrying
+    /// the definitions HERE, keyed by name, is what lets every occurrence be the
+    /// same bare marker while a consumer that needs the structure (an enum
+    /// downcast, a variant count, an SMT `declare-datatype`) still recovers it.
+    ///
+    /// The value is the FULL definitional `Ty`, not a variant list: a cut point
+    /// almost always lowers to `Ty::Adt` (7855 definitional `Ty::Adt` against 0
+    /// definitional `Ty::Datatype` over all 2330 shipped fixtures), and only a
+    /// whole `Ty` has room for `VariantDef::discriminant`, the flat
+    /// `__tag`/`__v{v}_{f}` view, `faithful_enum_repr`, `layout` and
+    /// `enum_layout`. See [`DatatypeDefs`] for how the key/value agreement rule
+    /// survives the widening.
+    ///
+    /// `trust_mir_extract::ty_convert` is the ONLY writer, and it writes exactly
+    /// one entry per canonical cut point of the body's own types.
+    ///
+    /// SERDE DISCIPLINE — read before touching this attribute. Six pin-drift
+    /// incidents in this repo all came from one cause: an additive
+    /// `#[serde(default)]` member re-serializes on already-audited values and
+    /// moves shipped hashes (see [`stable_model_json`]). An EMPTY table is
+    /// exactly the pre-carrier meaning ("this body carries no out-of-band
+    /// definitions"), which is what the back-fill re-states at every existing
+    /// construction site, so it MUST NOT appear on the wire at all — hence
+    /// `skip_serializing_if`. A NON-empty table IS hash-visible: it asserts what
+    /// the body's datatype names mean, so two bodies that agree everywhere else
+    /// but disagree on a definition are different objects and must not share a
+    /// content hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub datatype_defs: DatatypeDefs,
 }
 
 impl VerifiableBody {
+    /// Resolve a bare datatype marker through THIS body's definition table.
+    ///
+    /// Thin delegate to the free [`resolve_datatype_marker`]; see it for the
+    /// fail-closed contract and why a body-wide by-name search is forbidden.
+    #[must_use]
+    pub fn resolve_datatype_marker(&self, ty: &Ty) -> Option<Ty> {
+        resolve_datatype_marker(&self.datatype_defs, ty)
+    }
+
+    /// `ty` itself unless it is a bare marker this body defines out-of-band.
+    ///
+    /// The consumer-facing spelling of the additive order: an inline definition
+    /// wins, the table is consulted only for a marker that carries no structure,
+    /// and an unlisted marker is returned untouched so the consumer declines
+    /// exactly as it did before the table existed.
+    #[must_use]
+    pub fn resolved_datatype<'a>(&self, ty: &'a Ty) -> std::borrow::Cow<'a, Ty> {
+        resolved_datatype(&self.datatype_defs, ty)
+    }
+
     /// Discover guarded clauses encoded by block terminators.
     pub fn discovered_clauses(&self) -> Vec<DiscoveredClause> {
         self.blocks.iter().flat_map(BasicBlock::discovered_clauses).collect()
@@ -519,6 +810,249 @@ impl VerifiableBody {
 
         discovered.into_iter().flatten().collect()
     }
+}
+
+/// Trust (coroutine resume-state contract) — the recognized RESUME ENTRY
+/// dispatch of a coroutine body, carrying the LIVE resume-state set the
+/// executor-protocol contract quantifies over.
+///
+/// AUTHORITY: `live_states` is derived from exactly one source — the entry
+/// block's dispatch `SwitchInt` case set whose `exhaustive_enum_unreachable`
+/// flag is set. That flag is minted ONLY by `trust-mir-extract`'s
+/// `mark_exhaustive_enum_unreachable_switches` from rustc's own
+/// `otherwise -> Unreachable` arm (the compiler's certificate that the cases
+/// are exhaustive over the valid states), and the reserved terminal
+/// discriminants RETURNED=1 / POISONED=2 (rustc ABI constants, cross-checked
+/// against `rustc_middle` in trust-mir-extract) are subtracted — and a
+/// reserved discriminant may be subtracted ONLY when its arm is verifiably
+/// rustc's `ResumedAfter*` panic sentinel (the async-fn shape; see
+/// `block_is_resumed_after_panic_sentinel`). Never derived from an attribute
+/// or a function name; the panic-sentinel audit is a NECESSARY condition for
+/// exclusion, not the source of the case set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoroutineResumeStateContract {
+    /// Sorted, deduplicated live resume-state discriminant values. Always
+    /// satisfies [`crate::assumption::coroutine_resume_contract_states_are_valid`]:
+    /// non-empty, contains `UNRESUMED=0`, excludes `RETURNED=1`/`POISONED=2`.
+    pub live_states: Vec<u128>,
+    /// The single-assignment discriminant temp the entry dispatch switches on.
+    /// The bridge constrains EXACTLY the value assigned to this local by the
+    /// recognized entry read — never a frame field, never a later re-read.
+    pub discr_local: usize,
+}
+
+/// Whether `ty` peels through `&`/`&mut`/`*const`/`*mut` to a coroutine frame
+/// (a resume body's `self` is spelled `Pin<&mut {coroutine}>` → `&mut
+/// {coroutine}`). Model-level mirror of `trust_ir_bridge::ty_is_coroutine_frame`.
+fn ty_peels_to_coroutine(mut ty: &Ty) -> bool {
+    loop {
+        match ty {
+            Ty::Ref { inner, .. } => ty = inner,
+            Ty::RawPtr { pointee, .. } => ty = pointee,
+            _ => break,
+        }
+    }
+    matches!(ty, Ty::Coroutine { .. })
+}
+
+/// Whether `place`, in `body`, bases on a coroutine frame: its base local's
+/// declared type peels to `Ty::Coroutine` and every projection is a `Deref`
+/// (any field/index/downcast projection changes the type and DECLINES —
+/// fail-closed, since the recognizer must never mistake frame-field data for
+/// the resume-state selector).
+fn place_is_whole_coroutine_frame(body: &VerifiableBody, place: &Place) -> bool {
+    let Some(decl) = body.locals.iter().find(|local| local.index == place.local) else {
+        return false;
+    };
+    place.projections.iter().all(|projection| matches!(projection, Projection::Deref))
+        && ty_peels_to_coroutine(&decl.ty)
+}
+
+/// Whether block `id` in `body` is rustc's coroutine resume-state PANIC
+/// SENTINEL: a block whose terminator is the always-failing
+/// `Assert(const false, expected: true)` carrying a `ResumedAfter*` message —
+/// exactly the shape `insert_panic_block` mints for the reserved
+/// RETURNED/POISONED arms of an `async fn` resume body. Reaching such an arm
+/// unconditionally panics with the executor-protocol message (statements
+/// before an always-false assert cannot avert it), which is precisely the
+/// behavior the exported resume-state precondition excludes — so, and ONLY so,
+/// may the arm's discriminant be subtracted from the live set. Everything else
+/// fails this check, deliberately including the panic-CALL lowering of the
+/// sentinel and any conditional assert: fail-closed, decline the contract.
+fn block_is_resumed_after_panic_sentinel(body: &VerifiableBody, id: BlockId) -> bool {
+    body.blocks.iter().any(|bb| {
+        bb.id == id
+            && matches!(
+                &bb.terminator,
+                Terminator::Assert {
+                    cond: Operand::Constant(ConstValue::Bool(false)),
+                    expected: true,
+                    msg: AssertMessage::ResumedAfterReturn
+                        | AssertMessage::ResumedAfterPanic
+                        | AssertMessage::ResumedAfterDrop,
+                    ..
+                }
+            )
+    })
+}
+
+/// Recognize the coroutine RESUME ENTRY dispatch of `body` and compute the
+/// live resume-state contract, or `None` when any gate fails (fail-closed: a
+/// `None` keeps today's behavior — havoc'd selector, `Assume(false)` sentinel
+/// pruning, `assumption:coroutine` row, strict abort).
+///
+/// Shape gates, ALL required:
+/// 1. the entry block (`blocks[0]`, id 0) terminates in a `SwitchInt` whose
+///    `exhaustive_enum_unreachable` certificate is set and whose `otherwise`
+///    block is `Unreachable` (re-checked here, belt over the extractor's gate);
+/// 2. the switch selector is a whole-local, non-argument temp `d`;
+/// 3. the FIRST statement assigning `d` in the entry block is a whole-local
+///    `d = Discriminant(frame)` read of a coroutine frame, with NO preceding
+///    `SetDiscriminant`/`Deinit` on any coroutine-frame place in the entry
+///    block (a read after a state write must stay pure havoc — the written
+///    state RETURNED=1 lies outside the live set);
+/// 4. `d` is assigned exactly once in the whole body (statement writes and
+///    call destinations counted), so no other definition can reach the switch;
+/// 5. EVERY reserved-discriminant arm (`RETURNED=1` / `POISONED=2`) present in
+///    the certified case set targets a verified `ResumedAfter*` PANIC-SENTINEL
+///    block — the async-fn shape ([`block_is_resumed_after_panic_sentinel`]) —
+///    and at least one such arm exists. This is the D1 fail-closed narrowing:
+///    subtracting a reserved discriminant is only sound when resuming in that
+///    state provably panics with the executor-protocol message. `gen` /
+///    `async gen` / async-drop coroutines lower the `RETURNED=1` arm to LEGAL
+///    REACHABLE code (rustc's `insert_none_ret_block` returns `None` after
+///    exhaustion; `insert_poll_ready_block` returns `Poll::Ready(())`), so for
+///    those shapes — or ANY unrecognized arm — the whole contract DECLINES:
+///    pruning a legal arm behind an entry `Assume` would be an unproved,
+///    unpublished precondition that legal callers violate. Requiring ≥1
+///    sentinel arm also couples recognition to publication: a recognized body
+///    always yields ≥1 marked sentinel obligation, so the compiler's publish
+///    seam can never see the entry `Assume` without a row to account for it;
+/// 6. the live set = switch cases MINUS the reserved RETURNED/POISONED ABI
+///    discriminants is well-formed per
+///    [`crate::assumption::coroutine_resume_contract_states_are_valid`]
+///    (non-empty, sorted, contains `UNRESUMED=0`, excludes the reserved pair).
+#[must_use]
+pub fn coroutine_resume_state_contract(
+    body: &VerifiableBody,
+) -> Option<CoroutineResumeStateContract> {
+    let entry = body.blocks.first()?;
+    if entry.id.0 != 0 {
+        return None;
+    }
+    let Terminator::SwitchInt {
+        discr, targets, otherwise, exhaustive_enum_unreachable: true, ..
+    } = &entry.terminator
+    else {
+        return None;
+    };
+    // (belt) the otherwise arm must really be rustc's Unreachable certificate.
+    if !body
+        .blocks
+        .iter()
+        .any(|bb| bb.id == *otherwise && matches!(bb.terminator, Terminator::Unreachable))
+    {
+        return None;
+    }
+    // Whole-local, non-argument selector.
+    let discr_local = match discr {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place.local,
+        _ => return None,
+    };
+    if discr_local <= body.arg_count {
+        return None;
+    }
+    // The selector must be defined by the entry-block dispatch read, with no
+    // coroutine-frame discriminant write before it.
+    let mut recognized_entry_read = false;
+    for stmt in &entry.stmts {
+        match stmt {
+            Statement::Assign { place, rvalue, .. }
+                if place.local == discr_local && place.projections.is_empty() =>
+            {
+                let Rvalue::Discriminant(src) = rvalue else { return None };
+                if !place_is_whole_coroutine_frame(body, src) {
+                    return None;
+                }
+                recognized_entry_read = true;
+                break;
+            }
+            Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                if place_is_whole_coroutine_frame(body, place) =>
+            {
+                // A frame-state write precedes the read: the read observes a
+                // written state (e.g. RETURNED=1), not the executor's entry
+                // state — constraining it to the live set would be unsound.
+                return None;
+            }
+            _ => {}
+        }
+    }
+    if !recognized_entry_read {
+        return None;
+    }
+    // Exactly one write to the selector anywhere in the body.
+    let mut writes = 0usize;
+    for bb in &body.blocks {
+        for stmt in &bb.stmts {
+            let written = match stmt {
+                Statement::Assign { place, .. }
+                | Statement::SetDiscriminant { place, .. }
+                | Statement::Deinit { place } => Some(place.local),
+                _ => None,
+            };
+            if written == Some(discr_local) {
+                writes += 1;
+            }
+        }
+        if let Terminator::Call { dest, .. } = &bb.terminator
+            && dest.local == discr_local
+        {
+            writes += 1;
+        }
+    }
+    if writes != 1 {
+        return None;
+    }
+    // D1 fail-closed narrowing: every reserved-discriminant arm PRESENT in the
+    // certified case set must verifiably be the `ResumedAfter*` panic sentinel
+    // (the async-fn shape), and at least one must exist. For `gen`/`async gen`/
+    // async-drop coroutines the RETURNED=1 arm is LEGAL REACHABLE code (rustc's
+    // `insert_none_ret_block` / `insert_poll_ready_block`): excluding it would
+    // let the entry `Assume` prune a legal arm — an unproved, unpublished
+    // precondition legal callers violate. ANY non-sentinel reserved arm
+    // declines the WHOLE contract (behavior identical to before the lane
+    // existed). The ≥1 requirement is the publish coupling: a minted contract
+    // guarantees ≥1 sentinel obligation downstream, so the entry `Assume` can
+    // never outrun the row that accounts for it.
+    let mut reserved_sentinel_arms = 0usize;
+    for (value, target) in targets.iter() {
+        if *value == crate::assumption::COROUTINE_RESERVED_STATE_RETURNED
+            || *value == crate::assumption::COROUTINE_RESERVED_STATE_POISONED
+        {
+            if !block_is_resumed_after_panic_sentinel(body, *target) {
+                return None;
+            }
+            reserved_sentinel_arms += 1;
+        }
+    }
+    if reserved_sentinel_arms == 0 {
+        return None;
+    }
+    // Live states = certified exhaustive case set MINUS the reserved terminal
+    // discriminants (rustc ABI constants; see the assumption-module pins).
+    let mut live_states: Vec<u128> = targets
+        .iter()
+        .map(|(value, _)| *value)
+        .filter(|value| {
+            *value != crate::assumption::COROUTINE_RESERVED_STATE_RETURNED
+                && *value != crate::assumption::COROUTINE_RESERVED_STATE_POISONED
+        })
+        .collect();
+    live_states.sort_unstable();
+    live_states.dedup();
+    crate::assumption::coroutine_resume_contract_states_are_valid(&live_states)
+        .then_some(CoroutineResumeStateContract { live_states, discr_local })
 }
 
 /// A local variable declaration.
@@ -4955,6 +5489,18 @@ pub enum EnumTagEncodingInfo {
         /// EnumReprHint carrier exactly as its doc's "bridge maps 1:1" rule).
         niche_ty: EnumReprHint,
     },
+    /// Trust (#205R): no discriminant is stored at all — the image IS the sole
+    /// variant's payload. This is rustc's `Variants::Single` verdict, which it
+    /// reaches only for a `repr(Rust)` enum with one INHABITED variant.
+    ///
+    /// Carries no payload because there is nothing to place: no lane, no
+    /// offset, no width. Both fills additionally require the def to declare
+    /// EXACTLY ONE variant, so `Variants::Single` over an enum whose other
+    /// variants are merely uninhabited (`enum E { A(!), B(u8) }`) keeps
+    /// DECLINING — trust-ir's model cannot discriminate N declared variants
+    /// from a tag-free image, so accepting one would let a Load invent a
+    /// variant.
+    Untagged,
 }
 
 /// Trust (B3-3): the CONCRETE memory layout of an enum as rustc computed it —
@@ -5529,6 +6075,41 @@ impl Ty {
         }
     }
 
+    /// [`Ty::num_variants`], additively widened by an explicit datatype table
+    /// (R0).
+    ///
+    /// Identical to `num_variants` on every input it already answered — the
+    /// inline arms are tried FIRST — and additionally answers for a BARE
+    /// `Ty::Datatype` marker that `defs` explicitly defines. A marker with no
+    /// entry still returns `None`, so a discriminant range fact is never
+    /// manufactured for a datatype nobody wrote down.
+    ///
+    /// The bound stays sound for the same reason as before: `n` comes from the
+    /// producer's own declaration of what that name means, and a real value's
+    /// discriminant is always in `0..n`.
+    #[must_use]
+    pub fn num_variants_in(&self, defs: &DatatypeDefs) -> Option<usize> {
+        self.num_variants().or_else(|| datatype_marker_definition(defs, self)?.num_variants())
+    }
+
+    /// The field types of variant `variant_idx` of a DEFINITIONAL `Ty` — either
+    /// spelling.
+    ///
+    /// `Ty::Datatype` keeps `datatype_variant_field_tys`'s reading; a `Ty::Adt`
+    /// enum reads its first-class `VariantDef` list, which is the shape a
+    /// canonical cut point's recorded definition actually has (7855 shipped
+    /// definitional `Ty::Adt` against 0 definitional `Ty::Datatype`).
+    #[must_use]
+    pub fn definitional_variant_field_tys(&self, variant_idx: usize) -> Option<Vec<&Ty>> {
+        match self {
+            Ty::Datatype { .. } => self.datatype_variant_field_tys(variant_idx),
+            Ty::Adt { variants, .. } => {
+                variants.get(variant_idx).map(|v| v.fields.iter().map(|(_, ty)| ty).collect())
+            }
+            _ => None,
+        }
+    }
+
     /// For a `Ty::Datatype`, returns the field types of variant `variant_idx`,
     /// in declaration order. `None` for a non-datatype or an out-of-range
     /// variant index. Used by projection resolution to type an enum-payload
@@ -5541,6 +6122,24 @@ impl Ty {
                 .map(|(_, fields)| fields.iter().map(|(_, ty)| ty).collect()),
             _ => None,
         }
+    }
+
+    /// [`Ty::datatype_variant_field_tys`], additively widened by an explicit
+    /// datatype table (R0).
+    ///
+    /// The inline definition is tried FIRST; the table is consulted only for a
+    /// bare marker, and only for its own name. The returned field types are
+    /// borrowed either from `self` (inline) or from `defs` (resolved), which is
+    /// why both share the lifetime.
+    #[must_use]
+    pub fn datatype_variant_field_tys_in<'a>(
+        &'a self,
+        defs: &'a DatatypeDefs,
+        variant_idx: usize,
+    ) -> Option<Vec<&'a Ty>> {
+        self.datatype_variant_field_tys(variant_idx).or_else(|| {
+            datatype_marker_definition(defs, self)?.definitional_variant_field_tys(variant_idx)
+        })
     }
 
     /// Returns the bit width for integer types.
@@ -5766,6 +6365,33 @@ pub enum Statement {
         name: String,
         args: Vec<Operand>,
     },
+    /// `copy_nonoverlapping::<T>(src, dst, count)` — a non-diverging intrinsic
+    /// that rustc lowers to a STATEMENT, not a call.
+    ///
+    /// `src`/`dst` are pointer-valued operands and `count` is an element count,
+    /// so the destination is NOT a `Place`: this writes memory the version
+    /// oracle cannot version by place, which is why `write_effect` classifies it
+    /// `FailClosedOrBackstopped` rather than `Captured`.
+    ///
+    /// NOTE ON REACHABILITY: `trust-mir-extract`'s converter now emits this
+    /// variant whenever the element type (the pointee of `src`) is
+    /// determinable, falling back to [`Statement::Unsupported`] (fail-closed)
+    /// when it is not. The flip is only sound because the obligations travel
+    /// with the statement: `trust-vcgen`'s sep engine matches it in BOTH
+    /// reachability gates and routes it into `interpret_ptr_copy`, which mints
+    /// the src/dst `CopyBoundsViolation` and `[unsafe:sep:copy]` overlap rows;
+    /// `trust-ir-bridge`'s `lower_copy_nonoverlapping` models the EFFECT for
+    /// literal counts and fails closed on symbolic ones. An earlier flip that
+    /// shipped without the working obligation path verified an out-of-bounds
+    /// copy silently and was reverted in full (810baa6c4c);
+    /// `tests/ui/trust/copy_nonoverlapping_oob_refuted.rs` pins that refutation.
+    CopyNonOverlapping {
+        src: Operand,
+        dst: Operand,
+        count: Operand,
+        elem_ty: Ty,
+        span: SourceSpan,
+    },
     /// Internal TrustIr sentinel for a rustc MIR statement class that is not
     /// represented by a dedicated `Statement` variant. The sentinel itself is
     /// not an upstream MIR variant; downstream must fail closed by emitting
@@ -5810,6 +6436,10 @@ impl Statement {
             Statement::Assign { .. } => WriteEffect::Captured,
             Statement::SetDiscriminant { .. } => WriteEffect::Captured,
             Statement::Intrinsic { .. } => WriteEffect::FailClosedOrBackstopped,
+            // Writes through a POINTER operand, not a place, so the place-keyed
+            // version oracle cannot capture it — the `intrinsic's pointer arg`
+            // case named in `FailClosedOrBackstopped`'s own documentation.
+            Statement::CopyNonOverlapping { .. } => WriteEffect::FailClosedOrBackstopped,
             Statement::Deinit { .. } => WriteEffect::FailClosedOrBackstopped,
             Statement::Unsupported { .. } => WriteEffect::FailClosedOrBackstopped,
             Statement::Retag { .. } => WriteEffect::NoValueWrite,
@@ -8824,8 +9454,8 @@ mod tests {
             function_entry: Some(0x401000),
             instruction_address: 0x40100c,
             instruction_size: Some(4),
-            encoding: Some(0xD503_3B9F),
-            instruction_bytes: 0xD503_3B9F_u32.to_le_bytes().to_vec(),
+            encoding: Some(0xD503_3BBF),
+            instruction_bytes: 0xD503_3BBF_u32.to_le_bytes().to_vec(),
             source: None,
         };
         let ledger = UnsupportedLedger {
@@ -9193,6 +9823,7 @@ mod tests {
                 ],
                 arg_count: 2,
                 return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -9323,6 +9954,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let path_map = body.path_map();
@@ -9357,6 +9989,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         let path_map = body.path_map();
@@ -9384,6 +10017,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -9411,6 +10045,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -9430,6 +10065,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -9464,6 +10100,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -9525,6 +10162,7 @@ mod tests {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         };
 
         // Half 1: the default is stripped from hash material entirely, so a
@@ -9550,6 +10188,351 @@ mod tests {
         assert_ne!(
             small, huge,
             "distinct monomorphizations must not share a content hash (hunt-11 false-proof vector)"
+        );
+    }
+
+    /// Trust (R0 carrier): the two halves of the `VerifiableBody::datatype_defs`
+    /// hash domain. This is the SEVENTH additive member to join the rule, and the
+    /// first that is invisible by `skip_serializing_if` rather than by a strip
+    /// alone — so the assertion is correspondingly stronger: absent from the
+    /// ORDINARY wire, not merely from hash material.
+    ///
+    /// Half 1 (no erasure of history): an EMPTY table is exactly the pre-carrier
+    /// meaning — "this body carries no out-of-band datatype definitions" — which
+    /// is what every body meant before the field existed and what the back-fill
+    /// re-stated at 1402 construction sites. It must not reach the wire at all,
+    /// or every shipped fold-corpus fixture and every audited content hash moves
+    /// for a change that carries no information.
+    ///
+    /// Half 2 (no widening into erasure): a NON-empty table asserts what this
+    /// body's bare `Ty::Datatype` markers MEAN. Two bodies that agree everywhere
+    /// else but disagree on a definition are DIFFERENT objects, and stripping the
+    /// table would let a body whose marker resolves to `Big<u8>` ride the pin of
+    /// one audited as `Big<i32>` — the exact fail-open the by-name body search
+    /// was withdrawn for. Both halves are asserted here so neither can be
+    /// "fixed" alone.
+    #[test]
+    fn datatype_defs_empty_is_hash_invisible_but_populated_is_hash_visible() {
+        let body = |defs: DatatypeDefs| VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: defs,
+        };
+        let defs_of = |field: Ty| {
+            DatatypeDefs::from([(
+                "m::Big".to_string(),
+                Ty::Datatype {
+                    name: "m::Big".to_string(),
+                    variants: vec![(
+                        "m::Big::One".to_string(),
+                        vec![("0".to_string(), field)],
+                    )],
+                },
+            )])
+        };
+
+        // Half 1a: the empty table is absent from the ORDINARY serde wire, so a
+        // body that predates the carrier re-serializes byte-identically. This is
+        // what protects the shipped corpus fixtures, whose pins are taken over
+        // raw bytes and not over hash material.
+        let empty_wire = serde_json::to_string(&body(DatatypeDefs::new())).expect("serialize body");
+        assert!(
+            !empty_wire.contains("datatype_defs"),
+            "an empty table must not reach the wire at all, got {empty_wire}"
+        );
+
+        // Half 1b: decode of a record with no such key, then encode, is the
+        // identity on bytes — both directions, not just the write side.
+        let decoded: VerifiableBody =
+            serde_json::from_str(&empty_wire).expect("pre-carrier body decodes");
+        assert!(
+            decoded.datatype_defs.is_empty(),
+            "a missing key must decode as the empty table, never as anything else"
+        );
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serialize body"),
+            empty_wire,
+            "decode/encode of a pre-carrier body must be the identity on bytes"
+        );
+
+        // Half 1c: and it is absent from stable hash material too.
+        let empty_material =
+            stable_model_json(&body(DatatypeDefs::new())).expect("stable hash material");
+        assert!(
+            !empty_material.contains("datatype_defs"),
+            "an empty table must not appear in stable hash material, got {empty_material}"
+        );
+
+        // Half 2: a populated table IS identity, and DIFFERENT definitions under
+        // the SAME name are DIFFERENT identities.
+        let hash = |defs: DatatypeDefs| {
+            stable_sha256_hex(
+                stable_model_json(&body(defs)).expect("stable hash material").as_bytes(),
+            )
+        };
+        let bare = hash(DatatypeDefs::new());
+        let as_u8 = hash(defs_of(Ty::Int { width: 8, signed: false }));
+        let as_i32 = hash(defs_of(Ty::Int { width: 32, signed: true }));
+        assert_ne!(
+            bare, as_u8,
+            "a populated table must be hash-visible, not stripped like the empty one"
+        );
+        assert_ne!(
+            as_u8, as_i32,
+            "two different definitions of one datatype name must not share a content hash"
+        );
+    }
+
+    /// Trust (R0 consumer): the resolver's whole contract, in one place.
+    ///
+    /// `resolve_datatype_marker` is the ONLY door between a bare marker and the
+    /// structure it stands for, so every property the consumers rely on is
+    /// asserted here rather than re-derived at each of the ten call sites:
+    ///
+    ///   * ADDITIVE — the identity on everything that is not a bare marker, and
+    ///     on a bare marker the table does not define. This is what lets a
+    ///     consumer widen unconditionally and still be certain that nothing it
+    ///     previously accepted can change: only a decline can become an answer.
+    ///   * FAIL-CLOSED and KEYED — the lookup is by the marker's own name. An
+    ///     entry under any other name, or an empty entry, resolves nothing.
+    ///   * SHALLOW — exactly one level. Markers nested in the returned variant
+    ///     list stay bare, which is what makes a self-recursive datatype
+    ///     terminate; a transitive expansion of `Tree` would not.
+    ///   * EXACT — the reconstruction is `Ty::Datatype { name: <the key>,
+    ///     variants: <the entry> }`, so a resolved marker is `ty_eq` to the
+    ///     inline definition it replaces. Without this, resolving would trade R0
+    ///     for a new spelling disagreement instead of removing it.
+    #[test]
+    fn a_bare_marker_resolves_only_through_its_own_explicit_table_entry() {
+        let marker = |name: &str| Ty::Datatype { name: name.into(), variants: vec![] };
+        // `Tree = Leaf(i64) | One(Tree)`: the recursive child is itself a marker,
+        // which is the case the shallowness rule exists for.
+        let tree_variants: DatatypeVariants = vec![
+            ("Leaf".to_string(), vec![("0".to_string(), Ty::Int { width: 64, signed: true })]),
+            ("One".to_string(), vec![("0".to_string(), marker("Tree"))]),
+        ];
+        let inline = Ty::Datatype { name: "Tree".to_string(), variants: tree_variants.clone() };
+        let defs = DatatypeDefs::from([("Tree".to_string(), inline.clone())]);
+
+        // Resolves, and to EXACTLY the inline definition.
+        assert_eq!(resolve_datatype_marker(&defs, &marker("Tree")), Some(inline.clone()));
+        assert!(
+            resolve_datatype_marker(&defs, &marker("Tree"))
+                .is_some_and(|r| r.eq_ignoring_disc_index_safe(&inline)),
+            "a resolved marker must be ty_eq to the definition it stands for, or the \
+             widening trades R0 for a different spelling disagreement"
+        );
+        assert_eq!(datatype_marker_variants(&defs, &marker("Tree")), Some(&tree_variants));
+        assert_eq!(marker("Tree").num_variants_in(&defs), Some(2));
+        assert_eq!(
+            marker("Tree").datatype_variant_field_tys_in(&defs, 1),
+            Some(vec![&marker("Tree")]),
+            "the recursive child stays a BARE marker — resolution is one level",
+        );
+
+        // SHALLOW: the resolved value's own nested occurrence is still a marker,
+        // so `Tree` does not expand into itself forever.
+        let Some(Ty::Datatype { variants, .. }) = resolve_datatype_marker(&defs, &marker("Tree"))
+        else {
+            panic!("Tree resolves");
+        };
+        assert_eq!(variants[1].1[0].1, marker("Tree"));
+
+        // FAIL-CLOSED: no entry, another name's entry, and an empty entry all
+        // decline — and `num_variants_in` declines with them, so no discriminant
+        // range fact is ever manufactured for a datatype nobody wrote down.
+        let empty_entry = DatatypeDefs::from([(
+            "Tree".to_string(),
+            Ty::Datatype { name: "Tree".to_string(), variants: DatatypeVariants::new() },
+        )]);
+        // WIDENED CARRIER: the value is a whole `Ty` now, so an entry CAN name
+        // something other than its key. That disagreement must make the entry
+        // inert, not authoritative — the read-side half of the key/value
+        // agreement rule, and the half a deserialized table can only get from
+        // here (nothing forces wire bytes through `insert_datatype_def`).
+        let mislabelled = DatatypeDefs::from([(
+            "Tree".to_string(),
+            Ty::Datatype { name: "NotTree".to_string(), variants: tree_variants.clone() },
+        )]);
+        // …and an entry that is not a definitional shape at all.
+        let not_a_definition =
+            DatatypeDefs::from([("Tree".to_string(), Ty::Int { width: 64, signed: true })]);
+        for (label, table, ty) in [
+            ("no table at all", DatatypeDefs::new(), marker("Tree")),
+            ("another name's entry", defs.clone(), marker("Other")),
+            ("a vacuous entry", empty_entry, marker("Tree")),
+            ("an entry that names something else", mislabelled, marker("Tree")),
+            ("an entry that is not a definition", not_a_definition, marker("Tree")),
+        ] {
+            assert_eq!(resolve_datatype_marker(&table, &ty), None, "{label}");
+            assert_eq!(datatype_marker_variants(&table, &ty), None, "{label}");
+            assert_eq!(ty.num_variants_in(&table), None, "{label}");
+            assert!(matches!(resolved_datatype(&table, &ty), std::borrow::Cow::Borrowed(_)),
+                "{label}: an unresolved marker must come back BORROWED — the identity, \
+                 not a copy that merely compares equal");
+        }
+
+        // ADDITIVE: the identity on an inline definition (so the inline arm always
+        // wins) and on every non-datatype shape, even when the table would define
+        // a same-named datatype.
+        for ty in [inline.clone(), Ty::Unit, Ty::Int { width: 8, signed: false }] {
+            assert_eq!(resolve_datatype_marker(&defs, &ty), None);
+            assert!(matches!(resolved_datatype(&defs, &ty), std::borrow::Cow::Borrowed(_)));
+        }
+        assert_eq!(
+            inline.num_variants_in(&defs),
+            inline.num_variants(),
+            "a definition that was already inline must answer identically with or \
+             without a table",
+        );
+
+        // The withdrawn fail-open, as a failing assertion: one instantiation's
+        // entry must not answer for another, nor for the generics-ERASED name
+        // that `compact_oversized_field` emits for an unrelated compacted field.
+        let u8_only = DatatypeDefs::from([(
+            "k::Big<u8>".to_string(),
+            Ty::Datatype {
+                name: "k::Big<u8>".to_string(),
+                variants: vec![(
+                    "Mk".to_string(),
+                    vec![("0".to_string(), Ty::Int { width: 8, signed: false })],
+                )],
+            },
+        )]);
+        assert!(resolve_datatype_marker(&u8_only, &marker("k::Big<u8>")).is_some());
+        assert_eq!(resolve_datatype_marker(&u8_only, &marker("k::Big<i32>")), None);
+        assert_eq!(resolve_datatype_marker(&u8_only, &marker("k::Big")), None);
+    }
+
+    /// Trust (R0, WIDENED CARRIER): the table value is a FULL definitional `Ty`,
+    /// and the property the narrow value type used to get structurally — an
+    /// entry cannot disagree with its own key — is now maintained by validation
+    /// at BOTH ends.
+    ///
+    /// The four halves belong in one test because each is the failure mode of
+    /// the others:
+    ///
+    ///   1. an ADT-shaped definition resolves, WITH its discriminants and its
+    ///      flat view intact — the whole reason for the widening, since a cut
+    ///      point almost never lowers to `Ty::Datatype`;
+    ///   2. the key is DERIVED on insert, never supplied, so an inserted entry
+    ///      is filed under the name it claims and nothing else;
+    ///   3. a conflicting second definition of one name REMOVES the name (a name
+    ///      that means two things identifies nothing), and the removal is sticky
+    ///      against the first definition too;
+    ///   4. `datatype_marker_variants` stays NARROW — it answers only for a
+    ///      `Ty::Datatype` definition, so no caller can silently project an
+    ///      ADT's `VariantDef`s (discriminants and all) into a bare variant list.
+    #[test]
+    fn the_widened_table_holds_whole_definitions_and_still_cannot_disagree_with_its_key() {
+        let marker = |name: &str| Ty::Datatype { name: name.into(), variants: vec![] };
+        let i64_ty = || Ty::Int { width: 64, signed: true };
+        // `Tree` exactly as `lower_enum_adt` builds it: the flattened `__tag` /
+        // `__v{v}_{f}` view PLUS first-class variants carrying REAL tags. The
+        // tags here are [10, 20, 30] — the shipped `tag_xor` fixture's own
+        // non-index discriminants, which is the fact the narrow carrier had
+        // nowhere to put.
+        let tree_adt = Ty::Adt {
+            name: "Tree".into(),
+            fields: vec![("__tag".into(), i64_ty()), ("__v0_0".into(), i64_ty())],
+            variants: vec![
+                VariantDef { name: "Leaf".into(), discriminant: 10, fields: vec![] },
+                VariantDef {
+                    name: "One".into(),
+                    discriminant: 20,
+                    fields: vec![("0".into(), i64_ty())],
+                },
+                VariantDef { name: "Two".into(), discriminant: 30, fields: vec![] },
+            ],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
+
+        // 1. An ADT definition resolves, and to EXACTLY itself — no projection,
+        //    no re-spelling, so every discriminant survives the round trip.
+        let mut defs = DatatypeDefs::new();
+        assert!(insert_datatype_def(&mut defs, tree_adt.clone()));
+        assert_eq!(resolve_datatype_marker(&defs, &marker("Tree")), Some(tree_adt.clone()));
+        assert_eq!(datatype_marker_definition(&defs, &marker("Tree")), Some(&tree_adt));
+        assert_eq!(marker("Tree").num_variants_in(&defs), Some(3));
+        assert_eq!(
+            marker("Tree").datatype_variant_field_tys_in(&defs, 1),
+            Some(vec![&i64_ty()]),
+            "an ADT definition's per-variant field list must be readable through the table",
+        );
+        let Some(Ty::Adt { variants, .. }) = resolve_datatype_marker(&defs, &marker("Tree"))
+        else {
+            panic!("Tree resolves to an Adt");
+        };
+        assert_eq!(
+            variants.iter().map(|v| v.discriminant).collect::<Vec<_>>(),
+            vec![10, 20, 30],
+            "the NON-INDEX discriminants are the fact the narrow carrier could not hold",
+        );
+
+        // 2. The key is derived from the value's own name, so the entry is
+        //    filed under `Tree` and under nothing else — a caller cannot even
+        //    express the disagreement.
+        assert_eq!(defs.keys().collect::<Vec<_>>(), vec!["Tree"]);
+        // A value with no nominal name, and one with no structure, are refused.
+        let mut junk = DatatypeDefs::new();
+        assert!(!insert_datatype_def(&mut junk, Ty::Int { width: 8, signed: false }));
+        assert!(!insert_datatype_def(&mut junk, marker("Tree")));
+        assert!(!insert_datatype_def(
+            &mut junk,
+            Ty::Adt {
+                name: "Empty".into(),
+                fields: vec![],
+                variants: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                layout: None,
+                enum_layout: None,
+                adt_kind: None,
+            },
+        ));
+        assert!(junk.is_empty(), "nothing malformed may reach the table");
+
+        // 3. Re-inserting the SAME definition is idempotent; a DIFFERENT one
+        //    under the same name removes the name entirely, and the marker then
+        //    declines exactly as it did before any entry existed.
+        assert!(insert_datatype_def(&mut defs, tree_adt.clone()), "idempotent");
+        let mut other = tree_adt.clone();
+        if let Ty::Adt { variants, .. } = &mut other {
+            variants[0].discriminant = 99;
+        }
+        assert!(!insert_datatype_def(&mut defs, other));
+        assert!(!defs.contains_key("Tree"), "a name that means two things identifies nothing");
+        assert_eq!(resolve_datatype_marker(&defs, &marker("Tree")), None);
+
+        // 4. `datatype_marker_variants` is the NARROW reader: it answers for a
+        //    `Ty::Datatype` definition and declines for an ADT one, so an ADT's
+        //    discriminants can never be silently dropped by projecting through
+        //    it.
+        let dt_variants: DatatypeVariants =
+            vec![("Mk".to_string(), vec![("0".to_string(), i64_ty())])];
+        let dt = Ty::Datatype { name: "Dt".into(), variants: dt_variants.clone() };
+        let mut mixed = DatatypeDefs::new();
+        assert!(insert_datatype_def(&mut mixed, dt));
+        assert!(insert_datatype_def(&mut mixed, tree_adt.clone()));
+        assert_eq!(datatype_marker_variants(&mixed, &marker("Dt")), Some(&dt_variants));
+        assert_eq!(
+            datatype_marker_variants(&mixed, &marker("Tree")),
+            None,
+            "an ADT definition must NOT be projected into a bare variant list",
+        );
+        assert!(
+            datatype_marker_definition(&mixed, &marker("Tree")).is_some(),
+            "…while the whole definition is still available to a caller that can read it",
         );
     }
 
@@ -9641,6 +10624,7 @@ mod tests {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -10254,5 +11238,314 @@ mod tests {
         assert!(!Ty::Bool.disc_index_safe());
         assert!(!Ty::u32().disc_index_safe());
         assert!(!Ty::Array { elem: Box::new(Ty::u8()), len: 4 }.disc_index_safe());
+    }
+
+    // -----------------------------------------------------------------------
+    // Trust (coroutine resume-state contract): recognizer gates. The fixture
+    // mirrors the rustc lowering of a ZERO-AWAIT `async fn` resume body:
+    // `bb0: _3 = discriminant((*_1)); switchInt(_3) -> [0: body, 1: resumed-
+    // after-return sink, 2: resumed-after-panic sink, otherwise: unreachable]`.
+    // -----------------------------------------------------------------------
+
+    fn zero_await_resume_body() -> VerifiableBody {
+        let frame_ty = Ty::Ref {
+            mutable: true,
+            inner: Box::new(Ty::Coroutine {
+                name: "fixture::f::{closure#0}".into(),
+                upvars: vec![Ty::u8()],
+            }),
+        };
+        let sentinel = |id: usize, msg: AssertMessage| BasicBlock {
+            id: BlockId(id),
+            stmts: vec![],
+            terminator: Terminator::Assert {
+                cond: Operand::Constant(ConstValue::Bool(false)),
+                expected: true,
+                msg,
+                // rustc emits the protocol sink as a SELF-LOOP.
+                target: BlockId(id),
+                span: SourceSpan::default(),
+                unwind: UnwindEdge::Unreachable,
+            },
+        };
+        VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u16(), name: None },
+                LocalDecl { index: 1, ty: frame_ty, name: Some("self".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: None },
+                LocalDecl { index: 3, ty: Ty::u32(), name: None },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::Discriminant(Place {
+                            local: 1,
+                            projections: vec![Projection::Deref],
+                        }),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(3)),
+                        targets: vec![(0, BlockId(1)), (1, BlockId(2)), (2, BlockId(3))],
+                        otherwise: BlockId(4),
+                        exhaustive_enum_unreachable: true,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                sentinel(2, AssertMessage::ResumedAfterReturn),
+                sentinel(3, AssertMessage::ResumedAfterPanic),
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Unreachable },
+            ],
+            arg_count: 2,
+            return_ty: Ty::u16(),
+            datatype_defs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn coroutine_resume_contract_recognizes_zero_await_dispatch() {
+        let contract = coroutine_resume_state_contract(&zero_await_resume_body())
+            .expect("zero-await dispatch must be recognized");
+        // Live set = certified cases {0,1,2} minus reserved {1,2} = {0}.
+        assert_eq!(contract.live_states, vec![0]);
+        assert_eq!(contract.discr_local, 3);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_recognizes_one_await_dispatch() {
+        // A one-await coroutine adds suspend state 3 to the certified case set.
+        let mut body = zero_await_resume_body();
+        let Terminator::SwitchInt { targets, .. } = &mut body.blocks[0].terminator else {
+            unreachable!()
+        };
+        targets.push((3, BlockId(1)));
+        let contract =
+            coroutine_resume_state_contract(&body).expect("one-await dispatch must be recognized");
+        assert_eq!(contract.live_states, vec![0, 3]);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_without_exhaustiveness_certificate() {
+        // Without rustc's `otherwise -> Unreachable` certificate carrier the
+        // case set is NOT known exhaustive — no live-state authority exists.
+        let mut body = zero_await_resume_body();
+        let Terminator::SwitchInt { exhaustive_enum_unreachable, .. } =
+            &mut body.blocks[0].terminator
+        else {
+            unreachable!()
+        };
+        *exhaustive_enum_unreachable = false;
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_non_unreachable_otherwise() {
+        let mut body = zero_await_resume_body();
+        body.blocks[4].terminator = Terminator::Return;
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_non_coroutine_frame() {
+        // An ordinary enum match with the exhaustiveness flag set must never
+        // mint a coroutine contract — the source type is the discriminator.
+        let mut body = zero_await_resume_body();
+        body.locals[1].ty = Ty::adt("E", vec![]);
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_frame_field_projection() {
+        // A field projection reads frame DATA, not the resume-state selector.
+        let mut body = zero_await_resume_body();
+        let Statement::Assign { rvalue, .. } = &mut body.blocks[0].stmts[0] else {
+            unreachable!()
+        };
+        *rvalue = Rvalue::Discriminant(Place {
+            local: 1,
+            projections: vec![Projection::Deref, Projection::Field(0)],
+        });
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_write_before_entry_read() {
+        // A SetDiscriminant on the frame BEFORE the read means the read
+        // observes a written state (RETURNED=1 lies outside the live set);
+        // constraining it would be an unsound assumption.
+        let mut body = zero_await_resume_body();
+        body.blocks[0].stmts.insert(
+            0,
+            Statement::SetDiscriminant {
+                place: Place { local: 1, projections: vec![Projection::Deref] },
+                variant_index: 1,
+            },
+        );
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_multiply_assigned_selector() {
+        let mut body = zero_await_resume_body();
+        body.blocks[1].stmts.push(Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
+            span: SourceSpan::default(),
+        });
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_argument_selector() {
+        // Selector locals within `1..=arg_count` are caller-controlled.
+        let mut body = zero_await_resume_body();
+        body.arg_count = 3;
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_case_set_without_unresumed() {
+        // A dispatch whose certified case set omits UNRESUMED=0 is not a
+        // resume entry dispatch shape we understand — decline.
+        let mut body = zero_await_resume_body();
+        let Terminator::SwitchInt { targets, .. } = &mut body.blocks[0].terminator else {
+            unreachable!()
+        };
+        targets.remove(0);
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    #[test]
+    fn coroutine_resume_contract_declines_reserved_only_live_set() {
+        // Cases {1,2} minus reserved = ∅ → invalid live set → decline.
+        let mut body = zero_await_resume_body();
+        let Terminator::SwitchInt { targets, .. } = &mut body.blocks[0].terminator else {
+            unreachable!()
+        };
+        *targets = vec![(1, BlockId(2)), (2, BlockId(3))];
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // D1 (fail-closed narrowing): a reserved discriminant may be excluded from
+    // the live set ONLY when its arm is verifiably rustc's `ResumedAfter*`
+    // panic sentinel — the async-fn shape. `gen` / `async gen` / async-drop
+    // coroutines lower the RETURNED=1 arm to LEGAL REACHABLE code (calling
+    // `next()` after exhaustion returns `None`; polling returns
+    // `Poll::Ready(())` — rustc's `insert_none_ret_block` /
+    // `insert_poll_ready_block`, coroutine/mod.rs), so those shapes must
+    // DECLINE the whole contract: an entry Assume would prune a legal arm
+    // while the publish seam sees zero sentinel obligations — an unproved,
+    // unpublished precondition that legal callers violate.
+    // -----------------------------------------------------------------------
+
+    /// The async-fn shape (both reserved arms are panic sentinels) MINTS —
+    /// the positive control for the D1 family below.
+    #[test]
+    fn coroutine_resume_contract_mints_async_fn_sentinel_shape() {
+        let contract = coroutine_resume_state_contract(&zero_await_resume_body())
+            .expect("the async-fn sentinel shape must mint the contract");
+        assert_eq!(contract.live_states, vec![0]);
+    }
+
+    /// The `gen` shape: the RETURNED=1 arm is the none-return block — assign
+    /// `Option::None` to the return place and return. LEGAL reachable code
+    /// (next() after exhaustion), so the contract must DECLINE.
+    #[test]
+    fn coroutine_resume_contract_declines_gen_none_return_arm() {
+        let mut body = zero_await_resume_body();
+        // Replace the ResumedAfterReturn sentinel (block 2, the RETURNED=1
+        // target) with rustc's `insert_none_ret_block` shape.
+        body.blocks[2] = BasicBlock {
+            id: BlockId(2),
+            stmts: vec![Statement::Assign {
+                place: Place::local(0),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 16))),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Return,
+        };
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    /// The `async gen` shape: the RETURNED=1 arm is the poll-ready block —
+    /// write the `Poll::Ready` discriminant and return. LEGAL reachable code,
+    /// so the contract must DECLINE.
+    #[test]
+    fn coroutine_resume_contract_declines_async_gen_poll_ready_arm() {
+        let mut body = zero_await_resume_body();
+        body.blocks[2] = BasicBlock {
+            id: BlockId(2),
+            stmts: vec![Statement::SetDiscriminant {
+                place: Place::local(0),
+                variant_index: 0,
+            }],
+            terminator: Terminator::Return,
+        };
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    /// The async-drop shape: the RETURNED=1 arm is a plain ready block
+    /// (nothing to do, return). LEGAL reachable code, so DECLINE.
+    #[test]
+    fn coroutine_resume_contract_declines_async_drop_ready_arm() {
+        let mut body = zero_await_resume_body();
+        body.blocks[2] =
+            BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return };
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    /// A reserved arm whose assert is NOT the always-false sentinel (a
+    /// conditional `ResumedAfter*` assert over a real operand) is not the
+    /// compiler's panic sentinel — DECLINE, fail-closed.
+    #[test]
+    fn coroutine_resume_contract_declines_conditional_reserved_arm_assert() {
+        let mut body = zero_await_resume_body();
+        let Terminator::Assert { cond, .. } = &mut body.blocks[2].terminator else {
+            unreachable!()
+        };
+        *cond = Operand::Copy(Place::local(2));
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    /// The panic-CALL lowering of a sentinel (a `Call` into the panic runtime
+    /// instead of an `Assert` terminator) is deliberately NOT recognized —
+    /// fail-closed: only the exact compiler `Assert` shape may license
+    /// excluding a reserved discriminant.
+    #[test]
+    fn coroutine_resume_contract_declines_panic_call_lowered_reserved_arm() {
+        let mut body = zero_await_resume_body();
+        body.blocks[2] = BasicBlock {
+            id: BlockId(2),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                func: "core::panicking::panic".to_string(),
+                args: vec![],
+                dest: Place::local(2),
+                target: None,
+                span: SourceSpan::default(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                unwind: UnwindEdge::Unreachable,
+            },
+        };
+        assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    /// A dispatch with NO reserved arm at all (cases {0,3}) has nothing to
+    /// contract over — and minting would emit an entry Assume that no sentinel
+    /// obligation (hence no published row) accounts for. DECLINE.
+    #[test]
+    fn coroutine_resume_contract_declines_dispatch_without_reserved_arms() {
+        let mut body = zero_await_resume_body();
+        let Terminator::SwitchInt { targets, .. } = &mut body.blocks[0].terminator else {
+            unreachable!()
+        };
+        *targets = vec![(0, BlockId(1)), (3, BlockId(1))];
+        assert_eq!(coroutine_resume_state_contract(&body), None);
     }
 }

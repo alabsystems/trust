@@ -135,6 +135,7 @@ pub fn helper_callee() -> VerifiableFunction {
         }],
         arg_count: 1,
         return_ty: I32,
+        datatype_defs: Default::default(),
     };
     VerifiableFunction {
         name: "helper".into(),
@@ -203,6 +204,7 @@ pub fn main_like_caller() -> VerifiableFunction {
         ],
         arg_count: 1,
         return_ty: I32,
+        datatype_defs: Default::default(),
     };
     VerifiableFunction {
         name: "main_like".into(),
@@ -1418,6 +1420,7 @@ pub fn diamond_leaf() -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: I32,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1508,6 +1511,7 @@ fn diamond_intermediate(
             ],
             arg_count: 1,
             return_ty: I32,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1615,6 +1619,7 @@ pub fn diamond_top() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: I32,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1858,6 +1863,7 @@ pub fn sum_to_n_recursive() -> RecursiveFunction {
         ],
         arg_count: 1,
         return_ty: I32,
+        datatype_defs: Default::default(),
     };
     let func = VerifiableFunction {
         name: "sum_to_n".into(),
@@ -2398,6 +2404,7 @@ fn mutual_member(name: &str, def_path: &str, other_path: &str) -> RecursiveFunct
         ],
         arg_count: 1,
         return_ty: I32,
+        datatype_defs: Default::default(),
     };
     RecursiveFunction {
         func: VerifiableFunction {
@@ -3395,6 +3402,7 @@ mod tests {
                 }],
                 arg_count: 1,
                 return_ty: I32,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![Formula::Ge(
@@ -3462,6 +3470,7 @@ mod tests {
                 ],
                 arg_count: 1,
                 return_ty: I32,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![Formula::Ge(

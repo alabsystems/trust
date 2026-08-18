@@ -36,6 +36,7 @@ fn func_calling(callee: &str) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -92,19 +93,56 @@ fn method_tail_handles_trailing_turbofish() {
     // TWO trailing turbofishes — stripping only one left `<u8>`, so the alloc gate
     // silently disabled and `vec![x; n]` emitted no obligation. Strip both.
     assert_eq!(
-        super::method_tail("std::vec::from_elem::<u8>::<__trust_elem_bytes_1>"),
+        super::method_tail("std::vec::from_elem::<u8>::<__trust_elem_bytes@1>"),
         "from_elem"
     );
     assert_eq!(
         super::method_tail(
-            "core::iter::Iterator::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes_8>"
+            "core::iter::Iterator::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@8>"
         ),
         "collect"
     );
     // A method sink with the byte token keeps its type turbofish in the middle.
     assert_eq!(
-        super::method_tail("std::vec::Vec::<u8>::with_capacity::<__trust_elem_bytes_4096>"),
+        super::method_tail("std::vec::Vec::<u8>::with_capacity::<__trust_elem_bytes@4096>"),
         "with_capacity"
+    );
+}
+
+#[test]
+fn elem_bytes_token_rejects_user_spellable_lookalikes() {
+    // PERMANENT batch-6 adversarial-review D1 probe for THE stride channel
+    // feeding the OOM byte ceiling. `__trust_elem_bytes_1` is a LEGAL Rust
+    // identifier: a user type or a generic fn's type param of that name
+    // survives in the rendered path exactly when the extractor omits the real
+    // token (still-generic element / layout error). Under the old loose
+    // substring parse it read as stride 1 and shrank the capacity term.
+    assert_eq!(
+        super::parse_elem_bytes_token(
+            "alloc::vec::Vec::<__trust_elem_bytes_1>::with_capacity"
+        ),
+        None
+    );
+    // The retired underscore spelling never parses, even in trailing position
+    // (it is identifier-spellable, hence never an authority token).
+    assert_eq!(
+        super::parse_elem_bytes_token(
+            "std::vec::Vec::<u8>::with_capacity::<__trust_elem_bytes_4096>"
+        ),
+        None
+    );
+    // The `@` authority token parses ONLY as the trailing turbofish group.
+    assert_eq!(
+        super::parse_elem_bytes_token(
+            "std::vec::Vec::<u8>::with_capacity::<__trust_elem_bytes@4096>"
+        ),
+        Some(4096)
+    );
+    assert_eq!(
+        super::parse_elem_bytes_token(
+            "std::vec::Vec::<__trust_elem_bytes@4096>::with_capacity"
+        ),
+        None
     );
 }
 
@@ -250,6 +288,7 @@ fn flags_unbounded_vec_macro_from_elem() {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -317,6 +356,7 @@ fn flags_unbounded_repeat_n_collect() {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -370,6 +410,7 @@ fn from_elem_multibyte_adds_byte_aware_term() {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -417,6 +458,7 @@ fn func_calling_const_size(callee: &str, n: i128) -> VerifiableFunction {
             }],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -525,6 +567,7 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
             blocks,
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -571,8 +614,19 @@ fn allows_collect_over_small_range() {
 
 /// Builds `let it = <producer>(coll); [it = it.cloned();] it.collect()` — a
 /// collect whose source is an iterator over an already-materialized collection
-/// (`coll` is a parameter). `producer` is the full callee path of the producer.
-fn collection_collect_func(producer: &str, cloned: bool) -> VerifiableFunction {
+/// (`coll` is a parameter). `producer` is the full callee path of the producer,
+/// `iter_ty` the ADT NAME of the iterator value it returns.
+///
+/// `iter_ty` is not decoration: the bounded-source grant authenticates the callee
+/// path AND the type of the value whose `next` will run, so a bundle that names
+/// only one of the two cannot exercise the grant. Earlier revisions of this
+/// builder gave every local `Ty::u32()` — a shape the extractor never produces
+/// for an iterator — which is why the tests below could not see the
+/// user-ADT-in-the-chain hole. The spellings the tests pass are the extractor's
+/// own, taken from real `-Ztrust-dump=mir` bundles (see
+/// `trusted_root_spoof_iter_producer_tests` and
+/// `authenticated_std_iter_chain_tests`).
+fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> VerifiableFunction {
     let collect_term = |iter_local: usize| Terminator::Call {
         unwind: UnwindEdge::Unreachable,
         func: "core::iter::Iterator::collect".to_string(),
@@ -628,15 +682,27 @@ fn collection_collect_func(producer: &str, cloned: bool) -> VerifiableFunction {
         body: VerifiableBody {
             locals: vec![
                 LocalDecl { index: 0, ty: Ty::u32(), name: None },
-                LocalDecl { index: 1, ty: Ty::u32(), name: Some("coll".into()) },
-                LocalDecl { index: 2, ty: Ty::u32(), name: Some("it".into()) },
-                LocalDecl { index: 3, ty: Ty::u32(), name: Some("it2".into()) },
+                // The RECEIVER collection, typed as the compiler would render it
+                // for `producer` rather than as the historical `Ty::u32()`
+                // placeholder — see [`super::bounded_source_value_tests::faithful_receiver_ty`].
+                LocalDecl {
+                    index: 1,
+                    ty: super::bounded_source_value_tests::faithful_receiver_ty(producer),
+                    name: Some("coll".into()),
+                },
+                LocalDecl { index: 2, ty: Ty::adt(iter_ty, vec![]), name: Some("it".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::adt(format!("core::iter::adapters::cloned::Cloned<{iter_ty}>"), vec![]),
+                    name: Some("it2".into()),
+                },
                 LocalDecl { index: 4, ty: Ty::u32(), name: None },
                 LocalDecl { index: 5, ty: Ty::u32(), name: Some("out".into()) },
             ],
             blocks,
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -649,7 +715,11 @@ fn collection_collect_func(producer: &str, cloned: bool) -> VerifiableFunction {
 fn allows_collect_over_vec_iter() {
     // Collecting from an already-materialized std Vec is bounded by the
     // source's own (already-gated) allocation — must not be flagged.
-    let func = collection_collect_func("alloc::vec::Vec::<u32>::iter", false);
+    let func = collection_collect_func(
+        "alloc::vec::Vec::<u32>::iter",
+        "core::slice::iter::Iter<'_, u32>",
+        false,
+    );
     assert_eq!(unbounded_alloc_count(&func), 0, "collect over Vec::iter must not be flagged");
     assert_eq!(
         unsupported_mir_count(&func),
@@ -661,8 +731,11 @@ fn allows_collect_over_vec_iter() {
 #[test]
 fn allows_collect_over_hashmap_keys_cloned() {
     // Mirrors ny-cert `check_farkas`: `coeffs.keys().cloned().collect()`.
-    let func =
-        collection_collect_func("std::collections::hash_map::HashMap::<K, V>::keys", true);
+    let func = collection_collect_func(
+        "std::collections::hash_map::HashMap::<K, V>::keys",
+        "std::collections::hash::map::Keys<'_, K, V>",
+        true,
+    );
     assert_eq!(
         unbounded_alloc_count(&func),
         0,
@@ -676,7 +749,8 @@ fn flags_collect_over_custom_nonstd_iter() {
     // SOUNDNESS scoping: a custom (non-std) iterator producer is NOT a known
     // bounded collection source, so the collect stays GATED (visible Unknown),
     // never silently skipped — the std-path match must be precise.
-    let func = collection_collect_func("mycrate::Weird::iter", false);
+    let func =
+        collection_collect_func("mycrate::Weird::iter", "mycrate::Weird::Iter<'_>", false);
     assert_eq!(
         unsupported_mir_count(&func),
         1,
@@ -684,8 +758,107 @@ fn flags_collect_over_custom_nonstd_iter() {
     );
 }
 
+/// FALSIFY-ONCE for the VALUE-side half of the bounded-source identity, on the
+/// same bundle the positive test uses.
+///
+/// The producer path is the genuine, authenticated `alloc::vec::Vec::<u32>::iter`
+/// and the sink is a genuine std spelling — the ONLY thing planted is that the
+/// iterator local's own type is a USER ADT, i.e. a step that satisfies the
+/// callee-side authenticator while breaking the closure property it assumes.
+/// `authenticated_std_iter_chain_tests::the_walks_closure_property_is_enforced_not_assumed`
+/// states exactly how far that claim goes: the property holds of today's arm set,
+/// and the value check is what makes it CHECKED rather than re-derived by every
+/// reader.
+#[test]
+fn a_user_adt_iterator_value_under_an_authenticated_producer_stays_gated() {
+    let sound = collection_collect_func(
+        "alloc::vec::Vec::<u32>::iter",
+        "core::slice::iter::Iter<'_, u32>",
+        false,
+    );
+    assert_eq!(
+        unsupported_mir_count(&sound),
+        0,
+        "planted violation is gone: the authenticated control no longer takes the \
+         bounded-source skip, so the planted case below proves nothing"
+    );
+
+    let planted =
+        collection_collect_func("alloc::vec::Vec::<u32>::iter", "mycrate::Endless", false);
+    assert_eq!(
+        unsupported_mir_count(&planted),
+        1,
+        "a USER ADT iterator value must keep the obligation even when the producer \
+         path authenticates"
+    );
+}
+
+/// FALSIFY-ONCE for the CALLEE-side half at the adaptor step — the measured
+/// 2026-08-16 exploit, in the builder the positive tests share.
+///
+/// Both bundles have a genuine `core::slice`-rooted leaf producer and a genuine
+/// std iterator VALUE type; the only difference is whether the adaptor hop is
+/// std's `Iterator::cloned` or a user inherent function whose last path segment
+/// happens to be `cloned`. `mycrate::Adapt::cloned` returning an endless iterator
+/// is the whole exploit: no impersonation, no `--crate-name` trick.
+#[test]
+fn a_user_inherent_fn_named_like_an_adaptor_stays_gated() {
+    let sound = collection_collect_func_with_adaptor(
+        "core::iter::Iterator::cloned",
+        "core::iter::adapters::cloned::Cloned<core::slice::iter::Iter<'_, u32>>",
+    );
+    assert_eq!(
+        unsupported_mir_count(&sound),
+        0,
+        "planted violation is gone: the genuine std adaptor no longer takes the skip, \
+         so the planted case below proves nothing"
+    );
+
+    // The user adaptor's RESULT type is a std-rooted lie only the callee test can
+    // catch: give it the very type std's `cloned` would have produced.
+    let planted = collection_collect_func_with_adaptor(
+        "mycrate::Adapt::cloned",
+        "core::iter::adapters::cloned::Cloned<core::slice::iter::Iter<'_, u32>>",
+    );
+    assert_eq!(
+        unsupported_mir_count(&planted),
+        1,
+        "a user inherent fn whose last path segment is an adaptor name must not step \
+         the bounded-source walk through to its argument"
+    );
+}
+
+/// `Vec::iter()` fed through `adaptor_callee` (whose result local is typed
+/// `adaptor_ty`) into a `collect`. Same shape as [`collection_collect_func`]'s
+/// `cloned` arm with the adaptor's callee and result type under test.
+fn collection_collect_func_with_adaptor(
+    adaptor_callee: &str,
+    adaptor_ty: &str,
+) -> VerifiableFunction {
+    let mut func = collection_collect_func(
+        "alloc::vec::Vec::<u32>::iter",
+        "core::slice::iter::Iter<'_, u32>",
+        true,
+    );
+    for block in &mut func.body.blocks {
+        if let Terminator::Call { func: callee, .. } = &mut block.terminator
+            && super::callee_tail(callee) == "cloned"
+        {
+            *callee = adaptor_callee.to_string();
+        }
+    }
+    for decl in &mut func.body.locals {
+        if decl.index == 3 {
+            decl.ty = Ty::adt(adaptor_ty, vec![]);
+        }
+    }
+    func
+}
+
 /// Builds `a.keys().chain(b.keys()).cloned().collect()` (params `a`, `b`).
-fn chained_keys_collect_func(keys_path: &str) -> VerifiableFunction {
+/// `keys_ty` is the ADT name of the iterator `keys_path` returns — see
+/// [`collection_collect_func`] for why the bundle must carry it.
+fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFunction {
     let keys = |coll: usize, dest: usize, target: BlockId| Terminator::Call {
         unwind: UnwindEdge::Unreachable,
         func: keys_path.to_string(),
@@ -752,11 +925,28 @@ fn chained_keys_collect_func(keys_path: &str) -> VerifiableFunction {
         span: SourceSpan::default(),
         body: VerifiableBody {
             locals: (0..=7)
-                .map(|i| LocalDecl { index: i, ty: Ty::u32(), name: None })
+                .map(|i| {
+                    // 3, 4: the two `keys()` iterators; 5: their `chain`; 6: `cloned`.
+                    let chained = format!("core::iter::adapters::chain::Chain<{keys_ty}, {keys_ty}>");
+                    let ty = match i {
+                        // 1, 2: the two RECEIVER collections, typed as the
+                        // compiler renders them (was `Ty::u32()`).
+                        1 | 2 => super::bounded_source_value_tests::faithful_receiver_ty(keys_path),
+                        3 | 4 => Ty::adt(keys_ty, vec![]),
+                        5 => Ty::adt(chained.clone(), vec![]),
+                        6 => Ty::adt(
+                            format!("core::iter::adapters::cloned::Cloned<{chained}>"),
+                            vec![],
+                        ),
+                        _ => Ty::u32(),
+                    };
+                    LocalDecl { index: i, ty, name: None }
+                })
                 .collect(),
             blocks,
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -771,13 +961,43 @@ fn allows_collect_over_chained_keys() {
     // `a.keys().chain(b.keys()).cloned().collect()` — a chain of two
     // materialized-collection iterators is bounded (sum of two already-gated
     // allocations), so it must not be flagged.
-    let func = chained_keys_collect_func("std::collections::hash_map::HashMap::<K, V>::keys");
+    let func = chained_keys_collect_func(
+        "std::collections::hash_map::HashMap::<K, V>::keys",
+        "std::collections::hash::map::Keys<'_, K, V>",
+    );
     assert_eq!(
         unbounded_alloc_count(&func),
         0,
         "collect over a.keys().chain(b.keys()).cloned() must not be flagged"
     );
     assert_eq!(unsupported_mir_count(&func), 0, "...nor reported count-not-derivable Unknown");
+}
+
+/// FALSIFY-ONCE for the `chain` arm, which had its own crate-free `tail == "chain"`
+/// test. Both sides of the chain are genuine authenticated `keys()` producers with
+/// genuine std iterator types; only the `chain` callee is a user inherent fn whose
+/// last segment is `chain`. A user `chain` may yield anything at all, so the sum of
+/// its arguments' lengths is not a bound on its own output.
+#[test]
+fn a_user_inherent_fn_named_chain_stays_gated() {
+    let keys = "std::collections::hash_map::HashMap::<K, V>::keys";
+    let keys_ty = "std::collections::hash::map::Keys<'_, K, V>";
+    let mut planted = chained_keys_collect_func(keys, keys_ty);
+    let mut replaced = 0;
+    for block in &mut planted.body.blocks {
+        if let Terminator::Call { func: callee, .. } = &mut block.terminator
+            && super::callee_tail(callee) == "chain"
+        {
+            *callee = "mycrate::Adapt::chain".to_string();
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, 1, "the builder must contain exactly one `chain` call to plant on");
+    assert_eq!(
+        unsupported_mir_count(&planted),
+        1,
+        "a user inherent fn named `chain` must not license the sum-of-lengths bound"
+    );
 }
 
 fn unsupported_mir_count(func: &VerifiableFunction) -> usize {
@@ -818,6 +1038,7 @@ fn func_calling_no_args(callee: &str) -> VerifiableFunction {
             }],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -880,6 +1101,7 @@ fn func_calling_single_value(callee: &str, value_ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1125,6 +1347,7 @@ fn grow_after_guard(reassign: bool, cross_block: bool) -> VerifiableFunction {
             blocks,
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1280,6 +1503,7 @@ fn reseated_deref_store_drops_alloc_guard() {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

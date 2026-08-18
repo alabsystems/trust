@@ -1549,14 +1549,21 @@ fn conditional_branch_discr(
     target_addr: u64,
     fallthrough_addr: u64,
 ) -> Result<Operand, LiftError> {
-    if let Some(discr) = effects_for_block.iter().rev().find_map(|eff| {
-        if let Effect::ConditionalBranch { condition, .. } = eff {
-            Some(Operand::Symbolic(trust_machine_sem::condition_to_formula(state, *condition)))
-        } else {
-            None
-        }
+    // Find the condition FIRST, then convert it outside the closure: the
+    // conversion can now fail, and `?` cannot cross a `find_map` closure. Doing
+    // it this way keeps the failure a refusal of the whole lift instead of a
+    // `None` that would silently fall through to the `PcUpdate` recovery path
+    // below and derive a discriminant from a different effect.
+    if let Some(condition) = effects_for_block.iter().rev().find_map(|eff| {
+        if let Effect::ConditionalBranch { condition, .. } = eff { Some(*condition) } else { None }
     }) {
-        return Ok(discr);
+        let formula = trust_machine_sem::condition_to_formula(state, condition).map_err(|err| {
+            unresolved_control_flow_error(format!(
+                "block {} at 0x{:x} conditional branch uses a condition the machine model does not evaluate: {err}",
+                block.id, block.start_addr
+            ))
+        })?;
+        return Ok(Operand::Symbolic(formula));
     }
 
     match effects_for_block.last() {
@@ -1965,7 +1972,7 @@ fn lift_cfg_with_semantics(
                 }
                 let mut new_stmts = effect_to_stmts(effect, &layout, insn.address)?;
                 stmts.append(&mut new_stmts);
-                apply_effect_to_state(&mut state, effect);
+                apply_effect_to_state(&mut state, effect)?;
                 if arch == LiftArch::Aarch64 {
                     aarch64_provenance.apply_effect(insn, effect);
                 }
@@ -2399,8 +2406,13 @@ fn aarch64_bcond_effects(
     };
     let condition = aarch64_condition_operand(insn)?;
     let fallthrough = next_pc_formula(state, insn);
+    // A condition the machine model cannot evaluate must REFUSE the lift. It
+    // used to return `Formula::Bool(true)`, which would have folded this `Ite`
+    // to the taken target and turned a conditional branch into a straight line.
+    let cond_formula = trust_machine_sem::condition_to_formula(state, condition)
+        .map_err(|err| aarch64_operand_error(insn, 0, err.to_string()))?;
     let pc_value = Formula::Ite(
-        Box::new(trust_machine_sem::condition_to_formula(state, condition)),
+        Box::new(cond_formula),
         Box::new(target.clone()),
         Box::new(fallthrough.clone()),
     );
@@ -2824,10 +2836,38 @@ fn i128_to_wrapping_u64(value: i128) -> u64 {
 }
 
 /// Update the symbolic MachineState based on an Effect.
-fn apply_effect_to_state(state: &mut MachineState, effect: &Effect) {
+///
+/// SOUNDNESS: this used to end in `_ => {}` — an effect this function does not
+/// recognize left the threaded state UNCHANGED while `effect_to_stmts` had
+/// already emitted statements for it, so the two views of the same instruction
+/// silently diverged. The audit's phrasing for this site was "protected only by
+/// `effect_to_stmts` running first: ordering, not construction." Ordering is not
+/// a guarantee — `effect_to_stmts` is a DIFFERENT match, and nothing makes the
+/// two agree on which variants they cover. A variant added to `Effect` (which is
+/// `#[non_exhaustive]` and lives in another crate, so no wildcard here can ever
+/// be removed) would be accepted there and dropped here.
+///
+/// The state-affecting variants are now enumerated positively and everything
+/// else is REFUSED, so the two matches can only disagree by failing closed.
+///
+/// The control-flow variants are listed explicitly as deliberate no-ops rather
+/// than swept into the wildcard: `Branch`/`ConditionalBranch`/`Call`/`Return`
+/// carry their PC consequence in a SEPARATE `Effect::PcUpdate` emitted by the
+/// same instruction (that separation is precisely what the `PcUpdate` executor
+/// bug exposed), and `MemRead` has no state consequence of its own — the loaded
+/// value arrives as a `RegWrite`.
+fn apply_effect_to_state(state: &mut MachineState, effect: &Effect) -> Result<(), LiftError> {
     match effect {
-        Effect::RegWrite { index, value, .. } if (*index as usize) < state.gpr.len() => {
-            state.gpr[*index as usize] = value.clone();
+        Effect::RegWrite { index, value, .. } => {
+            let slot = usize::from(*index);
+            // `MachineState::gpr` is X0-X30 (31 slots), so index 31 is WZR/XZR
+            // and out of range. Discarding it is architectural, and it MATCHES
+            // `effect_to_stmts`, which returns `Nop` for `index >=
+            // layout.gpr_count` (also 31 for AArch64) — the two views of the
+            // same effect must agree, so this arm is deliberately not a refusal.
+            if slot < state.gpr.len() {
+                state.gpr[slot] = value.clone();
+            }
         }
         Effect::SpWrite { value } => {
             state.sp = value.clone();
@@ -2844,8 +2884,26 @@ fn apply_effect_to_state(state: &mut MachineState, effect: &Effect) {
             state.flags.c = c.clone();
             state.flags.v = v.clone();
         }
-        _ => {}
+        // No scalar-state consequence of their own; see the doc comment. This
+        // list is exactly the set `effect_to_stmts` admits without producing an
+        // assignment (`Nop` or the empty statement list), which is the property
+        // that makes the two matches safe to run in sequence. `Call` and
+        // `FpRegWrite` are absent from BOTH: `effect_to_stmts` refuses them, and
+        // they fall through to the refusal below here.
+        Effect::MemRead { .. }
+        | Effect::Branch { .. }
+        | Effect::ConditionalBranch { .. }
+        | Effect::Return { .. }
+        | Effect::Aarch64SyncBoundary { .. }
+        | Effect::Aarch64AtomicAccess { .. } => {}
+        other => {
+            return Err(unsupported_effect_error(format!(
+                "machine effect {other:?} has no modeled symbolic-state transition; refusing \
+                 rather than threading the pre-state through unchanged"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3930,7 +3988,7 @@ mod tests {
         let excluded = [
             (0xD503205F, Opcode::Wfe, "wait/event state"),
             (0xD503207F, Opcode::Wfi, "interrupt state"),
-            (0xD5033B9F, Opcode::Dmb, "ordering boundary"),
+            (0xD5033BBF, Opcode::Dmb, "ordering boundary"),
             (0xD5033FDF, Opcode::Isb, "instruction synchronization boundary"),
             (0xD503305F, Opcode::Clrex, "exclusive-monitor clear"),
             (0xC8DFFC20, Opcode::Ldar, "acquire ordering"),
@@ -4604,12 +4662,16 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0].terminator, Terminator::Return));
+        // `BvZeroExt`'s second field is the SMT-LIB extension AMOUNT, so an
+        // 8-bit load reaching a 32-bit W register adds 24 bits. This used to
+        // read `32` — it was pinning `sem_ldr_variant`'s target-width-as-amount
+        // bug, which made the lifted value a 40-bit term in a register slot.
         assert!(
             has_assign_to_with(&blocks[0], layout.gpr(0), |rvalue| matches!(
                 rvalue,
-                Rvalue::Use(Operand::Symbolic(Formula::BvZeroExt(_, 32)))
+                Rvalue::Use(Operand::Symbolic(Formula::BvZeroExt(_, 24)))
             )),
-            "LDRB W0 should zero-extend the byte load into W0"
+            "LDRB W0 should zero-extend the byte load into W0 by 24 bits (8 -> 32)"
         );
         assert_eq!(assign_count_to(&blocks[0], layout.mem_local), 1);
         assert!(
@@ -5720,7 +5782,7 @@ mod tests {
     fn test_aarch64_lift_system_barrier_records_partial_boundary_ledger() {
         let cfg = cfg_with_block(
             vec![
-                decode_aarch64(0xD5033B9F, 0x1000), // DMB ISH
+                decode_aarch64(0xD5033BBF, 0x1000), // DMB ISH
                 decode_aarch64(0xD65F03C0, 0x1004), // RET
             ],
             true,
@@ -5745,7 +5807,7 @@ mod tests {
         assert!(record.feature.contains("ordering=LoadsAndStores"));
         assert!(record.feature.contains("raw_option=0xb"));
         assert!(record.feature.contains("not proof-grade"));
-        assert_eq!(record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033B9F));
+        assert_eq!(record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033BBF));
     }
 
     #[test]
@@ -5804,7 +5866,7 @@ mod tests {
     fn test_aarch64_barrier_and_clrex_ledger_records_name_proof_blocker_provenance() {
         let cases = [
             (
-                0xD5033B9F,
+                0xD5033BBF,
                 "Dmb",
                 Some("ISH full"),
                 "DataMemoryBarrier",
@@ -5814,7 +5876,7 @@ mod tests {
                 "0xb",
             ),
             (
-                0xD5033F3F,
+                0xD5033F9F,
                 "Dsb",
                 Some("SY full"),
                 "DataSynchronizationBarrier",
@@ -5922,7 +5984,7 @@ mod tests {
                 decode_aarch64(0xD503203F, 0x1000), // YIELD
                 decode_aarch64(0xD5033FDF, 0x1004), // ISB
                 decode_aarch64(0xD503305F, 0x1008), // CLREX #0
-                decode_aarch64(0xD5033B9F, 0x100C), // DMB ISH
+                decode_aarch64(0xD5033BBF, 0x100C), // DMB ISH
                 decode_aarch64(0xD65F03C0, 0x1010), // RET
             ],
             true,
@@ -5956,10 +6018,10 @@ mod tests {
             dmb_record.origin.as_ref().map(|origin| origin.instruction_address),
             Some(0x100C)
         );
-        assert_eq!(dmb_record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033B9F));
+        assert_eq!(dmb_record.origin.as_ref().and_then(|origin| origin.encoding), Some(0xD5033BBF));
         assert_eq!(
             dmb_record.origin.as_ref().map(|origin| origin.instruction_bytes.as_slice()),
-            Some(&[0x9F, 0x3B, 0x03, 0xD5][..])
+            Some(&[0xBF, 0x3B, 0x03, 0xD5][..])
         );
     }
 
@@ -6019,7 +6081,7 @@ mod tests {
     fn test_aarch64_lift_dsb_remains_partial_boundary_ledger() {
         let cfg = cfg_with_block(
             vec![
-                decode_aarch64(0xD5033F3F, 0x1000), // DSB SY
+                decode_aarch64(0xD5033F9F, 0x1000), // DSB SY
                 decode_aarch64(0xD65F03C0, 0x1004), // RET
             ],
             true,
@@ -7779,5 +7841,128 @@ mod tests {
             )
             .count();
         assert!(pc_assigns >= 1, "NOP should produce at least one PC Assign");
+    }
+}
+
+/// `apply_effect_to_state` used to end in `_ => {}`: an effect it did not
+/// recognize left the threaded symbolic state UNCHANGED while `effect_to_stmts`
+/// had already emitted statements for the same effect, so the two views of one
+/// instruction silently diverged.
+///
+/// The audit called this site "protected only by `effect_to_stmts` running
+/// first: ordering, not construction". These tests pin the construction: the
+/// two matches must agree about which effects have no state consequence, and
+/// anything else must refuse.
+#[cfg(test)]
+mod apply_effect_totality_tests {
+    use trust_machine_sem::{
+        Aarch64AtomicAccessKind, Aarch64AtomicOrdering, Aarch64SyncBoundaryKind,
+        Aarch64SyncOrdering, Aarch64SyncScope, Effect, MachineState,
+    };
+    use trust_types::Formula;
+
+    use super::*;
+
+    fn bv(v: i128) -> Formula {
+        Formula::BitVec { value: v, width: 64 }
+    }
+
+    /// Every effect `effect_to_stmts` ACCEPTS must also be accepted by
+    /// `apply_effect_to_state`. If it were not, the lift would emit statements
+    /// for an effect and then refuse — or worse, before this change, silently
+    /// skip the state update and keep going.
+    #[test]
+    fn the_two_effect_matches_accept_the_same_effects() {
+        let layout = LocalLayout::aarch64();
+        let sync = Effect::Aarch64SyncBoundary {
+            kind: Aarch64SyncBoundaryKind::DataMemoryBarrier,
+            scope: Aarch64SyncScope::InnerShareable,
+            ordering: Aarch64SyncOrdering::LoadsAndStores,
+            clears_exclusive_monitor: false,
+            raw_option: Some(0b1011),
+        };
+        let atomic = Effect::Aarch64AtomicAccess {
+            kind: Aarch64AtomicAccessKind::Load,
+            ordering: Aarch64AtomicOrdering::Acquire,
+            address: bv(0x1000),
+            width_bytes: 4,
+            exclusive: false,
+        };
+        let effects = vec![
+            ("RegWrite", Effect::RegWrite { index: 0, width: 64, value: bv(1) }),
+            ("SpWrite", Effect::SpWrite { value: bv(1) }),
+            ("MemRead", Effect::MemRead { address: bv(0x1000), width_bytes: 4 }),
+            ("MemWrite", Effect::MemWrite { address: bv(0x1000), value: bv(7), width_bytes: 4 }),
+            ("PcUpdate", Effect::PcUpdate { value: bv(0x1004) }),
+            ("Branch", Effect::Branch { target: bv(0x2000) }),
+            ("Return", Effect::Return { target: bv(0x2000) }),
+            ("Aarch64SyncBoundary", sync),
+            ("Aarch64AtomicAccess", atomic),
+        ];
+
+        for (name, effect) in effects {
+            let stmts_ok = effect_to_stmts(&effect, &layout, 0x1000).is_ok();
+            let mut state = MachineState::symbolic();
+            let state_ok = apply_effect_to_state(&mut state, &effect).is_ok();
+            assert_eq!(
+                stmts_ok, state_ok,
+                "{name}: effect_to_stmts accepts={stmts_ok} but apply_effect_to_state \
+                 accepts={state_ok}; the two views of one instruction disagree"
+            );
+        }
+    }
+
+    /// `FpRegWrite` is refused by BOTH — it used to be refused by
+    /// `effect_to_stmts` and silently DROPPED by `apply_effect_to_state`.
+    /// Refusing in both is what makes the ordering irrelevant.
+    #[test]
+    fn an_effect_with_no_modeled_state_transition_is_refused_not_dropped() {
+        let mut state = MachineState::symbolic();
+        let before = state.clone();
+        let fp = Effect::FpRegWrite { index: 0, width: 64, value: bv(1) };
+
+        let err = apply_effect_to_state(&mut state, &fp)
+            .expect_err("an unmodeled effect must refuse, not silently no-op");
+        assert!(
+            matches!(err, LiftError::UnsupportedEffect { .. }),
+            "expected UnsupportedEffect, got {err:?}"
+        );
+        // And it must not have partially mutated the state on its way out.
+        assert_eq!(
+            format!("{:?}", state.gpr),
+            format!("{:?}", before.gpr),
+            "a refused effect must leave the state untouched"
+        );
+
+        // `effect_to_stmts` refuses it too, so ordering never decides the outcome.
+        let layout = LocalLayout::aarch64();
+        assert!(effect_to_stmts(&fp, &layout, 0x1000).is_err(), "effect_to_stmts must also refuse");
+    }
+
+    /// A write to the zero register is an architectural DISCARD, and both
+    /// matches must treat it that way — `MachineState::gpr` is X0-X30, so index
+    /// 31 is out of range in exactly the way `layout.gpr_count` makes it a `Nop`.
+    #[test]
+    fn zero_register_write_is_discarded_by_both_views() {
+        let mut state = MachineState::symbolic();
+        let before = state.clone();
+        let zr = Effect::RegWrite { index: 31, width: 64, value: bv(0xDEAD) };
+
+        apply_effect_to_state(&mut state, &zr).expect("a ZR write is architectural, not an error");
+        assert_eq!(
+            format!("{:?}", state.gpr),
+            format!("{:?}", before.gpr),
+            "a ZR write must not land in the register file"
+        );
+
+        let layout = LocalLayout::aarch64();
+        assert_eq!(layout.gpr_count, state.gpr.len(), "both views must agree on the file size");
+        assert!(
+            matches!(
+                effect_to_stmts(&zr, &layout, 0x1000).expect("ZR write lifts").as_slice(),
+                [Statement::Nop]
+            ),
+            "effect_to_stmts must make a ZR write a Nop"
+        );
     }
 }

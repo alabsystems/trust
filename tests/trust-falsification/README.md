@@ -2,8 +2,14 @@
 
 The load-bearing proof that the verifier is *useful*: for every real obligation
 the verifier reports PROVED, a buggy variant (deleted guard / widened bound /
-dropped precondition) must flip to FAILED under the default strict policy. No
-surviving mutant, no green.
+dropped precondition) must flip to FAILED. No surviving mutant, no green.
+
+Every fixture runs under **`-Ztrust-policy=certify`** — full static discharge,
+the release policy. The development DEFAULT (policy B, 1b920410d9) tolerates an
+undischarged obligation whose operation keeps its runtime check and exits 0;
+running the gate under that default made two shift-reduction mutants score
+`proved` and manufactured a false "false accept" headline on 2026-08-04
+(retracted — nothing false was proved; the gate measured the wrong policy).
 
 - `proved/*.rs` — real-obligation fixtures that MUST verify (exit 0).
 - `mutant/*.rs` — the matching buggy variants that MUST fail closed (exit 1).

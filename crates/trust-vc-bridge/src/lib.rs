@@ -184,8 +184,31 @@ pub fn trust_vc_native_trust_ir_kind_for_public_obligation(
         ObligationKind::MemorySafety | ObligationKind::Ownership | ObligationKind::BoundsCheck => {
             Some(trust_ir::ObligationKind::MemorySafety)
         }
+        // `trust.vc.unbounded_allocation` (#nia-oom) rides the SAME trust-vc
+        // MIR-memory proof-unit transport as BoundsCheck: the unit's predicate
+        // is the negated guard-conjoined `count >= CEILING` VC, discharged with
+        // a replayable import-time certificate. Mapping to MemorySafety here is
+        // native-suite DISPATCH identity only — the obligation's own formula
+        // (the capacity VC) is what the certificate must prove, so the P0
+        // "mapped into a proof that does not encode the ceiling" class cannot
+        // recur through this row.
+        kind if is_trust_vc_unbounded_allocation_obligation_kind(kind) => {
+            Some(trust_ir::ObligationKind::MemorySafety)
+        }
         _ => None,
     }
+}
+
+/// The `trust.vc.unbounded_allocation` Custom kind (#nia-oom allocation-capacity
+/// obligations). Namespace-exact; the `name` is a label within the admitted
+/// namespace, per the trust-verifier-api vocabulary rules.
+#[must_use]
+pub fn is_trust_vc_unbounded_allocation_obligation_kind(kind: &ObligationKind) -> bool {
+    matches!(
+        kind,
+        ObligationKind::Custom { namespace, .. }
+            if namespace == trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE
+    )
 }
 
 /// Schema used by the minimal Trust-side normalized trust_vc obligation artifact.
@@ -1377,13 +1400,21 @@ fn trust_vc_owned_support_level() -> SupportLevel {
 
 /// Obligation kinds owned by the trust_vc adapter.
 #[must_use]
-pub fn trust_vc_owned_obligation_kinds() -> [ObligationKind; 5] {
+pub fn trust_vc_owned_obligation_kinds() -> [ObligationKind; 6] {
     [
         ObligationKind::Precondition,
         ObligationKind::Postcondition,
         ObligationKind::MemorySafety,
         ObligationKind::Ownership,
         ObligationKind::BoundsCheck,
+        // #nia-oom: the allocation-capacity lane, admitted ONLY through the
+        // MIR-memory proof-unit + replayable-certificate transport (the
+        // BoundsCheck precedent). The name is the producer's single spelling.
+        ObligationKind::Custom {
+            namespace: trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE
+                .to_string(),
+            name: "unbounded_allocation".to_string(),
+        },
     ]
 }
 
@@ -1397,7 +1428,7 @@ pub fn is_trust_vc_owned_obligation_kind(kind: &ObligationKind) -> bool {
             | ObligationKind::MemorySafety
             | ObligationKind::Ownership
             | ObligationKind::BoundsCheck
-    )
+    ) || is_trust_vc_unbounded_allocation_obligation_kind(kind)
 }
 
 /// Returns true when trust_vc needs a typed contract frame from Requires/Ensures
@@ -1420,7 +1451,7 @@ pub fn requires_trust_vc_ownership_context(kind: &ObligationKind) -> bool {
     matches!(
         kind,
         ObligationKind::MemorySafety | ObligationKind::Ownership | ObligationKind::BoundsCheck
-    )
+    ) || is_trust_vc_unbounded_allocation_obligation_kind(kind)
 }
 
 /// Metadata producers must attach before trust_vc proof evidence can be accepted.
@@ -9129,6 +9160,67 @@ mod tests {
 
         let support = engine.supports(&obligation(ObligationKind::Termination, "term"));
         assert!(matches!(support, SupportLevel::Unsupported { .. }));
+
+        // Ownership of the allocation-capacity lane is NAMESPACE-exact: any
+        // other Custom namespace (privileged-hardened included) stays declined.
+        let support = engine.supports(&obligation(
+            ObligationKind::Custom {
+                namespace: "trust.vc.hardened".to_string(),
+                name: "raw_path_api".to_string(),
+            },
+            "hardened",
+        ));
+        assert!(matches!(support, SupportLevel::Unsupported { .. }));
+        let support = engine.supports(&obligation(
+            ObligationKind::Custom {
+                namespace: "trust.vc.unbounded_allocation.routable".to_string(),
+                name: "unbounded_allocation".to_string(),
+            },
+            "forged-namespace",
+        ));
+        assert!(matches!(support, SupportLevel::Unsupported { .. }));
+    }
+
+    /// Trust (#nia-oom, batch 6): the allocation-capacity Custom kind maps to
+    /// the SAME native MemorySafety dispatch identity as BoundsCheck — the
+    /// MIR-memory proof-unit + replayable-certificate transport — and to
+    /// nothing else. Dispatch only: the obligation's own formula (the capacity
+    /// VC) is what the certificate must prove.
+    #[cfg(feature = "trust-build")]
+    #[test]
+    fn unbounded_allocation_kind_maps_to_the_mir_memory_transport() {
+        let unbounded = ObligationKind::Custom {
+            namespace: trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE
+                .to_string(),
+            name: "unbounded_allocation".to_string(),
+        };
+        assert!(is_trust_vc_unbounded_allocation_obligation_kind(&unbounded));
+        assert!(is_trust_vc_owned_obligation_kind(&unbounded));
+        assert!(requires_trust_vc_ownership_context(&unbounded));
+        assert!(!requires_trust_vc_contract_frame(&unbounded));
+        assert_eq!(
+            trust_vc_native_trust_ir_kind_for_public_obligation(&unbounded),
+            Some(trust_ir::ObligationKind::MemorySafety)
+        );
+
+        // Namespace near-misses and other namespaces map to NOTHING.
+        for (namespace, name) in [
+            ("trust.vc.unbounded_allocation.routable", "unbounded_allocation"),
+            ("trust.vc", "unbounded_allocation"),
+            ("trust.vc.hardened", "unbounded_allocation"),
+        ] {
+            let forged = ObligationKind::Custom {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+            };
+            assert!(!is_trust_vc_unbounded_allocation_obligation_kind(&forged), "{namespace}");
+            assert!(!is_trust_vc_owned_obligation_kind(&forged), "{namespace}");
+            assert_eq!(
+                trust_vc_native_trust_ir_kind_for_public_obligation(&forged),
+                None,
+                "{namespace}"
+            );
+        }
     }
 
     #[test]

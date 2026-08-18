@@ -42,6 +42,7 @@ fn simple_binop(name: &str, op: BinOp) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

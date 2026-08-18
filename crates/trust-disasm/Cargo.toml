@@ -21,3 +21,11 @@ workspace = true
 thiserror = { workspace = true }
 
 [dev-dependencies]
+
+[features]
+# Exposes `Instruction::for_test`, a constructor for building an instruction
+# WITHOUT decoding one. Off in every production build: an `Instruction` that did
+# not come from the decoder is not a fact about any bytes. Enabled only by
+# dev-dependencies, so a consumer crate can test its own semantics guards
+# independently of whether the decoder happens to reject the shape first.
+test-construct = []

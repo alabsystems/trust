@@ -175,7 +175,7 @@ fn build_matrix(
         name: "matrix".to_string(),
         def_path: "test::matrix".to_string(),
         span: sp(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i64() },
+        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i64(), datatype_defs: Default::default() },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],

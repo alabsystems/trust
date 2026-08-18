@@ -1,0 +1,31 @@
+# Pin-coherence waivers, read by scripts/hooks-pin/pre-push.
+#
+# A row here means: "this submodule is knowingly off its recorded pin, someone
+# owns it, and it is not the pushing lane's fault." The pre-push pin gate steps
+# over the listed path and BLOCKS on every other drift. It is per-path on
+# purpose — a whole-gate quarantine would waive the next drift too, which is the
+# only drift the gate exists to catch.
+#
+# Format (`|`-separated, one row per line):
+#     <submodule path> | <expires YYYY-MM-DD> | <owner> | <reason>
+#
+# Rules the hook enforces mechanically, so a row cannot rot:
+#   * past `expires_on`, the row stops applying and the drift blocks again;
+#   * once the path is back AT its pin, the row FAILS the push until deleted.
+#
+# Adding a row is a decision, not a workaround. If the drift is yours, fix it:
+#     scripts/submodule_sync.sh              # classify, read-only
+#     scripts/submodule_sync.sh --restore    # BEHIND, plus AHEAD/DIVERGENT whose
+#                                            # every unique commit is held by a
+#                                            # durable ref (ANCHORED); refuses others
+
+# --- Opened 2026-08-13 at 352aa0306d, CLOSED 2026-08-13 -----------------------
+# first-party/trust-cg and first-party/trust-vc were waived here as DIVERGENT
+# (pin ecbc84402d95 / worktree 746aab73d028, and pin aae302c37bf4 / worktree
+# 45b0eb72c31b). Both are back AT their recorded pins — pins now eb23208b9745
+# and 60ac48545812, worktrees equal, `scripts/submodule_sync.sh` reports 12/12
+# SYNCED — so the hook's own rule fired: "once the path is back AT its pin, the
+# row FAILS the push until deleted." Deleted, and recorded rather than silently
+# dropped, so the next reader can see the waiver expired by being FIXED.
+#
+# No active rows. That is the intended steady state: every drift blocks.

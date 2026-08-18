@@ -95,6 +95,9 @@ fn make_indirect_module() -> Module {
         initializer: None,
         linkage: Linkage::External,
         tls: None,
+        // `None` = derive alignment from the global's `Ty`, which is the
+        // behaviour these fixtures had before `align` existed.
+        align: None,
     });
 
     // --- callee: ir_addf(x, y) = x + y  (FuncId 1) ---
@@ -367,6 +370,17 @@ fn dst_gpr_index(insn: &DisasmInst) -> Option<u8> {
     }
 }
 
+/// The FIRST SOURCE operand as a GPR index (operand 1) — for `ADD Rd, Rn, #imm`,
+/// this is `Rn`, the register the page address was materialized into.
+fn src_gpr_index(insn: &DisasmInst) -> Option<u8> {
+    match insn.operands().nth(1) {
+        Some(Operand::Reg(r)) if matches!(r.kind, trust_disasm::operand::RegKind::Gpr) => {
+            Some(r.index)
+        }
+        _ => None,
+    }
+}
+
 // ===========================================================================
 // TRACING PATH-MERGING EXECUTOR — the machine-side model of a KNOWN-target BLR.
 //
@@ -469,17 +483,30 @@ fn composed_indirect_output(
         }
         if insn.opcode == Opcode::Add {
             let rd = dst_gpr_index(&insn).expect("ADD has a GPR destination");
-            // A PAGEOFF12 reloc on this ADD CONFIRMS the symbol tag ONLY when the
-            // tag on Rd already matches (i.e. this is `ADD Rd, Rd, sym@PAGEOFF`
-            // following `ADRP Rd, sym@PAGE`). Any mismatch invalidates.
+            // A PAGEOFF12 reloc on this ADD materializes `sym`'s full address into
+            // Rd — but only when the ADD's SOURCE register already carries the
+            // matching PAGE21 tag from a preceding `ADRP Rn, sym@PAGE`.
+            //
+            // Reading the tag off Rd instead of Rn recognises only the
+            // same-register form `ADD Rd, Rd, sym@PAGEOFF`. The emitter also
+            // produces the CROSS-register form —
+            // `ADRP X2, sym@PAGE ; ADD X19, X2, sym@PAGEOFF` — landing the page in
+            // a scratch register and the full address in a callee-saved one. There
+            // Rd carries no tag, so the symbol was dropped and the BLR that follows
+            // failed closed on a target that is in fact known. Checking the SOURCE
+            // makes the tracer correct for both forms; it does not weaken it, since
+            // the relocation pair is what proves Rd holds `sym`.
             match relocs.get(&sec_off) {
                 Some(SymReloc::Pageoff12(sym)) => {
-                    if sym_reg.get(&rd) != Some(sym) {
-                        // The PAGEOFF12 does not confirm a matching PAGE21 tag on
-                        // Rd — do not trust it; invalidate.
+                    let page_tagged =
+                        src_gpr_index(&insn).is_some_and(|rn| sym_reg.get(&rn) == Some(sym));
+                    if page_tagged {
+                        sym_reg.insert(rd, sym.clone());
+                    } else {
+                        // No matching PAGE21 tag on this ADD's source — the
+                        // PAGEOFF12 alone proves nothing; invalidate.
                         sym_reg.remove(&rd);
                     }
-                    // else: tag on Rd confirmed; keep it.
                 }
                 _ => {
                     // A plain ADD overwrites Rd with a non-symbol value; invalidate.
@@ -855,6 +882,9 @@ fn open_target_indirect_call_via_non_function_global_fails_closed() {
         initializer: None,
         linkage: Linkage::External,
         tls: None,
+        // `None` = derive alignment from the global's `Ty`, which is the
+        // behaviour these fixtures had before `align` existed.
+        align: None,
     });
 
     let mut caller = IrFunction::new(FuncId::new(0), "ir_open", FuncTyId::new(0), BlockId::new(0));
@@ -923,6 +953,9 @@ fn impure_known_target_indirect_call_fails_closed_at_lowering() {
         initializer: None,
         linkage: Linkage::External,
         tls: None,
+        // `None` = derive alignment from the global's `Ty`, which is the
+        // behaviour these fixtures had before `align` existed.
+        align: None,
     });
 
     // callee: ir_impure(x, p) { *p = x; return x }  — the Store makes it impure.

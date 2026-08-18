@@ -10,6 +10,19 @@
 #   fast.pin-coherence   every submodule at its recorded pin
 #   fast.bridge-pin      the vendored Lean semantics match the trust-ir pin
 #
+# and one SCOPED lane, which is not in the under-a-minute budget and does not
+# pretend to be:
+#
+#   scoped.compiler-check  `x.py check --stage 1` INCLUDING test targets, run
+#                          only when the push touches compiler/, crates/,
+#                          src/bootstrap/, targo-trust/ or a first-party
+#                          gitlink. Skips instantly otherwise, so a docs push
+#                          pays nothing. It exists because the three lanes
+#                          above are drift and pin checks — none of them
+#                          compiles a line of the compiler, and `main` was
+#                          broken three times on 2026-08-12/13 by pushes that
+#                          never built the superproject.
+#
 # The bridge REPLAY (every bridged arm still carries its kernel-checked
 # agreement theorem) is deliberately NOT here: it kernel-checks 185 modules and
 # takes ~142s, and a pre-push gate that slow is one everyone learns to skip with
@@ -40,6 +53,17 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "pre-push: not inside a git worktree" >&2
   exit 1
 }
+
+# Git exports repository-local variables (notably GIT_DIR) while invoking a
+# hook.  Leaving them set makes a nested `git -C first-party/<repo> ...`
+# continue to inspect the superproject object store.  In a linked worktree that
+# made both pin gates report every healthy sibling as unresolvable even though
+# the same commands passed immediately outside the hook.  Resolve our root
+# first, then let every subsequent Git command discover the repository named by
+# its own working directory.
+for git_local_var in $(git rev-parse --local-env-vars); do
+  unset "$git_local_var"
+done
 cd "$REPO_ROOT"
 
 PYTHON_BIN=""
@@ -131,6 +155,13 @@ echo "Trust pre-push gate (no stage2 build required)"
 run_lane fast.pr-gate bash scripts/pr_gate.sh
 run_lane fast.pin-coherence bash scripts/check_pin_coherence.sh
 run_lane fast.bridge-pin bash scripts/check_bridge_pin.sh --check
+# NOT a `fast.` lane, and the id says so: it runs `x.py check --stage 1` (~9-11
+# min) and is therefore SCOPED — it skips instantly unless the push touches
+# compiler/, crates/, src/bootstrap/, targo-trust/ or a first-party gitlink, so
+# most pushes pay nothing. See the script header for the three separate times
+# `main` was broken by a push that never built the superproject, one of which
+# also hid a dropped soundness check.
+run_lane scoped.compiler-check bash scripts/check_compiler_targets_build.sh
 
 echo
 if [ "$FAILED" -eq 0 ]; then

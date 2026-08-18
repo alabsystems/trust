@@ -1,0 +1,777 @@
+{
+  "name": "vec_into_iter",
+  "def_path": "shapes::vec_into_iter",
+  "span": {
+    "file": "shapes.rs",
+    "line_start": 2,
+    "col_start": 0,
+    "line_end": 2,
+    "col_end": 91
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "alloc::vec::Vec",
+            "fields": [
+              [
+                "buf",
+                {
+                  "Adt": {
+                    "name": "alloc::raw_vec::RawVec",
+                    "fields": [
+                      [
+                        "inner",
+                        {
+                          "Adt": {
+                            "name": "alloc::raw_vec::RawVecInner",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "core::ptr::unique::Unique",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "Adt": {
+                                            "name": "core::ptr::non_null::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": {
+                                                      "Int": {
+                                                        "width": 8,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_marker",
+                                        {
+                                          "Adt": {
+                                            "name": "core::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ],
+                              [
+                                "cap",
+                                {
+                                  "Adt": {
+                                    "name": "core::num::niche_types::UsizeNoHighBit",
+                                    "fields": [
+                                      [
+                                        "0",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ],
+                              [
+                                "alloc",
+                                {
+                                  "Adt": {
+                                    "name": "alloc::alloc::Global",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "alloc::vec::Vec",
+            "fields": [
+              [
+                "buf",
+                {
+                  "Adt": {
+                    "name": "alloc::raw_vec::RawVec",
+                    "fields": [
+                      [
+                        "inner",
+                        {
+                          "Adt": {
+                            "name": "alloc::raw_vec::RawVecInner",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "core::ptr::unique::Unique",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "Adt": {
+                                            "name": "core::ptr::non_null::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": {
+                                                      "Int": {
+                                                        "width": 8,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_marker",
+                                        {
+                                          "Adt": {
+                                            "name": "core::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ],
+                              [
+                                "cap",
+                                {
+                                  "Adt": {
+                                    "name": "core::num::niche_types::UsizeNoHighBit",
+                                    "fields": [
+                                      [
+                                        "0",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ],
+                              [
+                                "alloc",
+                                {
+                                  "Adt": {
+                                    "name": "alloc::alloc::Global",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "alloc::vec::into_iter::IntoIter",
+            "fields": [
+              [
+                "buf",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "phantom",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "cap",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "alloc",
+                {
+                  "Adt": {
+                    "name": "core::mem::manually_drop::ManuallyDrop",
+                    "fields": [
+                      [
+                        "value",
+                        {
+                          "Adt": {
+                            "name": "core::mem::maybe_dangling::MaybeDangling",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Adt": {
+                                    "name": "alloc::alloc::Global",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::Vec<u8> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "shapes.rs",
+              "line_start": 2,
+              "col_start": 66,
+              "line_end": 2,
+              "col_end": 79
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::into_iter::IntoIter<u8> as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "shapes.rs",
+              "line_start": 2,
+              "col_start": 66,
+              "line_end": 2,
+              "col_end": 89
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "alloc::vec::Vec",
+        "fields": [
+          [
+            "buf",
+            {
+              "Adt": {
+                "name": "alloc::raw_vec::RawVec",
+                "fields": [
+                  [
+                    "inner",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVecInner",
+                        "fields": [
+                          [
+                            "ptr",
+                            {
+                              "Adt": {
+                                "name": "core::ptr::unique::Unique",
+                                "fields": [
+                                  [
+                                    "pointer",
+                                    {
+                                      "Adt": {
+                                        "name": "core::ptr::non_null::NonNull",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "RawPtr": {
+                                                "mutable": false,
+                                                "pointee": {
+                                                  "Int": {
+                                                    "width": 8,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "_marker",
+                                    {
+                                      "Adt": {
+                                        "name": "core::marker::PhantomData",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ],
+                          [
+                            "cap",
+                            {
+                              "Adt": {
+                                "name": "core::num::niche_types::UsizeNoHighBit",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ],
+                          [
+                            "alloc",
+                            {
+                              "Adt": {
+                                "name": "alloc::alloc::Global",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "_marker",
+                    {
+                      "Adt": {
+                        "name": "core::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          ],
+          [
+            "len",
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Struct"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

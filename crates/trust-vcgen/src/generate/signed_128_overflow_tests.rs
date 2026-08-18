@@ -5,7 +5,10 @@ use trust_types::{
     VerifiableFunction,
 };
 
-use super::{generate_v2_safety_vcs, v2_build_overflow_vc_for_operands};
+use super::{
+    generate_v2_safety_vcs, v2_build_overflow_vc_for_operands,
+    v2_overflow_assert_provably_cannot_fire,
+};
 
 fn assign(dest: usize, rvalue: Rvalue) -> Statement {
     Statement::Assign { place: Place::local(dest), rvalue, span: SourceSpan::default() }
@@ -278,6 +281,7 @@ fn i128_sub_fn() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -432,6 +436,7 @@ fn i128_neg_fn() -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -514,6 +519,7 @@ fn i128_signed_mul_stays_unsupported() {
             }],
             arg_count: 2,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -566,6 +572,7 @@ fn u128_add_overflow_still_refutable() {
             }],
             arg_count: 1,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -718,6 +725,7 @@ fn signed_max_sub_fixture() -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -828,6 +836,7 @@ fn unguarded_i128_sub_one_stays_refutable() {
             }],
             arg_count: 1,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -901,6 +910,7 @@ fn shift_def_without_bound_stays_refutable() {
             }],
             arg_count: 1,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -963,6 +973,7 @@ fn unguarded_i128_max_plus_one_stays_refutable() {
             }],
             arg_count: 2,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1098,6 +1109,7 @@ fn signed_min_neg_shifted_is_provable_unsat() {
             ],
             arg_count: 1,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1164,7 +1176,9 @@ fn signed_min_neg_shifted_is_provable_unsat() {
 // multiplier declined). When BOTH operands have KNOWN CONSTANT bounds on
 // every reaching path, the exact integer product's extremes lie at the four
 // corners of the box, so all-four-corners-fit-i128 PROVES no overflow with
-// pure i128 arithmetic. These tests pin: (1) both const-pinned → proved;
+// pure i128 arithmetic, and the obligation is then SUPPRESSED rather than
+// minted constant-false (which no downstream authority could discharge).
+// These tests pin: (1) both const-pinned → no obligation;
 // (2) one operand symbolic → fail-closed kept; (3) precondition-bounded box
 // whose corner overflows → fail-closed kept, and a safe box → proved;
 // (4) exact boundary correctness of the corner-fit predicate.
@@ -1218,6 +1232,7 @@ fn i128_mul_checked_fn(
             ],
             arg_count,
             return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1235,8 +1250,18 @@ fn tuple_decl(idx: usize) -> LocalDecl {
 }
 
 /// (1) `a * b` with block-defs `a = 3`, `b = 4`: both operands pinned to
-/// constants ⇒ the product provably cannot overflow ⇒ a `Bool(false)` proof
-/// VC (trivially UNSAT), NOT an UnsupportedMir fail-close.
+/// constants ⇒ the product provably cannot overflow ⇒ NO obligation is minted,
+/// and in particular NOT an UnsupportedMir fail-close.
+///
+/// This test previously required a `Bool(false)` VC and called it "UNSAT ⇒
+/// proved". It asserted at the WRONG SEAM: that row could never reach Proved
+/// downstream — `apply_vacuity_gate` rewrites a constant-false violation to
+/// Unknown, and a bare `Bool(false)` with `obligation: None` can carry no
+/// `ResultProofAuthority` even if exempted. The test passed at the vcgen
+/// boundary while the capability was dead one layer below it, which is exactly
+/// how the defect survived. The assertions below now pin the OUTCOME (no row
+/// at all, from either the builder or the assert lane), not the shape of a row
+/// that could not be discharged.
 #[test]
 fn i128_mul_both_const_pinned_proves_no_overflow() {
     let locals = vec![
@@ -1264,26 +1289,21 @@ fn i128_mul_both_const_pinned_proves_no_overflow() {
         &Operand::Copy(Place::local(2)),
         &SourceSpan::default(),
         None,
-    )
-    .expect("const-pinned i128 mul must still emit a VC");
-    assert!(
-        matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. }),
-        "must be a real ArithmeticOverflow proof, not UnsupportedMir; got {:?}",
-        vc.kind
     );
-    assert_eq!(
-        vc.formula,
-        Formula::Bool(false),
-        "3 * 4 provably cannot overflow i128 ⇒ Bool(false) violation (UNSAT ⇒ proved); got {:?}",
-        vc.formula
-    );
-    // A genuine proof: the violation is UNSAT for EVERY witness (never refutable).
     assert!(
-        !eval_bv_bool(&vc.formula, &|_| 0),
-        "the no-overflow proof VC must be unsatisfiable (never a masked overflow)"
+        vc.is_none(),
+        "3 * 4 provably cannot overflow i128 ⇒ NO obligation is minted; got {vc:?}"
     );
 
-    // End-to-end (assert terminator lane): no UnsupportedMir row; the proof row is present.
+    // End-to-end (assert terminator lane). BOTH absences matter, and they fail
+    // for opposite reasons:
+    //
+    //  * an `UnsupportedMir` row would mean the suppression never reached the
+    //    lane and it fell through to `RecognizedSafetyAssertProofGap` — a
+    //    needless runtime check (this is what happened when the builder alone
+    //    returned `None`, with no pre-check gate);
+    //  * an `ArithmeticOverflow` row would mean the constant-false obligation
+    //    came back, and it cannot be discharged by any downstream authority.
     let vcs = generate_v2_safety_vcs(&func);
     assert!(
         !vcs.iter().any(|v| matches!(v.kind, VcKind::UnsupportedMir { .. })),
@@ -1291,10 +1311,31 @@ fn i128_mul_both_const_pinned_proves_no_overflow() {
         vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
     );
     assert!(
-        vcs.iter().any(|v| matches!(v.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })
-            && v.formula == Formula::Bool(false)),
-        "the assert lane must emit the ArithmeticOverflow Bool(false) proof; kinds: {:?}",
+        !vcs.iter().any(|v| matches!(v.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })),
+        "the suppressed multiply must leave NO ArithmeticOverflow row; kinds: {:?}",
         vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
+    );
+}
+
+/// The suppression must be DECIDED, not blanket: a signed 128-bit multiply whose
+/// corner products do NOT fit stays fail-closed, and the assert lane still
+/// yields a row rather than silently dropping the check.
+///
+/// Without this, part 1's pre-check gate could regress into suppressing every
+/// `Overflow(Mul)` assert and nothing would notice — the dangerous direction,
+/// since a dropped obligation is indistinguishable from a discharged one in the
+/// final report.
+#[test]
+fn i128_mul_unbounded_box_is_not_suppressed_by_the_assert_gate() {
+    let overflow = i128_mul_precond_fn(0, i128::MAX, 0, 2);
+    assert!(
+        !v2_overflow_assert_provably_cannot_fire(&overflow, &overflow.body.blocks[0], BinOp::Mul),
+        "a box whose corner (i128::MAX * 2) overflows must NOT be suppressed"
+    );
+    let vcs = generate_v2_safety_vcs(&overflow);
+    assert!(
+        !vcs.is_empty(),
+        "an unbounded i128 mul must still contribute an obligation, never vanish"
     );
 }
 
@@ -1386,7 +1427,8 @@ fn i128_mul_precond_vc(func: &VerifiableFunction) -> VcKind {
 /// (3) Precondition-bounded boxes: `a ∈ [0, i128::MAX]`, `b ∈ [0, 2]` has the
 /// corner `i128::MAX * 2` OUTSIDE i128 ⇒ overflow is possible ⇒ the fail-
 /// closed UnsupportedMir is KEPT (never a false PROVE). A safe box
-/// `a, b ∈ [0, 1000]` (max corner 1_000_000) PROVES.
+/// `a, b ∈ [0, 1000]` (max corner 1_000_000) is DISCHARGED — no obligation is
+/// minted for it at all.
 #[test]
 fn i128_mul_precond_bounded_corner_overflow_fails_closed() {
     let overflow = i128_mul_precond_fn(0, i128::MAX, 0, 2);
@@ -1404,14 +1446,11 @@ fn i128_mul_precond_bounded_corner_overflow_fails_closed() {
         &Operand::Copy(Place::local(2)),
         &SourceSpan::default(),
         None,
-    )
-    .expect("must emit a VC");
+    );
     assert!(
-        matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })
-            && vc.formula == Formula::Bool(false),
-        "a precondition-bounded safe box (0..=1000)² must PROVE (Bool(false)); got kind {:?} formula {:?}",
-        vc.kind,
-        vc.formula
+        vc.is_none(),
+        "a precondition-bounded safe box (0..=1000)² provably cannot overflow ⇒ NO \
+         obligation is minted (suppression, not a constant-false row); got {vc:?}"
     );
 }
 

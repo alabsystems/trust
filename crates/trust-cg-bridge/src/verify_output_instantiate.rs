@@ -268,6 +268,13 @@ pub(crate) mod kx {
     pub fn or_cong2(c: Expr, x: Expr, xp: Expr, h: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.bvf_or_cong2"), [c, x, xp, h])
     }
+    /// The GENERAL two-sided OR congruence — the sibling of [`and_cong`] /
+    /// [`xor_cong`]. [`or_cong2`] above fixes the LEFT operand, which covers the
+    /// `Orr Wd, WZR, Ws` register-move wrapper and nothing else; this one covers
+    /// a machine `Orr` with two real operands, i.e. a user-level `|`.
+    pub fn or_cong(a: Expr, ap: Expr, b: Expr, bp: Expr, ha: Expr, hb: Expr) -> Expr {
+        Expr::apps(Expr::const_str("Clean.BVC.bvf_or_cong"), [a, ap, b, bp, ha, hb])
+    }
     pub fn zext_cong(x: Expr, xp: Expr, k: Expr, h: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.bvf_zext_cong"), [x, xp, k, h])
     }
@@ -367,8 +374,23 @@ pub(crate) mod kx {
     /// of type `List Bool → List Bool`. `selectStoreSame` is parametric over `m` and never
     /// inspects it, so abstracting the ~28-store frame stack as this one closed term is sound
     /// (the load short-circuits at the pointer store, above the frame). No axiom needed.
+    ///
+    /// NOT usable for a BARE read: `bvSelect (fun _ => nil) a` REDUCES to `nil` for every
+    /// address, which would equate every bare read with every other. Use [`mem_const`].
     pub fn opaque_mem() -> Expr {
         Expr::lam(clean_kernel::expr::BinderInfo::Default, list_bool(), nil())
+    }
+    /// The CALLER-PROVIDED memory `BVC_MEM_{key}` — an OPAQUE axiom of type
+    /// `List Bool → List Bool` (registered by `discharge_env`). Opaque is the whole
+    /// point: a read from it is stuck, so the only way two reads discharge against
+    /// each other is `selectAddrCong` on defeq addresses.
+    pub fn mem_const(key: &str) -> Expr {
+        Expr::const_str(&format!("BVC_MEM_{key}"))
+    }
+    /// `selectAddrCong m a a' (h : a = a') : bvSelect m a = bvSelect m a'` — the
+    /// address congruence at a FIXED array (the caller-provided-memory keystone).
+    pub fn select_addr_cong(m: Expr, a: Expr, ap: Expr, h: Expr) -> Expr {
+        Expr::apps(Expr::const_str("Clean.BVC.selectAddrCong"), [m, a, ap, h])
     }
     pub fn bv_len(xs: Expr) -> Expr {
         Expr::app(Expr::const_str("Clean.BVC.bvLen"), xs)
@@ -407,17 +429,113 @@ pub(crate) struct Reflected {
     pub(crate) proof: Expr,
 }
 
+/// Is `f` STRUCTURALLY GUARANTEED to contain no memory write?
+///
+/// FAIL-CLOSED BY CONSTRUCTION: this is a whitelist of the node kinds
+/// [`reflect_formula`] itself recurses through, and every other node — including
+/// every node this walker does not know how to look inside — answers `false`
+/// ("might store"). Adding a `Formula` variant therefore CANNOT silently widen
+/// the read-only fragment; it can only keep it closed until someone adds the
+/// variant here deliberately. `Formula::Store` is the one explicit `false`.
+///
+/// This is the side condition for the bare-read arm of `reflect_formula`. It has
+/// to be a property of the WHOLE obligation, not of the read: the hazard is that
+/// one syntactic memory name denotes the pre-state on one side and a post-store
+/// state on the other, which modelling both as the same opaque constant would
+/// silently equate. No write anywhere ⟹ no such divergence.
+fn is_store_free(f: &Formula) -> bool {
+    match f {
+        // Leaves.
+        Formula::Var(..) | Formula::SymVar(..) | Formula::BitVec { .. } => true,
+        // THE point of the walk.
+        Formula::Store(..) => false,
+        // Unary.
+        Formula::Not(x)
+        | Formula::BvNot(x, _)
+        | Formula::BvZeroExt(x, _)
+        | Formula::BvSignExt(x, _) => is_store_free(x),
+        Formula::BvExtract { inner, .. } => is_store_free(inner),
+        // Binary.
+        Formula::BvAdd(l, r, _)
+        | Formula::BvSub(l, r, _)
+        | Formula::BvMul(l, r, _)
+        | Formula::BvUDiv(l, r, _)
+        | Formula::BvSDiv(l, r, _)
+        | Formula::BvURem(l, r, _)
+        | Formula::BvSRem(l, r, _)
+        | Formula::BvAnd(l, r, _)
+        | Formula::BvOr(l, r, _)
+        | Formula::BvXor(l, r, _)
+        | Formula::BvShl(l, r, _)
+        | Formula::BvLShr(l, r, _)
+        | Formula::BvAShr(l, r, _) => is_store_free(l) && is_store_free(r),
+        Formula::BvConcat(l, r) | Formula::Select(l, r) => is_store_free(l) && is_store_free(r),
+        // EVERYTHING ELSE — including nodes whose children this walker cannot
+        // see into — is treated as possibly-storing.
+        _ => false,
+    }
+}
+
+/// Reflection state threaded through [`reflect_formula`]: the symbolic leaves and
+/// caller memories that need axioms, plus the ONE policy bit that decides whether
+/// a bare memory read (a load from state the function never wrote) is in the
+/// fragment.
+pub(crate) struct ReflectCtx {
+    /// `(name, width)` of each symbolic register leaf → a `BVC_LEAF_*` axiom.
+    pub(crate) leaves: Vec<(String, u32)>,
+    /// Each distinct caller-provided memory read → a `BVC_MEM_*` array axiom.
+    pub(crate) mems: Vec<String>,
+    /// May a bare `Select(MEM, a)` be admitted? See [`ReflectCtx::for_obligation`].
+    caller_memory_readable: bool,
+}
+
+impl ReflectCtx {
+    /// The FAIL-CLOSED constructor: caller memory is NOT readable. Any caller that
+    /// has not proved the read-only side condition gets this, and a bare read is
+    /// refused exactly as it was before this fragment was widened.
+    pub(crate) fn closed() -> Self {
+        Self { leaves: Vec::new(), mems: Vec::new(), caller_memory_readable: false }
+    }
+
+    /// Admit bare reads for THIS obligation iff NEITHER side writes memory.
+    ///
+    /// A read-only body reads the same untouched pre-state on both sides, so two
+    /// reads at provably-equal addresses are equal by `Clean.BVC.selectAddrCong` —
+    /// a congruence over the address at a FIXED array, which never interprets the
+    /// array. The moment a store exists anywhere the argument collapses: a read
+    /// could be before or after it, and `selectAddrCong` says nothing about that.
+    /// Aliasing and read-after-write stay OUT of the fragment.
+    pub(crate) fn for_obligation(machine: &Formula, auto: &Formula) -> Self {
+        // START CLOSED, then open only on evidence — never the other way round.
+        let mut ctx = Self::closed();
+        ctx.caller_memory_readable = is_store_free(machine) && is_store_free(auto);
+        ctx
+    }
+}
+
+/// The stable identity of a memory term, used to name its `BVC_MEM_*` axiom.
+///
+/// Only a NAMED, ARRAY-SORTED variable qualifies. Two bare reads discharge
+/// against each other only when they name the same memory, so this key is what
+/// separates "the caller's memory" from anything else; a derived or unnamed
+/// memory term has no such identity and is refused. Requiring `Sort::Array`
+/// keeps the key from being minted for a term that is not a memory at all.
+fn memory_key(f: &Formula) -> Option<String> {
+    match f {
+        Formula::Var(name, Sort::Array(..)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Reflect a gate `Formula` (add@N fragment) into a `BvF` Expr + stripped core +
 /// the `bvfEval`-headed kernel proof. PURELY STRUCTURAL / NON-FOLDING. Returns
 /// `Err` for any node outside the recognized fragment (→ caller falls through).
-/// Also returns the set of symbolic leaf names that need a `List Bool` axiom.
-pub(crate) fn reflect_formula(
-    f: &Formula,
-    leaves: &mut Vec<(String, u32)>,
-) -> Result<Reflected, String> {
+/// Also records, in `ctx`, the symbolic leaves and caller memories that need an
+/// axiom to state the obligation.
+pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Reflected, String> {
     match f {
         Formula::Var(name, Sort::BitVec(w)) => {
-            leaves.push((name.clone(), *w));
+            ctx.leaves.push((name.clone(), *w));
             let leaf_list = Expr::const_str(&format!("BVC_LEAF_{name}_{w}"));
             let l = kx::leaf(leaf_list);
             Ok(Reflected { bvf: l.clone(), core: l.clone(), proof: kx::eq_refl_list(kx::evalf(l)) })
@@ -432,7 +550,7 @@ pub(crate) fn reflect_formula(
         // This makes the mul machine core (which carries the MADD wrapper) match the IR
         // BvMul core (which doesn't). Mirrors the BvOr(0,·) arm exactly.
         Formula::BvAdd(l, r, _w) if matches!(&**l, Formula::BitVec { value: 0, .. }) => {
-            let rx = reflect_formula(r, leaves)?;
+            let rx = reflect_formula(r, ctx)?;
             let const_af = kx::const_(kx::all_false(kx::evalf(rx.core.clone())));
             let bvf = kx::add(const_af.clone(), rx.bvf.clone());
             let core = rx.core.clone();
@@ -458,8 +576,8 @@ pub(crate) fn reflect_formula(
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvAdd(l, r, _w) => {
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::add(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::add(rl.core.clone(), rr.core.clone());
             let proof = kx::add_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
@@ -468,8 +586,8 @@ pub(crate) fn reflect_formula(
         Formula::BvSub(l, r, _w) => {
             // SUB — the exact add analogue (traced #40-followup): BvSub core in the
             // same coercion wrappers. bvf_sub_cong is the bvfEval-headed Sub congruence.
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::sub(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::sub(rl.core.clone(), rr.core.clone());
             let proof = kx::sub_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
@@ -478,16 +596,16 @@ pub(crate) fn reflect_formula(
         Formula::BvAnd(l, r, _w) => {
             // AND — exact add analogue (traced #41): native BvAnd(wn0,wn1) (operands
             // ALIGNED, not commuted) in the same coercion wrappers. Pure coercion-id.
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::and(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::and(rl.core.clone(), rr.core.clone());
             let proof = kx::and_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvXor(l, r, _w) => {
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::xor(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::xor(rl.core.clone(), rr.core.clone());
             let proof = kx::xor_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
@@ -499,8 +617,8 @@ pub(crate) fn reflect_formula(
             // BvMul primitive the IR auto-spec uses. Pure coercion-identity over the
             // shared BvF.Mul; bvf_mul_cong cancels it by congruence (the multiplier
             // VALUE is not load-bearing — both sides compute the identical bvMul).
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::mul(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::mul(rl.core.clone(), rr.core.clone());
             let proof = kx::mul_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
@@ -514,8 +632,8 @@ pub(crate) fn reflect_formula(
             // DELIBERATELY NOT reflected (it stays in the `other` Err arm) — SDIV rounds toward
             // zero, which differs from `bvDiv`'s `Nat.div` floor for negatives, so signed div
             // must NEVER reflect to `BvF.Div`; it correctly stays [VALIDATED].
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::div(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::div(rl.core.clone(), rr.core.clone());
             let proof = kx::div_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
@@ -526,24 +644,24 @@ pub(crate) fn reflect_formula(
             // BvShl over the SAME operands (the amount is BvAnd(b, w-1) on both sides — the
             // BvAnd arm reflects it), differing only in operand coercion wrappers. bvf_shl_cong
             // cancels the shared BvF.Shl by congruence (the shift VALUE is not load-bearing).
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::shl(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::shl(rl.core.clone(), rr.core.clone());
             let proof = kx::shl_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvLShr(l, r, _w) => {
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::lshr(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::lshr(rl.core.clone(), rr.core.clone());
             let proof = kx::lshr_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvAShr(l, r, _w) => {
-            let rl = reflect_formula(l, leaves)?;
-            let rr = reflect_formula(r, leaves)?;
+            let rl = reflect_formula(l, ctx)?;
+            let rr = reflect_formula(r, ctx)?;
             let bvf = kx::ashr(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::ashr(rl.core.clone(), rr.core.clone());
             let proof = kx::ashr_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
@@ -551,7 +669,7 @@ pub(crate) fn reflect_formula(
         }
         Formula::BvOr(lhs, rhs, _w) => {
             if let Formula::BitVec { value: 0, .. } = &**lhs {
-                let rx = reflect_formula(rhs, leaves)?;
+                let rx = reflect_formula(rhs, ctx)?;
                 let const_af = kx::const_(kx::all_false(kx::evalf(rx.core.clone())));
                 let bvf = kx::or(const_af.clone(), rx.bvf.clone());
                 let core = rx.core.clone();
@@ -567,7 +685,33 @@ pub(crate) fn reflect_formula(
                 );
                 Ok(Reflected { bvf, core, proof })
             } else {
-                Err("reflect: BvOr lhs is not BitVec{0} (outside add@N wrapper fragment)".into())
+                // THE GENERAL TWO-OPERAND `Orr`, i.e. a user-level `|`.
+                //
+                // The arm above handles only `BvOr(BitVec{0}, x)` — the
+                // `Orr Wd, WZR, Ws` register-move wrapper — because for a long
+                // time `Clean.BVC.bvf_or_cong2` (left operand FIXED) was the only
+                // OR congruence that existed. Every other binary op has had the
+                // general two-sided form, so `|` was the single binary shape with
+                // no O(1) coercion-identity route: it fell out of this function
+                // with an `Err` and back onto bit-blast + SAT + kernel re-check.
+                //
+                // (c) MEASURED before `bvf_or_cong` existed, one function through
+                // `--emit=link`: `(x ^ y) ^ (x & y)` cost 2.76 s / 0.99 GB while
+                // `(x ^ y) | (x & y)` — the identical shape, one instruction
+                // different — cost 20.94 s / 27.41 GB, and the five-op form
+                // reached 54.78 GB. The ay-side export is NOT the cause and was
+                // measured to rule it out: the OR and XOR bit-blasts are
+                // identical in size (225 vars / 161 lemmas / 642 clauses / 225
+                // steps) and in time (~30 ms). The whole difference was taking
+                // this fallback at all.
+                //
+                // Structurally this is exactly the `BvAnd`/`BvXor` arms above.
+                let rl = reflect_formula(lhs, ctx)?;
+                let rr = reflect_formula(rhs, ctx)?;
+                let bvf = kx::or(rl.bvf.clone(), rr.bvf.clone());
+                let core = kx::or(rl.core.clone(), rr.core.clone());
+                let proof = kx::or_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
+                Ok(Reflected { bvf, core, proof })
             }
         }
         // MEMORY STORE-LOAD ROUNDTRIP: `Select(Store(M, a, v), a)` — a load at the SAME
@@ -582,8 +726,8 @@ pub(crate) fn reflect_formula(
         Formula::Select(mem, load_addr) => {
             if let Formula::Store(_under, store_addr, val) = &**mem {
                 if **store_addr == **load_addr {
-                    let ra = reflect_formula(load_addr, leaves)?;
-                    let rv = reflect_formula(val, leaves)?;
+                    let ra = reflect_formula(load_addr, ctx)?;
+                    let rv = reflect_formula(val, ctx)?;
                     let a_list = kx::evalf(ra.core);
                     let v_list = kx::evalf(rv.core.clone());
                     let m = kx::opaque_mem();
@@ -602,14 +746,60 @@ pub(crate) fn reflect_formula(
                     "reflect: Select store/load address mismatch (aliasing not in fragment)".into(),
                 );
             }
-            Err("reflect: Select over non-Store (bare memory read outside fragment)".into())
+            // ── BARE MEMORY READ — a load through a CALLER-PROVIDED pointer ────
+            //
+            // `Select(MEM, a)` over a memory the function never wrote is what a
+            // `&T` parameter dereference reflects to, and it is what used to put
+            // reference parameters outside the fragment entirely: the store-load
+            // arm above needs an immediately-covering store to bridge through
+            // `selectStoreSame`, and there is no store.
+            //
+            // It is ADMITTED here under ONE side condition, checked by the caller
+            // over the WHOLE obligation and defaulted to refusal
+            // (`ReflectCtx::closed`): the body performs NO STORE on either side.
+            // Then both sides read the same untouched pre-state, and the two reads
+            // are equal as soon as their ADDRESSES are — `Clean.BVC.selectAddrCong`
+            // transports that address equality under `bvSelect` at a fixed array.
+            //
+            // The memory is an OPAQUE `BVC_MEM_*` AXIOM, deliberately NOT the
+            // closed `opaque_mem` (`fun _ => List.nil`) the store-load path uses.
+            // `opaque_mem` is safe there only because `selectStoreSame` never
+            // inspects it; here it would REDUCE — `bvSelect (fun _ => nil) a ⟶ nil`
+            // for EVERY `a` — and every bare read in the universe would discharge
+            // against every other. With an axiom the read is stuck, the ONLY bridge
+            // is the address congruence, and a read at a different address (or from
+            // a differently-named memory) leaves the two cores non-defeq and is
+            // KERNEL-REJECTED.
+            if !ctx.caller_memory_readable {
+                return Err(
+                    "reflect: Select over non-Store (bare memory read outside fragment)".into()
+                );
+            }
+            let Some(key) = memory_key(mem) else {
+                return Err(
+                    "reflect: Select over an unnamed memory (bare memory read outside fragment)"
+                        .into(),
+                );
+            };
+            ctx.mems.push(key.clone());
+            let ra = reflect_formula(load_addr, ctx)?;
+            let m = kx::mem_const(&key);
+            let a_bvf = kx::evalf(ra.bvf);
+            let a_core = kx::evalf(ra.core);
+            // bvf / core are Leaf-wrapped reads at the bvf-side / core-side address;
+            // `bvfEval (Leaf l) ⟶ l`, so the proof below IS the required
+            // `bvfEval(bvf) = bvfEval(core)`.
+            let bvf = kx::leaf(kx::bv_select(m.clone(), a_bvf.clone()));
+            let core = kx::leaf(kx::bv_select(m.clone(), a_core.clone()));
+            let proof = kx::select_addr_cong(m, a_bvf, a_core, ra.proof);
+            Ok(Reflected { bvf, core, proof })
         }
         Formula::BvExtract { inner, high, low } => {
             if *low != 0 {
                 return Err("reflect: BvExtract low != 0 (outside fragment)".into());
             }
             if let Formula::BvZeroExt(z, k) = &**inner {
-                let rz = reflect_formula(z, leaves)?;
+                let rz = reflect_formula(z, ctx)?;
                 let kn = kx::nat_lit(*k);
                 let tag = rz.core.clone();
                 let zext_bvf = kx::zext(rz.bvf.clone(), kn.clone());
@@ -632,7 +822,7 @@ pub(crate) fn reflect_formula(
             } else {
                 // Bare extract of a leaf (operand wn = Extract[w-1:0](Var X)): part
                 // of the SHARED core, identical on both sides — core = bvf, refl.
-                let ri = reflect_formula(inner, leaves)?;
+                let ri = reflect_formula(inner, ctx)?;
                 let w = high - low + 1;
                 let tag = kx::const_(kx::bits(0, w));
                 let bvf = kx::extract(ri.bvf.clone(), tag);
@@ -660,9 +850,34 @@ pub(crate) fn reflection_contains_wrapper(e: &Expr) -> bool {
 /// `List Bool` opaques used ONLY to state the symbolic obligation; they are NOT
 /// dependencies of the `Clean.BVC.bvf_*` theorems (whose axiom closure stays
 /// empty), so they do not enter the [PROVED] grade's trusted closure.
-pub(crate) fn discharge_env(leaves: &[(String, u32)]) -> Result<Environment, String> {
-    let mut env = Environment::with_prelude();
-    env.init_bv_coercion().map_err(|e| format!("init_bv_coercion: {e:?}"))?;
+pub(crate) fn discharge_env(
+    leaves: &[(String, u32)],
+    mems: &[String],
+) -> Result<Environment, String> {
+    // THE BASE IS A CONSTANT, AND IT IS THE EXPENSIVE PART.
+    //
+    // `Environment::with_prelude()` kernel-type-checks every prelude
+    // declaration, and `init_bv_coercion()` adds the BVC layer on top. Neither
+    // depends on `leaves` — only the axioms added below do — so the pair was
+    // being rebuilt from scratch for EVERY obligation.
+    //
+    // (c) MEASURED (debug build; the ratio is the point, not the absolutes):
+    // building the base costs 7.42 s and cloning it costs 878 us — **8,447x**.
+    // After the `bvf_or_cong` repair put `|` on the O(1) path, a process sample
+    // put essentially ALL remaining discharge-thread time in `with_prelude`, so
+    // this was the entire residual cost of the fast path.
+    //
+    // Memoizing is sound because the base is a deterministic, immutable
+    // construction: every caller CLONES it before adding its own
+    // `BVC_LEAF_*` axioms, so no caller can observe another's mutation, and a
+    // clone carries the same kernel-checked declarations the build produced.
+    static BASE: std::sync::OnceLock<Result<Environment, String>> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let mut env = Environment::with_prelude();
+        env.init_bv_coercion().map_err(|e| format!("init_bv_coercion: {e:?}"))?;
+        Ok(env)
+    });
+    let mut env = base.as_ref().map_err(Clone::clone)?.clone();
     for (name, w) in leaves {
         // idempotent: a repeated (name,w) is fine (add_decl of an existing axiom
         // with the same type is a no-op-or-error we tolerate).
@@ -670,6 +885,19 @@ pub(crate) fn discharge_env(leaves: &[(String, u32)]) -> Result<Environment, Str
             name: Name::from_string(&format!("BVC_LEAF_{name}_{w}")),
             level_params: vec![],
             type_: kx::list_bool(),
+        });
+    }
+    // The caller-provided memories: OPAQUE `List Bool → List Bool` axioms, one per
+    // distinct memory name. Same status as the leaf axioms — they only state the
+    // obligation and are NOT dependencies of `Clean.BVC.selectAddrCong` (whose
+    // axiom closure stays empty), so the [PROVED] grade's trusted closure is
+    // unchanged. Opaque is load-bearing: an INTERPRETED memory would let reads at
+    // different addresses reduce to the same value.
+    for name in mems {
+        let _ = env.add_decl(clean_kernel::Declaration::Axiom {
+            name: Name::from_string(&format!("BVC_MEM_{name}")),
+            level_params: vec![],
+            type_: Expr::arrow(kx::list_bool(), kx::list_bool()),
         });
     }
     Ok(env)
@@ -1690,9 +1918,15 @@ pub(crate) fn try_o1_instantiation_discharge(
         return Some(t);
     }
 
-    let mut leaves: Vec<(String, u32)> = Vec::new();
-    let rm = reflect_formula(machine_out, &mut leaves).ok()?;
-    let ra = reflect_formula(auto, &mut leaves).ok()?;
+    // The read-only side condition is decided ONCE, over BOTH whole formulas,
+    // before any reflection runs — it is a property of the obligation, not of an
+    // individual read. `for_obligation` is the only constructor that can turn the
+    // bare-read arm on; everything else uses `ReflectCtx::closed`.
+    let mut ctx = ReflectCtx::for_obligation(machine_out, auto);
+    let rm = reflect_formula(machine_out, &mut ctx).ok()?;
+    let ra = reflect_formula(auto, &mut ctx).ok()?;
+    let ReflectCtx { leaves, mems, .. } = ctx;
+    let read_caller_memory = !mems.is_empty();
 
     // The discharge term: bvfEval(rm.bvf) = bvfEval(ra.bvf), via
     //   rm.proof : bvfEval(rm.bvf) = bvfEval(rm.core)
@@ -1717,14 +1951,21 @@ pub(crate) fn try_o1_instantiation_discharge(
     // empty-closure; the leaf axioms are not among their deps). Any panic/failure
     // ⟹ None (fall through).
     let result = run_recheck_thread("trust-mpos-o1-instantiate", move || {
-        let env = discharge_env(&leaves).ok()?;
+        let env = discharge_env(&leaves, &mems).ok()?;
         let tc = TypeChecker::with_mode(&env, env.mode());
         tc.check_type(&discharge, &goal).ok().map(|()| ())
     })
     .ok()
     .flatten();
 
-    result.map(|()| "Clean.BVC.bvf_wrapper_id+congruence (O(1) add@N)".to_string())
+    result.map(|()| {
+        if read_caller_memory {
+            "Clean.BVC.selectAddrCong+congruence (O(1) caller-memory read, no-store body)"
+                .to_string()
+        } else {
+            "Clean.BVC.bvf_wrapper_id+congruence (O(1) add@N)".to_string()
+        }
+    })
 }
 
 /// Does the formula contain a `Select` node (a memory read)? Cheap guard so the
@@ -1885,14 +2126,26 @@ pub(crate) fn try_mem_store_load_discharge(
 // ── Test-support surface (used by verify_output's B2b/B4 tests) ────────────────
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Reflected, discharge_env as denv, reflect_formula as reflect};
+    use super::{ReflectCtx, Reflected, discharge_env as denv, reflect_formula as reflect};
     use clean_kernel::{Environment, Expr};
     use trust_types::Formula;
 
-    /// Reflect a Formula (collecting leaf axioms internally).
+    /// Reflect a Formula under the FAIL-CLOSED policy (no bare caller-memory read).
     pub(crate) fn reflect_formula(f: &Formula) -> Result<Reflected, String> {
-        let mut leaves = Vec::new();
-        reflect(f, &mut leaves)
+        reflect(f, &mut ReflectCtx::closed())
+    }
+    /// Reflect a Formula under the policy the pair `(machine, auto)` earns — the
+    /// bare-read arm is live only if `is_store_free` holds on BOTH.
+    pub(crate) fn reflect_formula_for(
+        f: &Formula,
+        machine: &Formula,
+        auto: &Formula,
+    ) -> Result<Reflected, String> {
+        reflect(f, &mut ReflectCtx::for_obligation(machine, auto))
+    }
+    /// The read-only side condition itself, for direct testing.
+    pub(crate) fn store_free(f: &Formula) -> bool {
+        super::is_store_free(f)
     }
     /// Does `reflect_mem` accept this formula? (true iff Some).
     pub(crate) fn reflect_mem_ok(f: &Formula) -> bool {
@@ -1906,7 +2159,7 @@ pub(crate) mod test_support {
     pub(crate) fn env_with_leaves(leaves: &[(&str, u32)]) -> Environment {
         let owned: Vec<(String, u32)> =
             leaves.iter().map(|(n, w)| ((*n).to_string(), *w)).collect();
-        denv(&owned).expect("discharge_env")
+        denv(&owned, &[]).expect("discharge_env")
     }
     pub(crate) fn contains_wrapper(e: &Expr) -> bool {
         super::reflection_contains_wrapper(e)

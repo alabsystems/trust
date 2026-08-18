@@ -42,6 +42,7 @@ fn make_contract_function(
             }],
             arg_count,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts,
         preconditions: vec![],

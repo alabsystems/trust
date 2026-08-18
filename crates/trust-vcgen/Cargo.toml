@@ -46,7 +46,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-trust-router = { workspace = true }
+trust-router = { workspace = true, features = ["ay-backend"] }
 trust-report = { workspace = true }
 # range.rs's bound helpers are duplicated verbatim in trust-semantics, which
 # needs them to state the kernel `noOverflow` denotation without depending on

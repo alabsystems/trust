@@ -26,28 +26,29 @@
 //! * `-Z trust-ir-flip=no` disables the lane entirely (byte-compare baseline
 //!   for the equivalence probes). This is a tracked option because the lane
 //!   directly selects codegen/CTFE MIR.
-//! * no first-class `invariant`/`decreases` loop clauses. Their source names
-//!   currently bind through MIR debug-place provenance, while the direct
-//!   TrustIr module carries neither source-place identity nor `var_debug_info`.
-//!   Flipping such a body would preserve execution but erase the verifier's
-//!   only exact binder. The body stays on built MIR until that provenance rides
-//!   TrustIr; ordinary contract-free bodies remain eligible.
-//! * `-C debuginfo=0` only: the shim does not yet thread per-statement spans or
-//!   `var_debug_info`, so flipping under debuginfo would silently degrade debug info.
-//!   Fail-closed until spans ride trust-ir (P1.5). (Assert PANIC-LOCATION spans are already
-//!   exact — [`crate::flip`] stitches them from the borrow-checked sibling.)
+//! * first-class `invariant`/`decreases` clauses require the v35 semantic
+//!   source-provenance carrier. The compiler query is regenerated at both
+//!   record and consume time; compiler-source, semantic-body, and binding
+//!   digests plus an independently reconstructed natural-header/canonical
+//!   parameter map must all agree. Missing, stale, forged, or partial carriers
+//!   fail closed. Contract-free bodies remain eligible only with no carrier.
+//! * `-C debuginfo=0` only. Per-instruction spans and lexical scopes now ride
+//!   TrustIr, and parameter names reconstruct exactly, but corpus comparison
+//!   still finds line-row/column structural divergence and the producer does
+//!   not name locals. Flipping under debuginfo would therefore silently degrade
+//!   debug info. Assert panic-location spans are additionally stitched from the
+//!   borrow-checked sibling by [`crate::flip`].
 //! * no `-C instrument-coverage`: coverage mappings are span-derived; dummy spans would
 //!   corrupt them.
 //!
 //! # Per-BODY marker gate (slice 3 — replaces the old `-O0`-only session gate)
 //!
-//! The shim emits no `StorageLive`/`StorageDead` (reconstruction from the Module alone is
-//! provably impossible — `to_mir` module docs), so under `-O` a flipped body could lack the
-//! LLVM lifetime hints the built body carries. Instead of gating the whole session to `-O0`,
+//! The shim emits storage markers for OPERAND TEMPS only (wave-MF, 2026-08-12). Everything
+//! else is still unemitted, so under `-O` a flipped body could lack the LLVM lifetime hints
+//! the built body carries. Instead of gating the whole session to `-O0`,
 //! [`record_green`] takes the derived-MIR differential's EXACT marker-channel verdict
 //! (`DerivedReport::markers_exact`) and records a body at `-O` only when the marker
-//! sequences were proven line-identical (today: the built body's reachable subgraph is
-//! marker-free — unit fns, const-returning closures, param-identity bodies). When
+//! sequences were proven line-identical. When
 //! `!sess.emit_lifetime_markers()` (`-O0`, no sanitizers) marker divergence is
 //! codegen-immaterial — `RemoveStorageMarkers` (enabled exactly then, `mir_opt_level > 0`)
 //! deletes markers+Nops from every body before codegen and codegen only emits
@@ -56,14 +57,14 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com> | Copyright 2026 | License: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::DebugInfo;
 use rustc_span::def_id::LocalDefId;
-use trust_ir::{Module, ProofDigest};
+use trust_ir::{Inst, Module, ProofDigest, ValueId};
 
-use crate::{CalleeRef, Lowered};
+use crate::{CalleeRef, Lowered, ThinReborrow, ThinReborrowProvenance};
 
 /// One green body as the flip consumes it: the per-body mini-module, the
 /// callee-identity ledger `to_mir` spells calls from, and the lineage digest
@@ -83,6 +84,23 @@ pub struct GreenBody {
     /// some future path with a digest that does not describe its own payload fails
     /// closed rather than publishing a false attestation.
     pub(crate) lineage: ProofDigest,
+    /// Trust (enum-switch provenance): the hook-time [`Lowered::enum_fold_switch_blocks`], carried
+    /// because THIR IS NOT AVAILABLE AT FLIP TIME (see [`crate::flip::derive_flip_body`]) and the
+    /// set cannot be recovered from the module — that is the whole reason it exists.
+    ///
+    /// DELIBERATELY OUTSIDE the lineage digest. The digest names the (module, callee ledger) pair;
+    /// this set rides in the SAME registry entry the digest names, and the flip consumes both from
+    /// that one entry, so the two cannot desynchronize. Folding it into `body_lineage_digest`
+    /// would move every existing digest — including the pinned crystal A1 value — for no
+    /// soundness gain. An entry that somehow carried an EMPTY set would merely suppress the
+    /// reshape and miss flips: fail-closed, never a wrong body.
+    pub(crate) enum_fold_switch_blocks: std::collections::HashSet<trust_ir::BlockId>,
+    /// Opaque compiler-owned evidence that every carried
+    /// source-loop/TrustIR-header association matched the independently built
+    /// MIR header at one unique canonical CFG role.  Its private seal binds
+    /// the exact two role maps to `lineage`; it is Session-owned and never
+    /// serialized into the self-sealed artifact.
+    pub(crate) source_header_correspondence: crate::mir_differential::SourceHeaderCorrespondence,
 }
 
 /// Trust (L1): mint the registry entry for one green body — the SINGLE place a
@@ -96,9 +114,25 @@ pub struct GreenBody {
 ///
 /// Split out of `record_green` — which needs a `TyCtxt` and so cannot be unit
 /// tested — precisely so this rule is a test obligation and not a comment.
-fn green_body(module: &Module, callees: &[CalleeRef]) -> Option<GreenBody> {
-    let lineage = crate::lineage::body_lineage_digest(module, callees).ok()?;
-    Some(GreenBody { module: module.clone(), callees: callees.to_vec(), lineage })
+fn green_body(
+    definition: crate::lineage::DefinitionIdentity,
+    module: &Module,
+    callees: &[CalleeRef],
+    source_header_correspondence: crate::mir_differential::SourceHeaderCorrespondence,
+) -> Option<GreenBody> {
+    let lineage = crate::lineage::body_lineage_digest(definition, module, callees).ok()?;
+    if !source_header_correspondence.authenticates(lineage) {
+        return None;
+    }
+    // The provenance set is filled by `record_green` (the only caller with a `Lowered`); the unit
+    // tests below mint digest-only entries and never reach the reshape.
+    Some(GreenBody {
+        module: module.clone(),
+        callees: callees.to_vec(),
+        lineage,
+        enum_fold_switch_blocks: std::collections::HashSet::new(),
+        source_header_correspondence,
+    })
 }
 
 /// Green bodies for one compiler Session. The crate-local `DefIndex` is safe as
@@ -146,12 +180,13 @@ impl SessionFlipRegistry {
 ///
 /// # What `debuginfo == None` costs, measured
 ///
-/// The shim reconstructs MIR from the Module alone and the Module carries no
-/// spans or `var_debug_info`, so a flipped body would silently lose the
-/// line tables and local names the built body carries. That is not a
-/// correctness question — it is a debugger-visible regression the flip has no
-/// way to repair, so the session declines rather than emit a body it cannot
-/// describe.
+/// The shim reconstructs MIR from the Module alone. The Module now carries
+/// instruction spans, lexical scopes, and parameter names, but measured corpus
+/// parity still finds line-row/column divergence and the producer deliberately
+/// omits local names. A flipped body could therefore publish incomplete or
+/// different line tables and locals. That is not a correctness question — it
+/// is a debugger-visible regression, so the session declines rather than emit
+/// a body it cannot describe exactly.
 ///
 /// The scope of that decision deserves to be stated where the condition is,
 /// because it is larger than it reads. targo's `dev` profile resolves to
@@ -166,9 +201,9 @@ impl SessionFlipRegistry {
 /// cliff not: 4 at `-C debuginfo=0`, 1 at `-O`.)
 ///
 /// The gate is not a coverage lever. Relaxing it to raise the flip rate would
-/// trade real evidence for a bigger number; the way to widen this is to thread
-/// spans and `var_debug_info` through the Module so a flipped body can carry
-/// what it replaced.
+/// trade real evidence for a bigger number; the way to widen this is to close
+/// the measured span-attribution/structure differences and carry authenticated
+/// names for locals so a flipped body can reproduce what it replaced.
 pub fn flip_session_enabled(tcx: TyCtxt<'_>) -> bool {
     session_gates_allow_flip(
         tcx.sess.trust_ir_lower_enabled(),
@@ -243,15 +278,10 @@ const fn debuginfo_level_allows_flip(debuginfo: DebugInfo) -> bool {
     }
 }
 
-fn loop_contract_count_allows_flip(first_class_loop_contracts: usize) -> bool {
-    first_class_loop_contracts == 0
-}
-
 /// Trust (union lane): may a body that registered `union_lane` union PLACEHOLDER lanes flip?
 ///
-/// Never. Extracted as a `TyCtxt`-free predicate for the same reason
-/// [`loop_contract_count_allows_flip`] is: the refusal is then pinned by a unit test instead of
-/// living only inside a function no test can call.
+/// Never. Extracted as a `TyCtxt`-free predicate so the refusal is pinned by a
+/// unit test instead of living only inside a function no test can call.
 fn union_lane_allows_flip(union_lane: bool) -> bool {
     !union_lane
 }
@@ -294,28 +324,190 @@ fn fnptr_adapter_allows_flip(fnptr_adapter: bool) -> bool {
     !fnptr_adapter
 }
 
-/// Trust (wave-TR): may a body that FORWARDED an unledgered THIN SHARED REBORROW flip?
+/// Trust (wave-TR provenance ledger): may a body that FORWARDED unledgered THIN SHARED REBORROWS
+/// flip?
 ///
-/// Never, for now. The wave-TR arm returns a `&T` VALUE that this lowering did not produce and
-/// that is in no pointer ledger (`borrow_ptrs` / `ref_param_ptrs` / `global_ptrs` /
-/// `interior_ptrs`) — a call result, a by-ref match binding, a ref-typed local. That posture is
-/// right for the PRODUCER (the value already flowed unguarded before the reborrow existed; see
-/// `Lowered::thin_reborrow`), but it means the producer holds no record it could hand the flip
-/// about where the pointer came from. Codegen is the one seam where that matters, so it refuses.
+/// Only when EVERY forwarded row is one this gate can CERTIFY against the module it is about to
+/// hand codegen. Today that is exactly one provenance class, [`ThinReborrowProvenance::CallResult`],
+/// and the certificate is [`call_result_reborrow_is_confined`]. Every other class is refused, on
+/// the same reasoning the pre-ledger cut refused all of them.
 ///
-/// STATED AS ITS OWN PREDICATE rather than left to the wall that also refuses the class today.
-/// `to_mir` rejects the DOMINANT provenance — a `&T`-returning callee is outside its call fragment
-/// ("Call(callee return outside the fragment: …)"), because `ir_scalar_of_body` is `None` for a
-/// reference and the fallback arm demands a `Copy`, `!needs_drop` `ty::Adt(struct)`. That is a real
-/// wall and it is NOT ABOUT THIS LANE: it is a call RETURN-FIDELITY rule, it would evaporate the
-/// moment someone widened the return fragment for an unrelated reason, and it says nothing at all
-/// about the other provenances (a by-ref match binding reaches its value through `ExtractField`,
-/// under entirely separate gates). Relying on it would be relying on unreachability — the exact
-/// mistake [`union_lane_allows_flip`] and [`fnptr_adapter_allows_flip`] exist to avoid. Extracted
-/// `TyCtxt`-free for the same reason they are: the refusal is then pinned by a unit test instead of
-/// living only inside a function no test can call.
-fn thin_reborrow_allows_flip(thin_reborrow: bool) -> bool {
-    !thin_reborrow
+/// # What the refusal was, and why supplying a record is a CERTIFICATION rather than a relaxation
+///
+/// The pre-ledger predicate was literally `!thin_reborrow` over a bare `bool`, and its stated
+/// reason was: the wave-TR arm returns a `&T` VALUE that is in no pointer ledger (`borrow_ptrs` /
+/// `ref_param_ptrs` / `global_ptrs` / `interior_ptrs`), so "the producer holds no record it could
+/// hand the flip about where the pointer came from". That is a refusal for ABSENCE OF EVIDENCE,
+/// not for a known hazard — the arm emits ZERO instructions, mints no allocation and makes no
+/// memory-model claim. The honest way past it is therefore to produce the missing evidence and
+/// CHECK it, which is what `Lowered::thin_reborrows` and this function do. Nothing here weakens a
+/// guard: the gate still refuses every row it cannot account for, and it now additionally refuses
+/// rows whose class tag says `CallResult` while the module says otherwise.
+///
+/// # Why this lane is still stated as OUR decision
+///
+/// The wall that used to also refuse the dominant provenance HAS FALLEN. `to_mir` once put a
+/// `&T`-returning callee outside its call fragment ("Call(callee return outside the fragment: …)")
+/// because `ir_scalar_of_body` is `None` for a reference and the fallback arm demanded a `Copy`,
+/// `!needs_drop` `ty::Adt(struct)`. T2d added a shared-reference disjunct (`to_mir.rs:4401`/`:4448`,
+/// for the `<LevelArc as Deref>::deref(&payload) -> &Level` shape) and T2e added a
+/// scalar-`BackendRepr` enum disjunct, both for unrelated reasons. A `&T`-returning callee is now
+/// INSIDE the call fragment, so this lane is the only thing that was still refusing the class —
+/// which is precisely why it had to be a decision and not an inherited accident. `TyCtxt`-free for
+/// the same reason [`union_lane_allows_flip`] and [`fnptr_adapter_allows_flip`] are: the whole
+/// decision is then executable by a unit test.
+fn thin_reborrows_allow_flip(
+    module: &Module,
+    callees: &[CalleeRef],
+    thin_reborrows: &[ThinReborrow],
+) -> bool {
+    thin_reborrows.iter().all(|reborrow| match reborrow.provenance {
+        // CERTIFIABLE — and only if the module bears the claim out. See the function.
+        ThinReborrowProvenance::CallResult => {
+            call_result_reborrow_is_confined(module, callees, reborrow.value)
+        }
+        // REFUSED, unchanged from the pre-ledger cut. A binding read, a projection read and the
+        // catch-all all name values that no instruction in this body mints: the value is whatever
+        // a binding was bound to (possibly in a predecessor block, possibly by a `match` arm,
+        // possibly by the caller), or whatever a load found in memory this lowering does not
+        // model. There is no defining instruction to hand the flip, so there is nothing for a
+        // confinement check to check, and the honest posture is the original refusal.
+        //
+        // Spelled as three NAMED arms rather than a `_ =>` wildcard: a future provenance class
+        // must be classified deliberately here, and a wildcard would silently admit it into
+        // whatever bucket the compiler picked.
+        ThinReborrowProvenance::Binding
+        | ThinReborrowProvenance::Projection
+        | ThinReborrowProvenance::Other => false,
+    })
+}
+
+/// Trust (wave-TR provenance ledger): THE CONFINEMENT CHECK. Is `value` — a `&T` this body
+/// forwarded with no ledger entry behind it, claimed by the producer to be a CALL RESULT — minted
+/// by a direct call to a ledgered callee inside the very module the flip is about to derive MIR
+/// from?
+///
+/// # The property this establishes
+///
+/// If this returns `true` then, in the single body function of this per-body module:
+///
+///   1. `value` is not a block parameter of any block, so it never arrives along a control-flow
+///      edge and cannot mean different things in different predecessors;
+///   2. EXACTLY ONE instruction node lists `value` in its results, and `value` is that node's ONLY
+///      result, so the value has one unambiguous definition site and is not one lane of a
+///      multi-result instruction;
+///   3. that instruction is a DIRECT [`Inst::Call`] — not `CallIndirect`, not any other form; and
+///   4. its `callee` `FuncId` matches EXACTLY ONE entry in this body's callee identity ledger
+///      ([`crate::CalleeRef`]) — the same ledger `crate_module` uses to rewrite intra-crate callee
+///      ids and the same ledger the lineage digest frames, read under that ledger's own ambiguity
+///      rule. `FuncId` is `DefIndex`-derived and non-injective, so "present" is weaker than
+///      "named": two entries under one `FuncId` mean the callee identity is a guess, and this
+///      fails closed on that set exactly as `to_mir` and `crate_module::resolve_callee` do.
+///
+/// # Why that property makes the flip safe FOR THIS CLASS
+///
+/// The lane's stated hazard is that codegen would receive a pointer this body cannot account for.
+/// Under (1)–(4) it CAN, and the account travels with the artifact rather than beside it: the
+/// DEFINING INSTRUCTION of the forwarded pointer is in THE MODULE BEING FLIPPED, so `to_mir`
+/// materializes the value as the destination local of that same call. There is no free-floating
+/// reference in the flipped body.
+///
+/// STATED PRECISELY, because this is the text a later wave will cite when it widens the class:
+/// what the module contains is the instruction that OBTAINS the pointer, not the instruction that
+/// MINTS it. For the headline shape `<LevelArc as Deref>::deref(&payload) -> &Level` the pointer
+/// is created inside `deref`'s body, in another translation unit; a ledgered callee may equally
+/// return a pointer into one of its arguments, into a `'static`, or into another frame. NONE of
+/// (1)–(4) excludes those, and this check does not claim pointer provenance in the aliasing sense.
+/// It establishes a STRUCTURAL fact — this body has one nameable definition site for the value,
+/// and it is a call to a callee this body already declared — which is exactly what the lane was
+/// refusing for the absence of. Three specific ways the old refusal could have been right are
+/// closed by name:
+///
+///   * **A dangling or ambiguous value.** Zero definitions would mean the arm forwarded a
+///     `ValueId` the module never defines; two would mean the module is not in SSA at that value.
+///     Either is a malformed input to `to_mir`, and (1)+(2) refuse both instead of hoping the
+///     derived body happens to be well formed.
+///   * **An origin outside the flip's own admission.** (3)+(4) confine the definition to a direct
+///     call to a callee this body ALREADY declared, so the pointer's producing instruction is
+///     subject to exactly the admissions the call itself passed. An indirect call is refused
+///     because there is no statically-known callee to name — the record would be a record of
+///     nothing.
+///   * **A representation change hiding in the reborrow.** Already excluded upstream, and stated
+///     here so the argument is complete: `thin_shared_reborrow_shape_admits` established that
+///     `&*r` and `r` have the same region-erased type and that both sides are `FatShape::Thin`, so
+///     the forwarded value is bit-identical to the call's return value.
+///
+/// # What it does NOT establish
+///
+/// Nothing about whether the callee's own body is trustworthy, nothing about aliasing, and nothing
+/// about the MIR→machine-code leg (that is the differential gate's business). It establishes that
+/// the flip is not being asked to vouch for a pointer out of nowhere — which is the one thing the
+/// lane was refusing for.
+///
+/// # Non-vacuity
+///
+/// This is a check, not a rename: it can and does FAIL on a row whose class tag says `CallResult`.
+/// A call the producer lowered to something other than a direct `Inst::Call` (an intrinsic folded
+/// to arithmetic, a call whose result got rebound through a block parameter, a future arm that
+/// forwards one lane of a multi-result call) is refused HERE, by the module, with the tag saying
+/// otherwise. `test_a_call_result_row_the_module_does_not_bear_out_is_refused` drives exactly that.
+fn call_result_reborrow_is_confined(
+    module: &Module,
+    callees: &[CalleeRef],
+    value: ValueId,
+) -> bool {
+    // Fail closed unless this is a per-body mini-module with exactly one function. Stated as this
+    // function's OWN obligation rather than inherited from `green_body`'s lineage-digest rule: the
+    // lane gates run BEFORE the digest is minted, and a value id is only meaningful inside one
+    // function's SSA space, so scanning a multi-function module could match a different function's
+    // value of the same number.
+    let [body] = module.functions.as_slice() else {
+        return false;
+    };
+    // (1) NOT A BLOCK PARAMETER. A block param arrives along an edge; its "definition" is every
+    // predecessor's branch argument, which is not a site the flip can name.
+    if body.blocks.iter().any(|block| block.params.iter().any(|(param, _)| *param == value)) {
+        return false;
+    }
+    // (2) EXACTLY ONE defining node, and `value` is its ONLY result.
+    let mut definitions = body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.body)
+        .filter(|node| node.results.contains(&value));
+    let Some(definition) = definitions.next() else {
+        return false;
+    };
+    if definitions.next().is_some() {
+        return false;
+    }
+    if definition.results.as_slice() != [value] {
+        return false;
+    }
+    // (3) A DIRECT CALL — `CallIndirect` has no statically-known callee to record, and every other
+    // instruction form means the producer's `CallResult` claim does not describe what it emitted.
+    let Inst::Call { callee, .. } = &definition.inst else {
+        return false;
+    };
+    // (4) TO A LEDGERED CALLEE THE LEDGER CAN NAME — EXACTLY ONE ENTRY, never merely "at least
+    // one". `FuncId` is `DefIndex`-derived and NON-INJECTIVE by construction: `admit_callee_inner`
+    // dedups on FULL identity and deliberately KEEPS two entries under one `FuncId` (a
+    // local/extern index collision, or wave-C's two monomorphizations of one `DefId`) so that
+    // downstream consumers see the ambiguity instead of guessing. An existential is satisfied by
+    // that set, and it would mint a confinement certificate naming a callee that cannot be
+    // resolved — "a record of nothing", the same reason `CallIndirect` is refused above.
+    //
+    // This is the ambiguity rule of BOTH peer consumers of this ledger, stated the same way:
+    // `to_mir`'s Call arm (`[c] => .., [] => unsup("Call(unledgered callee FuncId)"), _ =>
+    // unsup("Call(ambiguous callee FuncId: index collision)")`) and `crate_module::resolve_callee`,
+    // whose `_ =>` arm declares `!ambiguous_callee_N` rather than link a guessed body.
+    //
+    // NOT written as `.any()` plus a note that `to_mir` refuses the body first. That would be
+    // relying on unreachability, which is the exact mistake this lane exists to avoid: the wall
+    // this gate replaced ("Call(callee return outside the fragment)") was widened away by T2d/T2e
+    // for unrelated reasons, and a future wave disambiguating a `FuncId` by `site_args` would
+    // retire `to_mir`'s refusal the same way — silently taking this certificate live.
+    matches!(callees.iter().filter(|entry| entry.func_id == *callee).count(), 1)
 }
 
 /// Trust: the conjunction of every per-body PLACEHOLDER/PROVENANCE LANE gate — the single thing
@@ -351,23 +543,69 @@ fn body_lane_gates_allow_flip(lowered: &Lowered) -> bool {
         // never flips — see `fnptr_adapter_allows_flip`. Load-bearing as a DECISION, not as a
         // consequence of the lineage digest's arity rule.
         && fnptr_adapter_allows_flip(lowered.fnptr_adapter)
-        // Trust (wave-TR): a body that forwarded an unledgered thin shared reborrow never flips —
-        // see `thin_reborrow_allows_flip`. Load-bearing as a DECISION, not as a consequence of
-        // `to_mir`'s call-return-fidelity gate happening to refuse the dominant provenance today.
-        && thin_reborrow_allows_flip(lowered.thin_reborrow)
+        // Trust (wave-TR provenance ledger): a body that forwarded unledgered thin shared reborrows
+        // flips only if EVERY forwarded row is certified against the module — see
+        // `thin_reborrows_allow_flip`. Load-bearing as a DECISION: `to_mir`'s
+        // call-return-fidelity gate used to refuse the dominant provenance for unrelated reasons
+        // and T2d/T2e have since widened it away, so nothing but this lane refuses the class.
+        //
+        // This conjunct is the one that reads the MODULE as well as a flag, which is why the
+        // aggregate takes `&Lowered` and not a tuple of bools: the certificate is about the
+        // artifact, not about a summary of it.
+        && thin_reborrows_allow_flip(&lowered.module, &lowered.callees, &lowered.thin_reborrows)
 }
 
-/// Whether this definition has enough source-place provenance for the current
-/// TrustIr -> MIR flip. Native loop clauses are parser-island expressions whose
-/// identifiers are rebound to MIR places during E4/E5 reconstruction. The
-/// direct module does not carry that binding yet, so only a definition with no
-/// first-class loop clauses may enter the flip registry.
-pub fn source_place_provenance_allows_flip(tcx: TyCtxt<'_>, def: LocalDefId) -> bool {
-    let first_class_loop_contracts = tcx
-        .hir_maybe_body_owned_by(def)
-        .and_then(|body| body.contract)
-        .map_or(0, |contract| contract.loop_clauses.len());
-    loop_contract_count_allows_flip(first_class_loop_contracts)
+/// Whether this definition's TrustIR module carries a complete source-loop and
+/// exact-place map authenticated by a freshly regenerated compiler query, and
+/// whether its bindings fit the verifier body's one global source-name space.
+///
+/// The v35 carrier authenticates `name -> hir_local_id -> loop-header parameter
+/// index`.  Carrier validation alone deliberately does not authorize a
+/// multi-loop HIR-id/BlockId association; `record_green` additionally requires
+/// the differential's compiler-stamped, canonical-role correspondence verdict.
+/// `to_mir` consumes the authenticated identity by reusing one MIR place per
+/// HIR binding and emitting real
+/// `var_debug_info` for the place. In particular, a
+/// mutable parameter no longer leaves a separately named frozen entry copy —
+/// the exact bug that once made `invariant n == 5` prove after `n -= 1`.
+///
+/// Authentication is still necessary but not sufficient. Two hygienically
+/// distinct bindings with one displayed spelling cannot be represented by the
+/// verifier's current global formula namespace, so that body remains refused.
+/// The MIR shim repeats the same injectivity check and fails closed if any place
+/// or type cannot be reconstructed exactly.
+pub fn source_place_provenance_allows_flip(
+    tcx: TyCtxt<'_>,
+    def: LocalDefId,
+    module: &Module,
+) -> bool {
+    match crate::source_provenance::validated_source_provenance(tcx, def, module) {
+        // Fail closed on every missing, stale, forged or ambiguous carrier.
+        Err(_) => false,
+        // Contract-free: nothing to erase, and the carrier correctly claims no
+        // authority. Unchanged by this gate.
+        Ok(None) => true,
+        // Contracted: bound roots are eligible only when their authenticated
+        // names remain globally injective for the reconstructed verifier body.
+        Ok(Some(provenance)) => loop_bindings_allow_flip(&provenance),
+    }
+}
+
+/// Trust: global `(name, HIR id)` injectivity required by today's formula-name
+/// interface. The carrier can represent repeated use of one binding across
+/// sequential loops. Shadowed bindings with the same spelling and one binding
+/// respelled across loops are not representable.
+fn loop_bindings_allow_flip(provenance: &trust_ir::SourceProvenance) -> bool {
+    let mut names = BTreeMap::<&str, u32>::new();
+    let mut bindings = BTreeMap::<u32, &str>::new();
+    provenance.loops.iter().flat_map(|source_loop| &source_loop.bindings).all(|binding| {
+        names
+            .insert(binding.name.as_str(), binding.hir_local_id)
+            .is_none_or(|previous| previous == binding.hir_local_id)
+            && bindings
+                .insert(binding.hir_local_id, binding.name.as_str())
+                .is_none_or(|previous| previous == binding.name)
+    })
 }
 
 /// Trust: called from the `mir_built` hook for bodies whose derived-MIR differential verdict is
@@ -375,13 +613,29 @@ pub fn source_place_provenance_allows_flip(tcx: TyCtxt<'_>, def: LocalDefId) -> 
 /// `markers_exact` is the differential's EXACT marker-channel verdict for THIS body; when the
 /// session emits lifetime markers (`-O` / sanitizers) it is required (see module docs).
 /// No-op unless every gate holds — the registry stays empty when the flip cannot fire.
-pub fn record_green(tcx: TyCtxt<'_>, def: LocalDefId, lowered: &Lowered, markers_exact: bool) {
+pub fn record_green(
+    tcx: TyCtxt<'_>,
+    def: LocalDefId,
+    lowered: &Lowered,
+    markers_exact: bool,
+    source_header_correspondence: Option<&crate::mir_differential::SourceHeaderCorrespondence>,
+) {
     if !flip_session_enabled(tcx) {
         return;
     }
-    if !source_place_provenance_allows_flip(tcx, def) {
+    if !source_place_provenance_allows_flip(tcx, def, &lowered.module) {
         return;
     }
+    // Trust: unlike compiler/source/semantic/binding digests, a self-sealed
+    // carrier cannot prove which of several natural headers belongs to one HIR
+    // loop.  The opaque value can only be minted by `compare_derived` after
+    // matching compiler-stamped built headers and translated TrustIR headers by
+    // equal UNIQUE canonical roles.  Require it for every body (contract-free
+    // comparisons get a bound empty-map witness) so no caller can substitute a
+    // naked success bit or silently omit the identity channel.
+    let Some(source_header_correspondence) = source_header_correspondence.copied() else {
+        return;
+    };
     // Trust: per-body marker gate (module docs). Fail-closed: an unproven marker sequence
     // must never reach codegen where markers are material.
     if tcx.sess.emit_lifetime_markers() && !markers_exact {
@@ -434,9 +688,14 @@ pub fn record_green(tcx: TyCtxt<'_>, def: LocalDefId, lowered: &Lowered, markers
     // for assembly. Fail-closed: no digest, no green — a flip event must always be able to
     // name, by digest, exactly which body it selected, or the whole attestation chain has a
     // hole at its first link.
-    let Some(entry) = green_body(&lowered.module, &lowered.callees) else {
+    let definition = crate::lineage::DefinitionIdentity::from_def_id(tcx, def.to_def_id());
+    let Some(mut entry) =
+        green_body(definition, &lowered.module, &lowered.callees, source_header_correspondence)
+    else {
         return;
     };
+    // Trust (enum-switch provenance): carry the hook-time set forward for the flip's re-derivation.
+    entry.enum_fold_switch_blocks = lowered.enum_fold_switch_blocks.clone();
     let def_index = def.to_def_id().index.as_u32();
     tcx.sess.with_trust_compiler_state::<SessionFlipRegistry, _>(|reg| {
         // `mir_built` runs once per def, so a SECOND registration for the same
@@ -471,14 +730,73 @@ pub fn take(tcx: TyCtxt<'_>, def: LocalDefId) -> Option<GreenBody> {
 #[cfg(test)]
 mod tests {
     use rustc_session::config::DebugInfo;
-    use trust_ir::{BlockId, FuncId, FuncTy, Function, Module};
+    use rustc_span::def_id::{CrateNum, DefId, DefIndex};
+    use trust_ir::{
+        Block, BlockId, FuncId, FuncTy, Function, Inst, InstrNode, Module, Ty, ValueId,
+    };
 
     use super::{
-        GreenBody, Lowered, SessionFlipRegistry, body_lane_gates_allow_flip,
-        enum_param_lane_allows_flip, fnptr_adapter_allows_flip, green_body,
-        loop_contract_count_allows_flip, session_gates_allow_flip, thin_reborrow_allows_flip,
-        union_lane_allows_flip,
+        CalleeRef, GreenBody, Lowered, SessionFlipRegistry, ThinReborrow, ThinReborrowProvenance,
+        body_lane_gates_allow_flip, call_result_reborrow_is_confined, enum_param_lane_allows_flip,
+        fnptr_adapter_allows_flip, green_body, loop_bindings_allow_flip, session_gates_allow_flip,
+        thin_reborrows_allow_flip, union_lane_allows_flip,
     };
+
+    fn probe_definition(index: u64) -> crate::lineage::DefinitionIdentity {
+        crate::lineage::DefinitionIdentity::test_only(0xC0DE, index)
+    }
+
+    /// Trust (#soundness): authenticated bound roots may flip now that `to_mir`
+    /// gives one HIR identity one real named place. The remaining representability
+    /// wall is global injectivity: a shadowed spelling or a respelled HIR binding
+    /// must not let the formula-name scan select either local by accident.
+    #[test]
+    fn loop_bindings_require_global_name_hir_injectivity() {
+        use trust_ir::{SourceBindingProvenance, SourceLoopProvenance, SourcePlace};
+        let digest = trust_ir::proof::ProofDigest::zero();
+        let mk = |loops: Vec<Vec<SourceBindingProvenance>>| trust_ir::SourceProvenance {
+            schema: 35,
+            compiler_source_digest: digest.clone(),
+            semantic_body_digest: digest.clone(),
+            binding_digest: digest.clone(),
+            loops: loops
+                .into_iter()
+                .enumerate()
+                .map(|(index, bindings)| SourceLoopProvenance {
+                    source_loop_id: index as u32,
+                    hir_local_id: index as u32,
+                    header: BlockId::new(index as u32 + 1),
+                    bindings,
+                })
+                .collect(),
+        };
+        let binding = |name: &str, hir_local_id: u32| SourceBindingProvenance {
+            name: name.to_string(),
+            hir_local_id,
+            place: SourcePlace::LoopParameter { index: 0 },
+        };
+
+        assert!(
+            loop_bindings_allow_flip(&mk(vec![Vec::new()])),
+            "a literal loop clause binds no source root and must stay flip-eligible"
+        );
+        assert!(
+            loop_bindings_allow_flip(&mk(vec![vec![binding("n", 1)]])),
+            "one authenticated bound source root is now exactly representable"
+        );
+        assert!(
+            loop_bindings_allow_flip(&mk(vec![vec![binding("n", 1)], vec![binding("n", 1)]])),
+            "the same HIR binding may be reused across sequential loop headers"
+        );
+        assert!(
+            !loop_bindings_allow_flip(&mk(vec![vec![binding("n", 1)], vec![binding("n", 2)]])),
+            "two shadowed HIR bindings with one spelling remain ambiguous"
+        );
+        assert!(
+            !loop_bindings_allow_flip(&mk(vec![vec![binding("n", 1)], vec![binding("m", 1)]])),
+            "one HIR binding may not acquire two formula spellings"
+        );
+    }
     use crate::lineage::body_lineage_digest;
 
     fn probe_module(fn_name: &str) -> Module {
@@ -492,10 +810,23 @@ mod tests {
         module
     }
 
+    fn green_body_for_test(
+        definition: crate::lineage::DefinitionIdentity,
+        module: &Module,
+    ) -> Option<GreenBody> {
+        let lineage = body_lineage_digest(definition, module, &[]).ok()?;
+        green_body(
+            definition,
+            module,
+            &[],
+            crate::mir_differential::SourceHeaderCorrespondence::test_only(lineage),
+        )
+    }
+
     /// Built through the production constructor, never by hand — a test that
     /// assembled a `GreenBody` field-by-field could not witness the fail-closed rule.
     fn green_probe(fn_name: &str) -> GreenBody {
-        green_body(&probe_module(fn_name), &[])
+        green_body_for_test(probe_definition(3), &probe_module(fn_name))
             .expect("a single-function probe module must mint a green body")
     }
 
@@ -509,7 +840,7 @@ mod tests {
     #[test]
     fn test_green_body_declines_when_lineage_cannot_be_digested() {
         assert!(
-            green_body(&Module::new("no_bodies"), &[]).is_none(),
+            green_body_for_test(probe_definition(3), &Module::new("no_bodies")).is_none(),
             "a body-less mini-module must not become a green entry: the flip event could \
              not name, by digest, which body it selected"
         );
@@ -522,13 +853,34 @@ mod tests {
             BlockId::new(0),
         ));
         assert!(
-            green_body(&two, &[]).is_none(),
+            green_body_for_test(probe_definition(3), &two).is_none(),
             "a mini-module carrying a producer-synthesized adapter names two program objects; \
              it must not become a green entry"
         );
         assert!(
-            green_body(&probe_module("probe"), &[]).is_some(),
+            green_body_for_test(probe_definition(3), &probe_module("probe")).is_some(),
             "the ordinary single-function case must still be admitted (the gate is not vacuous)"
+        );
+    }
+
+    #[test]
+    fn source_header_correspondence_witness_is_bound_to_exact_body_lineage() {
+        let definition = probe_definition(3);
+        let module = probe_module("first");
+        let lineage = body_lineage_digest(definition, &module, &[]).expect("probe lineage");
+        let witness = crate::mir_differential::SourceHeaderCorrespondence::test_only(lineage);
+
+        assert!(
+            green_body(definition, &module, &[], witness).is_some(),
+            "the witness must admit exactly the body lineage it seals"
+        );
+        assert!(
+            green_body(definition, &probe_module("changed"), &[], witness).is_none(),
+            "a module mutation cannot reuse an earlier built/derived correspondence witness"
+        );
+        assert!(
+            green_body(probe_definition(4), &module, &[], witness).is_none(),
+            "a different stable definition identity cannot reuse the witness"
         );
     }
 
@@ -554,25 +906,272 @@ mod tests {
         );
     }
 
-    /// Trust (wave-TR) FLIP REFUSAL, PINNED AS A DECISION. A body that forwarded an unledgered
-    /// thin shared reborrow (`&*r` where `r` is a call result / by-ref match binding / ref-typed
-    /// local) never flips.
+    // -----------------------------------------------------------------------------------------
+    // Trust (wave-TR provenance ledger): fixtures for the confinement check.
+    // -----------------------------------------------------------------------------------------
+
+    const PROBE_CALLEE: FuncId = FuncId::new(1);
+    /// The forwarded `&T`: the result of the probe body's call.
+    const FORWARDED: ValueId = ValueId::new(7);
+
+    fn probe_callee_ref(func_id: FuncId) -> CalleeRef {
+        let def_id = DefId { krate: CrateNum::from_u32(0), index: DefIndex::from_u32(11) };
+        CalleeRef {
+            func_id,
+            is_local: true,
+            def_index: 11,
+            def_id,
+            def_path: "thin_reborrow_probe::callee".to_string(),
+            force_havoc: false,
+            site_def_id: def_id,
+            site_args: Some(Vec::new()),
+            ret_ty: None,
+            ret_ty_conflict: false,
+            is_rust_abi: false,
+        }
+    }
+
+    /// A per-body mini-module whose single function's entry block runs `body`, the caller's own
+    /// instruction list. Every fixture below differs from the accept in exactly one way, so what
+    /// the check is reacting to is never in doubt.
+    fn reborrow_probe_module(body: Vec<InstrNode>) -> Module {
+        let mut module = Module::new("thin_reborrow_probe");
+        let ty = module.add_func_type(FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+        });
+        let mut function =
+            Function::new(FuncId::new(0), "thin_reborrow_probe_body", ty, BlockId::new(0));
+        let mut entry = Block::new(BlockId::new(0));
+        entry.body = body;
+        function.blocks.push(entry);
+        module.add_function(function);
+        module
+    }
+
+    /// `results: [FORWARDED]` on a direct `Call` to the ledgered callee — the ACCEPT shape, and
+    /// exactly what `&*<LevelArc as Deref>::deref(..)` emits.
+    fn call_defining_forwarded() -> InstrNode {
+        let mut node = InstrNode::new(Inst::Call { callee: PROBE_CALLEE, args: Vec::new() });
+        node.results = vec![FORWARDED];
+        node
+    }
+
+    fn call_result_row() -> ThinReborrow {
+        ThinReborrow { value: FORWARDED, provenance: ThinReborrowProvenance::CallResult }
+    }
+
+    /// Trust (wave-TR provenance ledger) **THE ACCEPT, STATED FIRST.** A gate that refuses
+    /// everything proves nothing, so the live admission is asserted before any refusal below.
     ///
-    /// The point of testing the PREDICATE rather than the pipeline: a wall also stops the dominant
-    /// provenance today — `to_mir` puts a `&T`-returning callee outside its call fragment. That is
-    /// a call RETURN-FIDELITY rule, not a decision about reborrow provenance, and it covers none of
-    /// the other provenances. A future wave that widens the return fragment must still meet this
-    /// line.
+    /// This is `chain_callresult` / `Level::is_zero` in miniature: a `&T` forwarded with no ledger
+    /// entry, whose defining instruction is a direct call to a callee this body declared.
     #[test]
-    fn test_thin_reborrow_body_never_flips() {
+    fn test_a_confined_call_result_reborrow_is_certified_and_flips() {
+        let module = reborrow_probe_module(vec![call_defining_forwarded()]);
+        let callees = [probe_callee_ref(PROBE_CALLEE)];
         assert!(
-            thin_reborrow_allows_flip(false),
-            "an ordinary body must still flip — otherwise this gate proves nothing"
+            call_result_reborrow_is_confined(&module, &callees, FORWARDED),
+            "a value minted by a direct call to a LEDGERED callee, defined exactly once and never \
+             a block parameter, is the one provenance this gate can account for — if this refuses, \
+             the whole wave is vacuous"
         );
         assert!(
-            !thin_reborrow_allows_flip(true),
-            "a body forwarding a reference value the producer's ledgers do not record must never \
-             reach codegen on that value"
+            thin_reborrows_allow_flip(&module, &callees, &[call_result_row()]),
+            "and the lane predicate must carry that certificate through"
+        );
+    }
+
+    /// Trust (wave-TR provenance ledger) **THE REFUSALS THE WAVE DOES NOT TOUCH — one fixture per
+    /// class.** A check that admits everything is not a check.
+    ///
+    /// Each row below is otherwise IDENTICAL to the accept above — same module, same callee
+    /// ledger, same `ValueId`, and a module that WOULD certify the value if it were claimed as a
+    /// call result. Only the producer's provenance class differs, so the refusal can only be
+    /// coming from the class.
+    #[test]
+    fn test_every_other_provenance_class_is_still_refused() {
+        let module = reborrow_probe_module(vec![call_defining_forwarded()]);
+        let callees = [probe_callee_ref(PROBE_CALLEE)];
+        for provenance in [
+            ThinReborrowProvenance::Binding,
+            ThinReborrowProvenance::Projection,
+            ThinReborrowProvenance::Other,
+        ] {
+            assert!(
+                !thin_reborrows_allow_flip(
+                    &module,
+                    &callees,
+                    &[ThinReborrow { value: FORWARDED, provenance }]
+                ),
+                "provenance class `{provenance:?}` names a value no instruction in this body \
+                 mints, so there is nothing to certify and the original refusal must stand — even \
+                 when the module would have borne out a `CallResult` claim for the same value"
+            );
+        }
+    }
+
+    /// Trust (wave-TR provenance ledger) **ONE UNCERTIFIABLE ROW POISONS THE BODY.** The gate is a
+    /// universal over rows, not an existential: a body that forwards one certifiable call result
+    /// and one binding read must not flip on the strength of the good row.
+    #[test]
+    fn test_a_single_uncertifiable_row_refuses_the_whole_body() {
+        let module = reborrow_probe_module(vec![call_defining_forwarded()]);
+        let callees = [probe_callee_ref(PROBE_CALLEE)];
+        assert!(
+            !thin_reborrows_allow_flip(
+                &module,
+                &callees,
+                &[
+                    call_result_row(),
+                    ThinReborrow { value: FORWARDED, provenance: ThinReborrowProvenance::Binding },
+                ]
+            ),
+            "every forwarded row must be certified; a body is only as accountable as its least \
+             accountable reborrow"
+        );
+    }
+
+    /// Trust (wave-TR provenance ledger) **THE NON-VACUITY PROOF: the check disagrees with the
+    /// tag.** This is what separates a confinement check from a rename.
+    ///
+    /// Every case carries the class tag `CallResult` — the producer's claim — and every case is
+    /// refused BY THE MODULE, because the module does not bear the claim out. If someone replaced
+    /// [`call_result_reborrow_is_confined`] with `true`, every assertion here goes red.
+    #[test]
+    fn test_a_call_result_row_the_module_does_not_bear_out_is_refused() {
+        let ledgered = [probe_callee_ref(PROBE_CALLEE)];
+
+        // (a) NO DEFINITION. The arm forwarded a value the module never defines.
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(Vec::new()),
+                &ledgered,
+                FORWARDED
+            ),
+            "a value with no defining instruction is a dangling id, not a call result"
+        );
+
+        // (b) TWO DEFINITIONS. Not SSA at this value; `to_mir` would have no single local.
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(vec![call_defining_forwarded(), call_defining_forwarded()]),
+                &ledgered,
+                FORWARDED
+            ),
+            "two defining instructions mean the pointer's origin is ambiguous"
+        );
+
+        // (c) NOT A CALL. A `CallResult` claim over an instruction that is not a call.
+        let mut not_a_call = InstrNode::new(Inst::Alloca { ty: Ty::I64, count: None, align: None });
+        not_a_call.results = vec![FORWARDED];
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(vec![not_a_call]),
+                &ledgered,
+                FORWARDED
+            ),
+            "the class tag is the producer's CLAIM; the instruction is the evidence, and here they \
+             disagree"
+        );
+
+        // (d) AN INDIRECT CALL. No statically-known callee, so the record would name nothing.
+        let mut indirect = InstrNode::new(Inst::CallIndirect {
+            callee: ValueId::new(1),
+            sig: trust_ir::FuncTyId::new(0),
+            args: Vec::new(),
+            calling_conv: trust_ir::CallingConv::C,
+        });
+        indirect.results = vec![FORWARDED];
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(vec![indirect]),
+                &ledgered,
+                FORWARDED
+            ),
+            "an indirect call has no callee identity to hand the flip"
+        );
+
+        // (e) AN UNLEDGERED CALLEE. The call is direct, but this body never declared that callee,
+        //     so `crate_module` cannot resolve or havoc it and the identity is unaccounted for.
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(vec![call_defining_forwarded()]),
+                &[probe_callee_ref(FuncId::new(2))],
+                FORWARDED
+            ),
+            "a callee outside the identity ledger is exactly the case `crate_module` fails closed \
+             on; the flip must not be more permissive than crate assembly"
+        );
+
+        // (i) AN AMBIGUOUS CALLEE: TWO LEDGER IDENTITIES BEHIND ONE `FuncId`. The call is direct
+        //     and the `FuncId` IS in the ledger — but it names two different callees, so WHICH
+        //     one minted the pointer is a guess. `FuncId` is `DefIndex`-derived and therefore
+        //     non-injective by construction (`admit_callee_inner` dedups on FULL identity and
+        //     KEEPS both entries precisely so this stays visible: a local/extern index collision,
+        //     or wave-C's two monomorphizations of one `DefId`). Both peer consumers of this exact
+        //     ledger refuse this set by name — `to_mir`'s Call arm ("Call(ambiguous callee FuncId:
+        //     index collision)") and `crate_module::resolve_callee`'s `_ =>` arm, which declares
+        //     `!ambiguous_callee_N` rather than link. An existential over the ledger would answer
+        //     "confined" here, which is strictly MORE PERMISSIVE than crate assembly.
+        let mut second_identity = probe_callee_ref(PROBE_CALLEE);
+        second_identity.def_id =
+            DefId { krate: CrateNum::from_u32(1), index: DefIndex::from_u32(11) };
+        second_identity.is_local = false;
+        second_identity.def_path = "other_crate::callee".to_string();
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(vec![call_defining_forwarded()]),
+                &[probe_callee_ref(PROBE_CALLEE), second_identity],
+                FORWARDED
+            ),
+            "two identities behind one FuncId means the callee cannot be NAMED; a confinement \
+             certificate over a guessed callee is a record of nothing, and the flip must not be \
+             more permissive than crate assembly"
+        );
+
+        // (f) A BLOCK PARAMETER. The value arrives along an edge, so its definition is every
+        //     predecessor's branch argument — not a site the flip can name.
+        let mut with_param = reborrow_probe_module(vec![call_defining_forwarded()]);
+        with_param.functions[0].blocks[0].params.push((FORWARDED, Ty::Ptr));
+        assert!(
+            !call_result_reborrow_is_confined(&with_param, &ledgered, FORWARDED),
+            "a block parameter has one id and many origins"
+        );
+
+        // (g) ONE LANE OF A MULTI-RESULT CALL. The forwarded pointer would be a projection of the
+        //     call's result tuple, which is a different shape from "the call returned this".
+        let mut multi = call_defining_forwarded();
+        multi.results.push(ValueId::new(8));
+        assert!(
+            !call_result_reborrow_is_confined(
+                &reborrow_probe_module(vec![multi]),
+                &ledgered,
+                FORWARDED
+            ),
+            "a multi-result call does not mint the forwarded pointer on its own"
+        );
+
+        // (h) NOT A PER-BODY MINI-MODULE. A value id only means something inside one function's
+        //     SSA space; scanning several could match a different function's value of that number.
+        let mut two_functions = reborrow_probe_module(vec![call_defining_forwarded()]);
+        let ty = two_functions.functions[0].ty;
+        two_functions.add_function(Function::new(FuncId::new(3), "second", ty, BlockId::new(0)));
+        assert!(
+            !call_result_reborrow_is_confined(&two_functions, &ledgered, FORWARDED),
+            "the confinement check states the single-function obligation itself rather than \
+             inheriting it from the lineage digest, which is minted LATER"
+        );
+    }
+
+    /// Trust (wave-TR provenance ledger): a body that forwarded NOTHING is unaffected. The
+    /// pre-ledger predicate was `!thin_reborrow`, so this is the case that must not have moved.
+    #[test]
+    fn test_a_body_that_forwarded_no_thin_reborrow_is_unchanged() {
+        assert!(
+            thin_reborrows_allow_flip(&probe_module("no_reborrows"), &[], &[]),
+            "an ordinary body must still flip — the gate may only speak about rows that exist"
         );
     }
 
@@ -581,6 +1180,9 @@ mod tests {
     fn lane_probe_lowered() -> Lowered {
         Lowered {
             module: probe_module("lane_gate_probe"),
+            // Synthetic probe; see the note in `Lowered::enum_fold_switch_blocks`. Empty
+            // keeps this helper at the CLEAN posture its doc comment promises.
+            enum_fold_switch_blocks: std::collections::HashSet::new(),
             body_kind: crate::BodyKind::Fn,
             opaque_collapse: false,
             enum_declines: Vec::new(),
@@ -592,7 +1194,7 @@ mod tests {
             place_path_carrier: false,
             zst_closure_arg: false,
             fnptr_adapter: false,
-            thin_reborrow: false,
+            thin_reborrows: Vec::new(),
             callees: Vec::new(),
             pending_consts: Vec::new(),
         }
@@ -622,7 +1224,16 @@ mod tests {
             ("union_lane", |l| l.union_lane = true),
             ("enum_param_lane", |l| l.enum_param_lane = true),
             ("fnptr_adapter", |l| l.fnptr_adapter = true),
-            ("thin_reborrow", |l| l.thin_reborrow = true),
+            // Trust (wave-TR provenance ledger): the lane's refusing posture, expressed as a row
+            // the probe module cannot possibly certify (the probe body has no instructions at
+            // all). This keeps the WIRING question — "does the aggregate read this lane?" —
+            // separate from the CERTIFICATION question, which the fixtures above own.
+            ("thin_reborrows", |l| {
+                l.thin_reborrows.push(ThinReborrow {
+                    value: ValueId::new(0),
+                    provenance: ThinReborrowProvenance::CallResult,
+                })
+            }),
         ];
         for (name, set) in lanes {
             let mut probe = lane_probe_lowered();
@@ -714,7 +1325,7 @@ mod tests {
         assert_eq!(taken.lineage, minted, "take must yield the digest minted at record time");
         assert_eq!(
             taken.lineage,
-            body_lineage_digest(&taken.module, &taken.callees)
+            body_lineage_digest(probe_definition(3), &taken.module, &taken.callees)
                 .expect("taken module must still digest"),
             "the carried digest must still describe the carried (module, ledger)"
         );
@@ -774,19 +1385,6 @@ mod tests {
         assert!(
             !session_gates_allow_flip(true, true, DebugInfo::None, true),
             "coverage mappings are span-derived; the shim's dummy spans would corrupt them"
-        );
-    }
-
-    #[test]
-    fn first_class_loop_clauses_are_the_only_source_provenance_gate() {
-        assert!(
-            loop_contract_count_allows_flip(0),
-            "an ordinary function must remain eligible at the source-provenance gate"
-        );
-        assert!(!loop_contract_count_allows_flip(1), "one native loop clause must block the flip");
-        assert!(
-            !loop_contract_count_allows_flip(2),
-            "an invariant/decreases pair must block the flip as one provenance-sensitive lane"
         );
     }
 

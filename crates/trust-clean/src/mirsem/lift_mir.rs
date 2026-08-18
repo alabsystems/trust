@@ -645,7 +645,7 @@ pub(super) fn sem_adt_guard_operand_of_mir(
 /// deeper/different projection shape (nested fields, an index-then-field, a
 /// bare `Field` with no `Deref`), or any other unmodeled operand — so a
 /// negative-control shape never gets a false certificate.
-pub(super) fn sem_field_read_operand(
+pub(crate) fn sem_field_read_operand(
     body: &trust_types::VerifiableBody,
     op: &trust_types::Operand,
     param_index: &dyn Fn(usize) -> Option<u64>,
@@ -763,6 +763,94 @@ pub(super) fn sem_field_read_operand(
             }
             Some(SemOperand::Field(Box::new(SemOperand::Var(idx)), u64::try_from(*fld).ok()?))
         }
+        // Trust: TRANSPARENT-UNWRAP leg (2026-08-18) — the MULTI-HOP by-value
+        // field chain (`_1.0.0` — the spelling the extractor's transparent-unwrap
+        // transmute leg emits for `NonZero::<u8>::get`-class bodies: the chased
+        // `#[repr(transparent)]` payload path, value-exact by the layout evidence
+        // the extractor verified at tcx time). The DUMP-SIDE defense-in-depth
+        // mirror of that chase, fail-closed per hop:
+        //   * the base is a BY-VALUE ADT parameter (same as the single-hop arm);
+        //   * every INTERMEDIATE hop's field type is a VARIANTLESS SINGLE-FIELD
+        //     struct Adt (the transparent-chain shape as visible in dump types —
+        //     a multi-field or enum hop declines: the extractor never emits
+        //     those, so their presence is a forged or corrupted dump);
+        //   * the TERMINAL field type is `Int`/`Bool` (the modeled scalars).
+        // The entry-time-value gates are the single-hop arm's, verbatim (the
+        // param must denote its entry value for the nested read to be stable).
+        // The denotation is the NESTED opaque selector
+        // `Field(Field(Var idx, f1), f2)` — `SemOperand::Field` is recursive by
+        // construction; `idx_elem` composes; NO value claim is asserted (the
+        // same "stable token keyed on (base, path)" reading as one hop).
+        projs
+            if projs.len() >= 2
+                && projs.iter().all(|p| matches!(p, Projection::Field(_))) =>
+        {
+            let idx = param_index(p.local)?;
+            // The type chase, hop by hop.
+            let mut cur_ty = &body.locals.get(p.local)?.ty;
+            for (n, proj) in projs.iter().enumerate() {
+                let Projection::Field(fld) = proj else { return None };
+                let Ty::Adt { fields, variants, adt_kind, .. } = cur_ty else { return None };
+                if !variants.is_empty() {
+                    return None; // an enum hop — never transparent-chain shaped.
+                }
+                // G-STRUCT-KIND, per hop (audit, same round): a single-field UNION
+                // hop is bit-compatible in practice but the stamp is this family's
+                // fail-closed evidence discipline — a dump the extractor wrote
+                // carries `Some(Struct)` on every real transparent hop; anything
+                // else is forged or pre-stamp and declines.
+                if *adt_kind != Some(trust_types::AdtKind::Struct) {
+                    return None;
+                }
+                let last = n + 1 == projs.len();
+                if fields.len() != 1 {
+                    return None; // EVERY hop base must be the single payload (a
+                                 // 1-ZST-carrying transparent struct declines —
+                                 // the dump cannot compute ZST-ness; fail closed).
+                }
+                let (_, fty) = fields.get(*fld)?;
+                if last && !matches!(fty, Ty::Int { .. } | Ty::Bool) {
+                    return None; // terminal must be a modeled scalar.
+                }
+                cur_ty = fty;
+            }
+            // Entry-time-value gates — the single-hop by-value arm's, verbatim.
+            if param_reassigned_by_stmt(body, p.local) {
+                return None;
+            }
+            let field_written = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s, trust_types::Statement::Assign { place, .. }
+                    if place.local == p.local && !place.projections.is_empty())
+            });
+            if field_written {
+                return None;
+            }
+            let call_dest_written = body.blocks.iter().any(|b| {
+                matches!(&b.terminator,
+                    trust_types::Terminator::Call { dest, .. } if dest.local == p.local)
+            });
+            if call_dest_written {
+                return None;
+            }
+            let mutably_aliased = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s,
+                    trust_types::Statement::Assign {
+                        rvalue: trust_types::Rvalue::Ref { mutable: true, place }, ..
+                    } | trust_types::Statement::Assign {
+                        rvalue: trust_types::Rvalue::AddressOf(true, place), ..
+                    }
+                    if place.local == p.local)
+            });
+            if mutably_aliased {
+                return None;
+            }
+            let mut acc = SemOperand::Var(idx);
+            for proj in projs {
+                let Projection::Field(fld) = proj else { return None };
+                acc = SemOperand::Field(Box::new(acc), u64::try_from(*fld).ok()?);
+            }
+            Some(acc)
+        }
         _ => None,
     }
 }
@@ -820,7 +908,7 @@ pub(super) fn sem_field_read_operand(
 /// A projected referent, a mutable re-borrow, a multiply-assigned/aliased `_2`,
 /// a write-through, or a reassigned referent all decline — never a false
 /// certificate.
-pub(super) fn sem_discriminant_base_of_mir(
+pub(crate) fn sem_discriminant_base_of_mir(
     body: &trust_types::VerifiableBody,
     place: &trust_types::Place,
     param_index: &dyn Fn(usize) -> Option<u64>,
@@ -833,6 +921,7 @@ pub(super) fn sem_discriminant_base_of_mir(
     if let Some(idx) = param_index(place.local) {
         return match place.projections.as_slice() {
             [] if crate::assignment_types::modeled_enum_variant_count(
+                &body.datatype_defs,
                 &body.locals.get(place.local)?.ty,
             )
             .is_some() =>
@@ -841,7 +930,11 @@ pub(super) fn sem_discriminant_base_of_mir(
             }
             [Projection::Deref] => match body.locals.get(place.local).map(|l| &l.ty) {
                 Some(Ty::Ref { mutable: false, inner })
-                    if crate::assignment_types::modeled_enum_variant_count(inner).is_some()
+                    if crate::assignment_types::modeled_enum_variant_count(
+                        &body.datatype_defs,
+                        inner,
+                    )
+                    .is_some()
                         && !deref_write_exists(body, place.local) =>
                 {
                     Some(SemOperand::Var(idx))
@@ -867,7 +960,8 @@ pub(super) fn sem_discriminant_base_of_mir(
     }
     match body.locals.get(place.local).map(|l| &l.ty) {
         Some(Ty::Ref { mutable: false, inner })
-            if crate::assignment_types::modeled_enum_variant_count(inner).is_some() => {}
+            if crate::assignment_types::modeled_enum_variant_count(&body.datatype_defs, inner)
+                .is_some() => {}
         _ => return None, // the reference temp must itself point to an enum.
     }
     let definition = if let Some((use_block, use_statement)) = use_site {
@@ -885,8 +979,11 @@ pub(super) fn sem_discriminant_base_of_mir(
     if param_reassigned_by_stmt(body, referent.local) {
         return None;
     }
-    if crate::assignment_types::modeled_enum_variant_count(&body.locals.get(referent.local)?.ty)
-        .is_none()
+    if crate::assignment_types::modeled_enum_variant_count(
+        &body.datatype_defs,
+        &body.locals.get(referent.local)?.ty,
+    )
+    .is_none()
     {
         return None; // a scalar/struct referent has no modeled discriminant.
     }
@@ -1152,7 +1249,7 @@ pub(super) fn ordering_is_three_way_sign_encoding(ty: &trust_types::Ty, disc_wid
 ///   * `_o`'s declared type is the vendored `cmp::Ordering` with the exact
 ///     `Less→-1`/`Equal→0`/`Greater→1` sign encoding at the carrier width;
 ///   * `a` resolves to a modeled scalar operand.
-pub(super) fn resolve_signum_ordering_sign(
+pub(crate) fn resolve_signum_ordering_sign(
     body: &trust_types::VerifiableBody,
     ordering_place: &trust_types::Place,
     disc_width: u32,
@@ -1216,7 +1313,7 @@ pub(super) fn resolve_signum_ordering_sign(
 /// `Less` tag would not survive). (The `i8` `signum` needs no cast — the
 /// `Discriminant` read writes `_0` directly — and is recognized at the
 /// `Rvalue::Discriminant` return arm, not here.)
-pub(super) fn resolve_signum_cast_rvalue(
+pub(crate) fn resolve_signum_cast_rvalue(
     body: &trust_types::VerifiableBody,
     op: &trust_types::Operand,
     dest_ty: &trust_types::Ty,
@@ -1570,7 +1667,7 @@ pub(super) fn resolve_bool_cast_embed_rvalue(
 /// (`false`) for anything else — a projected place, a non-Bool-typed local, or a
 /// non-Bool constant — so a genuine INTEGER `BitOr`/`BitAnd` is never swept into
 /// the Bool-connective fragment.
-pub(super) fn mir_operand_is_bool_typed(
+pub(crate) fn mir_operand_is_bool_typed(
     body: &trust_types::VerifiableBody,
     op: &trust_types::Operand,
 ) -> bool {
@@ -1669,7 +1766,7 @@ pub(super) fn slice_len_of_param_place(
 ///     block, or its block dominates the metadata-read block. This is checked at
 ///     the exact use site so a later or sibling-branch cast in hostile serialized
 ///     MIR cannot donate a value to the returning path.
-pub(super) fn resolve_ptr_metadata_slice_len(
+pub(crate) fn resolve_ptr_metadata_slice_len(
     body: &trust_types::VerifiableBody,
     op: &trust_types::Operand,
     param_index: &dyn Fn(usize) -> Option<u64>,
@@ -2180,7 +2277,7 @@ pub(super) fn cond_tree_to_rvalue(cond: &SemCondTree) -> SemRvalue {
 /// rvalue outside `{Cmp(op, Use a, Use b), Ne(cond, false)/Eq(cond, true) normalize,
 /// And, Or}` — an arithmetic value, a non-0/1 `Ne`/`Eq`, or a nested non-`Use` compare
 /// side declines, never mis-denotes an integer as a Cond.
-pub(super) fn sem_rvalue_to_cond_tree(rv: &SemRvalue) -> Option<SemCondTree> {
+pub(crate) fn sem_rvalue_to_cond_tree(rv: &SemRvalue) -> Option<SemCondTree> {
     match rv {
         // A flat comparison leaf `op (Use a) (Use b)` — the bare range-bound
         // `self <= hi` the compact diamond's then arm holds.

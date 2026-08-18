@@ -171,8 +171,36 @@ fn bootstrap_disables_default_trust_verification(
     build_compiler_stage != 0 && !rustflags_contain_trust_verifier_control(rustflags)
 }
 
-fn cargo_target_rustflags_env(target: TargetSelection) -> String {
-    format!("CARGO_TARGET_{}_RUSTFLAGS", crate::envify(&target.triple))
+pub(super) const TRUST_BOOTSTRAP_NO_VERIFY_FLAG: &str = "-Ztrust-verify=off";
+
+/// Put bootstrap's non-self-proving off-switch in the ONE rustflags lane Cargo
+/// will actually read for these units.
+///
+/// Cargo does not merge rustflags sources; it picks the first that exists, in
+/// the order `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, `target.<triple>.rustflags`
+/// (env form `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`), `build.rustflags`. Bootstrap
+/// sets one of the first two for essentially every step (`-Wrust_2018_idioms`
+/// alone guarantees it), so the off-switch used to be delivered through a
+/// variable Cargo had already decided to ignore — it never reached rustc, and
+/// the batteries-on default verified the entire third-party dependency graph.
+/// Measured against memchr-2.7.6 with the stage0 seed: target-var only -> the
+/// unit gets `-Zno-trust-verify` and builds in 8s; both vars set -> the unit
+/// gets bootstrap's `-W` flags and NO verifier control, and dies in the SIMD
+/// paths. The scope is unchanged: bootstrap always passes `--target`, so plain
+/// `RUSTFLAGS` reaches exactly the target units the target-specific variable
+/// was aiming at, and host build-script/proc-macro units keep going through the
+/// shim's `TRUST_BOOTSTRAP_SHIM_NO_VERIFY` lane as before.
+///
+/// An explicit verifier control already in `rustflags` still wins: it suppresses
+/// this default entirely (and any control other than the exact off-switch has
+/// already aborted in `rustflags_request_bootstrap_verification`).
+fn apply_bootstrap_trust_verification_default(
+    rustflags: &mut Rustflags,
+    build_compiler_stage: u32,
+) {
+    if bootstrap_disables_default_trust_verification(build_compiler_stage, &rustflags.0) {
+        rustflags.arg(TRUST_BOOTSTRAP_NO_VERIFY_FLAG);
+    }
 }
 
 fn trust_cg_codegen_is_active(
@@ -592,31 +620,40 @@ impl From<Cargo> for BootstrapCommand {
         cargo.command.env_remove("RUSTDOCFLAGS");
         cargo.command.env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
 
-        if !cargo.rustflags.0.is_empty() {
-            let (var, value) =
-                flags_env("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", &cargo.rustflags.0);
-            cargo.command.env(var, value);
-        }
-
         // Bootstrap is deliberately not self-proof. It uses Cargo's
         // compatibility identity and gives only its rustc/rustdoc shims this
         // narrow control marker; Stage1+ target units also receive the compiler
         // off-switch explicitly. The bounded self-verification harness is a
         // separate evidence producer.
-        let rustflags = &cargo.rustflags.0;
+        //
+        // This runs BEFORE the rustflags env is materialized below, because the
+        // off-switch has to be part of that payload — see
+        // `apply_bootstrap_trust_verification_default` for why any other
+        // variable is silently discarded by Cargo.
         if std::env::var_os("TRUST_FLYWHEEL").is_some() {
             panic!(
                 "TRUST_FLYWHEEL is retired: bootstrap has no authenticated proof session and cannot claim self-verification; use scripts/stage2_verify_self_build.sh for bounded compiler-crate evidence"
             );
         }
-        if rustflags_request_bootstrap_verification(rustflags) {
+        if rustflags_request_bootstrap_verification(&cargo.rustflags.0) {
             panic!(
                 "bootstrap compiler verification flags are unsupported without an authenticated artifact-bound bootstrap protocol; use scripts/stage2_verify_self_build.sh instead"
             );
         }
         cargo.command.env("TRUST_BOOTSTRAP_SHIM_NO_VERIFY", "1");
-        if bootstrap_disables_default_trust_verification(cargo.build_compiler_stage, rustflags) {
-            cargo.command.env(cargo_target_rustflags_env(cargo.target), "-Ztrust-verify=off");
+        // Trust (loud-when-off): the off-switch below is bootstrap's
+        // announced, recorded non-self-proving policy — quiet the compiler's
+        // once-per-crate vanilla note for every unit this invocation drives.
+        cargo.command.env("TRUST_VANILLA_ANNOUNCED", "1");
+        apply_bootstrap_trust_verification_default(
+            &mut cargo.rustflags,
+            cargo.build_compiler_stage,
+        );
+
+        if !cargo.rustflags.0.is_empty() {
+            let (var, value) =
+                flags_env("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", &cargo.rustflags.0);
+            cargo.command.env(var, value);
         }
 
         if !cargo.rustdocflags.0.is_empty() {
@@ -1432,20 +1469,57 @@ impl Builder<'_> {
                 .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_libdir(compiler));
         }
 
-        // Tools that use compiler libraries may inherit the `-lLLVM` link
-        // requirement, but the `-L` library path is not propagated across
-        // separate Cargo projects. We can add LLVM's library path to the
-        // rustc args as a workaround.
+        // Tools that use compiler libraries inherit LLVM's native link
+        // requirements, but Cargo metadata does not propagate the matching
+        // search directories across separate projects. Recover LLVM's own
+        // libdir, absolute system-library parents, and the common Homebrew
+        // prefix libdir. Homebrew's llvm-config emits dependencies such as
+        // zstd as bare `-l` names, so LLVM's Cellar libdir alone is not enough.
         if (mode == Mode::ToolRustcPrivate || mode == Mode::Codegen)
             && let Some(llvm_config) = self.llvm_config(target)
         {
             let llvm_libdir_raw =
-                command(llvm_config).cached().arg("--libdir").run_capture_stdout(self).stdout();
-            let llvm_libdir = llvm_libdir_raw.trim();
-            if target.is_msvc() {
-                rustflags.arg(&format!("-Clink-arg=-LIBPATH:{llvm_libdir}"));
-            } else {
-                rustflags.arg(&format!("-Clink-arg=-L{llvm_libdir}"));
+                command(&llvm_config).cached().arg("--libdir").run_capture_stdout(self).stdout();
+            let mut native_dirs = Vec::new();
+            let llvm_libdir = PathBuf::from(llvm_libdir_raw.trim());
+            if llvm_libdir.is_dir() {
+                native_dirs.push(llvm_libdir);
+            }
+
+            let system_libs = command(&llvm_config)
+                .cached()
+                .args(["--link-static", "--system-libs"])
+                .run_capture_stdout(self)
+                .stdout();
+            for token in system_libs.split_whitespace() {
+                let library = Path::new(token);
+                if library.is_absolute()
+                    && let Some(parent) = library.parent()
+                    && parent.is_dir()
+                {
+                    let parent = parent.to_path_buf();
+                    if !native_dirs.contains(&parent) {
+                        native_dirs.push(parent);
+                    }
+                }
+            }
+
+            if let Some(opt_dir) =
+                llvm_config.ancestors().find(|path| path.file_name() == Some(OsStr::new("opt")))
+                && let Some(prefix) = opt_dir.parent()
+            {
+                let common_libdir = prefix.join("lib");
+                if common_libdir.is_dir() && !native_dirs.contains(&common_libdir) {
+                    native_dirs.push(common_libdir);
+                }
+            }
+
+            for native_dir in native_dirs {
+                if target.is_msvc() {
+                    rustflags.arg(&format!("-Clink-arg=-LIBPATH:{}", native_dir.display()));
+                } else {
+                    rustflags.arg(&format!("-Clink-arg=-L{}", native_dir.display()));
+                }
             }
         }
 

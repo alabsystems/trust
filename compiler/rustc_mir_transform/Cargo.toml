@@ -40,7 +40,7 @@ trust-mir-extract = { workspace = true }
 # an artifact-backed (replayable unsat-proof) arithmetic prover. The historical
 # stacker/cc dep conflict that gated this off appears resolved (stacker aligned
 # at 0.1.24 across workspaces). Revert if the bootstrap dep graph conflicts.
-trust-router = { workspace = true, features = ["ay-backend", "ay-certify", "trust-build", "trust-cg-output-gate"] }
+trust-router = { workspace = true, features = ["ay-backend", "ay-certify", "trust-build", "trust-cg-output-gate", "trust-vc-native"] }
 trust-spec-elab = { workspace = true }
 trust-strengthen = { workspace = true }
 # Trust: P1 item 5 — the trust-ir flip (trust_ir_flip.rs) re-derives codegen MIR from the green

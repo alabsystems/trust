@@ -171,6 +171,7 @@ fn binary_search_function() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

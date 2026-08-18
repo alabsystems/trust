@@ -23,6 +23,12 @@ pub mod validation;
 // Wiring into the rustc_codegen_trust_cg dylib + bootstrap is a follow-on.
 #[cfg(feature = "ay-proofs")]
 pub mod verify_output;
+// Trust: F1 — the SAME proven-output gate with its SPECIFICATION SIDE derived
+// from the producer's `trust_ir::Function` instead of from a MIR-shaped
+// `VerifiableFunction`. This is what lets `-Ztrust-cg-frontend=trust-ir` be
+// GATED rather than emitted unverified.
+#[cfg(feature = "ay-proofs")]
+pub mod verify_output_trust_ir;
 // Trust: B4 — the O(1) structured-instantiation [PROVED] path (additive fast
 // path for the proven-output gate; gated on `kernel-recheck`).
 #[cfg(feature = "kernel-recheck")]

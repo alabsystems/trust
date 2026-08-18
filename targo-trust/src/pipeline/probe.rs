@@ -639,12 +639,36 @@ pub(crate) fn inspect_trustd_runtime_closure(
     )
 }
 
+/// Fails closed off macOS — and says why, because the old message ("unsupported
+/// on this host and fails closed") named neither the actual limit nor anywhere
+/// to look, so a Linux release attempt read as a mysterious blocker rather than
+/// a documented gate.
+///
+/// The limit is the SCHEMA, not this missing function body: `validate()`
+/// requires `native_format == "mach-o-thin"` and a `trusted_macho_inspector_path`,
+/// and `validate_for_candidate` re-inspects — so even a hand-authored JSON
+/// closure is rejected twice over. Writing an ELF arm here would not help until
+/// the schema admits one.
+///
+/// It is also not a like-for-like port. Mach-O `LC_LOAD_DYLIB` records a
+/// resolved absolute path; ELF `DT_NEEDED` records a bare SONAME (`libc.so.6`)
+/// whose resolution depends on the very loader configuration this closure
+/// exists to pin. An ELF closure is therefore weaker evidence in kind and needs
+/// its own `native_format` so no reader conflates the two. See task #43.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn inspect_trustd_runtime_closure(
     _candidate: &Path,
 ) -> Result<TrustdRuntimeClosure, String> {
-    Err("trustd runtime-closure inspection is unsupported on this host and fails closed"
-        .to_string())
+    Err(concat!(
+        "trustd runtime-closure inspection fails closed on this host: product-proof ",
+        "version-identity and daemon-protocol evidence is producible only on macOS. ",
+        "This is a schema limit, not a missing implementation — TrustdRuntimeClosure ",
+        "requires native_format == \"mach-o-thin\" and a trusted Mach-O inspector, and ",
+        "re-validates on the candidate. An ELF arm is a schema widening whose evidence ",
+        "is weaker in kind (DT_NEEDED gives SONAMEs, not resolved paths); see task #43 ",
+        "and docs/testing-strategy.md."
+    )
+    .to_string())
 }
 
 const TRUST_VERIFY_PROBE_SOURCE: &str = r#"

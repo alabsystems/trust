@@ -60,7 +60,7 @@ pub(crate) fn convert_basic_block<'tcx>(
         .map(|stmt| convert_statement(tcx, stmt, local_decls, typing_env))
         .collect();
 
-    let terminator = convert_terminator(tcx, bb_data.terminator(), typing_env);
+    let terminator = convert_terminator(tcx, bb_data.terminator(), local_decls, typing_env);
 
     BasicBlock { id: BlockId(bb.as_usize()), stmts, terminator }
 }
@@ -97,7 +97,7 @@ fn convert_statement<'tcx>(
         mir::StatementKind::AscribeUserType(box (_, _), _) => Statement::Nop,
         mir::StatementKind::Coverage(_) => Statement::Coverage,
         mir::StatementKind::Intrinsic(box intrinsic) => {
-            convert_nondiverging_intrinsic(tcx, intrinsic, span, typing_env)
+            convert_nondiverging_intrinsic(tcx, intrinsic, span, local_decls, typing_env)
         }
         mir::StatementKind::ConstEvalCounter => Statement::ConstEvalCounter,
         mir::StatementKind::Nop => Statement::Nop,
@@ -109,6 +109,9 @@ fn convert_nondiverging_intrinsic<'tcx>(
     tcx: TyCtxt<'tcx>,
     intrinsic: &mir::NonDivergingIntrinsic<'tcx>,
     span: SourceSpan,
+    // Needed to type the copy's pointer operands: the element type is the
+    // pointee of `src`, and without it the copy cannot be modeled.
+    local_decls: Option<&mir::LocalDecls<'tcx>>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
 ) -> Statement {
     match intrinsic {
@@ -117,17 +120,38 @@ fn convert_nondiverging_intrinsic<'tcx>(
             args: vec![convert_operand(tcx, operand, typing_env)],
         },
         mir::NonDivergingIntrinsic::CopyNonOverlapping(copy) => {
-            let operands = vec![
-                convert_operand(tcx, &copy.src, typing_env),
-                convert_operand(tcx, &copy.dst, typing_env),
-                convert_operand(tcx, &copy.count, typing_env),
-            ];
-            Statement::Unsupported {
-                kind: "NonDivergingIntrinsic::CopyNonOverlapping".to_string(),
-                detail: "memory copy side effects require explicit memory-model lowering"
-                    .to_string(),
-                operands,
-                span,
+            let src = convert_operand(tcx, &copy.src, typing_env);
+            let dst = convert_operand(tcx, &copy.dst, typing_env);
+            let count = convert_operand(tcx, &copy.count, typing_env);
+            // The element type is the pointee of `src`; it is what turns a count
+            // into a modeled element-wise copy. A copy whose element type cannot
+            // be determined must NOT become a modeled statement — it stays
+            // `Unsupported` and keeps aborting the function's lowering, exactly
+            // as every copy did before.
+            //
+            // Emitting the modeled variant is only sound because the obligations
+            // travel with it: `SepEngine::interpret_statement` routes this
+            // statement into `interpret_ptr_copy` (the same interpreter as the
+            // call spelling), and BOTH sep-engine reachability gates
+            // (`has_unsafe_patterns`, `has_intrinsic_unsafe_surface`) fire on
+            // the statement itself. The 810baa6c4c revert documents the failure
+            // mode when any link of that chain is missing: a 64-byte copy into
+            // an 8-byte array verified silently.
+            let elem_ty = local_decls
+                .map(|decls| copy.src.ty(decls, tcx))
+                .and_then(|ptr_ty| ptr_ty.builtin_deref(true))
+                .map(|pointee| convert_ty_with_env(tcx, typing_env, pointee));
+            match elem_ty {
+                Some(elem_ty) => {
+                    Statement::CopyNonOverlapping { src, dst, count, elem_ty, span }
+                }
+                None => Statement::Unsupported {
+                    kind: "NonDivergingIntrinsic::CopyNonOverlapping".to_string(),
+                    detail: "memory copy side effects require explicit memory-model lowering"
+                        .to_string(),
+                    operands: vec![src, dst, count],
+                    span,
+                },
             }
         }
     }
@@ -168,6 +192,100 @@ pub(crate) fn is_real_sysroot_crate(
         .into_iter()
         .flatten()
         .any(|did| tcx.stable_crate_id(did.krate).as_u64() == target)
+}
+
+/// A crate that WEARS a sysroot name (`core`/`alloc`/`std`) without BEING one.
+///
+/// This is the producer-side half of every `core::`/`alloc::`/`std::` root anchor
+/// downstream ([`trust_types::path_root_is_authenticated_sysroot_crate`]): a
+/// consumer may read a path's root as sysroot provenance only because a crate
+/// that fails this test has its paths stamped
+/// ([`trust_types::TRUST_UNAUTHENTICATED_CRATE_PATH_PREFIX`], rule 2).
+///
+/// IDENTITY, NOT UNIQUENESS — the 2026-08-17 correction. The older stamp
+/// ([`disambiguate_direct_call_path`]) fires on DUPLICATE crate names, and a
+/// duplicate-name test is not an authenticator: in a `#![no_std]` graph the real
+/// `std` is never injected, so a crate built `--crate-name std` is the ONLY
+/// `std`, was emitted UNSTAMPED, and its `std::vec::Vec::<u8>::iter` returning an
+/// endless iterator collected with zero obligations (measured: exit 0, no
+/// diagnostics; byte-identical aux named `mycrate` gives exit 1 and two errors).
+/// [`is_real_sysroot_crate`] answers the identity question instead, from
+/// compiler-owned lang/diagnostic-item anchors that no source-spellable name can
+/// move.
+///
+/// NO LOCAL EXEMPTION, deliberately, and the discriminator is the same anchor
+/// set: the real `core`/`alloc`/`std` each OWN one of the anchors
+/// (`Option`/`clone`, `Vec`/`owned_box`, `HashMap`/`HashSet`) and therefore
+/// authenticate themselves while they are the crate under compilation, whereas a
+/// crate that merely calls itself `std` owns none and is stamped even for its own
+/// items — which is what stops it self-verifying with sysroot grants. Missing
+/// anchors mean "not authenticated", so an anchorless graph fails CLOSED (stamped
+/// ⇒ grants refused ⇒ visible unproved obligations).
+///
+/// # WHAT THIS DOES NOT AUTHENTICATE — residual R2, MEASURED 2026-08-17
+///
+/// [`is_real_sysroot_crate`]'s anchors are ATTRIBUTES, and
+/// `#[rustc_diagnostic_item]` is spellable by any crate that writes
+/// `#![feature(rustc_attrs)]`. rustc hard-errors on a duplicate registration
+/// (MEASURED: `error: duplicate diagnostic item in crate 'std': 'Vec'` when the
+/// real `alloc` is also loaded), so the forgery is possible only for a name whose
+/// REAL owner is absent from the graph — but that is exactly the `#![no_std]`
+/// case this predicate exists for: an aux built `--crate-name std` carrying
+/// `#[rustc_diagnostic_item = "HashMap"]` compiles, its consumer compiles, and no
+/// duplicate error fires (MEASURED on `stage2` at `0a3cd0152`), so
+/// `get_diagnostic_item(HashMap)` resolves INTO it and this predicate answers
+/// `false`.
+///
+/// The closure is PROVENANCE, not attributes: `tcx.used_crate_source(krate)`
+/// yields the `dylib`/`rlib`/`rmeta` paths the crate was actually loaded from,
+/// and `tcx.sess.opts.sysroot` says which of them is the compiler's own. That
+/// conjunct is NOT applied here because it is not sound as a REQUIREMENT in two
+/// configurations this crate must keep working: `cargo -Zbuild-std` puts a
+/// genuine `core`/`alloc`/`std` in the target directory rather than the sysroot,
+/// and the bootstrap library lane supplies them by `--extern` from the build
+/// directory. Requiring residency would stamp the real sysroot in both, which is
+/// fail-CLOSED but a silent precision loss for exactly the `no_std` population
+/// this lane serves. This bound is PRE-EXISTING and shared by all 20 existing
+/// [`is_real_sysroot_crate`] call sites; the identity rule does not widen it.
+pub(crate) fn impersonates_sysroot_crate(
+    tcx: TyCtxt<'_>,
+    krate: rustc_span::def_id::CrateNum,
+) -> bool {
+    trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(krate).as_str())
+        && !is_real_sysroot_crate(tcx, krate)
+}
+
+/// Apply the SYSROOT-IMPERSONATION stamp (rule 2 only) to an already-rendered
+/// path belonging to `krate`.
+///
+/// Used for the TYPE names the extractor emits (`Ty::Adt`, `Ty::Datatype`,
+/// `AggregateKind::Adt`, and the by-name datatype references that must match
+/// them), which the duplicate-name rule never covered — it is minted inside
+/// [`direct_call_def_path`], a CALLEE renderer. That gap was the second half of
+/// the measured `#![no_std]` forgery: the endless iterator's local rendered
+/// `Ty::Adt { name: "std::vec::Endless" }`, unstamped, and
+/// `trust_vcgen::generate::alloc_vcs::ty_is_authenticated_std_iterator`
+/// authenticates a type purely by that printed root.
+///
+/// Rule 1 (duplicate names) is deliberately NOT applied here: it would restamp
+/// every type name in any graph that merely contains a duplicate dependency, and
+/// type names are compared for structural identity across the bridge. Rule 2
+/// fires only on a graph that contains a sysroot impersonator, so an honest
+/// compilation renders byte-for-byte what it rendered before.
+pub(crate) fn sysroot_authenticated_path(
+    tcx: TyCtxt<'_>,
+    krate: rustc_span::def_id::CrateNum,
+    path: String,
+) -> String {
+    // Rule 2 alone IS `impersonates_sysroot_crate` — the equivalence with
+    // `trust_types::sysroot_identity_stamp_required(_, name, real, false)` is
+    // pinned by `rule_two_alone_is_exactly_the_impersonation_predicate` there,
+    // so these two producers cannot drift apart.
+    trust_types::stamp_unauthenticated_crate_path(
+        path,
+        tcx.stable_crate_id(krate).as_u64(),
+        impersonates_sysroot_crate(tcx, krate),
+    )
 }
 
 /// Leaf-name set of std/alloc/core wrappers whose `Clone` DEEP-clones its contents
@@ -810,10 +928,53 @@ pub fn is_derived_total_method(_tcx: TyCtxt<'_>, _def_id: rustc_span::def_id::De
     false
 }
 
+/// The fn-pointer signature an INDIRECT call dispatches through, when the callee
+/// operand can be typed here.
+///
+/// `Some` requires ALL of: local declarations to type the operand against, an
+/// operand whose type is exactly `TyKind::FnPtr` (a `dyn Fn*` receiver, a
+/// closure, or anything else is NOT one), and a signature whose binder we can
+/// discharge without inventing anything. Everything else is `None`, which keeps
+/// the caller's historical fail-closed `Opaque` bail — a rewrite is admitted
+/// only when the callee's ABI is actually known.
+///
+/// LATE-BOUND REGIONS ARE DISCHARGED BY ERASURE. `no_bound_vars()` alone rejects
+/// the single most common fn-pointer shape in real code — any pointer taking or
+/// returning a reference is `for<'a> fn(&'a T) -> _` (this is what kept every
+/// `winnow::binary::{u16,u32,…}::{closure#0}` and
+/// `hashbrown::…::rehash_in_place::{closure#0}` opaque). Erasing those regions
+/// is sound HERE because it changes nothing this function's result is used for:
+/// Trust's `Ty` model carries no lifetimes at all (`Ty::Ref` has no region
+/// field), the argument/return types the bundle records come from
+/// `convert_operand`/`convert_place`, not from this signature, and the only
+/// field read off it is `safety()`, which no region instantiation can alter.
+/// A binder over TYPES or CONSTS is a different matter — it would mean the ABI
+/// is not yet known — so it stays fail-closed.
+fn indirect_call_fn_ptr_sig<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    local_decls: Option<&mir::LocalDecls<'tcx>>,
+) -> Option<ty::FnSig<'tcx>> {
+    let local_decls = local_decls?;
+    let ty = func.ty(local_decls, tcx);
+    if !matches!(ty.kind(), ty::TyKind::FnPtr(..)) {
+        return None;
+    }
+    let sig = ty.fn_sig(tcx);
+    if let Some(sig) = sig.no_bound_vars() {
+        return Some(sig);
+    }
+    if !sig.bound_vars().iter().all(|v| matches!(v, ty::BoundVariableKind::Region(_))) {
+        return None;
+    }
+    Some(tcx.instantiate_bound_regions_with_erased(sig))
+}
+
 /// Convert a rustc Terminator to our Terminator.
 fn convert_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
     terminator: &mir::Terminator<'tcx>,
+    local_decls: Option<&mir::LocalDecls<'tcx>>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
 ) -> Terminator {
     // Trust: extract per-terminator source span for diagnostics
@@ -887,9 +1048,16 @@ fn convert_terminator<'tcx>(
             // the whole function failed to lower, and every user `assert!`
             // fell closed to Unknown. Indirect calls and NON-panic diverging
             // calls still stay opaque / fail-closed.
+            // Same shape, same routing, for a diverging call that is UB-if-reached
+            // (`unreachable_unchecked`): "this point must be proven unreachable" is
+            // exactly the obligation an explicit `panic!` gets. See
+            // `is_ub_if_reached_diverging_call` for why a string gate is sound here
+            // (it only ever ADDS an obligation) and why the `Opaque` bail it replaces
+            // was strictly worse (it dropped the whole function from the native lane).
             let is_diverging_panic = target.is_none()
                 && func_name != "<indirect>"
-                && is_panic_diverging_call(&func_name);
+                && (is_panic_diverging_call(&func_name)
+                    || is_ub_if_reached_diverging_call(&func_name));
             // Trust: a DIRECT call to a recognized bulk-allocation / collect sink
             // (`with_capacity`/`reserve`/`resize`/`from_elem`/`collect`/`from_iter`)
             // whose post-inlining shape has NO normal-return target (`target ==
@@ -913,9 +1081,49 @@ fn convert_terminator<'tcx>(
             if target.is_none() && func_name != "<indirect>" && is_total_noreturn_call(&func_name) {
                 return Terminator::Return;
             }
+            // Trust (indirect-call fail-soft): an INDIRECT call — `func` is a
+            // fn-POINTER VALUE, not a `FnDef`, so there is no `DefId` and no path
+            // to render — that HAS a normal-return target and whose callee operand
+            // types as a `TyKind::FnPtr` right here. rustc reaches this shape by
+            // inlining the `<fn(..) as Fn<..>>::call` shim, whose whole body is
+            // `_0 = move _1(move _2.0)`.
+            //
+            // Previously EVERY indirect call bailed to `Opaque`, which drops the
+            // WHOLE function from the native lane: `fn apply(f: fn(u32)->u32, x:
+            // u32) -> u32 { f(x) }` had every obligation reported Unsupported.
+            // Emit a STRUCTURED `Call` instead, with the callee VALUE recorded as
+            // `args[0]` under the reserved `TRUST_INDIRECT_CALLEE_PATH` name
+            // (`args[1..]` are the real arguments). The bridge then lowers it to a
+            // real `Inst::CallIndirect` plus the audited open-dispatch havoc —
+            // exactly the encoding it already uses for the `Fn*::call*`-shim
+            // spelling of the same call (`try_lower_fnptr_indirect_call`).
+            //
+            // SOUNDNESS. The callee is UNKNOWN and is modeled as unknown: the
+            // bridge attaches an `Assert(false)+NoPanic` marker on every path
+            // through the call site, so panic-freedom through this body is
+            // UNPROVABLE, and the result is a fresh unconstrained value. Nothing
+            // may treat the reserved name as a known function, a summary key, or a
+            // totality claim (`@` makes it unspellable as a def path). The call's
+            // WRITE channel is the ordinary `Terminator::Call` one — dest plus the
+            // whole-body `&mut`/`AddressOf` escape analysis every unknown-callee
+            // direct call already goes through — so recording the callee operand as
+            // an extra argument can only WIDEN the havoc, never narrow it. This is
+            // strictly weaker than the `Opaque` bail in what it lets the verifier
+            // conclude about the CALL, and strictly stronger in what it lets the
+            // verifier conclude about the REST of the function.
+            //
+            // FAIL-CLOSED ADMISSION. `indirect_call_fn_ptr_sig` requires real local
+            // declarations and an exact `TyKind::FnPtr` callee. A `dyn Fn*`
+            // receiver, an unresolved generic, a diverging indirect call (no normal
+            // target), and every synthetic body that carries no `local_decls` all
+            // keep the historical `Opaque` bail.
+            let indirect_fn_ptr_sig = (func_name == "<indirect>" && target.is_some())
+                .then(|| indirect_call_fn_ptr_sig(tcx, func, local_decls))
+                .flatten();
             if (func_name == "<indirect>" || target.is_none())
                 && !is_diverging_panic
                 && !is_direct_bulk_alloc_sink
+                && indirect_fn_ptr_sig.is_none()
             {
                 let opaque_kind = if func_name == "<indirect>" {
                     "Call(indirect)".to_string()
@@ -923,6 +1131,31 @@ fn convert_terminator<'tcx>(
                     format!("Call::{func_name}")
                 };
                 return opaque_terminator(opaque_kind, successors, span);
+            }
+            if let Some(sig) = indirect_fn_ptr_sig {
+                let mut indirect_args = Vec::with_capacity(args.len() + 1);
+                indirect_args.push(convert_operand(tcx, func, typing_env));
+                indirect_args.extend(
+                    args.iter().map(|spanned| convert_operand(tcx, &spanned.node, typing_env)),
+                );
+                return Terminator::Call {
+                    func: trust_types::TRUST_INDIRECT_CALLEE_PATH.to_string(),
+                    args: indirect_args,
+                    dest: convert_place(tcx, destination, typing_env),
+                    target: target.map(|bb| BlockId(bb.as_usize())),
+                    span,
+                    // An indirect call is never a recognized atomic intrinsic —
+                    // those are direct `FnDef`s — and is never a foreign ITEM.
+                    atomic: None,
+                    is_foreign: false,
+                    // Trust: T5A — the callee's SIGNATURE safety is authoritative
+                    // and is readable here from the fn-pointer type, so calling an
+                    // `unsafe fn` pointer keeps demanding its SAFETY evidence.
+                    // `func_operand_is_unsafe_sig` cannot see this: it only reads a
+                    // `FnDef` constant.
+                    is_unsafe_sig: matches!(sig.safety(), rustc_hir::Safety::Unsafe),
+                    unwind: convert_unwind_action(*unwind),
+                };
             }
             let converted_args: Vec<Operand> = args
                 .iter()
@@ -1140,6 +1373,28 @@ fn is_panic_diverging_call(callee: &str) -> bool {
         || callee.contains("panic_cannot_unwind")
 }
 
+/// A diverging call whose EXECUTION IS UNDEFINED BEHAVIOR: `core::hint::unreachable_unchecked`
+/// and the `unreachable` intrinsic it wraps. Reaching one is the violation, so the program
+/// point must be PROVEN unreachable — exactly the obligation shape
+/// `is_panic_diverging_call` already routes for an explicit `panic!`.
+///
+/// SOUNDNESS OF A STRING GATE HERE. Unlike `is_total_noreturn_call` (which would ERASE the
+/// continuation, so a forged `my::process::exit -> !` that really panics would lose its panic),
+/// this predicate only ever ADDS an obligation: the call site gets `assert(false)` under the
+/// path condition plus a `PanicFreedom` row, and control ends in `Unreachable` — which the
+/// caller could not continue past in any case, since the callee diverges. A user function that
+/// merely SHARES the tail is therefore held to a STRICTER standard, never a laxer one. The
+/// previous behavior was a hard `Opaque` bail that dropped the WHOLE enclosing function from
+/// the native lane, so every one of its other obligations collapsed to Unsupported.
+///
+/// Kept in lockstep with `is_ub_if_reached_call` in `trust-ir-bridge/src/lower.rs`: a call
+/// routed to `Call` here must be recognized there, or it fails closed at the bridge instead.
+fn is_ub_if_reached_diverging_call(callee: &str) -> bool {
+    callee.ends_with("::unreachable_unchecked")
+        || callee == "core::intrinsics::unreachable"
+        || callee.ends_with("::intrinsics::unreachable")
+}
+
 /// No string-only diverging-call identity can authorize a path-ending rewrite.
 ///
 /// `std::process::exit` is total and non-returning, but the rendered callee path is not an
@@ -1169,13 +1424,30 @@ pub(crate) fn is_total_noreturn_call(callee: &str) -> bool {
 /// symbol, NOT an alloc-error-handler, so it stays a real obligation. The separate vcgen
 /// `UnboundedAllocation` lane still sees the preserved `with_capacity`/`collect` size operand.
 ///
-/// STD-ORIGIN GATE: a user fn merely named `handle_alloc_error` in a non-std crate cannot enter
-/// this class (mirrors the origin gates on the totality sentinels).
+/// ROOT-SEGMENT NAME TEST — **not** an origin gate, and not a provenance check. The first
+/// conjunct compares the rendered path's FIRST SEGMENT against three crate NAMES. A crate name
+/// is not an identity: MEASURED on this tree's rig, a `#![no_std]` crate compiled
+/// `--crate-name alloc`, whose `pub mod alloc` declares an ordinary
+/// `pub fn __rust_alloc_error_handler`, renders its callee at the seam as
+/// `alloc::alloc::__rust_alloc_error_handler` — byte-for-byte a string this predicate accepts.
+/// (`direct_call_def_path`'s `@`-stamp does not help: it is a duplicate-NAME detector, and the
+/// sole crate of a name is emitted unstamped.) So the narrowing this buys is "a user fn merely
+/// named `handle_alloc_error` under a DIFFERENTLY-named root cannot enter the class", which is
+/// weaker than the sysroot-origin property the old wording asserted.
+///
+/// NOT REACHED TODAY: MEASURED, and by rustc rather than by reading — a non-test build of this
+/// crate emits "function `is_alloc_failure_abort_call` is never used" from the
+/// `dead_code` lint, and a repo-wide grep agrees (every other reference is a doc comment or the
+/// unit test below). There is NO production call site, so the class grants nothing and the
+/// lost-recovery direction described above is, today, vacuous for this predicate. The string
+/// contract is pinned by that test so a future wiring inherits it rather than re-deriving it.
+/// Wire it only behind the authoritative signals (`is_foreign`, and a real sysroot-crate
+/// identity check), not behind this name test.
 fn is_alloc_failure_abort_call(callee: &str) -> bool {
-    let std_origin = callee.starts_with("alloc::")
+    let root_segment_names_a_sysroot_crate = callee.starts_with("alloc::")
         || callee.starts_with("std::")
         || callee.starts_with("core::");
-    if !std_origin {
+    if !root_segment_names_a_sysroot_crate {
         return false;
     }
     callee.ends_with("::handle_alloc_error")
@@ -1662,6 +1934,144 @@ fn convert_rvalue<'tcx>(
                         && ty.ty_adt_def().is_some_and(|def| {
                             tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
                         });
+                    // Trust: TRANSPARENT-UNWRAP leg (2026-08-18) — the NonZero-class
+                    // transmute OUT of a `#[repr(transparent)]` struct chain into the
+                    // EXACT integer primitive the chain terminates at
+                    // (`NonZero<u8> -> u8`, `core::num::nonzero::NonZero::<u8>::get`'s
+                    // deliberate `transmute_unchecked` — MCP#807 bans the field
+                    // projection in RUSTC MIR, not in this model). Sound
+                    // UNCONDITIONALLY: repr(transparent) is a std layout GUARANTEE
+                    // (identical size/ABI at every hop), and the unwrap DIRECTION
+                    // drops the validity invariant (the source's valid range is a
+                    // subset of the target's) — no obligation exists. The value is
+                    // BIT-IDENTICAL to the flattened payload field, so emit the EXACT
+                    // semantics: the field-projection READ (`_1.0.0`), never a Cast —
+                    // the projection is value-exact by the same layout evidence, needs
+                    // no new model type, and works for any third-party transparent
+                    // chain, not just std's NonZero. The WRAP direction (int ->
+                    // NonZero) stays fail-closed: its validity invariant is a real
+                    // obligation, and the measured corpus path (`NonZero::new`) is a
+                    // NICHE-OPTION transmute — a different evidence class.
+                    //
+                    // Gates (ALL required; each `None`/mismatch falls through to
+                    // Unsupported):
+                    //   1. src/typing_env present (synthetic rvalues fail closed);
+                    //   2. concreteness (no params/infer/opaques — the R3 discipline);
+                    //   3. every hop a `#[repr(transparent)]` STRUCT (unions excluded:
+                    //      field overlap voids the chase) with a UNIQUE non-1-ZST
+                    //      field (the rustc_lint `transparent_newtype_field` rule);
+                    //   4. the terminal type SYNTACTICALLY EQUAL to the transmute
+                    //      target, and integral (width+signedness identity for free —
+                    //      `NonZero<i32> -> u32` stays fail-closed);
+                    //   5. layout cross-check: both ends `BackendRepr::Scalar` with
+                    //      the SAME `Primitive` — guards the CHASE's own correctness
+                    //      (compare the primitive ONLY: the valid-range delta IS the
+                    //      invariant story, not a bits question).
+                    let transparent_unwrap_hops = (|| -> Option<Vec<usize>> {
+                        use rustc_abi::BackendRepr;
+                        if !ty.is_integral() {
+                            return None;
+                        }
+                        let src = src_ty?;
+                        let te = typing_env?;
+                        if src.has_non_region_param()
+                            || src.has_non_region_infer()
+                            || src.has_opaque_types()
+                        {
+                            return None;
+                        }
+                        let mut hops = Vec::new();
+                        let mut cur = src;
+                        // Defensive depth cap; rustc rejects infinite transparent
+                        // recursion, so 8 exceeds every real chain.
+                        for _ in 0..8usize {
+                            // PEEL the pattern type (audit, same round): the
+                            // transparent chain TERMINATES at `TyKind::Pat(u8, 1..)`
+                            // (`define_valid_range_type!`'s spelling), a validity
+                            // REFINEMENT of the base scalar — bit-identical layout
+                            // (the Scalar-primitive cross-check below verifies it),
+                            // narrower valid range (the unwrap direction's story).
+                            // convert.rs peels Pat identically elsewhere (the
+                            // clone/derived-trait totality walks).
+                            if let ty::TyKind::Pat(base, _) = cur.kind() {
+                                cur = *base;
+                            }
+                            if cur == *ty {
+                                if hops.is_empty() {
+                                    return None; // an identity transmute — not this leg.
+                                }
+                                let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
+                                let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                                return match (ls.backend_repr, lt.backend_repr) {
+                                    (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
+                                        if a.primitive() == b.primitive() =>
+                                    {
+                                        Some(hops)
+                                    }
+                                    _ => None,
+                                };
+                            }
+                            let ty::TyKind::Adt(def, args) = cur.kind() else {
+                                return None;
+                            };
+                            if !def.is_struct() || !def.repr().transparent() {
+                                return None;
+                            }
+                            let mut found = None;
+                            for (i, f) in def.non_enum_variant().fields.iter().enumerate() {
+                                // NORMALIZE the field type (audit, same round):
+                                // NonZero's own field is the PROJECTION ALIAS
+                                // `<T as ZeroablePrimitive>::NonZeroInner` — the raw
+                                // unnormalized alias never matches `TyKind::Adt` and
+                                // the chase died fail-closed on its motivating case.
+                                // Concreteness was gated above, so normalization is
+                                // safe (the E0275 hazard is param-bearing input).
+                                let fty = tcx
+                                    .try_normalize_erasing_regions(te, f.ty(tcx, args))
+                                    .ok()?;
+                                let is_1zst = tcx
+                                    .layout_of(te.as_query_input(fty))
+                                    .is_ok_and(|l| l.is_1zst());
+                                if !is_1zst {
+                                    if found.is_some() {
+                                        return None; // two payload fields — not transparent-shaped.
+                                    }
+                                    found = Some((i, fty));
+                                }
+                            }
+                            let (i, fty) = found?;
+                            hops.push(i);
+                            cur = fty;
+                        }
+                        None
+                    })();
+                    if let Some(hops) = transparent_unwrap_hops {
+                        // Append the chased Field hops to the operand's place —
+                        // the value-exact spelling. A non-place operand (constant)
+                        // fails closed below.
+                        match operand {
+                            Operand::Copy(mut place) => {
+                                place
+                                    .projections
+                                    .extend(hops.into_iter().map(trust_types::Projection::Field));
+                                return Rvalue::Use(Operand::Copy(place));
+                            }
+                            Operand::Move(mut place) => {
+                                place
+                                    .projections
+                                    .extend(hops.into_iter().map(trust_types::Projection::Field));
+                                return Rvalue::Use(Operand::Move(place));
+                            }
+                            other => {
+                                return unsupported_rvalue(
+                                    "CastKind::Transmute",
+                                    "transparent-unwrap transmute of a non-place operand"
+                                        .to_string(),
+                                    vec![other],
+                                );
+                            }
+                        }
+                    }
                     if ty.is_any_ptr() || ty.is_box() || ptr_to_int || ptr_to_nonnull {
                         Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty))
                     } else {
@@ -1744,13 +2154,19 @@ fn convert_rvalue<'tcx>(
                 mir::AggregateKind::Array(_) => AggregateKind::Array,
                 mir::AggregateKind::Adt(def_id, variant_idx, adt_args, _, active_field) => {
                     AggregateKind::Adt {
-                        name: crate::safe_def_path_str(tcx, *def_id),
+                        // Sysroot-authenticated: the aggregate NAME is what
+                        // `alloc_vcs`'s range-family arm anchors, so an
+                        // impersonating `core` must not be able to spell
+                        // `core::ops::range::Range` and buy a count.
+                        name: crate::sysroot_authenticated_def_path_str(tcx, *def_id),
                         variant: variant_idx.as_usize(),
                         active_field: active_field.map(|field| field.as_usize()),
                         // Trust (C1): these args were discarded. Both sides of the derived-vs-built
                         // comparison run through this converter, so carrying them makes a
                         // wrong-args reconstruction visible to the comparator for the first time.
-                        args: Some(crate::safe_def_path_str_with_args(tcx, *def_id, adt_args)),
+                        args: Some(crate::sysroot_authenticated_def_path_str_with_args(
+                            tcx, *def_id, adt_args,
+                        )),
                     }
                 }
                 mir::AggregateKind::Closure(def_id, args) => {
@@ -2326,10 +2742,9 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
     // integer-sorted symbol that asserts no value, so value/div/index/equality
     // obligations over it stay `unknown`, never falsely proved (the div-zero and
     // const-eq folds in trust-vcgen treat it as unknown-valued, NOT known-nonzero or
-    // known-unequal). Bare `bool` const-generics and associated-type-projection
-    // (`Alias`) consts are deliberately NOT handled here: a `bool` needs a Bool sort
-    // (not an integer one) and an `Alias` const has no resolved integer width at
-    // extraction time, so both stay fail-closed below.
+    // known-unequal). An associated-type-projection (`Alias`) const is deliberately
+    // NOT handled here and stays fail-closed below: see the refusal at the end of
+    // this function for the precise reason (no resolvable sort, not merely no width).
     match ty.kind() {
         TyKind::Int(int_ty) => {
             let width = crate::ty_convert::int_width_from_int_ty(int_ty, tcx);
@@ -2374,6 +2789,20 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
         // dict-gated arithmetic. SOUND: the symbol asserts no value, so the
         // proof holds for both instantiations or not at all. Non-param bool
         // consts (assoc consts etc.) keep the fail-closed refusal below.
+        //
+        // A NON-param bool `OpaqueScalar` was tried here and REVERTED: unlike
+        // `ConstParam`, `OpaqueScalar` carries no identity, so trust-vcgen
+        // (`lib.rs`) and the CHC lane (`chc.rs`) both intern it to the ONE name
+        // `__trust_opaque_scalar_u1`. Two DISTINCT assoc consts then collapse
+        // onto one symbol, `if T::A { if !T::B { .. } }` becomes `S ∧ ¬S` =
+        // false, the arm is pruned and its obligation discharged VACUOUSLY.
+        // MEASURED: that shape verified PROVED and kernel-certified while the
+        // single-const control correctly FAILED. Per-occurrence freshening does
+        // not save it — `freshen_aliasing_opaque_occurrences` runs only on the
+        // σ-callsite path, not on the intra-function obligation. Re-land only
+        // once `OpaqueScalar` is identity-keyed the way `ConstParam` is. The
+        // same aliasing is live TODAY for two distinct INTEGER assoc consts via
+        // the `Int`/`Uint` arms above — pre-existing, tracked separately.
         TyKind::Bool => {
             if let Some((index, name)) = const_param_identity(tcx, const_op) {
                 return Operand::Constant(ConstValue::ConstParam {
@@ -2385,6 +2814,47 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
             }
         }
         _ => {}
+    }
+
+    // Trust (v7/D3 — a refusal must carry the fix, with options).
+    //
+    // An `Alias(Projection)` constant — `<Self as Flags>::Bits::EMPTY` in
+    // bitflags' generic trait-default bodies — is the load-bearing case here, and
+    // it is NOT a missing feature: it cannot be lowered soundly at this layer.
+    // What is missing is the INSTANTIATION of the projection's `Self`. The MIR is
+    // extracted pre-monomorphization, so `<Self as Flags>::Bits` names whatever
+    // associated type the (not-yet-chosen) impl supplies. `normalize_alias` in
+    // `ty_convert.rs` refuses the same type for the same reason
+    // (`has_non_region_param`). A trait bound cannot substitute for the
+    // instantiation: `Flags::Bits: Bits` admits `u8` through `i128` (and any
+    // downstream impl of the public `Bits` trait), so the bound does not pin a
+    // WIDTH, a SIGNEDNESS, or even a sort — a `u8` and a `u128` `EMPTY` differ in
+    // exactly the mask/overflow facts an obligation over them would turn on.
+    // Minting an integer `OpaqueScalar` here would therefore have to GUESS a
+    // width, and a guessed-wide symbol makes narrow-type overflow obligations
+    // vacuously satisfiable — a false PROVE, which is the one outcome that is
+    // worse than this refusal. Note that the corresponding pre-monomorphization
+    // alias TYPE is already modeled fact-free (`PRE_MONO_ALIAS_{KIND,DETAIL}` ->
+    // the bridge's opaque zero-field struct); no equivalent exists for a VALUE of
+    // that type, and inventing one would not unblock these bodies anyway.
+    // MEASURED: the identical body with the projection-typed CONST replaced by a
+    // projection-typed PARAMETER (`fn empty_control(bits: Self::B) -> Self {
+    // Self::from_bits_retain(bits) }`) still fails, on the absent-callee
+    // panic-freedom obligation for the still-generic `Self::from_bits_retain`. So
+    // a value model for this const would relabel the failure, not remove it.
+    if matches!(ty.kind(), TyKind::Alias(..)) {
+        return unsupported_operand(
+            "Const",
+            format!(
+                "unsupported constant of MIR type {ty:?}: an associated-type projection has no \
+                 resolved sort before monomorphization (the impl that supplies the associated \
+                 type is not chosen yet, and its trait bound does not pin a width or a sort); \
+                 refusing to prove with a guessed value. Options: verify a MONOMORPHIC wrapper \
+                 that instantiates the projection (`fn f() {{ generic::<ConcreteFlags>() }}`), \
+                 give the body a concrete-typed local instead of the projection, or accept the \
+                 obligation as unproved under `-Z trust-policy=advisory`"
+            ),
+        );
     }
 
     unsupported_operand(
@@ -2555,11 +3025,27 @@ fn array_ref_u8_const_bytes<'tcx>(tcx: TyCtxt<'tcx>, c: &mir::Const<'tcx>) -> Op
     let mir::ConstValue::Scalar(scalar) = val else { return None };
     let ptr = scalar.to_pointer(&tcx).discard_err()?;
     let (prov, offset) = ptr.into_pointer_or_addr().ok()?.prov_and_relative_offset();
-    let alloc = tcx.global_alloc(prov.alloc_id()).unwrap_memory();
+    // `unwrap_memory()` `bug!`s on every non-`Memory` global: Function, VTable,
+    // Static and TypeId. The type gates above constrain the POINTER TYPE
+    // (`&[u8; N]`) — which says nothing about what KIND of global the pointee
+    // is. A promoted/anonymous const byte string lands in `GlobalAlloc::Memory`
+    // and reads fine; a NAMED `static [u8; N]` lands in `GlobalAlloc::Static`
+    // and passed every gate before aborting the compiler. Degrade to `None`
+    // like every other exit in this exact-or-`None` reader: the const stays
+    // opaque, so precision is lost and no proof can be minted from it.
+    let mir::interpret::GlobalAlloc::Memory(alloc) = tcx.global_alloc(prov.alloc_id()) else {
+        return None;
+    };
     let start = offset.bytes() as usize;
-    let bytes = alloc
-        .inner()
-        .inspect_with_uninit_and_ptr_outside_interpreter(start..start.checked_add(len)?);
+    // Guard the ALLOCATION bound too, not just integer overflow:
+    // `inspect_with_uninit_and_ptr_outside_interpreter` is a raw slice index and
+    // panics past the end. The sibling reader guards this explicitly; this one
+    // did not.
+    let end = start.checked_add(len)?;
+    if end > alloc.inner().size().bytes() as usize {
+        return None;
+    }
+    let bytes = alloc.inner().inspect_with_uninit_and_ptr_outside_interpreter(start..end);
     Some(bytes.to_vec())
 }
 
@@ -2617,7 +3103,7 @@ fn convert_const_aggregate_rvalue<'tcx>(
                 .collect::<Option<Vec<_>>>()?;
             Some(Rvalue::Aggregate(
                 AggregateKind::Adt {
-                    name: crate::safe_def_path_str(tcx, adt_def.did()),
+                    name: crate::sysroot_authenticated_def_path_str(tcx, adt_def.did()),
                     variant: destructured.variant.as_usize(),
                     active_field: None,
                     // Trust (C1): the const-destructure path does not carry the site's
@@ -2664,11 +3150,15 @@ fn convert_mir_const_value_aggregate_rvalue<'tcx>(
         }
         ty::TyKind::Adt(adt_def, adt_args) => Some(Rvalue::Aggregate(
             AggregateKind::Adt {
-                name: crate::safe_def_path_str(tcx, adt_def.did()),
+                name: crate::sysroot_authenticated_def_path_str(tcx, adt_def.did()),
                 variant: contents.variant?.as_usize(),
                 active_field: None,
                 // Trust (C1): the args ARE in hand here, so record them.
-                args: Some(crate::safe_def_path_str_with_args(tcx, adt_def.did(), adt_args)),
+                args: Some(crate::sysroot_authenticated_def_path_str_with_args(
+                    tcx,
+                    adt_def.did(),
+                    adt_args,
+                )),
             },
             ops,
         )),
@@ -4081,8 +4571,12 @@ fn adt_field_idx<'tcx>(
 /// bare, or with its concrete `::<F, T>` turbofish (`func_operand_name` renders the
 /// monomorphized instantiation, e.g. `std::thread::Builder::spawn_unchecked::<
 /// {closure@…}, ()>`; V1 compared the bare path for equality and therefore NEVER
-/// fired). A crate-name collision on `std` renders with the `__trust_crate@…::`
-/// disambiguation prefix (`direct_call_def_path`) and correctly fails this match.
+/// fired). A crate that is not the real `std` renders with the
+/// `__trust_crate@…::` prefix (`direct_call_def_path`) and correctly fails this
+/// match — under EITHER producer rule: a crate-name collision (rule 1) or, since
+/// 2026-08-17, a `std` whose `StableCrateId` is not the sysroot's
+/// ([`impersonates_sysroot_crate`], rule 2). Before rule 2 existed, a `#![no_std]`
+/// graph's UNIQUE impersonator was stamped by neither.
 fn is_builder_spawn_callee(name: &str) -> bool {
     const SPAWN: &str = "std::thread::Builder::spawn";
     const SPAWN_UNCHECKED: &str = "std::thread::Builder::spawn_unchecked";
@@ -5441,13 +5935,21 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                             generic_args,
                             crate::safe_def_path_str_with_args(tcx, *def_id, generic_args),
                         );
-                        // Carry the AUTHORITATIVE element byte size (tcx.layout_of) as a
-                        // trailing `::<__trust_elem_bytes_N>` token so vcgen sizes EVERY
-                        // concrete element — including a named struct/enum whose spelling
-                        // does not reveal its size. A trailing turbofish, so `method_tail`
-                        // strips it and the `with_capacity` tail recognizers are unaffected.
+                        // Carry the AUTHORITATIVE element byte size (tcx.layout_of) as the
+                        // trailing `::<__trust_elem_bytes@N>` token — the shared
+                        // `trust_types` spelling: `@` is not identifier-spellable and the
+                        // consumers admit ONLY the trailing-position grammar, so a user
+                        // type/param named after the token can never impersonate it
+                        // (batch-6 review D1; the old `_N` spelling was a legal
+                        // identifier). vcgen thus sizes EVERY concrete element —
+                        // including a named struct/enum whose spelling does not reveal
+                        // its size. A trailing turbofish, so `method_tail` strips it and
+                        // the `with_capacity` tail recognizers are unaffected.
                         match bulk_alloc_elem_byte_size(tcx, generic_args) {
-                            Some(sz) => format!("{concrete}::<__trust_elem_bytes_{sz}>"),
+                            Some(sz) => format!(
+                                "{concrete}{}",
+                                trust_types::render_trailing_elem_bytes_token(sz)
+                            ),
                             None => concrete,
                         }
                     } else {
@@ -5664,6 +6166,203 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 /// Rust identifier, so the synthetic namespace cannot collide with a real def
 /// path; retaining the original path as a suffix also preserves conservative
 /// tail classifiers used by VC generation.
+///
+/// # This key is STILL MANY-TO-ONE — narrowed at the RENDERING seam, not made injective
+///
+/// The disambiguation above is scoped to duplicate CRATE names (and, in such a
+/// crate graph, to the generic arguments).  Neither fires between two items of
+/// ONE crate, so this key is MANY-TO-ONE inside a crate:
+/// `def_path_str`/`def_path_str_with_args` omitted `DefPathData` disambiguators,
+/// and three witnesses were MEASURED on this tree, none of them needing a
+/// shadowed name anyone would notice:
+///
+/// * two block-scoped `struct S` declared in two different blocks of one
+///   function both rendered `<krate::f::S as core::fmt::Write>::write_fmt`, so
+///   their two DISTINCT `write_fmt` callees shared a key;
+/// * two block-scoped `trait Tick` in two blocks of one function both rendered
+///   `<dyn krate::f::Tick as krate::f::Tick>::tick`, so two `dyn` sites with
+///   two DIFFERENT vtables shared a key;
+/// * a macro that mints a local type per expansion produced the same collision
+///   without anyone writing a shadow at all.
+///
+/// Consequences, both live, and both exploited:
+///
+/// * A consumer that keys a per-callee SUMMARY by this string may hand one
+///   definition's summary to another definition's call.
+/// * A consumer that DISCHARGES an obligation by inserting this string into an
+///   authenticated set discharges it for every call that renders to it — not
+///   only for the one that was examined.  That is a fail-OPEN direction, and it
+///   was a real, exploited false proof THREE TIMES OVER, in three independent
+///   consumers: `rustc_mir_transform::trust_verify::static_str_write_fmt`'s
+///   `sites[0]`-only revision, the `dyn` reliance rule's per-site `out.insert`
+///   in `trust_verify::dyn_dispatch_reliance`, and
+///   `trust_verify::collect_expected_absent_callees`'s `assumed_total_out`,
+///   where one block's `#[trust::assume_total]` audit discharged the
+///   identically-keyed call on a DIFFERENT block-scoped type.  All three were
+///   compiled and RUN.
+///
+/// Fixing that per consumer failed twice, because the sets do not stay inside
+/// one bundle: `abi_total_panic_free` and `type_total_std` are copied verbatim
+/// into crate-scoped `Session` state (`register_abi_nonunwind_total_callee` /
+/// `register_type_total_std_callee`) and spent NAME-KEYED as an interprocedural
+/// panic-freedom discharge for every function in the crate, so no per-bundle
+/// ledger can contain them.
+///
+/// So the key is NARROWED at its single rendering seam instead:
+/// [`crate::safe_def_path_str`] and [`crate::safe_def_path_str_with_args`] —
+/// the only producers of Trust's def-path identity space, and the two functions
+/// every string here is built from — render under
+/// `with_def_path_disambiguators`.  That closes the three classes above plus two
+/// more: a type parameter named after a primitive (§RESIDUAL 5) and a FOREIGN
+/// import merging into its `extern` block's GRANDPARENT namespace (§RESIDUAL 6).
+/// The named-segment disambiguator and the `ty::ParamTy` marker move only
+/// previously-ambiguous spellings; the `{{extern}}` segment moves EVERY foreign
+/// path, which is a lost-recovery direction and is enumerated on
+/// [`crate::safe_def_path_str`] rather than argued.
+///
+/// Note the exact reach of the first of those: the three witnesses above are all
+/// same-namespace siblings, and the disambiguator counts siblings per `(parent,
+/// DefPathData)`.  `DefPathData::TypeNs(sym)` and `DefPathData::ValueNs(sym)` are
+/// DIFFERENT variants, so two same-named siblings in DIFFERENT namespaces are
+/// each `#0` and both still render the bare name — §RESIDUAL 7, MEASURED OPEN.
+///
+/// One thing this function's own `@`-stamp is NOT: an authenticator.
+/// `ambiguous_callee` below is `local_has_same_name || another_external_has_same
+/// _name` — a DUPLICATE-NAME detector.  A crate that is the ONLY one of its name
+/// in the graph is emitted UNSTAMPED whatever it calls itself, so the absence of
+/// a stamp is not evidence that a `core::`/`alloc::`/`std::` root is the real
+/// sysroot crate.  Do not build a trust decision on that absence.
+///
+/// # RESIDUAL — the key is NOT injective.  Do not assume it is.
+///
+/// 1. **A GENERIC CALL's key is indistinguishable from a GENERIC DEFINITION's
+///    path — MEASURED OPEN, a live false proof.**  `safe_def_path_str_with_args`
+///    renders a CALL from the caller's `args`; when those args contain a
+///    `ty::Param`, the result is spelled exactly like the DEFINITION path of a
+///    generic body, because `ty::ParamTy` is `{index, name}` with no owner
+///    (`rustc_middle/src/ty/sty.rs`, printed at
+///    `rustc_middle/src/ty/print/pretty.rs` `ty::ParamTy`).  A blanket
+///    `impl<T: Marker> Tr for T` has def path `<T as krate::Tr>::m`; the
+///    unresolvable dispatch in `fn f<T: Tr>(x: &T) { x.m() }` renders the SAME
+///    string, and `trust_ir_bridge::lower.rs` `resolve_call_target`'s
+///    `known_functions.get(callee)` binds the call to that proved body — no
+///    obligation, no assumption row.  Reproducer:
+///    `probe/blanket2.rs` in the round-2 evidence dir; `f` verifies clean while
+///    a downstream `impl Tr for Foo` may panic.
+///
+///    This CANNOT be fixed by rendering.  The SOUND case (`fn f<T: Marker>`,
+///    where the blanket really is every instantiation's target) and the UNSOUND
+///    case (`fn f<T: Tr>`) produce byte-identical strings; the only discriminator
+///    is `ty::Instance::try_resolve` under the CALLER's
+///    `TypingEnv::post_analysis(caller_def_id)`, and `func_operand_name` is not
+///    given a caller.  Closing it needs a call-site identity that carries the
+///    caller's instantiation environment — not a def-path string.
+///    `trust_verify::collect_expected_absent_callees` DOES have that env and
+///    already classifies the call correctly (`Ok(None)` ⇒ fatal-absent); the
+///    bridge's by-name bind is what overrides it.
+///
+/// 2. **An `{{impl}}` segment's own disambiguator is still dropped**
+///    (`print_impl_path` renders `<Self as Trait>`), so two impls that
+///    instantiate to the SAME `(self_ty, trait_ref)` under one parent still
+///    alias.  Coherence forbids that for ordinary code; it needs specialization.
+///    INFERRED from reading `print_impl_path`; not probed.
+///
+/// 3. **`{{constructor}}` is the OTHER unconditionally-dropped segment.**  A
+///    tuple/unit-struct ctor renders as its STRUCT's path, so a block-scoped
+///    `struct S(u32)` and a block-scoped `fn S` in two blocks of one function
+///    both render `krate::go::S` — MEASURED.  What is ALSO measured is that this
+///    does not reach a callee key in the direct-construction shape: `S(x)`
+///    lowers to an `Aggregate`, not a `Call`, so the only extracted callee is
+///    the local `fn` and there is NO obligation differential on either compiler.
+///    A REIFIED ctor does reach a key, inside an `FnDef` TYPE in a turbofish
+///    (MEASURED: `apply::<fn(u32) -> krate::go::S {krate::go::S}>`); that has
+///    NOT been driven to a false proof.  Left open deliberately: rendering it
+///    moves every tuple/unit-struct and enum-variant ctor spelling, including
+///    `core::option::Option::Some`, and that blast radius is not measured by the
+///    `{{extern}}` change's evidence.
+///
+/// 4. **Const parameters are not marked.**  `ty::ParamConst` renders its bare
+///    name like `ty::ParamTy` does, but a concrete const argument renders as a
+///    LITERAL (`3`, `'a'`) and `true`/`false` are keywords, so no const
+///    parameter name can collide with a concrete const rendering.  INFERRED from
+///    the print arms; a const-generic probe showed no differential, which is
+///    consistent but does not prove the class empty.
+///
+/// 5. Closed, and recorded so nobody re-widens it: a type PARAMETER named after a
+///    primitive (`fn go<u8: Tr>(x: &u8, v: &Prim)`) used to render the
+///    unresolvable `x.m()` as the bundled `impl Tr for u8` body's path.  Marked
+///    at the `ty::ParamTy` print arm.  That marker is exactly the primitives
+///    because they are the only concrete types the seam renders as a bare
+///    identifier (every ADT is crate-qualified under
+///    `resolve_crate_name`/`no_visible`/`no_trimmed`; MEASURED with a parameter
+///    named after a local struct, which does NOT collide).
+///
+/// 6. Closed, and recorded: a FOREIGN import merged into its `extern` block's
+///    GRANDPARENT namespace, where an ordinary same-named item lives.  The
+///    `{{extern}}` segment is now rendered on every foreign path (`{extern#N}`).
+///    An earlier revision gated on `disambiguator != 0`, which closes the alias
+///    only when a SECOND extern block happens to exist; the single-block case —
+///    the common one — stayed a MEASURED false proof (a bodyless
+///    `extern "C"`/`extern "C-unwind"` import bound to a same-named local body,
+///    an `[overflow:add]` obligation reported PROVED).  The disambiguator cannot
+///    express this class at all: the two items have DIFFERENT `DefPath` parents.
+///
+/// 7. **Same-named siblings in DIFFERENT NAMESPACES still alias — MEASURED
+///    OPEN.**  This is the limit of residual 5's disambiguator, and it is the
+///    reason the closure above must not be described as removing "same-named
+///    sibling definitions" without qualification.  A
+///    `DisambiguatedDefPathData` disambiguator counts siblings per `(parent,
+///    DefPathData)`, and `TypeNs(sym)` and `ValueNs(sym)` are DIFFERENT
+///    `DefPathData` VARIANTS — so a `fn S` and a `struct S` under one parent
+///    are BOTH `#0` and both still render `S` under this seam.
+///    Reproducer (`#![no_std]`, `core` only), one function, two blocks:
+///
+///    ```text
+///    pub fn go(x: u32) -> u32 {
+///        let a = { fn S(v: u32) -> u32 { fn m(v: u32) -> u32 { v } m(v) } S(x) };
+///        let b = { struct S; impl S { fn m(v: u32) -> u32 { v + 1 } } S::m(x) };
+///        a.wrapping_add(b)
+///    }
+///    ```
+///
+///    `-Ztrust-dump=mir` emits FOUR bundled bodies under THREE def paths: two
+///    DISTINCT bodies both keyed `krate::go::S::m` (3925 and 1972 bytes; only
+///    the `impl` one contains the `Add`).  MEASURED byte-identically on the
+///    seam's own build AND on the pristine base, so this is PRE-EXISTING — the
+///    `{{extern}}` closure neither causes it nor closes it.  Renaming one `S`
+///    splits the four bodies into four distinct paths.
+///
+///    It is NOT inert.  Two consumer-level differentials, each one identifier
+///    apart from its control, MEASURED on both builds:
+///      * obligation COUNT — the aliased program reports 2 obligations (the
+///        extra one an `[assert] runtime-checked` carrying the absent-callee
+///        note) where the renamed control reports 1;
+///      * `#[trust::assume_total]` DONATION — the control's discharge row reads
+///        `solver trust-assumed-total reported Proved without exact
+///        kernel/native proof authority`, and under the alias that same row
+///        reads `compiler retained the existing assertion because the proof is
+///        not yet static`: the declared verdict is not spent.
+///
+///    Both shapes fail CLOSED — the alias COSTS credit rather than granting it,
+///    which is a lost recovery, itself a defect.  That is exactly what is
+///    claimed here and no more: TWO SHAPES MEASURED, no shape driven to a false
+///    proof.  It is NOT a claim that the class is safe.  The fail-OPEN direction
+///    of this same one-string-two-`DefId`s key is what the three witnesses at
+///    the top of this comment were, in three independent consumers, so treat a
+///    granting cross-namespace instance as reachable until someone measures
+///    otherwise.
+///
+///    Not closed here because the only rendering that separates the namespaces
+///    is a namespace tag on EVERY named segment — modules are `TypeNs` too, so
+///    every path in the identity space moves, including the ROOT+TAIL and
+///    LAST-SEGMENT matches enumerated on [`crate::safe_def_path_str`].  That
+///    blast radius is not measured by this change's evidence, and the seam's
+///    rule is that an unmeasured move is not shipped.
+///
+/// The two `CallKeyLedger`-based group decisions in
+/// `trust_verify::dyn_dispatch_reliance` and `static_str_write_fmt` are kept as
+/// belt: they are subset-monotone (they can only withhold credit) and they cover
+/// residual 2.
 pub(crate) fn direct_call_def_path<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -5685,6 +6384,8 @@ pub(crate) fn direct_call_def_path<'tcx>(
         def_id.is_local(),
         tcx.stable_crate_id(def_id.krate).as_u64(),
         ambiguous_callee,
+        trust_types::crate_name_wears_sysroot_spelling(callee_crate_name.as_str()),
+        is_real_sysroot_crate(tcx, def_id.krate),
     );
 
     // A concrete diagnostic path is still not an identity when one of its
@@ -5730,17 +6431,39 @@ fn disambiguate_generic_call_path(path: String, args_fingerprint: Option<Fingerp
     format!("{path}::<__trust_args@{lo:016x}{hi:016x}>")
 }
 
+/// Mint the [`trust_types::TRUST_UNAUTHENTICATED_CRATE_PATH_PREFIX`] stamp for a
+/// callee path, under BOTH producer rules.
+///
+/// The two rules are independent and neither implies the other:
+///
+/// * **rule 1, uniqueness** (`ambiguous_crate_name`, local-exempt) — two loaded
+///   crates render the same name, so the name picks neither;
+/// * **rule 2, identity** (`crate_name_wears_sysroot_spelling &&
+///   !crate_is_real_sysroot`, NOT local-exempt) — see
+///   [`impersonates_sysroot_crate`].
+///
+/// The decision itself lives in `trust_types::sysroot_identity_stamp_required`,
+/// which is where its truth table is unit-tested; this crate needs a full
+/// compiler build to run a test at all, so the rule was deliberately factored
+/// somewhere that stable cargo can falsify it.
 fn disambiguate_direct_call_path(
     path: String,
     is_local: bool,
     stable_crate_id: u64,
     ambiguous_crate_name: bool,
+    crate_name_wears_sysroot_spelling: bool,
+    crate_is_real_sysroot: bool,
 ) -> String {
-    if is_local || !ambiguous_crate_name {
-        path
-    } else {
-        format!("__trust_crate@{stable_crate_id:016x}::{path}")
-    }
+    trust_types::stamp_unauthenticated_crate_path(
+        path,
+        stable_crate_id,
+        trust_types::sysroot_identity_stamp_required(
+            is_local,
+            crate_name_wears_sysroot_spelling,
+            crate_is_real_sysroot,
+            ambiguous_crate_name,
+        ),
+    )
 }
 
 /// Remove every balanced trailing turbofish group while retaining the real
@@ -6325,22 +7048,82 @@ mod tests {
         assert!(!s("std::process::exit"));
     }
 
+    // Trust-Std: reaching `unreachable_unchecked` IS the violation, so the call is
+    // routed to the must-be-unreachable encoding (obligation-ADDING) instead of the
+    // `Opaque` bail that dropped the whole enclosing function. The TERMINATING
+    // diverging calls stay out: modeling those erases the continuation, which a
+    // string spelling may not authorize.
+    #[test]
+    fn is_ub_if_reached_diverging_call_admits_only_the_unreachable_family() {
+        use super::is_ub_if_reached_diverging_call as u;
+        assert!(u("core::hint::unreachable_unchecked"));
+        assert!(u("std::hint::unreachable_unchecked"));
+        assert!(u("core::intrinsics::unreachable"));
+        // Terminating, not UB-if-reached: still opaque/fail-closed.
+        assert!(!u("std::process::exit"));
+        assert!(!u("std::process::abort"));
+        assert!(!u("alloc::alloc::handle_alloc_error"));
+        // Neighbours that neither diverge nor are UB-on-reach.
+        assert!(!u("core::hint::black_box"));
+        assert!(!u("core::hint::assert_unchecked"));
+        assert!(!u("core::slice::<impl [T]>::get_unchecked"));
+        // A panic keeps its own classifier and its own wording.
+        assert!(!u("core::panicking::panic"));
+    }
+
+    /// Rule 2 (sysroot identity) at the callee renderer, BOTH states. The
+    /// `#![no_std]` exploit's measured facts — external, named `std`, not a real
+    /// sysroot crate, and UNIQUE — are refused by rule 1 alone and stamped by
+    /// rule 2. The controls pin that an honest sysroot callee and the real
+    /// sysroot crate under compilation are untouched.
+    #[test]
+    fn a_unique_sysroot_impersonator_is_stamped_by_identity_not_by_uniqueness() {
+        let path = "std::vec::Vec::<u8>::iter".to_string();
+        // Planted violation: rule 1 alone leaves this path bare. Assert it, so
+        // the AFTER line below cannot pass vacuously.
+        assert_eq!(
+            disambiguate_direct_call_path(path.clone(), false, 0x11, false, false, true),
+            path,
+            "planted violation is gone: rule 1 no longer passes the unique impersonator"
+        );
+        assert_eq!(
+            disambiguate_direct_call_path(path.clone(), false, 0x11, false, true, false),
+            "__trust_crate@0000000000000011::std::vec::Vec::<u8>::iter",
+        );
+        // The genuine sysroot callee in an ordinary graph: byte-identical.
+        assert_eq!(
+            disambiguate_direct_call_path(path.clone(), false, 0x11, false, true, true),
+            path,
+        );
+        // The real `std` being built calls its own items: local AND authenticated.
+        assert_eq!(
+            disambiguate_direct_call_path(path.clone(), true, 0x11, false, true, true),
+            path,
+        );
+        // A LOCAL crate that only calls itself `std` is stamped anyway — rule 2
+        // has no local exemption, so it cannot self-verify with sysroot grants.
+        assert_eq!(
+            disambiguate_direct_call_path(path.clone(), true, 0x11, false, true, false),
+            "__trust_crate@0000000000000011::std::vec::Vec::<u8>::iter",
+        );
+    }
+
     #[test]
     fn duplicate_crate_call_paths_are_injective_and_keep_the_real_suffix() {
         let path = "shared::contracted".to_string();
         assert_eq!(
-            disambiguate_direct_call_path(path.clone(), true, 0x11, true),
+            disambiguate_direct_call_path(path.clone(), true, 0x11, true, false, false),
             path,
             "local calls keep their call-graph identity"
         );
         assert_eq!(
-            disambiguate_direct_call_path(path.clone(), false, 0x11, false),
+            disambiguate_direct_call_path(path.clone(), false, 0x11, false, false, false),
             path,
             "unique external crates keep the stable diagnostic spelling"
         );
 
-        let first = disambiguate_direct_call_path(path.clone(), false, 0x11, true);
-        let second = disambiguate_direct_call_path(path.clone(), false, 0x22, true);
+        let first = disambiguate_direct_call_path(path.clone(), false, 0x11, true, false, false);
+        let second = disambiguate_direct_call_path(path.clone(), false, 0x22, true, false, false);
         assert_eq!(first, "__trust_crate@0000000000000011::shared::contracted");
         assert_eq!(second, "__trust_crate@0000000000000022::shared::contracted");
         assert_ne!(first, second, "dependency versions must not share contract-summary keys");
@@ -6411,7 +7194,22 @@ mod tests {
         assert!(a("std::alloc::handle_alloc_error"));
         assert!(a("alloc::alloc::__rust_alloc_error_handler"));
         assert!(a("alloc::alloc::__rdl_oom"));
-        // STD-ORIGIN GATE: a like-named user fn must NOT enter the class.
+        // `__rust_alloc_error_handler` is a FOREIGN import (`library/alloc/src/
+        // alloc.rs`, inside an `extern` block), so under `safe_def_path_str` the
+        // seam now spells it with the `{extern#N}` segment the pretty printer
+        // used to drop. This class GRANTS credit (it excuses the OOM
+        // continuation), so a spelling the tail match missed would be a LOST
+        // recovery, not a hole. The match is on the ROOT and the TAIL, and a
+        // ForeignMod segment is neither.
+        assert!(a("alloc::alloc::{extern#0}::__rust_alloc_error_handler"));
+        assert!(a("alloc::alloc::{extern#1}::__rust_alloc_error_handler"));
+        // The root test is POSITION-INDEPENDENT of the new middle segment: a
+        // non-matching root stays non-matching when `{extern#N}` is inserted.
+        // That is all this line pins. It is NOT an origin or provenance check —
+        // see the ROOT-SEGMENT NAME TEST note on `is_alloc_failure_abort_call`.
+        assert!(!a("my_crate::alloc::{extern#0}::__rust_alloc_error_handler"));
+        // Same, without the new segment: a like-named user fn under a
+        // non-matching root does not enter the class.
         assert!(!a("my_crate::alloc::handle_alloc_error"));
         // A genuine panic path must NOT be absorbed here (it stays a real obligation).
         assert!(!a("alloc::raw_vec::capacity_overflow"));
@@ -6927,7 +7725,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             }
 
             for (name, terminator) in synthetic_metadata_terminators() {
-                self.results.terminators.insert(name, convert_terminator(tcx, &terminator, None));
+                self.results.terminators.insert(name, convert_terminator(tcx, &terminator, None, None));
             }
 
             for item_id in tcx.hir_free_items() {
@@ -7594,7 +8392,10 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                 mir::UnwindAction::Cleanup(_) => "Cleanup",
             }
             .to_string();
-            Some((unwind_name, convert_terminator(tcx, term, Some(body.typing_env(tcx)))))
+            Some((
+                unwind_name,
+                convert_terminator(tcx, term, Some(&body.local_decls), Some(body.typing_env(tcx))),
+            ))
         })
     }
 
@@ -7605,7 +8406,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         body.basic_blocks.iter().find_map(|bb| {
             let terminator = bb.terminator();
             let Terminator::Call { args, .. } =
-                convert_terminator(tcx, terminator, Some(body.typing_env(tcx)))
+                convert_terminator(tcx, terminator, Some(&body.local_decls), Some(body.typing_env(tcx)))
             else {
                 return None;
             };

@@ -1529,6 +1529,7 @@ mod wrapping_identity_tests {
                 blocks: Vec::new(),
                 arg_count: 2,
                 return_ty,
+                datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),

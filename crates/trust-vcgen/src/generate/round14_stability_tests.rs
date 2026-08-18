@@ -15,6 +15,7 @@ fn func_with_param(ty: Ty) -> VerifiableFunction {
             blocks: vec![],
             arg_count: 1,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

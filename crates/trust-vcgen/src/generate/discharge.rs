@@ -42,6 +42,14 @@ pub(super) fn generate_vcs_with_discharge_impl(
     // function to Unknown. SOUNDNESS: DROP-ONLY.
     let _gen_work_scope = crate::gen_work_scope();
 
+    // Trust (BLOCKER 2 — callee effect summaries): install the MIR-derived callee
+    // write-sets for this whole entry so the obligation walk AND the
+    // abstract-interp pre-pass in `discharge_body_vcs` read the SAME call-havoc
+    // oracle. A forked oracle between the version MINT and the fact KILL is the
+    // one failure this lane must not introduce; an empty/absent scope is the
+    // pre-existing conservative behaviour.
+    let _write_sets = callee_write_set::enter_callee_write_sets(summaries);
+
     let all_vcs = generate_vcs_impl(func, summaries, hardened, box_deref_spans);
     discharge_body_vcs(func, all_vcs)
 }
@@ -286,6 +294,11 @@ pub(super) fn generate_vcs_with_discharge_and_summaries_configured_impl(
     // Resets on this outermost 0→1 entry; the nested calls share it. SOUNDNESS:
     // DROP-ONLY.
     let _gen_work_scope = crate::gen_work_scope();
+
+    // Trust (BLOCKER 2): the callsite-precondition lane below also consults
+    // `terminator_def_names`, so it must see the same refined call-havoc oracle
+    // as the body lane (see `generate_vcs_with_discharge_impl`).
+    let _write_sets = callee_write_set::enter_callee_write_sets(Some(summaries));
 
     let callsite_precondition_vcs = generate_callsite_precondition_vcs(func, summaries);
 
@@ -982,7 +995,11 @@ pub(super) fn is_aliasing_opaque_symbol_name(name: &str) -> bool {
 /// ("each occurrence an independent fresh symbol"). Splitting a shared symbol only REMOVES
 /// implied equalities ⇒ the obligation can only move SAT-ward ⇒ `certify_vc`'s UNSAT (discharge)
 /// set strictly shrinks ⇒ a previously-false discharge is killed, a genuine one is preserved.
-/// The opaque arms always mint `Sort::Int`, so the fresh leaf keeps that sort.
+/// The fresh leaf KEEPS THE LEAF'S OWN SORT: not every alias-prone opaque is `Sort::Int` — a
+/// `bool` const-generic (`ConstParam { width: 1, signed: false }`) is in this family and mints
+/// `Sort::Bool`, so the previous hardcoded `Sort::Int` handed the solver an ill-typed `And`/`Not`
+/// operand on the σ path. Sort is orthogonal to the argument above: renaming splits equalities
+/// whatever the sort is.
 pub(super) fn freshen_aliasing_opaque_occurrences(
     formula: &Formula,
     counter: &std::cell::Cell<u32>,
@@ -992,7 +1009,8 @@ pub(super) fn freshen_aliasing_opaque_occurrences(
     {
         let n = counter.get();
         counter.set(n + 1);
-        return Formula::var_owned(format!("{name}__r1occ{n}"), Sort::Int);
+        let sort = formula.var_sort().cloned().unwrap_or(Sort::Int);
+        return Formula::var_owned(format!("{name}__r1occ{n}"), sort);
     }
     formula.clone().map_children(&mut |child| freshen_aliasing_opaque_occurrences(&child, counter))
 }

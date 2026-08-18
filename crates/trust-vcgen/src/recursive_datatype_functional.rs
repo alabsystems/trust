@@ -196,12 +196,15 @@ pub(crate) fn involves_modeled_datatype(func: &VerifiableFunction) -> bool {
 /// The datatype the function's match scrutinee carries: the first parameter
 /// whose (indirection-peeled) type is a FULL datatype (non-empty variants).
 fn scrutinee_datatype(func: &VerifiableFunction) -> Option<Ty> {
-    (1..=func.body.arg_count).filter_map(|i| local_ty(func, i)).find_map(
-        |ty| match peel_indirection(ty) {
-            dt @ Ty::Datatype { variants, .. } if !variants.is_empty() => Some(dt.clone()),
-            _ => None,
-        },
-    )
+    (1..=func.body.arg_count).filter_map(|i| local_ty(func, i)).find_map(|ty| {
+        // R0: the scrutinee is a PARAMETER, an outermost position. Widen a bare
+        // marker through the body's explicit table before demanding structure;
+        // the inline arm still wins when the definition is present, and a marker
+        // the table does not define is returned untouched and declines here.
+        let dt = crate::resolved_ty(func, peel_indirection(ty));
+        matches!(&*dt, Ty::Datatype { variants, .. } if !variants.is_empty())
+            .then(|| dt.into_owned())
+    })
 }
 
 /// Peel reference / raw-pointer indirection (the modeled datatype erases the
@@ -222,7 +225,12 @@ pub(crate) fn param_binders(func: &VerifiableFunction) -> Vec<(String, Sort)> {
             let ty = local_ty(func, i)?;
             Some((
                 crate::place_to_var_name(func, &Place::local(i)),
-                crate::sort_for_ty(peel_indirection(ty)),
+                // R0: a parameter is an OUTERMOST nominal position — exactly where
+                // the withdrawn root-relative rule used to inline the definition.
+                // Under markers-everywhere it is spelled bare, so the binder's sort
+                // must be widened through the body's table or `declare-fun` would
+                // reference a sort no `declare-datatype` ever declared.
+                crate::sort_for_ty_in(func, peel_indirection(ty)),
             ))
         })
         .collect()
@@ -298,7 +306,8 @@ fn walk(
             let Some(matched_ty) = local_ty(func, matched.local) else {
                 return false;
             };
-            let dt = peel_indirection(matched_ty).clone();
+            // R0: widen a bare marker through the body's own table (inline first).
+            let dt = crate::resolved_ty(func, peel_indirection(matched_ty)).into_owned();
             let Ty::Datatype { variants, .. } = &dt else {
                 return false;
             };
@@ -364,7 +373,7 @@ fn walk(
             // Fresh IH result variable standing for the recursive call's output.
             let ih_name = format!("__ih{ih_counter}");
             *ih_counter += 1;
-            let ret_sort = crate::sort_for_ty(peel_indirection(&func.body.return_ty));
+            let ret_sort = crate::sort_for_ty_in(func, peel_indirection(&func.body.return_ty));
             let ih_var = Formula::var_owned(ih_name.clone(), ret_sort.clone());
             state.binders.push((ih_name, ret_sort));
             state.store.insert(dest.local, ih_var.clone());
@@ -458,7 +467,9 @@ fn aggregate_to_ctor(
     variant: usize,
     ops: &[Operand],
 ) -> Option<Formula> {
-    let dest_ty = peel_indirection(local_ty(func, dest_local)?);
+    // R0: the destination local's own datatype — an outermost position, so it is
+    // spelled bare under markers-everywhere. Inline definition first, table second.
+    let dest_ty = &*crate::resolved_ty(func, peel_indirection(local_ty(func, dest_local)?));
     let Ty::Datatype { variants, .. } = dest_ty else {
         return None;
     };
@@ -501,7 +512,11 @@ pub(crate) fn resolve_place(
     }
     let mut term =
         state.store.get(&place.local).cloned().or_else(|| param_var(func, place.local))?;
-    let mut base_ty = peel_indirection(local_ty(func, place.local)?).clone();
+    // R0: resolve at every assignment of the walk accumulator — the base local AND
+    // each datatype-typed field stepped into — so a chain through a recursive child
+    // keeps typing. Shallow (one level per step), so it terminates.
+    let mut base_ty =
+        crate::resolved_ty(func, peel_indirection(local_ty(func, place.local)?)).into_owned();
     let mut pending_variant: Option<usize> = None;
 
     for proj in &place.projections {
@@ -533,7 +548,7 @@ pub(crate) fn resolve_place(
                         arg: Box::new(term),
                     };
                 }
-                base_ty = peel_indirection(fty).clone();
+                base_ty = crate::resolved_ty(func, peel_indirection(fty)).into_owned();
             }
             _ => return None,
         }
@@ -548,7 +563,8 @@ pub(crate) fn param_var(func: &VerifiableFunction, local: usize) -> Option<Formu
     let ty = local_ty(func, local)?;
     Some(Formula::var_owned(
         crate::place_to_var_name(func, &Place::local(local)),
-        crate::sort_for_ty(peel_indirection(ty)),
+        // R0: definitional position — see `param_binders`.
+        crate::sort_for_ty_in(func, peel_indirection(ty)),
     ))
 }
 
@@ -759,6 +775,7 @@ mod tests {
             ],
             arg_count: 1,
             return_ty: level_dt(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "mirror".to_string(),
@@ -935,5 +952,95 @@ mod tests {
             recursive_datatype_functional_vcs(&f).is_empty(),
             "a bundle that does not cover every constructor must not be emitted"
         );
+    }
+
+    /// R0 — the whole point, measured on the REAL extracted fixture.
+    ///
+    /// Rewrite every `Ty::Datatype` in `mirror`'s locals and return slot to the
+    /// BARE marker spelling, which is what markers-everywhere emits: the root
+    /// parameter, the return slot and the recursive-call destination all stop
+    /// carrying their own definition. Then assert the three things that together
+    /// say the restructure is a repair and not a capability trade:
+    ///
+    ///   1. WITHOUT the table the lane emits NOTHING. This is what makes the
+    ///      widening safe to apply unconditionally — a marker with no explicit
+    ///      definition still declines, exactly as it does today. It is also the
+    ///      proof that deleting the root special case ALONE would have been a
+    ///      capability loss: `scrutinee_datatype` requires a non-empty variant
+    ///      list on a PARAMETER, and there is no longer one anywhere.
+    ///   2. A table that defines some OTHER datatype does not help. Resolution is
+    ///      keyed by the marker's own name, never a scan for whatever definition
+    ///      happens to be in scope — the withdrawn fail-open design would pass
+    ///      test 1 and fail this one.
+    ///   3. WITH its own entry the lane emits the bundle it emitted from the
+    ///      inline definition — VC for VC, formula for formula, sort for sort.
+    ///      Equality (not merely "3 VCs") is the assertion that matters: it says
+    ///      the two spellings of `level::Level` now MEAN the same thing, which is
+    ///      exactly the asymmetry R0 names.
+    #[test]
+    fn markers_everywhere_declines_until_the_table_defines_the_cut_point() {
+        use trust_types::DatatypeDefs;
+
+        /// The markers-everywhere spelling: every datatype occurrence, at every
+        /// depth, reduced to its by-name marker.
+        fn strip(ty: &mut Ty) {
+            match ty {
+                Ty::Datatype { variants, .. } => variants.clear(),
+                Ty::Ref { inner, .. } => strip(inner),
+                Ty::RawPtr { pointee, .. } => strip(pointee),
+                _ => {}
+            }
+        }
+        fn markers_everywhere(mut f: VerifiableFunction) -> VerifiableFunction {
+            for l in &mut f.body.locals {
+                strip(&mut l.ty);
+            }
+            strip(&mut f.body.return_ty);
+            f
+        }
+
+        let inline = recursive_datatype_functional_vcs(&extracted_mirror_func(identity_post()));
+        assert_eq!(inline.len(), 3, "baseline: the inline definition emits the bundle");
+
+        let mut f = markers_everywhere(extracted_mirror_func(identity_post()));
+        assert!(
+            f.body.locals.iter().all(|l| !matches!(&l.ty, Ty::Datatype { variants, .. } if !variants.is_empty())),
+            "the fixture really is markers-everywhere",
+        );
+
+        // 1. No table — decline.
+        assert!(
+            recursive_datatype_functional_vcs(&f).is_empty(),
+            "a cut point spelled bare everywhere, with no out-of-band definition, \
+             must emit nothing — markers alone are a capability loss",
+        );
+
+        // 2. Another datatype's entry — still decline.
+        f.body.datatype_defs = DatatypeDefs::from([(
+            "other::Other".to_string(),
+            Ty::Datatype {
+                name: "other::Other".to_string(),
+                variants: vec![("Only".to_string(), vec![])],
+            },
+        )]);
+        assert!(
+            recursive_datatype_functional_vcs(&f).is_empty(),
+            "a definition filed under another name must not resolve this marker",
+        );
+
+        // 3. Its own entry — the identical bundle.
+        let def = level_dt();
+        let Ty::Datatype { name, .. } = &def else { unreachable!("level_dt") };
+        f.body.datatype_defs = DatatypeDefs::from([(name.clone(), def.clone())]);
+        let resolved = recursive_datatype_functional_vcs(&f);
+        assert_eq!(resolved.len(), inline.len(), "same bundle size, got {resolved:#?}");
+        for (a, b) in inline.iter().zip(&resolved) {
+            assert_eq!(a.kind, b.kind, "VC kinds must match");
+            assert_eq!(
+                a.formula, b.formula,
+                "the two spellings of one datatype must produce the SAME formula — \
+                 including every sort, or the restructure has only moved R0",
+            );
+        }
     }
 }

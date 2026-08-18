@@ -795,6 +795,76 @@ fn coroutine_protocol_premise_is_visible_and_cannot_pass_strict_or_memory_safe_g
     assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 1, memory_safe_counts), Fail);
 }
 
+// Trust (coroutine resume-state contract): the published exported-contract row
+// is CONDITIONAL evidence — counted with the assumption ledger (never proof
+// credit), rendered under its own kind — and both defect directions fail
+// closed: a favorable-outcome claim and a shape mismatch each count as a
+// genuine unknown.
+#[test]
+fn coroutine_resume_contract_row_counts_as_conditional_evidence_never_proof() {
+    use GateDecision::*;
+
+    let well_formed = || {
+        let mut row = gate_row(
+            trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND,
+            VerificationOutcome::Unknown,
+            "",
+        );
+        row.backend = trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_SOLVER.to_string();
+        row.reason =
+            Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON.to_string());
+        row.message = trust_types::assumption::coroutine_resume_contract_row_description(&[0]);
+        row
+    };
+
+    // Well-formed: conditional evidence in the `assumed` bucket, zero defects,
+    // and never a strict/certify pass on its own.
+    let results = [well_formed()];
+    let (counts, defects) = partition_outcome_counts(&results);
+    assert!(defects.is_empty(), "well-formed contract row is not a defect: {defects:?}");
+    assert_eq!(counts.assumed, 1);
+    assert_eq!(counts.unknown, 0);
+    assert_eq!(counts.proved, 0, "a published contract must never mint proof credit");
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Advisory, 0, counts),
+        ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 }
+    );
+    assert!(
+        !matches!(
+            evaluate_verification_gate(GateLane::Strict, 0, counts),
+            GateDecision::Pass
+        ),
+        "an exported contract is verified-modulo-callers, never a bare strict pass"
+    );
+
+    // Defect direction 1: a favorable-outcome claim is laundering — unknown +
+    // loud defect (the correction (1e) pin: a defective row must not green).
+    let mut launder = well_formed();
+    launder.outcome = VerificationOutcome::Proved;
+    let (counts, defects) = partition_outcome_counts(&[launder]);
+    assert_eq!(counts.unknown, 1);
+    assert_eq!(counts.assumed, 0);
+    assert_eq!(defects.len(), 1);
+
+    // Defect direction 2: the kind WITHOUT the compiler's exact shape (here:
+    // missing the pinned reason — i.e. "lacking bridge evidence") is a defect.
+    let mut bare_kind = well_formed();
+    bare_kind.reason = None;
+    let (counts, defects) = partition_outcome_counts(&[bare_kind]);
+    assert_eq!(counts.unknown, 1);
+    assert_eq!(counts.assumed, 0);
+    assert_eq!(defects.len(), 1);
+
+    // Defect direction 3: a live-state set naming a reserved terminal state
+    // (RETURNED=1) fails the shared trust-types parser — defect, not evidence.
+    let mut poisoned = well_formed();
+    poisoned.message = poisoned.message.replace("{0}", "{0, 1}");
+    let (counts, defects) = partition_outcome_counts(&[poisoned]);
+    assert_eq!(counts.unknown, 1);
+    assert_eq!(counts.assumed, 0);
+    assert_eq!(defects.len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Trust (assertion-grade coverage, roadmap §4.1): a run with
 // `processed != eligible` must never read as a pass; an absent coverage row

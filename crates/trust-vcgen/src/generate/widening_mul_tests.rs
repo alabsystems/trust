@@ -45,6 +45,7 @@ fn widening_mul_fn(src: Ty, dst: Ty) -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: dst,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

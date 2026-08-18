@@ -665,8 +665,17 @@ fn prepare_emit_publication(target: &EmitPublicationTarget) -> Result<PreparedPu
 /// copy that had already drifted (it missed `AssignOp(unbound local)` and still listed the
 /// emitter-less `Borrow(&mut unbound local)`). That copy now calls [`is_cascade_tag`], so the
 /// pinning tests below govern every classification the coverage program ranks off.
-pub const CASCADE_TAGS: [&str; 3] =
-    ["VarRef(unbound)", "Borrow(unbound local)", "AssignOp(unbound local)"];
+/// `Borrow(inner unlowered)` (2026-08-11) is the fourth, and it was carved OUT of
+/// `Borrow(non-local place)`: that name previously covered three unrelated sites, one of which
+/// (`lib.rs`, the `None` arm after `lower_expr(inner)` failed) is a pure echo of a leaf the inner
+/// expression already recorded. Sharing a name with two genuine refusals made the census
+/// histogram unplannable — summing one string over three meanings measures nothing.
+pub const CASCADE_TAGS: [&str; 4] = [
+    "VarRef(unbound)",
+    "Borrow(unbound local)",
+    "AssignOp(unbound local)",
+    "Borrow(inner unlowered)",
+];
 
 /// Trust: PRIMARY vs CASCADE classification for one collect-all tag. See [`CASCADE_TAGS`].
 /// The single classifier — both the coverage recorder ([`record`]) and the `mir_built` hook's
@@ -916,7 +925,12 @@ pub fn record(
     // `flip_registry::record_green` minted for this body (same pure function, same input), or
     // the flip event and the artifact row cannot be matched. A refusal (no single function)
     // records `None`: such a body was never green-recorded, so there is no flip to match.
-    let lineage = crate::lineage::body_lineage_digest(&lowered.module, &lowered.callees).ok();
+    let lineage = crate::lineage::body_lineage_digest(
+        crate::lineage::DefinitionIdentity::from_def_id(tcx, def.to_def_id()),
+        &lowered.module,
+        &lowered.callees,
+    )
+    .ok();
 
     let Lowered {
         mut module,
@@ -963,7 +977,7 @@ pub fn record(
         // does not describe.
         //
         // WHERE THE TWO GATES DIVERGE, explicitly, because the flip's stated reason
-        // (`flip_registry::thin_reborrow_allows_flip`: "the producer holds no record it could hand
+        // (`flip_registry::thin_reborrows_allow_flip`: "the producer holds no record it could hand
         // the flip about where the pointer came from") would, taken alone, argue for refusing here
         // too — a wave-TR body typically carries a call, hence is `deferred`, hence is what the
         // crate-seam differential's step 0 executes, and that is precisely the consequence cited
@@ -975,13 +989,23 @@ pub fn record(
         // exclusion here. If that turns out to be wrong the correction is to gate the splice too —
         // NOT to weaken the flip refusal, which is the conservative side of the same question.
         //
-        // Bound explicitly rather than via `..` for the same reason `opaque_collapse` is: a future
-        // field must not slip past this destructure.
-        thin_reborrow: _thin_reborrow,
+        // UNCHANGED by the provenance ledger. The field is now a `Vec<ThinReborrow>` rather than a
+        // `bool`, and the flip gate now CERTIFIES one of its classes instead of refusing all of
+        // them — but the reason this file ignores it is about MISREPRESENTATION, which is
+        // orthogonal to provenance, so it neither gains nor loses force. The binding is still
+        // explicit for the same reason `opaque_collapse` is: a future field must not slip past
+        // this destructure.
+        thin_reborrows: _thin_reborrows,
         // Trust (wave-EF): the register_enum decline-reason ledger. Empty unless
         // `TRUST_ENUM_DECLINE_CENSUS=1`; carried to coverage BESIDE `unsupported`, never
         // inside it. Bound explicitly for the same reason `opaque_collapse` is.
         enum_declines: lowered_enum_declines,
+        // Trust (enum-switch provenance): consumed by `to_mir`'s wave-V reshape via the
+        // differential and the flip registry, NOT by crate assembly — the assembled module is the
+        // producer's IR verbatim, and this set describes how that IR maps BACK to built MIR. Bound
+        // explicitly for the same reason `opaque_collapse` is: a future field must not slip past
+        // this destructure.
+        enum_fold_switch_blocks: _enum_fold_switch_blocks,
     } = lowered;
     let deferred = lowered_unsupported.is_empty() && pending_consts.is_empty() && contains_call;
     // Trust: `functions[0]` is THE body function. The producer maintains that: both
@@ -1852,6 +1876,14 @@ pub fn finalize_and_dump(tcx: TyCtxt<'_>) -> FinalizeSummary {
         }
         for (class, n) in by_class {
             tracing::debug!(class = %class, n, "trust-ir-lower: module validation error");
+        }
+        // Trust (#197 follow-up): the class histogram is what the scorecard ratchets, but a class
+        // name cannot localize a defect — every item in this campaign started by re-deriving which
+        // FUNCTION and which TYPES the error was about, by hand. This event carries the error's own
+        // Debug rendering (which names the ids and types), on a DISTINCT message so no scorecard
+        // regex can pick it up as a class row. Same `tracing::enabled!` guard as the walk itself.
+        for e in &verrors {
+            tracing::debug!(detail = ?e, "trust-ir-lower: module validation detail");
         }
         tracing::debug!(
             total = verrors.len(),
@@ -3257,7 +3289,7 @@ enum CalleeResolution {
     /// sites that disagree mint DISTINCT declarations rather than one whose signature contradicts
     /// half its callers — pre-monomorphization, one `def_path` at two instantiations genuinely is
     /// two functions, and names are display identity only (resolution is by `FuncId`).
-    Decl { key: String, name: String, is_extern: bool, ret: Option<Ty> },
+    Decl { key: String, name: String, is_extern: bool, ret: Option<Ty>, rust_abi: bool },
 }
 
 struct Assembled {
@@ -3343,16 +3375,108 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
     // remap precondition (resolvability, positional ids, nested-first ordering), so a `None`
     // from `prepare_body_tables` is a defensive tripwire (body simply not admitted, recorded in
     // coverage as un-spliced), never a silent mis-emit.
+    //
+    // Trust (#197 item 1): pass 1 is THREE steps, not one — collect candidates, refuse the
+    // result-arity-incoherent ones TO A FIXPOINT, then assign dense ids. The refusal has to be
+    // here for the reason stated above: it is only sound before a `FuncId` exists. Pass 2 is the
+    // intuitive site (it already rewrites callees) and is WRONG — a late refusal punches a hole in
+    // the dense id space, mis-numbers the declarations minted at `assigned.len() + decls.len()`,
+    // and dangles every `Local` edge, trading 66 arity errors for a worse dangling-callee class.
     let mut module = Module::new(crate_name.to_string());
     let mut assigned: Vec<(u32, FuncId)> = Vec::new();
     let mut prepared: Vec<(u32, Function, FuncTy, BodyMaps)> = Vec::new();
-    for r in records {
+    let mut candidates: Vec<(usize, u32, Function, FuncTy, BodyMaps)> = Vec::new();
+    for (record_index, r) in records.iter().enumerate() {
         if splice_ok(r, records) {
             if let Some((func, func_ty, maps)) = prepare_body_tables(r, &mut module) {
-                assigned.push((r.def_index, FuncId::new(assigned.len() as u32)));
-                prepared.push((r.def_index, func, func_ty, maps));
+                // Trust (L1, artifact-lineage attestation): the CANONICAL-REMAPPING certificate,
+                // structure half — `crate::remap_certificate`. The lineage digest makes the
+                // artifact row and the flip event name ONE pre-assembly object; it says nothing
+                // about whether the function that object BECAME still has that object's shape.
+                // The remap is allowed to rewrite ids, `Ty`s and span file ids, and nothing
+                // else, so the block set, the instruction sequence, the SSA numbering, the
+                // opcodes, the proof annotations and the source line/column must survive it
+                // exactly. A body whose remap moved any of those is REFUSED here — not
+                // spliced, and recorded in coverage as un-spliced, exactly like a `None` from
+                // `prepare_body_tables` above.
+                //
+                // It runs HERE, in pass 1, for the reason this pass exists: refusal is only
+                // sound before a `FuncId` is assigned (see the pass-1 comment above). Pass 2
+                // writes only through `*callee` / `*sig` / `*fid` / `*ty` bindings taken from
+                // `match &mut node.inst` arms — it never assigns a `node.inst` or a `Vec` — so
+                // it cannot violate what is certified here. That argument is the whole of
+                // pass 2's coverage; if it stops holding, this certificate must be re-sited.
+                //
+                // `r.function` is the pre-assembly function (`Some`, since `splice_ok` passed).
+                if let Some(before) = r.function.as_ref() {
+                    if crate::remap_certificate::certify_remap_shape(before, &func).is_err() {
+                        continue;
+                    }
+                }
+                candidates.push((record_index, r.def_index, func, func_ty, maps));
             }
         }
+    }
+    // Trust (#197 item 1): refuse to splice a body that binds a call result the callee's
+    // DECLARATION cannot carry. FIXPOINT, because refusal is contagious: dropping body B turns
+    // every `CalleeResolution::Local(B)` edge into a `local-unlowered:` Decl, whose `decl_ret`
+    // can newly be `None` — so a caller that was coherent against the spliced B can become
+    // incoherent against the declared B. One pass would leave those behind.
+    let mut live: Vec<bool> = vec![true; candidates.len()];
+    loop {
+        let live_defs: std::collections::BTreeSet<u32> = candidates
+            .iter()
+            .zip(live.iter())
+            .filter(|(_, keep)| **keep)
+            .map(|(c, _)| c.1)
+            .collect();
+        // Only Some-ness is read by the predicate (a `Local` edge links to a spliced body, whose
+        // signature carries a real return type), so a placeholder id is exact here.
+        let probe = |def_index: u32| -> Option<FuncId> {
+            live_defs.contains(&def_index).then(|| FuncId::new(0))
+        };
+        // Declared param count of a LIVE candidate, by def_index. A refused body is not spliced,
+        // so it declares nothing — `0` is the honest answer for it, and it is also what keeps the
+        // two predicates converging together in one fixpoint rather than fighting.
+        //
+        // SNAPSHOTTED, not computed on demand: the refusal loop below mutates `live`, so a closure
+        // that read it would hold an immutable borrow across the mutation. Both this map and
+        // `live_defs` are therefore taken from the SAME start-of-iteration state, which is also
+        // what makes the iteration well-defined — every predicate in one round sees one world.
+        let live_params: std::collections::BTreeMap<u32, usize> = candidates
+            .iter()
+            .zip(live.iter())
+            .filter(|(_, keep)| **keep)
+            .map(|(c, _)| (c.1, c.3.params.len()))
+            .collect();
+        let params_of = |def_index: u32| -> usize { live_params.get(&def_index).copied().unwrap_or(0) };
+        let mut changed = false;
+        for i in 0..candidates.len() {
+            if !live[i] {
+                continue;
+            }
+            let (record_index, _, func, func_ty, maps) = &candidates[i];
+            let r = &records[*record_index];
+            if call_result_arity_incoherent(r, func, maps, &probe)
+                || place_carrier_reaches_real_params(r, func, maps, &probe, &params_of)
+                || signature_is_identity_spelled(&module, func_ty)
+            {
+                live[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (i, c) in candidates.into_iter().enumerate() {
+        if !live[i] {
+            continue;
+        }
+        // `records` is sorted+deduped by def_index and candidates preserve that order, so
+        // `assigned` stays sorted and the `binary_search_by_key` lookups below remain valid.
+        assigned.push((c.1, FuncId::new(assigned.len() as u32)));
+        prepared.push((c.1, c.2, c.3, c.4));
     }
     let lookup = |def_index: u32| -> Option<FuncId> {
         assigned.binary_search_by_key(&def_index, |(d, _)| *d).ok().map(|i| assigned[i].1)
@@ -3361,7 +3485,7 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
     // ---- Pass 2: splice functions, rewriting intra-crate callee FuncIds. ----
     // Fail-closed declarations: (dedup key, id, display name), first-encounter order.
     // Trust (#178): `(dedup key, id, display name, agreed table-free return type)`.
-    let mut decls: Vec<(String, FuncId, String, Option<Ty>)> = Vec::new();
+    let mut decls: Vec<(String, FuncId, String, Option<Ty>, bool)> = Vec::new();
     let mut rows: Vec<CoverageRow> = Vec::new();
 
     for r in records {
@@ -3414,20 +3538,56 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
             BodyKind::StaticInit => format!("{}::{{static-init}}", r.def_path),
         };
         f.ty = intern_func_ty(&mut module, func_ty.clone());
+        // Trust (#180): a SPLICED body is a Rust function, so say so. `Function::new` defaults
+        // `calling_conv` to `C`, and leaving it there would make every call from this body to a
+        // now-correctly-Rust-ABI declaration read as a CROSS-CONVENTION CALL EDGE
+        // (`Module::first_ffi_boundary`'s second scan) — trading one false FFI boundary for
+        // another. The declaration and definition halves have to move together.
+        f.calling_conv = trust_ir::CallingConv::Rust;
         // (EnumDefs/StructDefs/types were interned and every embedded `EnumId`/`StructId`/`TyId`
         // remapped in pass 1 — `prepare_body_tables`; `f`/`func_ty` here are the pre-remapped
         // clones.)
 
         for block in &mut f.blocks {
             for node in &mut block.body {
+                // Trust (#197b): the arity THIS instruction declares. MANDATORY companion to
+                // #197a, not a refinement of it. `validate_instruction_result_arities` compares
+                // the callee declaration's `returns.len()` against `node.results.len()`, so a
+                // declaration minted from a site binding a DIFFERENT number of results must not
+                // carry a return type — and must key separately, exactly as `ret_key` already
+                // splits by TYPE.
+                //
+                // The hazard is measured, not hypothetical. In
+                // tests/ui/threads-sendsync/task-comm-6.rs one `FuncId` covers `Result::unwrap`
+                // at two instantiations: `Result<(), SendError<isize>>::unwrap()` (4 sites, bind
+                // 0 results) and `Result<isize, RecvError>::unwrap()` (4 sites, bind 1). Because
+                // `emit_call` returns early on `is_never()`/unit BEFORE its recording block while
+                // the value site still writes back to every entry sharing the `func_id`, the unit
+                // entry ends up carrying `Some(Isize)` — order-dependently. Keying on unanimity
+                // ALONE would therefore move those 4 errors to their mirror rather than clear
+                // them. Corpus census: 178 `expected 0` errors, exactly 2 mixed-arity decls,
+                // 5 occurrences.
+                let nres = node.results.len();
                 match &mut node.inst {
                     Inst::Call { callee, .. } => match resolve_callee(r, *callee, &lookup, body_maps) {
                         CalleeResolution::Local(id) => {
                             *callee = id;
                             row.calls_resolved += 1;
                         }
-                        CalleeResolution::Decl { key, name, is_extern, ret } => {
-                            *callee = decl_id(&mut decls, assigned.len(), key, name, ret);
+                        CalleeResolution::Decl { key, name, is_extern, ret, rust_abi } => {
+                            // A declaration's `returns` must agree with what THIS site binds.
+                            // Disagreement splits the declaration rather than silently picking
+                            // one site's view; `nres` joins the key so the split is stable.
+                            // `(None, 1)` is the UNFIXABLE case — an opaque/RPIT/async return
+                            // `map_ty` declined, so the decl honestly has no type while the site
+                            // binds one. Splitting its key would change nothing, so leave those
+                            // byte-identical; only a decl that DOES carry a type and meets a site
+                            // that binds a different count needs the split.
+                            let (key, ret) = match (&ret, nres) {
+                                (Some(_), n) if n != 1 => (format!("{key}|nres:{n}"), None),
+                                _ => (key, ret),
+                            };
+                            *callee = decl_id(&mut decls, assigned.len(), key, name, ret, rust_abi);
                             if is_extern {
                                 row.calls_extern += 1;
                             } else {
@@ -3440,7 +3600,16 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
                     // immutable record (`body_sig_ok`), so the lookup succeeds; the guard is
                     // shape-preserving, never a default.
                     Inst::CallIndirect { sig, .. } => {
+                        // Trust (#184 follow-on): REMAP the body-table signature before interning
+                        // it. It used to be re-interned raw, which was sound only because
+                        // `body_sig_ok` required every param/return to be table-free — the same
+                        // wall that confined declaration returns. With `BodyMaps` in hand the
+                        // signature can carry `Ty::Struct`/`Ty::Enum` correctly, so the wall comes
+                        // down. A `None` (dangling or not-yet-interned id) declines the body.
                         if let Some(ft) = r.func_types.get(sig.as_usize()).cloned() {
+                            let Some(ft) = remap_func_ty(&ft, body_maps) else {
+                                continue;
+                            };
                             *sig = intern_func_ty(&mut module, ft);
                         }
                     }
@@ -3452,7 +3621,12 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
                     Inst::Const { ty, value } => {
                         if let Constant::FnDef(fid) = value {
                             if let Ty::Func(sig) = ty {
+                                // Trust (#184 follow-on): same remap as the CallIndirect arm — a
+                                // reified fn-pointer constant's signature was also re-interned raw.
                                 if let Some(ft) = r.func_types.get(sig.as_usize()).cloned() {
+                                    let Some(ft) = remap_func_ty(&ft, body_maps) else {
+                                        continue;
+                                    };
                                     *sig = intern_func_ty(&mut module, ft);
                                 }
                             }
@@ -3461,8 +3635,8 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
                                     *fid = id;
                                     row.calls_resolved += 1;
                                 }
-                                CalleeResolution::Decl { key, name, is_extern, ret } => {
-                                    *fid = decl_id(&mut decls, assigned.len(), key, name, ret);
+                                CalleeResolution::Decl { key, name, is_extern, ret, rust_abi } => {
+                                    *fid = decl_id(&mut decls, assigned.len(), key, name, ret, rust_abi);
                                     if is_extern {
                                         row.calls_extern += 1;
                                     } else {
@@ -3503,7 +3677,7 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
         // Where the call sites agreed on a table-free result type, spell it. Where they did not,
         // keep the empty `returns` — honest for a callee no site takes a value from, and still
         // the old behavior for everything this lane cannot type.
-        for (_key, id, name, ret) in &decls {
+        for (_key, id, name, ret, rust_abi) in &decls {
             let sig = intern_func_ty(
                 &mut module,
                 FuncTy {
@@ -3515,6 +3689,12 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
             let mut d = Function::new(*id, name.clone(), sig, BlockId::new(0))
                 .with_producer(trust_ir::Producer::TRust);
             d.linkage = Linkage::External;
+            // Trust (#180): state the callee's REAL ABI. The `C` default was a false claim for a
+            // Rust function, and it made the repr(Rust) foreign-boundary check fire on ordinary
+            // Rust cross-crate calls.
+            if *rust_abi {
+                d.calling_conv = trust_ir::CallingConv::Rust;
+            }
             module.add_function(d);
         }
     }
@@ -3523,6 +3703,220 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
     let spliced = rows.iter().filter(|r| r.spliced).count();
 
     Assembled { module, coverage_rows: rows, lowered, spliced, declarations: decls.len(), assigned }
+}
+
+/// Trust (#197 item 3b, R2): does `ty` reach a struct the assembled module could not LAY OUT?
+///
+/// A `StructDef` with no `size`/`align` is one `map_ty` declined to lay out, which in practice
+/// means an IDENTITY or UNREVEALED spelling — `S<T>` before instantiation, `Foo<<Bar as
+/// Trait>::Assoc>` before the projection is revealed. Its concrete twin is a SEPARATE
+/// `StructDef` with a real layout, because `map_ty` interns per SPELLING: `S<T>` is `struct.1`
+/// and `S<i32>` is `struct.3`, and nothing in the module records that they denote one type.
+///
+/// Recursive with a visited set: the outer struct is the one that lacks a layout in every
+/// measured case, but a layout-less struct can also sit behind a reference or inside another
+/// struct's fields, and a self-referential `Box` shape would otherwise loop.
+fn ty_reaches_unlaid_struct(module: &Module, ty: &Ty, seen: &mut std::collections::BTreeSet<u32>) -> bool {
+    match ty {
+        Ty::Struct(sid) => {
+            if !seen.insert(sid.index()) {
+                return false;
+            }
+            let Some(sd) = module.structs.iter().find(|s| s.id == *sid) else {
+                // Unresolvable id: not this predicate's question — `splice_ok`'s remap
+                // preconditions already refuse a body with a dangling struct reference.
+                return false;
+            };
+            if sd.size.is_none() || sd.align.is_none() {
+                return true;
+            }
+            sd.fields.iter().any(|f| ty_reaches_unlaid_struct(module, &f.ty, seen))
+        }
+        Ty::Ref(inner) | Ty::RefMut(inner) | Ty::PtrConst(inner) | Ty::PtrMut(inner)
+        | Ty::Rc(inner) => ty_reaches_unlaid_struct(module, inner, seen),
+        Ty::Array(_, _) | Ty::Tuple(_) => false,
+        _ => false,
+    }
+}
+
+/// Trust (#197 item 3b, R2): is this prepared signature an IDENTITY spelling rather than a
+/// monomorphic claim?
+///
+/// THE DEFECT. A spliced `Function`'s signature is a claim about a concrete callable. When the
+/// body was lowered at its IDENTITY instantiation the signature carries the generic spelling,
+/// and a monomorphic caller then passes the CONCRETE one — two `StructId`s for one type:
+///
+///   CallArgTypeMismatch { callee: "twice", expected: "struct.1", actual: "struct.3" }
+///   struct @S<T>   { struct.0 }                id=1   (no size — identity)
+///   struct @S<i32> { struct.2 } size=0 align=0 id=3   (concrete)
+///
+/// and the same shape unrevealed-vs-revealed for TAIT:
+///
+///   ReturnTypeMismatch { expected: "struct.1", actual: "struct.3" }
+///   struct @Foo<<Bar as Trait>::Assoc> { .. }           id=1   (no size — unrevealed)
+///   struct @Foo<()>                    { .. } size=0    id=3   (revealed)
+///
+/// Measured: 7 CATM + 4 RTM, the entire residue after items 1 and 3.
+///
+/// THIS IS WAVE-20's RULE, one step further out. wave-20 already refuses to LINK a forced-havoc
+/// (generic) call site — "linking a polymorphic call to the callee's identity-lowered body is an
+/// identity lie". These edges are the ones that rule misses: the SITE is concrete, so nothing
+/// marks it havoc, but the CALLEE's spliced signature is still identity-spelled. Refusing the
+/// callee turns the edge into an honest declaration whose return comes from the ledger at the
+/// concrete site.
+///
+/// WHY LAYOUT-LESSNESS IS THE RIGHT SIGNAL, and not a proxy for one. `map_ty` gives a struct a
+/// layout exactly when it could compute one, which is exactly when the type is monomorphic. So
+/// "no layout" IS "not monomorphic", read off the interned definition rather than re-derived
+/// from rustc — no `map_ty` probe (which MUTATES: `param_opaque`, spurious interning), no
+/// rustc-level walk to keep in sync, and no value-type map to drift from the validator's.
+///
+/// THE REAL FIX IS B8. Per-Instance lowering makes the callee's signature concrete at each
+/// instantiation and the two spellings become one; this predicate then stops firing on its own.
+/// Until then a body whose signature is not a monomorphic claim must not be presented as a
+/// callable definition — the honest state is "declared, not defined".
+fn signature_is_identity_spelled(module: &Module, func_ty: &FuncTy) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    func_ty
+        .params
+        .iter()
+        .chain(func_ty.returns.iter())
+        .any(|t| ty_reaches_unlaid_struct(module, t, &mut seen))
+}
+
+/// Trust (#197 item 3): does this body hand a place-path VALUE to a call edge whose callee is a
+/// spliced local with REAL declared params? If so the body must not be spliced.
+///
+/// THE DEFECT. `place_path_carrier` is set by the wave-RS/wave-MC lanes when they substitute a
+/// receiver PLACE VALUE for the pointer the callee's parameter declares. The producer already
+/// knows this is a deliberate spelling mismatch — `run_seam_differentials` withholds such a body
+/// from linked interpretation for exactly this reason, in its own words: *"the carrier arg is a
+/// VALUE standing in for the callee's pointer param, so linked interpretation manufactures a
+/// signature-mismatch THIR-defect verdict out of a deliberate spelling."* But it still SPLICES
+/// the body, and the assembled module then carries that value across the edge, which is
+/// `CallArgTypeMismatch { expected: "ptr", actual: "struct.N" }`. Measured: 24 occurrences.
+///
+/// This is the SAME hazard as `zst_closure_arg` one type over, and `splice_ok` already refuses
+/// that one with the matching argument — "the ASSEMBLED module would carry it across a call edge
+/// whose callee declares a real closure type, with nothing in the module recording that the two
+/// denote the same value". The carrier lane was withheld from the seam but never from the splice;
+/// this closes that asymmetry.
+///
+/// WHY NOT COMPARE THE TYPES DIRECTLY. The exact predicate is the validator's — zip the args
+/// against `callee_ty.params` and compare each `Ty`. Reproducing that here means reimplementing
+/// `validate.rs`'s value-type map (`value_type` / `infer_result_type`) in a second crate with no
+/// shared code, and a predicate that drifts from the checker it guards refuses the WRONG bodies.
+/// The right long-term fix is to make the validator's typing public and call the one
+/// implementation (the discipline `pin_enum_tag_lane` already follows: "deliberately the same
+/// function and not a mirrored twin"). Until then this uses the producer's own flag, which is set
+/// at the exact site that creates the mismatch and cannot drift from it.
+///
+/// DELIBERATELY AN OVER-APPROXIMATION, and narrowed to keep it small. The flag is per-BODY, not
+/// per-call, so a body carrying at one edge and calling a real-param local at another is refused
+/// too. The `Local`-with-params conjunct is what keeps that from being the whole carrier lane:
+/// a carrier whose callee is a BODYLESS declaration is vacuously valid today, because
+/// `validate.rs` zips args against `callee_ty.params`, which is EMPTY under the bodyless
+/// `params: [], is_vararg: true` encoding — so every forced-havoc / extern / symbolic-callee
+/// carrier site validates and must keep splicing. Refusing on the bare flag would demote that
+/// entire lane for no validity gain.
+fn place_carrier_reaches_real_params(
+    r: &BodyRecord,
+    func: &Function,
+    maps: &BodyMaps,
+    lookup: &dyn Fn(u32) -> Option<FuncId>,
+    params_of: &dyn Fn(u32) -> usize,
+) -> bool {
+    if !r.place_path_carrier {
+        return false;
+    }
+    for block in &func.blocks {
+        for node in &block.body {
+            let Inst::Call { callee, .. } = &node.inst else {
+                continue;
+            };
+            if !matches!(resolve_callee(r, *callee, lookup, maps), CalleeResolution::Local(_)) {
+                continue;
+            }
+            // `Local` means `resolve_callee` found exactly one local ledger identity for this
+            // `FuncId` (its own `[c] if c.is_local` arm), so this re-filter names the same entry.
+            if let Some(c) = r.callees.iter().find(|c| c.func_id == *callee && c.is_local) {
+                if params_of(c.def_index) > 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Trust (#197 item 1): does this prepared body bind a call result its callee's DECLARATION
+/// cannot carry? If so the body must not be spliced — pass 1 refuses it, before any `FuncId`
+/// exists.
+///
+/// THE DEFECT THIS CLOSES. `emit_call` binds an SSA result whenever the call is non-unit and
+/// non-diverging, but a DECLARATION's return type comes from the ledger and is `Option<Ty>` —
+/// `None` means "this site could not be typed" (an opaque/RPIT/async return `map_ty` declined),
+/// which the assembler writes as `returns: []`, a positive claim that the callee returns
+/// NOTHING. `validate_instruction_result_arities` then compares `returns.len()` against
+/// `node.results.len()` and reports `InstrResultArityMismatch`. Measured: 66 occurrences over
+/// 37 files, the largest ill-formed-module class.
+///
+/// It cannot be fixed where it is observed. Pass 2's declaration arm already splits a decl whose
+/// type disagrees with a site's binding count, and its own comment names the residue exactly:
+/// *"`(None, 1)` is the UNFIXABLE case — the decl honestly has no type while the site binds
+/// one."* Unfixable THERE is right: pass 2 may not refuse a body without desyncing the dense id
+/// space. So the answer is to refuse earlier, which is what this predicate is for.
+///
+/// THE PREDICATE MIRRORS THE VALIDATOR, not a paraphrase of it: it reproduces pass 2's own
+/// `(Some(_), n) if n != 1 => None` adjustment first, then compares the resulting `returns.len()`
+/// against the site's `results.len()`. Keeping the two in one shape is deliberate — a predicate
+/// that drifts from the emitter it guards refuses the wrong bodies.
+///
+/// SCOPE, deliberately narrow on both sides:
+/// * `Inst::Call` ONLY. `Inst::Const`/`Constant::FnDef` is EXCLUDED even though it is also a
+///   call-graph edge that pass 2 rewrites through `resolve_callee`: the bridge takes a Const's
+///   arity from its own `ty`, never from the callee's `returns`, so including it would refuse
+///   bodies that have no arity error at all. `Inst::Invoke` is likewise absent — the producer
+///   emits none (measured: zero in `lib.rs`), and pass 2 does not rewrite Invoke callees either,
+///   so teaching this predicate about it ALONE would make the two disagree.
+/// * A call binding ZERO results is untouched. `call @decl(...)` with no result is the
+///   overwhelmingly common valid shape and validates today; dropping the count comparison and
+///   refusing on `ret.is_none()` alone would be mass loss.
+///
+/// WHAT NOT TO DO INSTEAD. Two cheaper-looking shortcuts are both unsound. Emitting a 0-result
+/// `Call` at the dead `let _ = f()` sites is order-dependent: `emit_call`'s `(None, Some(t))` arm
+/// has no retro-poison, so a later typed site leaves the decl `-> (t)` and produces the mismatch
+/// in the OPPOSITE direction. And simply dropping the unused result binding leaves `returns: []`
+/// asserting "returns nothing" about a callee that returns a real value — laundering a detected
+/// defect into a silent ABI lie, which is the #189 family.
+fn call_result_arity_incoherent(
+    r: &BodyRecord,
+    func: &Function,
+    maps: &BodyMaps,
+    lookup: &dyn Fn(u32) -> Option<FuncId>,
+) -> bool {
+    for block in &func.blocks {
+        for node in &block.body {
+            let Inst::Call { callee, .. } = &node.inst else {
+                continue;
+            };
+            let CalleeResolution::Decl { ret, .. } = resolve_callee(r, *callee, lookup, maps)
+            else {
+                // A `Local` edge links to a spliced body whose signature carries a real return
+                // type; the arity question is answered by that signature, not by a declaration.
+                continue;
+            };
+            let nres = node.results.len();
+            let ret = match (&ret, nres) {
+                (Some(_), n) if n != 1 => None,
+                _ => ret,
+            };
+            if usize::from(ret.is_some()) != nres {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Resolve one emitted callee `FuncId` through the body's identity ledger. Fail-closed: only a
@@ -3546,6 +3940,7 @@ fn resolve_callee(
             name: c.def_path.clone(),
             is_extern: false,
             ret: decl_ret(c, maps),
+            rust_abi: c.is_rust_abi,
         },
         [c] if c.is_local => match lookup(c.def_index) {
             Some(id) => CalleeResolution::Local(id),
@@ -3555,6 +3950,7 @@ fn resolve_callee(
                 name: c.def_path.clone(),
                 is_extern: false,
                 ret: decl_ret(c, maps),
+                rust_abi: c.is_rust_abi,
             },
         },
         [c] => CalleeResolution::Decl {
@@ -3562,6 +3958,7 @@ fn resolve_callee(
             name: c.def_path.clone(),
             is_extern: true,
             ret: decl_ret(c, maps),
+            rust_abi: c.is_rust_abi,
         },
         // No ledger entry at all — there is no site evidence to type a return with.
         [] => CalleeResolution::Decl {
@@ -3569,16 +3966,42 @@ fn resolve_callee(
             name: format!("!unknown_callee_{}", callee.index()),
             is_extern: false,
             ret: None,
+            // No ledger evidence of the ABI — keep the conservative foreign default.
+            rust_abi: false,
         },
-        // Two identities behind one DefIndex-derived FuncId (local/extern index collision):
-        // linking either would be a guess. Declare.
-        // Two identities behind one FuncId: their return types are not jointly attributable.
-        _ => CalleeResolution::Decl {
-            key: format!("ambiguous:{}", callee.index()),
-            name: format!("!ambiguous_callee_{}", callee.index()),
-            is_extern: false,
-            ret: None,
-        },
+        // Two identities behind one DefIndex-derived FuncId (local/extern index collision, or
+        // wave-C's two monomorphizations of one `DefId` under one `FuncId`): which BODY to link is
+        // a guess, so declare.
+        //
+        // Trust (#197a): the RESULT TYPE is a separate question, and this arm used to answer it
+        // `None` under the claim that "their return types are not jointly attributable". The
+        // LEDGER has already answered it: `emit_call` writes `ret_ty` to EVERY entry sharing the
+        // `func_id` and poisons the whole set on the first disagreement, so a genuine conflict is
+        // already `ret_ty_conflict` before this runs. What the old arm discarded was the ledger's
+        // own UNANIMOUS verdict — `size_of::<A>()` and `size_of::<B>()` both return `usize`, yet
+        // adding the second instantiation turned a valid `(...) -> (usize)` declaration into
+        // `(...) -> ()` and minted two errors. Measured: 116 `InstrResultArityMismatch`.
+        _ => {
+            let ret = unanimous_ret(&idents, maps);
+            // Trust (#197a follow-up): the ABI must come from the ledger too, by the SAME
+            // unanimity rule as the return type. This arm used to hardcode `false` and call it
+            // "the conservative foreign default" — but `false` is not conservative, it is a
+            // CLAIM: it says these callees use the C ABI, and `is_foreign_abi_boundary` then
+            // holds `repr(Rust)` structs to FFI repr rules (#190 is the same mistake one level
+            // out). It was inert only while `ret` was always `None`, because the repr check has
+            // nothing to inspect without a type. Giving the declaration a real return type made
+            // the latent lie observable: +2 `FfiStructReprUnpinned` on
+            // tests/ui/threads-sendsync/task-comm-16.rs, where every identity behind
+            // `!ambiguous_callee_12363` is an ordinary Rust `Result::unwrap`.
+            let rust_abi = idents.iter().all(|c| c.is_rust_abi);
+            CalleeResolution::Decl {
+                key: format!("ambiguous:{}{}", callee.index(), ret_suffix(&ret)),
+                name: format!("!ambiguous_callee_{}", callee.index()),
+                is_extern: false,
+                ret,
+                rust_abi,
+            }
+        }
     }
 }
 
@@ -3640,12 +4063,19 @@ fn stamp_target_info_if_vacuous(tcx: TyCtxt<'_>, module: &mut Module) {
                 | Ty::Never
         )
     }
+    // Trust (#180, v36): the target is now stamped UNCONDITIONALLY. The old gate stamped only
+    // when the `struct_passing` claim was VACUOUS — no by-value aggregate crossing any call edge —
+    // because both policy values assert `byval`/`sret` `ParamAttrs` this producer never emits, and
+    // asserting one would have been a false ABI claim carried into `Module::stable_digest`.
+    //
+    // trust-ir v36 adds `StructPassingPolicy::Unclassified`, which says exactly what is true here:
+    // this producer performs no aggregate classification. With an honest value available the gate
+    // is no longer needed — `triple`/`pointer_size`/`endianness` were always plain facts about the
+    // compilation target, and withholding them bought nothing but `TargetInfoRequired`.
     let aggregate_at_a_boundary = module.func_types.iter().any(|ft| {
         ft.params.iter().chain(ft.returns.iter()).any(crosses_by_value_aggregate)
     });
-    if aggregate_at_a_boundary {
-        return;
-    }
+    let _ = aggregate_at_a_boundary; // retained: the scan is the honesty argument's evidence.
     let target = &tcx.sess.target;
     module.target_info = Some(trust_ir::TargetInfo {
         triple: target.llvm_target.to_string(),
@@ -3660,7 +4090,10 @@ fn stamp_target_info_if_vacuous(tcx: TyCtxt<'_>, module: &mut Module) {
         abi: None,
         // Vacuous by the scan above: no by-value aggregate crosses any call edge in this module,
         // so this field ranges over nothing. It is the serde default and carries no content here.
-        struct_passing: trust_ir::StructPassingPolicy::default(),
+        // Trust (#180, v36): the truthful value. NOT `default()` (`NativeC`) — that would claim
+        // native-C classification the producer does not perform. A consumer needing a
+        // classification must refuse the module rather than infer one; see the variant's docs.
+        struct_passing: trust_ir::StructPassingPolicy::Unclassified,
     });
 }
 
@@ -3690,27 +4123,65 @@ fn ret_key(c: &crate::CalleeRef, maps: &BodyMaps) -> String {
     }
 }
 
+/// Trust (#197a): the return type EVERY identity behind one ambiguous `FuncId` agrees on.
+///
+/// `None` — any entry unknown, poisoned by `ret_ty_conflict`, or un-remappable — keeps the honest
+/// empty `returns`. This does NOT decide which body to link; it only declines to throw away a
+/// verdict the ledger already reached.
+fn unanimous_ret(idents: &[&crate::CalleeRef], maps: &BodyMaps) -> Option<Ty> {
+    let first = decl_ret(idents.first()?, maps)?;
+    idents
+        .iter()
+        .all(|c| decl_ret(c, maps).as_ref() == Some(&first))
+        .then_some(first)
+}
+
+/// Trust (#197a): `ret_key`'s twin for an already-computed `Option<Ty>` (the ambiguous arm has
+/// no single `CalleeRef` to key on). Same spelling, so the two agree by construction.
+fn ret_suffix(ret: &Option<Ty>) -> String {
+    match ret {
+        Some(t) => format!("|ret:{t:?}"),
+        None => String::new(),
+    }
+}
+
 /// Trust: mint-or-reuse a fail-closed declaration `FuncId` (`defined` = count of pass-1
 /// defined functions; declarations take the ids after them, first-encounter order). Shared by
 /// the `Inst::Call` callee rewrite and the `Constant::FnDef` rewrite.
 fn decl_id(
-    decls: &mut Vec<(String, FuncId, String, Option<Ty>)>,
+    decls: &mut Vec<(String, FuncId, String, Option<Ty>, bool)>,
     defined: usize,
     key: String,
     name: String,
     ret: Option<Ty>,
+    rust_abi: bool,
 ) -> FuncId {
-    match decls.iter().find(|(k, _, _, _)| *k == key) {
-        Some((_, id, _, _)) => *id,
+    match decls.iter().find(|(k, _, _, _, _)| *k == key) {
+        Some((_, id, _, _, _)) => *id,
         None => {
             let id = FuncId::new((defined + decls.len()) as u32);
             // Trust (#178): `ret` rides the entry so the declaration can be given a signature that
             // actually returns something. It is part of `key`, so a reused entry's stored `ret`
             // always equals this one — no last-writer-wins ambiguity.
-            decls.push((key, id, name, ret));
+            decls.push((key, id, name, ret, rust_abi));
             id
         }
     }
+}
+
+/// Trust (#184 follow-on): remap every param/return of a BODY-numbered `FuncTy` into the
+/// assembled module's numbering. `None` (fail-closed) if any component does not remap — the
+/// caller skips the instruction's rewrite, which leaves the body un-spliceable rather than
+/// carrying a dangling id.
+fn remap_func_ty(ft: &FuncTy, maps: &BodyMaps) -> Option<FuncTy> {
+    let mut out = FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: ft.is_vararg };
+    for p in &ft.params {
+        out.params.push(maps.remap(p)?);
+    }
+    for r in &ft.returns {
+        out.returns.push(maps.remap(r)?);
+    }
+    Some(out)
 }
 
 /// Equality-interning into `Module::func_types` (`add_func_type` itself never dedups).
@@ -4455,6 +4926,10 @@ fn prepare_body_tables(
         // Fast path: no TABLES to remap — but spans still cross module boundaries, and a span
         // file id is only meaningful against the table that minted it (C2-spans).
         let mut f = func.clone();
+        // Source provenance is sealed to the original single-body mini-module.
+        // Crate assembly changes the containing module/files/function identity,
+        // so this ordinary transform must drop authority, never self-reseal it.
+        f.source_provenance = None;
         for block in &mut f.blocks {
             for node in &mut block.body {
                 remap_node_span(node, &r.files, module);
@@ -4468,6 +4943,9 @@ fn prepare_body_tables(
         *t = remap_ty(t, &enum_map, &struct_map, &ty_map, &closure_map)?;
     }
     let mut f = func.clone();
+    // Same invalidation as the table-free fast path: every remap changes the
+    // semantic image authenticated by the per-body carrier.
+    f.source_provenance = None;
     for block in &mut f.blocks {
         for (_, ty) in &mut block.params {
             *ty = remap_ty(ty, &enum_map, &struct_map, &ty_map, &closure_map)?;
@@ -4578,14 +5056,25 @@ fn intern_closure_ty(module: &mut Module, ct: trust_ir::ClosureTy) -> trust_ir::
 /// arms call `intern_func_ty` with no `remap_ty`), so a per-body `StructId`/`EnumId`/`TyId` carried
 /// through would dangle against the assembled tables. The producer's `map_fn_ptr_ty` enforces only
 /// the HIGHER-ORDER bound, and since `ty_contains_func_resolved` it deliberately admits
-/// struct/enum-bearing signatures (the `fn() -> Name` shape behind the `LazyLock` statics) that
-/// this gate then refuses — a `lowered`-only admission. See
-/// `test_every_newly_admitted_component_is_still_refused_by_the_splice_predicate`: the two halves
-/// are consistent precisely because every signature that widening newly admits fails
-/// `ty_table_free`.
+/// struct/enum-bearing signatures (the `fn() -> Name` shape behind the `LazyLock` statics).
+///
+/// STALE-DOC CORRECTION (#184 follow-on). This comment used to continue: "…that this gate then
+/// refuses — a `lowered`-only admission", citing
+/// `test_every_newly_admitted_component_is_still_refused_by_the_splice_predicate` as proof that
+/// "the two halves are consistent precisely because every signature that widening newly admits
+/// fails `ty_table_free`". That stopped being true when #184 removed the `all(ty_table_free)`
+/// requirement below, and neither the comment nor the test was updated — so the retired contract
+/// stayed asserted and turned main red. The protection MOVED rather than vanished: an
+/// unresolvable component is now declined by `remap_func_ty`, tested by
+/// `test_remap_func_ty_is_the_wall_that_replaced_table_freedom`.
 fn body_sig_ok(r: &BodyRecord, sig: FuncTyId) -> bool {
     match r.func_types.get(sig.as_usize()) {
-        Some(ft) => !ft.is_vararg && ft.params.iter().chain(ft.returns.iter()).all(ty_table_free),
+        // Trust (#184 follow-on): the `all(ty_table_free)` requirement is GONE. It existed only
+        // because the seam re-interned these signatures RAW; both sites now remap through
+        // `BodyMaps`, so a table-indexed param/return resolves correctly. Resolvability is
+        // re-checked at the remap (a dangling id declines the body), exactly as #174 replaced
+        // table-freedom with resolvability for enum variant fields.
+        Some(ft) => !ft.is_vararg,
         None => false,
     }
 }
@@ -5383,7 +5872,7 @@ mod authority_tests {
             is_vararg: false,
         });
         module.add_function(Function::new(FuncId::new(0), "probe", ty, BlockId::new(0)));
-        let digest = crate::lineage::body_lineage_digest(&module, &[])
+        let digest = crate::lineage::body_lineage_digest(lineage_probe_definition(3), &module, &[])
             .expect("single-function probe module must digest");
 
         let mut with_digest = coverage_row(3, false);
@@ -5413,6 +5902,13 @@ mod authority_tests {
         );
     }
 
+    /// The definition a lineage probe body belongs to. The digest binds it, so a fixture
+    /// must name one — and `lineage_body_record` derives it from `def_index`, so two
+    /// fixture bodies are two definitions exactly when their records are.
+    fn lineage_probe_definition(index: u64) -> crate::lineage::DefinitionIdentity {
+        crate::lineage::DefinitionIdentity::test_only(0xC0DE, index)
+    }
+
     /// A per-body record whose mini-module is the minimal spliceable shape: one
     /// zero-argument, block-free function, no tables, no callees. `lineage` is minted by
     /// the production function over that same mini-module, exactly as `record` does.
@@ -5421,8 +5917,13 @@ mod authority_tests {
         let func_ty = FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: false };
         let ty = module.add_func_type(func_ty.clone());
         module.add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)));
-        let lineage = crate::lineage::body_lineage_digest(&module, &[])
-            .expect("the minimal per-body mini-module must digest");
+        let lineage =
+            crate::lineage::body_lineage_digest(
+                lineage_probe_definition(u64::from(def_index)),
+                &module,
+                &[],
+            )
+                .expect("the minimal per-body mini-module must digest");
         let function = module.functions.remove(0);
         BodyRecord {
             def_index,
@@ -5535,6 +6036,10 @@ mod authority_tests {
     ) -> crate::Lowered {
         crate::Lowered {
             module: Module::new("param_lane_confinement_probe"),
+            // Synthetic probe: no lowered blocks at all, so no enum-fold switch. Empty is
+            // also the fail-closed value — an unrecorded fold can only MISS a flip, never
+            // miscompile, because the comparator re-verifies derived == built.
+            enum_fold_switch_blocks: std::collections::HashSet::new(),
             body_kind: BodyKind::Fn,
             opaque_collapse: ledger_nonempty,
             enum_declines: Vec::new(),
@@ -5551,7 +6056,7 @@ mod authority_tests {
             place_path_carrier: false,
             zst_closure_arg: false,
             fnptr_adapter: false,
-            thin_reborrow: false,
+            thin_reborrows: Vec::new(),
             callees: Vec::new(),
             pending_consts: Vec::new(),
         }
@@ -5803,6 +6308,11 @@ mod authority_tests {
             site_args: None,
             ret_ty: None,
             ret_ty_conflict: false,
+            // #180: the conservative value the mint itself uses for a callee it
+            // does not query (`lib.rs`, `is_rust_abi: !def_id.is_local() && ..`).
+            // A probe callee has no `tcx`, so it can only state `false` — the
+            // pre-existing foreign-boundary treatment, never a new claim.
+            is_rust_abi: false,
         }
     }
 
@@ -5907,8 +6417,17 @@ mod authority_tests {
                 "{newly_admitted:?} must still be refused by the splice's own predicate"
             );
         }
-        // Stated as the gate, not only as the predicate: a body whose indirect-call signature
-        // carries the widened shape does not splice.
+        // Trust (#184 follow-on): THE HANDOFF, restated. This assertion used to read
+        // `!body_sig_ok(...)` — "`fn() -> Name` resolves, and is still not MOVABLE". That was true
+        // while `body_sig_ok` required `all(ty_table_free)`. #184 removed that requirement
+        // deliberately, because both seam sites now remap through `BodyMaps`, and this test was
+        // not updated with it — so it asserted a retired contract and main went red.
+        //
+        // The protection did not disappear; it MOVED, from a predicate to a remap fail-closure.
+        // Asserting the move is the honest form of this check: `body_sig_ok` now admits the
+        // widened signature, and `remap_func_ty` is what declines it when a component cannot be
+        // resolved into the assembled module's numbering
+        // (`test_remap_func_ty_is_the_wall_that_replaced_table_freedom`).
         let mut r = lineage_body_record(1, "probe::struct_bearing_sig");
         r.func_types = vec![
             FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: false },
@@ -5919,8 +6438,101 @@ mod authority_tests {
             },
         ];
         assert!(
+            body_sig_ok(&r, FuncTyId::new(1)),
+            "post-#184 `fn() -> Name` RESOLVES and is movable; the remap, not this predicate, \
+             is what refuses an unresolvable component"
+        );
+        // …and a vararg signature is still refused here, so the predicate is not vacuous.
+        r.func_types[1].is_vararg = true;
+        assert!(
             !body_sig_ok(&r, FuncTyId::new(1)),
-            "`fn() -> Name` resolves, and is still not MOVABLE — that is the whole distinction"
+            "`body_sig_ok` must still refuse a vararg signature"
+        );
+    }
+
+    /// Trust (#184 follow-on): THE WALL THAT REPLACED TABLE-FREEDOM, and it had no test.
+    ///
+    /// `body_sig_ok` dropped its `all(ty_table_free)` requirement because both seam sites remap
+    /// through `BodyMaps`. That moved the protection from a PREDICATE (tested by
+    /// `test_every_newly_admitted_component_is_still_refused_by_the_splice_predicate`) to a REMAP
+    /// FAIL-CLOSURE (tested by nothing). A wall with no test is how the retired one stayed
+    /// asserted long enough to turn main red; this is the replacement's own test.
+    ///
+    /// `remap_ty`'s struct arm is `Ty::Struct((*struct_map.get(i)?)?)` — a DOUBLE `?`, so
+    /// out-of-range and not-yet-interned are separate decline paths. Both are exercised.
+    #[test]
+    fn test_remap_func_ty_is_the_wall_that_replaced_table_freedom() {
+        let sig = |params: Vec<Ty>, returns: Vec<Ty>| FuncTy {
+            params,
+            returns,
+            is_vararg: false,
+        };
+
+        // ACCEPT CONTROL. Without it every decline below passes against a `remap` that is
+        // constantly `None`, which is exactly the vacuity this module keeps having to re-check.
+        let resolved = BodyMaps {
+            enum_map: vec![Some(trust_ir::EnumId::new(7))],
+            struct_map: vec![Some(StructId::new(3))],
+            ty_map: Vec::new(),
+            closure_map: Vec::new(),
+        };
+        let out = remap_func_ty(
+            &sig(vec![Ty::Struct(StructId::new(0))], vec![Ty::Enum(trust_ir::EnumId::new(0))]),
+            &resolved,
+        )
+        .expect("every component resolves");
+        assert_eq!(
+            out.params,
+            vec![Ty::Struct(StructId::new(3))],
+            "the param must be REMAPPED into module numbering, not copied through"
+        );
+        assert_eq!(out.returns, vec![Ty::Enum(trust_ir::EnumId::new(7))]);
+
+        // DECLINE 1 — not-yet-interned (the inner `?`). This is the case #184's own comment
+        // names: "a reference to a not-yet-interned def is a decline instead of a wrong id".
+        let not_interned = BodyMaps {
+            enum_map: Vec::new(),
+            struct_map: vec![None],
+            ty_map: Vec::new(),
+            closure_map: Vec::new(),
+        };
+        assert!(
+            remap_func_ty(&sig(Vec::new(), vec![Ty::Struct(StructId::new(0))]), &not_interned)
+                .is_none(),
+            "a not-yet-interned struct must decline the whole signature"
+        );
+
+        // DECLINE 2 — out of range (the outer `?`).
+        let empty = BodyMaps {
+            enum_map: Vec::new(),
+            struct_map: Vec::new(),
+            ty_map: Vec::new(),
+            closure_map: Vec::new(),
+        };
+        assert!(
+            remap_func_ty(&sig(vec![Ty::Struct(StructId::new(0))], Vec::new()), &empty).is_none(),
+            "an out-of-range struct id must decline the whole signature"
+        );
+
+        // DECLINE 3 — NESTED. The recursion must fail closed too, or a widened signature could
+        // smuggle an unresolvable id inside a tuple past a top-level-only check.
+        assert!(
+            remap_func_ty(
+                &sig(vec![Ty::Tuple(vec![Ty::U64, Ty::Struct(StructId::new(0))])], Vec::new()),
+                &not_interned,
+            )
+            .is_none(),
+            "an unresolvable component NESTED in a tuple must decline the signature"
+        );
+
+        // …and the same tuple resolves when its component does — the nested accept control.
+        assert!(
+            remap_func_ty(
+                &sig(vec![Ty::Tuple(vec![Ty::U64, Ty::Struct(StructId::new(0))])], Vec::new()),
+                &resolved,
+            )
+            .is_some(),
+            "a resolvable nested component must NOT decline"
         );
     }
 
@@ -6435,7 +7047,12 @@ mod cascade_tag_tests {
     fn test_cascade_tags_exact_set_is_pinned() {
         assert_eq!(
             CASCADE_TAGS,
-            ["VarRef(unbound)", "Borrow(unbound local)", "AssignOp(unbound local)"],
+            [
+                "VarRef(unbound)",
+                "Borrow(unbound local)",
+                "AssignOp(unbound local)",
+                "Borrow(inner unlowered)",
+            ],
         );
     }
 
@@ -6465,6 +7082,10 @@ mod cascade_tag_tests {
             "Borrow(non-scalar pointee)",
             "Borrow(of a borrow ptr)",
             "Borrow(non-local place)",
+            // Carved out of `Borrow(non-local place)` 2026-08-11: a genuine refusal by
+            // `shared_reborrow_arm` after the reborrow reached `ReborrowTarget::Ptr`. Its echo
+            // sibling `Borrow(inner unlowered)` went the other way, into `CASCADE_TAGS`.
+            "Borrow(ptr reborrow refused)",
             "Borrow(&mut unpromoted local)",
             "Borrow(&mut slot missing)",
             "Borrow(&mut non-local place)",

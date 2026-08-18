@@ -175,6 +175,28 @@ pub(crate) fn detect_logic(formula: &Formula) -> &'static str {
         return "ALL";
     }
 
+    // Lever C: BITVECTORS MIXED WITH INTEGERS. Every QF_*BV / *BV name below
+    // routes ay to the eager bit-blast pipeline, which carries no integer
+    // theory, so Int-sorted variables come back with NO assignment. Model
+    // completion then fills them with the sort default (0), and the validator
+    // correctly reports the original Int assertion as violated — the query
+    // degrades to `unknown (:reason-unknown incomplete)` instead of `sat`.
+    //
+    // MEASURED: a five-line query (`_45: Int`, `heap: Array Int Int`,
+    // `(= _45 7)`) is `unknown` + MODEL-UNCONFIRMED under QF_AUFBV and `sat`
+    // under ALL — identical formula, only the logic line differs. Across the
+    // orca-alab workspace this mislabel produced ~59,896 MODEL-UNCONFIRMED
+    // events; all 627 distinct violated shapes evaluate false under the
+    // sort-default fill, and none has `0` on its right-hand side.
+    //
+    // SOUNDNESS: identical to the datatype lever above — `ALL` only WIDENS the
+    // admissible theory set and never changes a formula's models, so it cannot
+    // turn a SAT violation into UNSAT. It can only let a query be decided that
+    // was previously abandoned.
+    if features.has_bitvectors && features.has_integers {
+        return "ALL";
+    }
+
     match (
         features.has_bitvectors,
         features.has_arrays,
@@ -269,6 +291,13 @@ pub(crate) fn visit_datatype_bearing_sorts(formula: &Formula, f: &mut impl FnMut
 /// Formula features relevant to logic detection.
 struct FormulaFeatures {
     has_bitvectors: bool,
+    /// Int/Real-sorted content. Required because a BV-family logic name routes
+    /// ay to the eager bit-blast pipeline, which has NO integer theory: the Int
+    /// vars come back unassigned, model completion fills them with the sort
+    /// default 0, and the validator then correctly finds the original Int
+    /// assertion false. Measured: the same formula is `unknown
+    /// (:reason-unknown incomplete)` under QF_AUFBV and `sat` under ALL.
+    has_integers: bool,
     has_floating_point: bool,
     has_arrays: bool,
     has_quantifiers: bool,
@@ -279,6 +308,7 @@ struct FormulaFeatures {
 fn analyze_formula(formula: &Formula) -> FormulaFeatures {
     let mut features = FormulaFeatures {
         has_bitvectors: false,
+        has_integers: false,
         has_floating_point: false,
         has_arrays: false,
         has_quantifiers: false,
@@ -357,6 +387,14 @@ fn analyze_formula(formula: &Formula) -> FormulaFeatures {
             | Formula::SymVar(_, Sort::Float { .. } | Sort::RoundingMode) => {
                 features.has_floating_point = true;
             }
+
+            // Integer/real detection. Mirrors the BV and array cases: a var of
+            // Int/Real sort is enough — the arithmetic operators over them are
+            // already covered by whichever branch built them.
+            Formula::Var(_, Sort::Int) | Formula::SymVar(_, Sort::Int) => {
+                features.has_integers = true;
+            }
+            Formula::Int(_) => features.has_integers = true,
 
             // Array detection
             Formula::Select(..) | Formula::Store(..) => features.has_arrays = true,

@@ -4522,6 +4522,24 @@ fn collect_datatype_defs(
     }
     let mut defs = std::collections::HashMap::new();
     let mut conflicted = std::collections::HashSet::new();
+    // R0: SEED from the body's EXPLICIT out-of-band table before scanning it.
+    // Under markers-everywhere a recursive datatype has no definitional
+    // occurrence in the body at all — the producer moved it here — so without
+    // this seed the map is empty and every back-reference falls closed to the
+    // opaque `Trust.Param.@datatype::<name>` carrier. This is NOT the withdrawn
+    // by-name body search: an entry is a keyed, producer-asserted, hash-visible
+    // declaration, validated by `datatype_marker_variants` to name itself. Only
+    // the `Ty::Datatype`-shaped entries belong in THIS map (it is a variant-list
+    // map); an ADT-shaped entry is `collect_adt_compaction_defs`'s business.
+    // A body definitional occurrence that DISAGREES with the entry still
+    // conflicts the name away below — fail-closed, exactly as two disagreeing
+    // body occurrences do.
+    for name in body.datatype_defs.keys() {
+        let marker = Ty::Datatype { name: name.clone(), variants: vec![] };
+        if let Some(variants) = trust_types::datatype_marker_variants(&body.datatype_defs, &marker) {
+            defs.insert(name.clone(), variants.clone());
+        }
+    }
     for local in &body.locals {
         walk(&local.ty, &mut defs, &mut conflicted);
     }
@@ -4896,6 +4914,18 @@ pub(crate) fn collect_adt_compaction_defs(
     }
     let mut defs = std::collections::HashMap::new();
     let mut conflicted = std::collections::HashSet::new();
+    // R0: SEED from the body's EXPLICIT out-of-band table, same rationale as
+    // `collect_datatype_defs` above — under markers-everywhere a cut point has no
+    // `Ty::Adt` occurrence left in the body, and this map is exactly the ADT half
+    // of what the table records. `trust_types::datatype_definition` validates that
+    // an entry names itself before it is served.
+    for name in body.datatype_defs.keys() {
+        if let Some(def @ Ty::Adt { .. }) =
+            trust_types::datatype_definition(&body.datatype_defs, name)
+        {
+            defs.insert(name.clone(), def.clone());
+        }
+    }
     for local in &body.locals {
         walk(&local.ty, &mut defs, &mut conflicted);
     }
@@ -6976,7 +7006,7 @@ mod tests {
                 name: "f".into(),
                 def_path: "crate::f".into(),
                 span: Default::default(),
-                body: VerifiableBody { locals, blocks: vec![], arg_count: 1, return_ty: Ty::Bool },
+                body: VerifiableBody { locals, blocks: vec![], arg_count: 1, return_ty: Ty::Bool, datatype_defs: Default::default() },
                 contracts: vec![],
                 preconditions: vec![],
                 postconditions: vec![],
@@ -7037,6 +7067,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -7505,6 +7536,7 @@ mod tests {
                 blocks: vec![],
                 arg_count: 1,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -8083,6 +8115,7 @@ mod tests {
             blocks: vec![],
             arg_count: 1,
             return_ty: i32(),
+            datatype_defs: Default::default(),
         };
         let func = VerifiableFunction {
             name: "double_gt".into(),
@@ -9214,6 +9247,7 @@ mod tests {
             blocks: vec![],
             arg_count: 0,
             return_ty: ty.clone(),
+            datatype_defs: Default::default(),
         };
         VerifiableFunction {
             name: "probe".into(),

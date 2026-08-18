@@ -294,6 +294,7 @@ fn make_add_function() -> VerifiableFunction {
             }],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -357,6 +358,7 @@ fn test_lower_multiple_functions_into_one_module() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -409,6 +411,7 @@ fn test_lower_noncapturing_closure_aggregate_as_unit_environment() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -471,6 +474,7 @@ fn test_lower_closure_aggregate_refines_unsupported_rustc_marker_from_captures()
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -566,6 +570,7 @@ fn test_lower_rust_call_closure_shim_uses_registered_env_and_flattens_tuple_args
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -598,6 +603,7 @@ fn test_lower_rust_call_closure_shim_uses_registered_env_and_flattens_tuple_args
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -691,6 +697,7 @@ fn test_rust_call_closure_shim_without_body_fails_closed() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -733,6 +740,7 @@ fn test_unsupported_rustc_closure_marker_without_aggregate_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -770,6 +778,7 @@ fn test_symbolic_operand_lowers_to_formula_dialect_op() {
             }],
             arg_count: 0,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -828,6 +837,7 @@ fn test_bool_symbolic_operand_lowers_with_json_and_schema_attrs() {
             }],
             arg_count: 0,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -882,6 +892,7 @@ fn test_u64_symbolic_operand_preserves_unsigned_destination_type() {
             }],
             arg_count: 0,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -931,6 +942,7 @@ fn test_contextual_i64_symbolic_operand_preserves_signed_binary_lowering() {
             }],
             arg_count: 0,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1004,6 +1016,7 @@ fn test_contextless_int_and_array_symbolic_sorts_fail_closed_with_destination_co
                 }],
                 arg_count: 0,
                 return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -1070,6 +1083,7 @@ fn test_lifted_memory_array_formula_preserves_typed_memory_state_not_u64_coercio
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1146,6 +1160,7 @@ fn test_non_memory_array_formula_to_u64_stays_fail_closed() {
             }],
             arg_count: 0,
             return_ty: Ty::Int { width: 64, signed: false },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1182,6 +1197,7 @@ fn test_lower_unit_return_function() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1217,6 +1233,7 @@ fn test_lower_never_return_emits_empty_return_values() {
             }],
             arg_count: 0,
             return_ty: Ty::Never,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1254,6 +1271,7 @@ fn test_lower_constant_use() {
             }],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1311,6 +1329,7 @@ fn test_symbolic_operand_lowers_to_formula_dialect_not_undef() {
             }],
             arg_count: 0,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1388,6 +1407,7 @@ fn test_symbolic_formula_survives_canonical_trust_ir_roundtrip() {
             }],
             arg_count: 0,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1459,6 +1479,7 @@ fn exact_binary_source_provenance_artifact_fixture() -> DecompilationArtifact {
             }],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1637,6 +1658,7 @@ fn test_canonical_trust_ir_rejects_layout_sensitive_cast_without_typed_layout_ev
         }],
         arg_count: 1,
         return_ty: Ty::u64(),
+        datatype_defs: Default::default(),
     };
 
     let error = lower_decompilation_artifact_to_trust_ir(&artifact)
@@ -1837,6 +1859,7 @@ fn test_canonical_trust_ir_preserves_typed_symbolic_formula_not_undef() {
             }],
             arg_count: 0,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1920,6 +1943,7 @@ fn test_symbolic_aggregate_lowers_without_undef_seed() {
             }],
             arg_count: 0,
             return_ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -1997,6 +2021,7 @@ fn test_symbolic_array_repeat_lowers_without_undef_seed() {
             }],
             arg_count: 0,
             return_ty: Ty::Array { elem: Box::new(Ty::u64()), len: 2 },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2070,6 +2095,7 @@ fn test_symbolic_local_aggregate_lowers_without_undef_seed() {
             }],
             arg_count: 0,
             return_ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2130,6 +2156,7 @@ fn test_binary_origin_symbolic_aggregate_lowers_without_undef_seed() {
             }],
             arg_count: 0,
             return_ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2178,6 +2205,7 @@ fn test_symbolic_checked_binary_lowers_without_undef_tuple() {
             }],
             arg_count: 0,
             return_ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2254,6 +2282,7 @@ fn test_symbolic_slice_raw_ptr_aggregate_lowers_without_undef_seed() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2322,6 +2351,7 @@ fn test_lower_goto_terminator() {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2367,6 +2397,7 @@ fn test_lower_goto_to_entry_passes_entry_args() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2418,6 +2449,7 @@ fn test_lower_condbr_to_entry_passes_entry_args() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2469,6 +2501,7 @@ fn test_lower_switch_int_binary() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2524,6 +2557,7 @@ fn test_lower_switch_int_bool_out_of_range_fails_closed() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2563,6 +2597,7 @@ fn test_lower_switch_int_u8_preserves_unsigned_width() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2615,6 +2650,7 @@ fn test_lower_switch_int_multiway() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2660,6 +2696,7 @@ fn test_lower_switch_to_entry_passes_entry_args() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2700,6 +2737,7 @@ fn test_lower_unreachable() {
             }],
             arg_count: 0,
             return_ty: Ty::Never,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2727,6 +2765,7 @@ fn test_unreachable_mir_blocks_are_pruned_before_trust_ir_validation() {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2764,6 +2803,7 @@ fn test_lower_unary_not() {
             }],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2772,12 +2812,270 @@ fn test_lower_unary_not() {
     };
 
     let module = lower_to_trust_ir(&func).expect("should lower");
+    // A scalar-bool `!` is the `ICmp Eq(x, false)` respelling, NOT the integer-only
+    // `UnOp::Not` (which `validate_module` rejects, sinking the whole module).
+    assert!(
+        !module_has_scalar_bool_unop(&module),
+        "a bool `!` must not be spelled UnOp::Not: {:?}",
+        module.functions[0].blocks[0].body
+    );
     let bb0 = &module.functions[0].blocks[0];
-    let has_not = bb0
+    let has_eq_false = bb0
         .body
         .iter()
-        .any(|node| matches!(&node.inst, Inst::UnOp { op: trust_ir::inst::UnOp::Not, .. }));
-    assert!(has_not, "should have a Not instruction");
+        .any(|node| matches!(&node.inst, Inst::ICmp { op: ICmpOp::Eq, ty: TrustIrTy::Bool, .. }));
+    assert!(has_eq_false, "should have a Bool ICmp Eq against the false constant");
+    assert_valid_module(&module);
+    for input in [false, true] {
+        let outcome = Interpreter::with_module(&module)
+            .execute_func(
+                trust_ir::FuncId::new(0),
+                vec![InterpretValue::bool(input)],
+            )
+            .expect("the respelled bool `!` must interpret");
+        assert_eq!(
+            outcome.returns[0].as_bool().expect("a bool result"),
+            !input,
+            "`!{input}` must evaluate to {}",
+            !input
+        );
+    }
+}
+
+/// Every `Inst::UnOp` in `module` whose declared type is the scalar `Bool` — the
+/// exact shape `check_unop_operand` rejects (`Not` is typed over integers, integer
+/// vectors and bool VECTORS only), which makes `validate_module` reject the whole
+/// module and strips native proof authority from every obligation in it.
+fn scalar_bool_unop_sites(module: &trust_ir::Module) -> Vec<(String, usize, usize)> {
+    let mut sites = Vec::new();
+    for func in &module.functions {
+        for (block_index, block) in func.blocks.iter().enumerate() {
+            for (node_index, node) in block.body.iter().enumerate() {
+                if matches!(&node.inst, Inst::UnOp { ty: TrustIrTy::Bool, .. }) {
+                    sites.push((func.name.clone(), block_index, node_index));
+                }
+            }
+        }
+    }
+    sites
+}
+
+fn module_has_scalar_bool_unop(module: &trust_ir::Module) -> bool {
+    !scalar_bool_unop_sites(module).is_empty()
+}
+
+/// A single-block `VerifiableFunction` computing `local0 = <rvalue>` at `Ty::Bool`,
+/// with `arg_count` bool arguments in locals `1..=arg_count`.
+fn bool_rvalue_function(name: &str, arg_count: usize, rvalue: Rvalue) -> VerifiableFunction {
+    let mut locals = vec![LocalDecl { index: 0, ty: Ty::Bool, name: None }];
+    for index in 1..=arg_count {
+        locals.push(LocalDecl { index, ty: Ty::Bool, name: Some(format!("a{index}")) });
+    }
+    VerifiableFunction {
+        name: name.to_string(),
+        def_path: format!("test::{name}"),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals,
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue,
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// TOTALITY of the producer invariant: NO bool operation the bridge lowers emits a
+/// scalar-`Bool` `Inst::UnOp`, and every resulting module validates AND computes the
+/// Rust operator exactly. `^` is the second producer (the `Select(a, !b, b)`
+/// connective's inner `!b`); `!` is the first.
+#[test]
+fn test_lower_bool_ops_never_emit_scalar_bool_unop() {
+    let cases: Vec<(&str, Rvalue, fn(bool, bool) -> bool)> = vec![
+        (
+            "bool_not",
+            Rvalue::UnaryOp(UnOp::Not, Operand::Copy(Place::local(1))),
+            (|a, _b| !a) as fn(bool, bool) -> bool,
+        ),
+        (
+            "bool_and",
+            Rvalue::BinaryOp(
+                BinOp::BitAnd,
+                Operand::Copy(Place::local(1)),
+                Operand::Copy(Place::local(2)),
+            ),
+            |a, b| a && b,
+        ),
+        (
+            "bool_or",
+            Rvalue::BinaryOp(
+                BinOp::BitOr,
+                Operand::Copy(Place::local(1)),
+                Operand::Copy(Place::local(2)),
+            ),
+            |a, b| a || b,
+        ),
+        (
+            "bool_xor",
+            Rvalue::BinaryOp(
+                BinOp::BitXor,
+                Operand::Copy(Place::local(1)),
+                Operand::Copy(Place::local(2)),
+            ),
+            |a, b| a ^ b,
+        ),
+    ];
+    for (name, rvalue, expected) in cases {
+        let arg_count = if name == "bool_not" { 1 } else { 2 };
+        let func = bool_rvalue_function(name, arg_count, rvalue);
+        let module = lower_to_trust_ir(&func).expect("bool op should lower");
+        assert!(
+            !module_has_scalar_bool_unop(&module),
+            "{name} emitted a scalar-bool UnOp at {:?}",
+            scalar_bool_unop_sites(&module)
+        );
+        assert_valid_module(&module);
+        for a in [false, true] {
+            for b in [false, true] {
+                let mut args = vec![InterpretValue::bool(a)];
+                if arg_count == 2 {
+                    args.push(InterpretValue::bool(b));
+                }
+                let outcome = Interpreter::with_module(&module)
+                    .execute_func(trust_ir::FuncId::new(0), args)
+                    .unwrap_or_else(|err| panic!("{name} must interpret: {err:?}"));
+                assert_eq!(
+                    outcome.returns[0].as_bool().expect("a bool result"),
+                    expected(a, b),
+                    "`{name}` must evaluate to `{}` for a={a} b={b}",
+                    expected(a, b)
+                );
+            }
+        }
+    }
+}
+
+/// THE CHANNEL. An in-band bool `OpaqueScalar { width: 1, signed: false }` is a
+/// value whose two type channels DISAGREE: `emit_const` resolves it to a
+/// `TrustIrTy::Bool`-typed `Undef`, while `operand_trust_type` calls it
+/// `Ty::Int { width: 1 }`. Gating the respelling on `operand_trust_type` would
+/// therefore refuse it — and a `BridgeError` from `lower_rvalue` flips
+/// `verifiable_function_lowers_in_module_context` to FALSE, which is the predicate
+/// the driver's fail-soft bundling loop uses to DROP a bundle member. A validation
+/// rejection withholds the bundle; an eviction sheds the callee and can leave an
+/// admitted destructor's drop-glue row discharged with the body absent. So the seam
+/// gates on the VALUE's trust-ir type and this shape must (a) keep its membership
+/// and (b) produce a VALID module.
+#[test]
+fn test_bool_not_of_in_band_opaque_scalar_keeps_membership_and_validates() {
+    let planted = bool_rvalue_function(
+        "not_opaque_bool",
+        0,
+        Rvalue::UnaryOp(
+            UnOp::Not,
+            Operand::Constant(ConstValue::OpaqueScalar { width: 1, signed: false }),
+        ),
+    );
+    let target = bool_rvalue_function(
+        "target",
+        1,
+        Rvalue::UnaryOp(UnOp::Not, Operand::Copy(Place::local(1))),
+    );
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (a) MEMBERSHIP: the bundling probe must keep it. This is the assertion a
+    // fail-closed `BridgeError` on this shape breaks.
+    assert!(
+        verifiable_function_lowers_in_module_context(
+            &[target, planted.clone()],
+            1,
+            &empty,
+            &empty
+        ),
+        "a bool `!` of an in-band bool OpaqueScalar must not be EVICTED from the bundle"
+    );
+    // (b) VALIDITY: and the module it lowers to must actually validate, which the
+    // pristine `UnOp::Not` spelling did not.
+    let module = lower_to_trust_ir(&planted).expect("must lower");
+    assert!(
+        !module_has_scalar_bool_unop(&module),
+        "the OpaqueScalar bool `!` must be respelled, sites={:?}",
+        scalar_bool_unop_sites(&module)
+    );
+    assert_valid_module(&module);
+}
+
+/// THE RESIDUAL, honestly. A `Neg` whose destination maps to scalar `Bool` is not
+/// constructible from Rust and has no respelling. It must stay a VALIDATION
+/// rejection — the lowering SUCCEEDS (membership kept, nothing evicted) and
+/// `validate_module` refuses the module, byte-for-byte the pre-seam behaviour.
+/// Both halves are asserted: no `BridgeError`, and a non-empty error list.
+#[test]
+fn test_bool_destination_neg_stays_a_validation_rejection_not_an_eviction() {
+    let planted = bool_rvalue_function(
+        "neg_bool",
+        1,
+        Rvalue::UnaryOp(UnOp::Neg, Operand::Copy(Place::local(1))),
+    );
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert!(
+        verifiable_function_lowers_in_module_context(&[planted.clone()], 0, &empty, &empty),
+        "the residual must not become an eviction"
+    );
+    let module = lower_to_trust_ir(&planted).expect("the residual still lowers");
+    assert!(
+        module_has_scalar_bool_unop(&module),
+        "a bool-destination Neg has no respelling and must reach the validator as-is"
+    );
+    let errors = validate_module(&module);
+    assert!(
+        !errors.is_empty(),
+        "a bool-destination Neg must be REFUSED by validate_module, not silently admitted"
+    );
+}
+
+/// The `false` constant `emit_unop` inlines must stay byte-identical to the one
+/// `emit_const(&ConstValue::Bool(false))` mints, so the two cannot drift.
+#[test]
+fn test_emit_unop_false_const_matches_emit_const() {
+    let via_seam = lower_to_trust_ir(&bool_rvalue_function(
+        "via_seam",
+        1,
+        Rvalue::UnaryOp(UnOp::Not, Operand::Copy(Place::local(1))),
+    ))
+    .expect("must lower");
+    let via_emit_const = lower_to_trust_ir(&bool_rvalue_function(
+        "via_emit_const",
+        1,
+        Rvalue::Use(Operand::Constant(ConstValue::Bool(false))),
+    ))
+    .expect("must lower");
+    let const_node = |module: &trust_ir::Module| {
+        module.functions[0].blocks[0]
+            .body
+            .iter()
+            .find_map(|node| match &node.inst {
+                Inst::Const { ty, value } => Some((ty.clone(), value.clone())),
+                _ => None,
+            })
+            .expect("a Const node")
+    };
+    assert_eq!(
+        const_node(&via_seam),
+        const_node(&via_emit_const),
+        "emit_unop's inlined false constant must equal emit_const's"
+    );
 }
 
 #[test]
@@ -2807,6 +3105,7 @@ fn test_lower_signed_comparison_uses_operand_type() {
             }],
             arg_count: 2,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2853,6 +3152,7 @@ fn test_lower_unsigned_comparison_uses_operand_type() {
             }],
             arg_count: 2,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2899,6 +3199,7 @@ fn test_lower_cmp_i32_to_i8_uses_icmp_selects() {
             }],
             arg_count: 2,
             return_ty: Ty::i8(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -2969,6 +3270,7 @@ fn test_lower_cmp_u32_uses_unsigned_icmp() {
             }],
             arg_count: 2,
             return_ty: Ty::i8(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3022,6 +3324,7 @@ fn test_lower_cmp_float_rejected() {
             }],
             arg_count: 2,
             return_ty: Ty::i8(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3065,6 +3368,7 @@ fn test_lower_checked_add() {
             }],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3141,6 +3445,7 @@ fn test_lower_checked_add_tuple_field_zero_projection() {
             }],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3200,6 +3505,7 @@ fn test_lower_checked_add_tuple_field_one_assert() {
             ],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3322,6 +3628,7 @@ fn test_lower_guarded_checked_add_with_widthless_int_constants() {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3412,6 +3719,7 @@ fn test_lower_checked_add_rejects_non_fitting_int_constant() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3479,6 +3787,7 @@ fn test_lower_midpoint_function() {
             ],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3533,6 +3842,7 @@ fn test_lower_nop_statement() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3579,6 +3889,7 @@ fn test_metadata_statements_do_not_block_lowering() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3610,6 +3921,7 @@ fn test_unsupported_statement_reports_detail() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3642,6 +3954,7 @@ fn test_deinit_and_unknown_intrinsic_fail_closed() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3667,6 +3980,7 @@ fn test_deinit_and_unknown_intrinsic_fail_closed() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3702,6 +4016,7 @@ fn test_unsupported_rvalue_and_operand_report_detail() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3738,6 +4053,7 @@ fn test_unsupported_rvalue_and_operand_report_detail() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3774,6 +4090,7 @@ fn test_lower_contracts_to_obligations() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![
             Contract {
@@ -3838,6 +4155,7 @@ fn test_contract_obligations_carry_stable_source_metadata() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![contract.clone()],
         preconditions: vec![],
@@ -3918,6 +4236,7 @@ fn test_lower_drop_terminator() {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -3964,6 +4283,7 @@ fn test_nontrivial_drop_fails_soft_with_honest_panic_obligation() {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -4056,6 +4376,7 @@ fn drop_glue_test_fn(drop_ty: Ty) -> VerifiableFunction {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -4873,6 +5194,7 @@ fn test_lower_unresolved_call_fails_soft_with_honest_panic_obligation() {
             ],
             arg_count: 0,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -4941,6 +5263,7 @@ fn test_panic_call_lowers_to_panic_freedom_obligation() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -4954,6 +5277,98 @@ fn test_panic_call_lowers_to_panic_freedom_obligation() {
             && po.description.contains("must be unreachable")
     });
     assert!(has_panic_freedom, "panic call should yield a PanicFreedom obligation");
+}
+
+/// SOUNDNESS PIN (false proof closed 2026-08-14). The whole-function
+/// `mir-assertions:<fn>:panic-freedom` aggregate exists ONLY for panic sources
+/// that get no counted per-site obligation of their own — a diverging panic
+/// `Call` (`panic!`/`assert!`/`unreachable!`) or an assumption marker. A body
+/// whose panic sites are all `Terminator::Assert` (bounds / overflow / div)
+/// emits per-site obligations and NO aggregate (pinned by
+/// `test_lower_assert_terminator`).
+///
+/// That asymmetry is why the compiler's removed
+/// `apply_whole_function_panic_freedom_subsumption` could never be sound: it
+/// discharged the aggregate from "every OTHER published row is a static proof",
+/// but whenever the aggregate exists at least one panic source is carried by it
+/// ALONE, so the sibling conjunction never covers the panic being ruled out.
+/// Measured false proof:
+/// `while i < 4 { assert!(n != i); t ^= i; i += 1; }` verified rc=0 off the
+/// unrelated `i += 1` overflow proof (see
+/// `tests/trust-falsification/mutant/pf_subsume_loop_assert_sibling.rs`).
+///
+/// If this ever changes — i.e. a diverging panic `Call` starts publishing its
+/// own counted per-site row — a subsumption lane becomes expressible again, but
+/// only against a per-site coverage check. Until then this test is the premise.
+#[test]
+fn panic_call_aggregate_has_no_independent_per_site_carrier() {
+    let func = VerifiableFunction {
+        name: "panics".to_string(),
+        def_path: "test::panics".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    is_foreign: false,
+                    func: "core::panicking::panic".to_string(),
+                    args: vec![],
+                    dest: Place::local(0),
+                    target: None,
+                    span: SourceSpan::default(),
+                    atomic: None,
+                },
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("panic call must lower, not fail closed");
+
+    let panic_sources = module
+        .proof_obligations
+        .iter()
+        .filter(|obligation| obligation.kind == trust_ir::ObligationKind::PanicFreedom)
+        .filter_map(|obligation| obligation.formula.as_ref())
+        .filter_map(|formula| serde_json::from_str::<serde_json::Value>(&formula.payload).ok())
+        .filter_map(|payload| {
+            payload.get("source_id").and_then(|value| value.as_str()).map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+
+    // The whole-function carrier the compiler surfaces as the counted
+    // `assertion:panic-freedom:0` public obligation.
+    assert!(
+        panic_sources.iter().any(|id| id == "mir-assertions:test::panics:panic-freedom"),
+        "a diverging panic call must mint the whole-function carrier; got {panic_sources:?}"
+    );
+    // The site's OWN row exists here, but ONLY as a bridge-local `PanicFreedom`
+    // obligation. Every bridge-local row is dropped at the public-inventory
+    // boundary (`reset_native_trust_ir_proof_inventory_to_public_bundle`), and
+    // the diverging panic Call is NOT a `Terminator::Assert`, so trust-vcgen
+    // emits no counted safety twin for it either. The public verdict therefore
+    // reaches this panic site ONLY through the aggregate.
+    assert!(
+        panic_sources.iter().any(|id| id == "mir-assert:test::panics:bb0:terminator"),
+        "the panic site's own row must exist bridge-locally; got {panic_sources:?}"
+    );
+    assert!(
+        !module.proof_obligations.iter().any(|obligation| matches!(
+            obligation.kind,
+            trust_ir::ObligationKind::BoundsCheck | trust_ir::ObligationKind::ArithmeticSafety
+        )),
+        "a diverging panic Call must not masquerade as a counted per-site safety obligation"
+    );
 }
 
 #[test]
@@ -5030,6 +5445,7 @@ fn str_pattern_method_with_panicking_closure_is_not_summarized_total() {
                 fields: vec![],
                 disc_index_safe: false,
                 faithful_enum_repr: None, enum_layout: None, },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5080,6 +5496,7 @@ fn test_lower_intra_module_call_terminator_validates() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5113,6 +5530,7 @@ fn test_lower_intra_module_call_terminator_validates() {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5158,6 +5576,7 @@ fn test_lower_cast_widening() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5190,6 +5609,7 @@ fn test_cast_constant_uses_constant_type_instead_of_i64_fallback() {
             }],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5228,6 +5648,7 @@ fn test_layout_sensitive_cast_without_tuple_layout_evidence_is_blocked() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5309,6 +5730,7 @@ fn test_lower_f64_add_emits_fadd_and_validates() {
             }],
             arg_count: 2,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5354,6 +5776,7 @@ fn test_lower_f64_lt_emits_fcmp_not_icmp() {
             }],
             arg_count: 2,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5399,6 +5822,7 @@ fn test_lower_f64_neg_emits_fneg() {
             }],
             arg_count: 1,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5439,6 +5863,7 @@ fn test_cast_f64_to_int_uses_target_signedness() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5465,6 +5890,7 @@ fn test_cast_f64_to_int_uses_target_signedness() {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5526,6 +5952,7 @@ fn test_lower_floatbits64_constant_preserves_bits() {
             }],
             arg_count: 0,
             return_ty: Ty::f64_ty(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5567,6 +5994,7 @@ fn test_opaque_terminator_rejected_even_with_single_target() {
             ],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5605,6 +6033,7 @@ fn test_field_projection_on_non_aggregate_rejected() {
             }],
             arg_count: 1,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5651,6 +6080,7 @@ fn test_nested_field_projected_store_rebuilds_outer_aggregate() {
             }],
             arg_count: 2,
             return_ty: Ty::Tuple(vec![inner_ty, Ty::u64()]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5722,6 +6152,7 @@ fn projected_store_through_pointer(
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5807,6 +6238,7 @@ fn address_of_test_function(
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -5997,6 +6429,7 @@ fn test_direct_projected_store_into_flat_enum_lowers_as_sound_havoc() {
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6034,6 +6467,7 @@ fn test_whole_faithful_enum_store_through_reference_remains_supported() {
             }],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6105,6 +6539,7 @@ fn discriminant_read_function(name: &str, enum_ty: Ty) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::PtrSizedInt { signed: true },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6207,6 +6642,7 @@ fn pointer_width_switch_function(name: &str, discr_ty: Ty, case: u128) -> Verifi
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6295,6 +6731,7 @@ fn test_faithful_downcast_field_reads_variant_local_payload_lane() {
             }],
             arg_count: 1,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6383,6 +6820,7 @@ fn mismatched_variant_operand_function(faithful: bool, op: BinOp) -> VerifiableF
             }],
             arg_count: 2,
             return_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6443,6 +6881,7 @@ fn set_discriminant_function(enum_ty: Ty, variant_index: usize) -> VerifiableFun
             }],
             arg_count: 1,
             return_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6566,11 +7005,164 @@ fn multi_block_local_function(early_read: bool) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+    }
+}
+
+fn writer_after_reader_in_slice_function() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "writer_after_reader_in_slice".into(),
+        def_path: "test::writer_after_reader_in_slice".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i32(), name: None },
+                LocalDecl { index: 1, ty: Ty::i32(), name: Some("tmp".into()) },
+            ],
+            // Execution is bb0 -> bb2 -> bb1, but lowering follows this slice's
+            // bb0,bb1,bb2 order. A flat map would therefore lower bb1's read
+            // before bb2's dominating write and emit a never-defined ValueId.
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Goto(BlockId(2)),
+                },
+                TrustBlock {
+                    id: BlockId(1),
+                    stmts: vec![local_copy_assign(0, 1)],
+                    terminator: Terminator::Return,
+                },
+                TrustBlock {
+                    id: BlockId(2),
+                    stmts: vec![i32_const_assign(1, 41)],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+            ],
+            arg_count: 0,
+            return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn test_dominating_writer_lowered_after_reader_uses_entry_slot() {
+    let module = lower_to_trust_ir(&writer_after_reader_in_slice_function())
+        .expect("slice order must not manufacture an undefined SSA use");
+    assert_valid_module(&module);
+    let outcome = Interpreter::with_module(&module)
+        .execute_func(trust_ir::FuncId::new(0), vec![])
+        .expect("the real CFG writes before it reads");
+    assert_eq!(
+        outcome.returns[0].kind,
+        InterpretValue::int(TrustIrTy::I32, 41).unwrap().kind
+    );
+}
+
+#[test]
+fn test_implicit_return_slot_read_participates_in_dominance() {
+    let mut function = writer_after_reader_in_slice_function();
+    // The return block now contains no explicit `_0` copy. Its `Return`
+    // terminator still reads `_0`, whose sole writer is deliberately later in
+    // slice order but earlier in real CFG order.
+    function.body.blocks[1].stmts.clear();
+    function.body.blocks[2].stmts = vec![i32_const_assign(0, 73)];
+
+    let module = lower_to_trust_ir(&function)
+        .expect("the implicit return-slot read must receive dominated storage");
+    assert_valid_module(&module);
+    let outcome = Interpreter::with_module(&module)
+        .execute_func(trust_ir::FuncId::new(0), vec![])
+        .expect("the real CFG initializes `_0` before Return");
+    assert_eq!(
+        outcome.returns[0].kind,
+        InterpretValue::int(TrustIrTy::I32, 73).unwrap().kind
+    );
+}
+
+fn sibling_borrow_function() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "sibling_borrow".into(),
+        def_path: "test::sibling_borrow".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i32(), name: None },
+                LocalDecl { index: 1, ty: Ty::u8(), name: Some("choice".into()) },
+                LocalDecl { index: 2, ty: Ty::i32(), name: Some("value".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) },
+                    name: Some("borrow".into()),
+                },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![i32_const_assign(2, 55)],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(1)),
+                        targets: vec![(1, BlockId(1))],
+                        otherwise: BlockId(2),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                TrustBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(3),
+                            rvalue: Rvalue::Ref { mutable: false, place: Place::local(2) },
+                            span: SourceSpan::default(),
+                        },
+                        local_copy_assign(0, 2),
+                    ],
+                    terminator: Terminator::Return,
+                },
+                TrustBlock {
+                    id: BlockId(2),
+                    stmts: vec![local_copy_assign(0, 2)],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn test_address_taken_local_alloca_dominates_sibling_use() {
+    let module = lower_to_trust_ir(&sibling_borrow_function())
+        .expect("an address-taken local must allocate in the entry block");
+    assert_valid_module(&module);
+    for choice in [0, 1] {
+        let outcome = Interpreter::with_module(&module)
+            .execute_func(
+                trust_ir::FuncId::new(0),
+                vec![InterpretValue::int(TrustIrTy::U8, choice).unwrap()],
+            )
+            .expect("both sibling paths read the initialized entry slot");
+        assert_eq!(
+            outcome.returns[0].kind,
+            InterpretValue::int(TrustIrTy::I32, 55).unwrap().kind
+        );
     }
 }
 
@@ -6681,6 +7273,7 @@ fn fieldless_enum_reassignment_function(faithful: bool) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6833,6 +7426,7 @@ fn test_promoted_argument_slot_preserves_the_entry_parameter() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6913,6 +7507,7 @@ fn test_downcast_then_nested_aggregate_field_resets_active_variant() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -6967,6 +7562,7 @@ fn test_projected_binary_rvalue_store_rebuilds_aggregate() {
             }],
             arg_count: 3,
             return_ty: tuple_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7019,6 +7615,7 @@ fn test_array_index_projected_store_emits_insert_element() {
             }],
             arg_count: 3,
             return_ty: array_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7073,6 +7670,7 @@ fn test_fetch_nand_atomic_rejected() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7128,6 +7726,7 @@ fn test_atomic_store_metadata_without_authenticated_evidence_rejected() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7180,6 +7779,7 @@ fn test_atomic_load_metadata_without_authenticated_evidence_rejected() {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7235,6 +7835,7 @@ fn test_atomic_fetch_add_metadata_without_authenticated_evidence_rejected() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7290,6 +7891,7 @@ fn test_atomic_fetch_min_metadata_without_authenticated_evidence_rejected() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7346,6 +7948,7 @@ fn test_atomic_compare_exchange_metadata_without_authenticated_evidence_rejected
             ],
             arg_count: 1,
             return_ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7404,6 +8007,7 @@ fn test_lower_assert_terminator() {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7461,6 +8065,7 @@ fn test_lower_aggregate_construction() {
             }],
             arg_count: 2,
             return_ty: Ty::Tuple(vec![Ty::i32(), Ty::i32()]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7480,6 +8085,16 @@ fn test_lower_aggregate_construction() {
         )
     });
     assert!(has_undef, "aggregate construction should start with Undef");
+    let seed = bb0
+        .body
+        .iter()
+        .find(|node| matches!(&node.inst, Inst::Undef { ty: TrustIrTy::Tuple(_) }))
+        .expect("aggregate seed");
+    assert_eq!(
+        seed.proofs.as_slice(),
+        [trust_ir::ProofAnnotation::FreshSymbolicHavoc],
+        "an aggregate seed is fresh and unconstrained, never narrowing authority"
+    );
 
     let insert_count =
         bb0.body.iter().filter(|n| matches!(&n.inst, Inst::InsertField { .. })).count();
@@ -7519,6 +8134,7 @@ fn test_lower_fat_raw_ptr_aggregate_to_slice_fat_ptr() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7584,6 +8200,7 @@ fn test_lower_array_ref_to_slice_ref_cast_builds_fat_pointer() {
                 mutable: false,
                 inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
             },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7655,6 +8272,7 @@ fn test_lower_array_raw_ptr_to_slice_raw_ptr_cast_builds_fat_pointer() {
                 mutable: false,
                 pointee: Box::new(Ty::Slice { elem: Box::new(Ty::i32()) }),
             },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7729,6 +8347,7 @@ fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7779,6 +8398,7 @@ fn test_lower_address_of_slice_subslice_preserves_metadata() {
                 pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
                 mutable: false,
             },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7838,6 +8458,7 @@ fn test_lower_ref_direct_local_materializes_borrow() {
             }],
             arg_count: 1,
             return_ty: ref_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7899,6 +8520,7 @@ fn test_address_taken_local_assignment_updates_storage_and_reads_load() {
             }],
             arg_count: 1,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -7962,6 +8584,7 @@ fn test_lower_array_subslice_value_is_fixed_array() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8023,6 +8646,7 @@ fn test_lower_address_of_array_subslice_is_thin_array_pointer() {
             }],
             arg_count: 1,
             return_ty: ptr_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8085,6 +8709,7 @@ fn test_lower_discriminant_rvalue() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8133,6 +8758,7 @@ fn test_lower_discriminant_rvalue_untagged_adt_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8178,6 +8804,7 @@ fn test_lower_discriminant_rvalue_result_type_mismatch_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8227,6 +8854,7 @@ fn test_lower_discriminant_read_bare_int_havocs_dest() {
             }],
             arg_count: 1,
             return_ty: Ty::isize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8277,6 +8905,7 @@ fn test_lower_discriminant_read_bare_bool_still_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::isize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8286,9 +8915,220 @@ fn test_lower_discriminant_read_bare_bool_still_fails_closed() {
 
     let err =
         lower_to_trust_ir(&func).expect_err("non-Int non-Adt Discriminant read must fail closed");
+    // The op label must name the READ. `explicit_discriminant_field` is shared by
+    // the write and read paths and used to hardcode "SetDiscriminant", so every
+    // read failure was reported as a write failure.
     assert!(
-        matches!(err, BridgeError::UnsupportedOp(ref msg) if msg.contains("SetDiscriminant is modeled only")),
-        "expected the fail-closed UnsupportedOp diagnostic, got {err:?}"
+        matches!(&err, BridgeError::UnsupportedOp(msg) if msg.contains("Discriminant read is modeled only")),
+        "expected the fail-closed UnsupportedOp diagnostic naming the READ, got {err:?}"
+    );
+    assert!(
+        matches!(&err, BridgeError::UnsupportedOp(msg) if !msg.contains("SetDiscriminant")),
+        "a Discriminant READ failure must not be reported as SetDiscriminant, got {err:?}"
+    );
+    assert!(
+        matches!(&err, BridgeError::UnsupportedOp(msg) if msg.contains("is not an ADT at all")),
+        "expected the MALFORMED (not opaque-by-design) wording for a Bool place, got {err:?}"
+    );
+}
+
+// ── Lever A: discriminant traffic on an OPAQUE by-name datatype marker ───────
+//
+// `compact_oversized_field` / the `adt_stack` back-edge guard replace an
+// oversized or self-referential FIELD with `Ty::Datatype { name, variants: [] }`
+// — variants absent BY DESIGN, not by a construction bug. Both discriminant
+// paths used to hard-Err on it, aborting the whole function's lowering.
+// Reproduced end to end (a 61-variant enum as a struct field): pre-change
+// stage2 reports `failed to lower `repro::bump_if_a` … got Datatype { name:
+// "repro::Kind", variants: [] }` for a body whose only discriminant traffic is
+// `match h.kind` — a READ.
+
+/// A struct whose first field the extractor compacted to a bare datatype marker
+/// — the exact production shape (`regex_syntax::ast::Group { kind: GroupKind }`).
+fn compacted_field_holder_ty() -> Ty {
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "test::Holder".to_string(),
+        fields: vec![
+            ("kind".to_string(), Ty::Datatype { name: "test::Kind".into(), variants: vec![] }),
+            ("n".to_string(), Ty::u32()),
+        ],
+        variants: Vec::new(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+/// A `Discriminant` READ of a field compacted to a bare datatype marker must
+/// lower to a FRESH UNCONSTRAINED dest (havoc) instead of aborting the whole
+/// function. No `Const` and no `Assume` may be emitted — the havoc'd tag carries
+/// no fact, so it can never discharge a bound.
+#[test]
+fn test_lower_discriminant_read_bare_datatype_marker_havocs_dest() {
+    let func = VerifiableFunction {
+        name: "discr_marker_read".to_string(),
+        def_path: "test::discr_marker_read".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::isize(), name: None },
+                LocalDecl { index: 1, ty: compacted_field_holder_ty(), name: Some("h".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Discriminant(Place::field(1, 0)),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::isize(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func)
+        .expect("Discriminant read of a compacted field must lower (havoc'd dest), not Err");
+    assert_valid_module(&module);
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::I64)),
+        "expected a fresh unconstrained I64 (Undef) discriminant value"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Const { .. })),
+        "an opaque-marker Discriminant read must not materialize any constant"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+        "an opaque-marker Discriminant read must not emit any Assume (no synthesized fact)"
+    );
+}
+
+/// The WRITE mirror: `SetDiscriminant` on a field compacted to a bare datatype
+/// marker stores a FRESH UNCONSTRAINED value of the marker's opaque sort.
+///
+/// SCOPE, recorded rather than implied: this arm is symmetry with the READ arm
+/// and with the bare-`Ty::Int` write arm beside it. Probing stage2 with
+/// `h.kind = Kind::A` and `o.slot = None` on a compacted field did NOT produce a
+/// projected MIR `SetDiscriminant` (rustc stages the variant in a whole-typed
+/// temp first), so unlike the read arm this one has no observed production
+/// trigger — it exists so the class cannot re-open as a whole-function abort.
+#[test]
+fn test_lower_set_discriminant_bare_datatype_marker_havocs_slot() {
+    let func = VerifiableFunction {
+        name: "discr_marker_write".to_string(),
+        def_path: "test::discr_marker_write".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: compacted_field_holder_ty(), name: Some("h".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::SetDiscriminant {
+                    place: Place::field(1, 0),
+                    variant_index: 0,
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func)
+        .expect("SetDiscriminant on a compacted field must lower (havoc'd slot), not Err");
+    assert_valid_module(&module);
+    let opaque_struct = module
+        .structs
+        .iter()
+        .find(|s| s.name == "datatype::test::Kind")
+        .expect("the marker must be registered as an opaque zero-field struct");
+    assert!(
+        opaque_struct.fields.is_empty(),
+        "the marker's struct must stay zero-field (a pure havoc slot)"
+    );
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        bb0.body.iter().any(|n| {
+            matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Struct(opaque_struct.id))
+        }),
+        "expected a fresh unconstrained value of the marker's opaque sort"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+        "an opaque-marker SetDiscriminant must not emit any Assume (no synthesized fact)"
+    );
+}
+
+/// FAIL-CLOSED pin AND the opaque-vs-definition split: the havoc arms match
+/// EXACTLY the BARE marker (`variants: []`). A `Ty::Datatype` that carries its
+/// own inline variant list is a Lever-A DEFINING occurrence with real
+/// constructors — a datatype-precise model is possible for it and belongs in the
+/// vcgen/SMT lane — so it must still hard-error, and its diagnostic must say so
+/// rather than read like the opaque marker's.
+#[test]
+fn test_lower_discriminant_read_datatype_definition_still_fails_closed() {
+    let defined = Ty::Datatype {
+        name: "test::Level".to_string(),
+        variants: vec![
+            ("Zero".to_string(), vec![]),
+            ("Succ".to_string(), vec![("pred".to_string(), Ty::u64())]),
+        ],
+    };
+    let func = VerifiableFunction {
+        name: "discr_datatype_def".to_string(),
+        def_path: "test::discr_datatype_def".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::isize(), name: None },
+                LocalDecl { index: 1, ty: defined, name: Some("l".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Discriminant(Place::local(1)),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::isize(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let err = lower_to_trust_ir(&func)
+        .expect_err("a Datatype DEFINITION must still fail closed on a Discriminant read");
+    assert!(
+        matches!(&err, BridgeError::UnsupportedOp(msg)
+            if msg.contains("Lever-A datatype DEFINITION with 2 constructor(s)")),
+        "expected the DEFINITION wording, distinct from the opaque marker's, got {err:?}"
+    );
+    assert!(
+        matches!(&err, BridgeError::UnsupportedOp(msg) if msg.contains("Discriminant read")),
+        "the definition diagnostic must still name the READ, got {err:?}"
     );
 }
 
@@ -8336,6 +9176,7 @@ fn discriminant_range_fixture(discs: &[i128], disc_index_safe: bool) -> Verifiab
             }],
             arg_count: 1,
             return_ty: Ty::isize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8438,6 +9279,7 @@ fn test_discriminant_cross_width_u8_dest_isize_tag_bounds_and_assigns() {
             }],
             arg_count: 1,
             return_ty: Ty::u8(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8505,6 +9347,7 @@ fn test_lower_set_discriminant_explicit_tag_inserts_tag_field() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8556,6 +9399,7 @@ fn test_lower_set_discriminant_untagged_adt_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8601,6 +9445,7 @@ fn test_lower_set_discriminant_bare_int_stores_fresh_unconstrained_tag() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8663,6 +9508,7 @@ fn test_lower_tagged_option_none_aggregate_sets_false_tag() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8721,6 +9567,7 @@ fn test_lower_tagged_option_some_aggregate_sets_payload_and_true_tag() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8783,6 +9630,7 @@ fn test_lower_tagged_option_some_symbolic_payload_sets_tag() {
             }],
             arg_count: 0,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8856,6 +9704,7 @@ fn test_lower_datatype_local_move_through() {
             }],
             arg_count: 1,
             return_ty: dt,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -8911,6 +9760,7 @@ fn test_lower_datatype_field_projection_fail_softs_to_dest_typed_havoc() {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9016,6 +9866,7 @@ fn test_lower_nested_compacted_field_read_keeps_unrelated_obligations() {
             ],
             arg_count: 2,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9090,6 +9941,7 @@ fn test_lower_compacted_field_read_without_expected_type_still_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9104,7 +9956,7 @@ fn test_lower_compacted_field_read_without_expected_type_still_fails_closed() {
         matches!(
             err,
             BridgeError::UnsupportedOp(ref msg)
-                if msg.contains("Field projection .0 on non-aggregate type Datatype")
+                if msg.contains("Field projection .0 into the compacted-aggregate marker")
                     && msg.contains("__trust_compacted_aggregate")
         ),
         "expected the fail-closed Field-projection error, got {err:?}"
@@ -9146,6 +9998,7 @@ fn test_lower_projected_store_into_compacted_field_still_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9156,6 +10009,225 @@ fn test_lower_projected_store_into_compacted_field_still_fails_closed() {
     let err = lower_to_trust_ir(&func)
         .expect_err("a store into a compacted field must keep failing closed");
     assert!(matches!(err, BridgeError::UnsupportedOp(_)), "expected UnsupportedOp, got {err:?}");
+}
+
+// ─── THROUGH-POINTER field store into an opaque datatype object ─────────────
+//
+// `fn set_v(n: &mut Node, v: u32) { n.v = v }` where `Node` is self-recursive
+// (`Option<Box<Node>>`), so `Node` is a canonical cut point and its every
+// occurrence is the bare marker. Measured with the shipped stage2 `trustc`:
+//   failed to lower `dt2::set_v` ... unsupported operation:
+//   Field projection .0 on non-aggregate type Datatype { name: "dt2::Node",
+//   variants: [] }
+// This is the shape of every `&mut self` field setter on such a type — the
+// `log::RecordBuilder::{level,target,args,file,line,module_path}` family in the
+// workspace log. `lower_projected_store` deliberately passes NO expected type
+// on this path, so no read/borrow fail-soft applies and the whole function was
+// dropped from the native lane.
+
+/// `(*_1).0 = <value>` where `_1: &mut <marker>`.
+fn marker_field_store_func(marker_name: &str, projections: Vec<Projection>) -> VerifiableFunction {
+    let marker = datatype_ref_ty(marker_name);
+    VerifiableFunction {
+        name: "set_field".to_string(),
+        def_path: "test::set_field".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(marker) },
+                    name: Some("n".into()),
+                },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("v".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place { local: 1, projections },
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn test_projected_store_into_opaque_datatype_havocs_the_whole_object() {
+    let func = marker_field_store_func(
+        "dt2::Node",
+        vec![Projection::Deref, Projection::Field(0)],
+    );
+    let module = lower_to_trust_ir(&func)
+        .expect("a field store into an opaque datatype object must fail-soft, not drop the fn");
+    assert_valid_module(&module);
+
+    let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    // The opaque datatype registers a ZERO-FIELD struct; the havoc must be typed
+    // at exactly that, i.e. the WHOLE object, never a fabricated field slot.
+    let marker_struct = module
+        .structs
+        .iter()
+        .find(|s| s.name == "datatype::dt2::Node")
+        .expect("the marker's opaque zero-field struct is registered");
+    assert!(marker_struct.fields.is_empty(), "a datatype marker has no field slots");
+    let marker_ty = TrustIrTy::Struct(marker_struct.id);
+
+    let havoc = body
+        .iter()
+        .find_map(|node| match (&node.inst, node.results.first()) {
+            (Inst::Undef { ty }, Some(id)) if *ty == marker_ty => Some(*id),
+            _ => None,
+        })
+        .expect("a whole-object Undef havoc typed at the marker's opaque struct");
+    assert!(
+        body.iter().any(|node| matches!(
+            &node.inst,
+            Inst::Store { ty, value, .. } if *ty == marker_ty && *value == havoc
+        )),
+        "the havoc must be STORED over the object — emitting nothing would leave a \
+         pre-store fact live across a write that really happened"
+    );
+    // No fabricated structure: the marker has no field slots, so nothing may
+    // index into it.
+    assert!(
+        !body.iter().any(|node| matches!(&node.inst, Inst::InsertField { .. })),
+        "the fail-soft must not fabricate an aggregate write"
+    );
+}
+
+#[test]
+fn test_projected_store_into_opaque_datatype_carries_no_fact() {
+    // SOUNDNESS PIN: the fail-soft is a pure havoc. It must emit no `Assume`,
+    // no constant, and no equality about the object's contents — otherwise it
+    // would be asserting something about memory it did not model.
+    let func =
+        marker_field_store_func("dt2::Node", vec![Projection::Deref, Projection::Field(0)]);
+    let module = lower_to_trust_ir(&func).expect("lowers");
+    let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        !body.iter().any(|node| matches!(&node.inst, Inst::Assume { .. })),
+        "a havoc completion must never assume anything about the havoc'd object"
+    );
+}
+
+#[test]
+fn test_projected_store_into_opaque_datatype_through_nested_deref_fails_closed() {
+    // SOUNDNESS BOUNDARY: with a `Deref` still to come, the write lands through
+    // a pointer LOADED FROM INSIDE the object and may therefore target memory
+    // OUTSIDE it. A whole-object havoc would not cover that write, so this must
+    // keep the historical hard fail.
+    let func = marker_field_store_func(
+        "dt2::Node",
+        vec![Projection::Deref, Projection::Field(0), Projection::Deref],
+    );
+    assert!(
+        matches!(lower_to_trust_ir(&func), Err(BridgeError::UnsupportedOp(_))),
+        "a store through a pointer loaded out of the opaque object must fail closed"
+    );
+}
+
+#[test]
+fn test_projected_store_into_opaque_datatype_through_index_fails_closed() {
+    // SOUNDNESS BOUNDARY: an `Index` on the remaining walk carries a bounds
+    // panic that must stay modeled; havocing the object would silently drop it.
+    let func = marker_field_store_func(
+        "dt2::Node",
+        vec![Projection::Deref, Projection::Field(0), Projection::Index(2)],
+    );
+    assert!(
+        matches!(lower_to_trust_ir(&func), Err(BridgeError::UnsupportedOp(_))),
+        "a store through an Index inside the opaque object must fail closed"
+    );
+}
+
+#[test]
+fn test_opaque_datatype_field_diagnostic_distinguishes_its_two_causes() {
+    // The two producers of `Ty::Datatype { name, variants: [] }` have OPPOSITE
+    // prognoses and used to report one undifferentiated message. A compacted
+    // marker's contents are recorded NOWHERE; a canonical cut point's structure
+    // IS recorded in `datatype_defs` (what is missing there is a field slot in
+    // the lowered VALUE, not the structure). The messages must say which.
+    // Driven through the PRODUCTION path (`lower_to_trust_ir` -> the aggregate
+    // projected-store walk -> `field_type`), not by calling the guard directly:
+    // this is the same fixture shape as
+    // `test_lower_projected_store_into_compacted_field_still_fails_closed`,
+    // which pins that this store keeps failing closed.
+    let refusal = |marker_name: &str| {
+        let outer = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "test::Outer".to_string(),
+            fields: vec![
+                ("payload".to_string(), datatype_ref_ty(marker_name)),
+                ("len".to_string(), Ty::u64()),
+            ],
+            variants: Vec::new(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let func = VerifiableFunction {
+            name: "store".to_string(),
+            def_path: "test::store".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: outer, name: Some("c".into()) },
+                ],
+                blocks: vec![TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place {
+                            local: 1,
+                            projections: vec![Projection::Field(0), Projection::Field(0)],
+                        },
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(3, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+        lower_to_trust_ir(&func).expect_err("a store into a marker interior fails closed")
+    };
+    let compacted = refusal("__trust_compacted_aggregate");
+    let by_name = refusal("dt2::Node");
+    let (compacted, by_name) = match (compacted, by_name) {
+        (BridgeError::UnsupportedOp(a), BridgeError::UnsupportedOp(b)) => (a, b),
+        other => panic!("expected two UnsupportedOp refusals, got {other:?}"),
+    };
+    assert_ne!(compacted, by_name, "the two causes must not report the same message");
+    assert!(
+        compacted.contains("compacted-aggregate marker")
+            && compacted.contains("never lowered")
+            && compacted.contains("Fix at the type"),
+        "the compacted cause must name the size bound and its fix: {compacted}"
+    );
+    assert!(
+        by_name.contains("by-name datatype marker `dt2::Node`")
+            && by_name.contains("datatype_defs")
+            && by_name.contains("zero-field opaque struct"),
+        "the by-name cause must name the table and the representation limit: {by_name}"
+    );
 }
 
 #[test]
@@ -9191,6 +10263,7 @@ fn test_lower_compacted_field_read_as_known_call_arg_fail_softs() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9229,6 +10302,7 @@ fn test_lower_compacted_field_read_as_known_call_arg_fail_softs() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9293,6 +10367,7 @@ fn test_lower_aggregate_from_compacted_field_read_fail_softs() {
             }],
             arg_count: 1,
             return_ty: Ty::Tuple(vec![Ty::u64(), Ty::u64()]),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9362,6 +10437,7 @@ fn test_lower_borrow_of_compacted_field_fail_softs_to_dest_typed_gep() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9439,6 +10515,7 @@ fn test_lower_borrow_through_ref_of_compacted_datatype_field_fail_softs() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9523,6 +10600,7 @@ fn test_lower_borrow_of_compacted_field_with_unmappable_dest_still_fails_closed(
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9536,7 +10614,7 @@ fn test_lower_borrow_of_compacted_field_with_unmappable_dest_still_fails_closed(
         matches!(
             err,
             BridgeError::UnsupportedOp(ref msg)
-                if msg.contains("Field projection .0 on non-aggregate type Datatype")
+                if msg.contains("Field projection .0 into the compacted-aggregate marker")
                     && msg.contains("__trust_compacted_aggregate")
         ),
         "expected the ORIGINAL fail-closed Field-projection error, got {err:?}"
@@ -9637,6 +10715,7 @@ fn compacted_vec_box_write_func(operands: Vec<Operand>) -> VerifiableFunction {
             }],
             arg_count: 4,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9703,7 +10782,7 @@ fn test_lower_aggregate_into_compacted_slot_with_unlowerable_operand_still_fails
         matches!(
             err,
             BridgeError::UnsupportedOp(ref msg)
-                if msg.contains("Field projection .0 on non-aggregate type Datatype")
+                if msg.contains("Field projection .0 into the compacted-aggregate marker")
                     && msg.contains("__trust_compacted_aggregate")
         ),
         "expected the fail-closed Field-projection error, got {err:?}"
@@ -9711,10 +10790,22 @@ fn test_lower_aggregate_into_compacted_slot_with_unlowerable_operand_still_fails
 }
 
 #[test]
-fn test_lower_datatype_discriminant_fails_closed() {
+fn test_lower_datatype_discriminant_emits_no_tag_fact() {
     // Discriminant reads need the flat `Ty::Adt` `__tag` machinery; an opaque
-    // datatype value carries no tag, so the read must fail closed (never an
-    // assumed range fact, never a fabricated tag).
+    // datatype value carries no tag, so the read must emit NEVER AN ASSUMED
+    // RANGE FACT AND NEVER A FABRICATED TAG.
+    //
+    // That property — this pin's whole soundness content, stated in its own
+    // original comment — is now asserted DIRECTLY. It used to be asserted
+    // indirectly, as `expect_err`, because there was no model for the shape at
+    // all and a hard `Err` was the only way to guarantee no fact was emitted.
+    // A hard `Err` is a WHOLE-FUNCTION lowering abort, so it also poisoned
+    // every unrelated obligation in the function to Unsupported (measured: 14
+    // of 521 production `regex_syntax` bodies, every one a `match` on a
+    // compacted field). The bare marker now lowers to a fresh unconstrained
+    // value — the same over-approximation the bare-`Ty::Int` arm, the
+    // coroutine-frame arm and the opaque-datatype field read already use — so
+    // the guarantee is stated as what it always meant.
     let dt = datatype_ref_ty("selfcheck::CheckError");
     let func = VerifiableFunction {
         name: "dt_discr".to_string(),
@@ -9736,6 +10827,7 @@ fn test_lower_datatype_discriminant_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9743,9 +10835,22 @@ fn test_lower_datatype_discriminant_fails_closed() {
         spec: Default::default(),
     };
 
-    let err = lower_to_trust_ir(&func)
-        .expect_err("discriminant read on an opaque datatype must fail closed");
-    assert!(matches!(err, BridgeError::UnsupportedOp(_)), "expected UnsupportedOp, got {err:?}");
+    let module = lower_to_trust_ir(&func)
+        .expect("discriminant read on an opaque datatype must lower to a havoc, not abort");
+    assert_valid_module(&module);
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::Undef { .. })),
+        "expected the tag to be a fresh unconstrained value"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+        "NEVER an assumed range fact for an opaque datatype's discriminant"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Const { .. })),
+        "NEVER a fabricated tag constant for an opaque datatype's discriminant"
+    );
 }
 
 #[test]
@@ -9790,6 +10895,7 @@ fn test_lower_enum_aggregate_with_datatype_payload_field() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9869,6 +10975,7 @@ fn typed_absent_call_with_metadata(
                 TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
             ],
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -9895,6 +11002,52 @@ fn test_primitive_ord_gate_requires_canonical_trait_and_primitive_types() {
     ))
     .expect("primitive Ord::min lowers through its typed gate");
     assert!(!has_absent_callee_panic_obligation(&primitive));
+    let primitive_body: Vec<&Inst> = primitive.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| block.body.iter().map(|node| &node.inst))
+        .collect();
+    assert!(
+        primitive_body
+            .iter()
+            .any(|inst| matches!(inst, Inst::ICmp { op: ICmpOp::Ule, ty: TrustIrTy::U64, .. })),
+        "unsigned min must compare with Ule"
+    );
+    assert!(
+        primitive_body
+            .iter()
+            .any(|inst| matches!(inst, Inst::Select { ty: TrustIrTy::U64, .. })),
+        "integer min must select one exact operand"
+    );
+    assert!(
+        primitive_body.iter().all(|inst| !matches!(inst, Inst::Undef { .. })),
+        "integer min must not retain a havoc result"
+    );
+
+    let signed_max = lower_to_trust_ir(&typed_absent_call(
+        "core::cmp::Ord::max",
+        vec![Ty::i64(), Ty::i64()],
+        Ty::i64(),
+    ))
+    .expect("primitive signed Ord::max lowers through its typed gate");
+    let signed_body: Vec<&Inst> = signed_max.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| block.body.iter().map(|node| &node.inst))
+        .collect();
+    assert!(
+        signed_body
+            .iter()
+            .any(|inst| matches!(inst, Inst::ICmp { op: ICmpOp::Sge, ty: TrustIrTy::I64, .. })),
+        "signed max must compare with Sge"
+    );
+    assert!(
+        signed_body
+            .iter()
+            .any(|inst| matches!(inst, Inst::Select { ty: TrustIrTy::I64, .. })),
+        "integer max must select one exact operand"
+    );
+    assert!(signed_body.iter().all(|inst| !matches!(inst, Inst::Undef { .. })));
 
     let user = Ty::adt("my_crate::PanickyOrd", vec![("value".into(), Ty::u64())]);
     let user_call = lower_to_trust_ir(&typed_absent_call(
@@ -10281,6 +11434,7 @@ fn test_int_try_from_lowered_total_no_panic_obligation() {
                 ],
                 arg_count: 1,
                 return_ty: result_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -10359,6 +11513,7 @@ fn absent_call_test_fn(callee: &str, is_foreign: bool) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -10684,6 +11839,7 @@ fn test_lower_absent_callee_fail_soft() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -10706,6 +11862,14 @@ fn test_lower_absent_callee_fail_soft() {
         insts.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
         "expected the havoc (Undef) result for the absent callee"
     );
+    assert!(
+        insts.iter().any(|node| {
+            matches!(node.inst, Inst::Undef { .. })
+                && node.proofs.as_slice()
+                    == [trust_ir::ProofAnnotation::FreshSymbolicHavoc]
+        }),
+        "the absent-callee result must carry only fresh-havoc admission"
+    );
     // (c) exactly one honest PanicFreedom obligation with the marker prefix.
     let marked: Vec<_> = module
         .proof_obligations
@@ -10726,6 +11890,237 @@ fn test_lower_absent_callee_fail_soft() {
     assert!(
         !insts.iter().any(|n| matches!(n.inst, Inst::Call { .. })),
         "an absent callee must not lower to a real Call"
+    );
+}
+
+/// A cleanup block that actually DOES something (here: one statement before the
+/// re-raise) is a real landing pad, not the built-phase no-op artifact, so its
+/// edge is modelled — demonic branch, fresh-havoc selector, both successors.
+#[test]
+fn test_cleanup_edge_is_emitted_and_uses_only_fresh_havoc() {
+    let func = VerifiableFunction {
+        name: "cleanup_edge".to_string(),
+        def_path: "test::cleanup_edge".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u64(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("x".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Cleanup(BlockId(2)),
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        func: "mycrate::may_unwind".to_string(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                TrustBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(1),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Resume,
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("cleanup-carrying call must lower");
+    assert_valid_module(&module);
+    let entry = &module.functions[0].blocks[0];
+    let havoc = entry
+        .body
+        .iter()
+        .find(|node| matches!(node.inst, Inst::Undef { ty: TrustIrTy::Bool }))
+        .expect("demonic cleanup selector");
+    assert_eq!(
+        havoc.proofs.as_slice(),
+        [trust_ir::ProofAnnotation::FreshSymbolicHavoc],
+        "the selector is admitted as fresh only; it grants no narrowing authority"
+    );
+    assert!(entry.body.iter().any(|node| matches!(
+        &node.inst,
+        Inst::CondBr { then_target, else_target, .. }
+            if [then_target.index(), else_target.index()].contains(&2)
+                && [then_target.index(), else_target.index()].contains(&1)
+    )));
+}
+
+/// The built-phase NO-OP LANDING PAD (statement-free, lone `Resume`) is the one
+/// cleanup shape that must NOT be wired.
+///
+/// MIR at `Built` phase hands every checked-arith `Assert` and every `Call` such
+/// a pad; rustc deletes it itself (`AbortUnwindingCalls` under `-Cpanic=abort`,
+/// `RemoveNoopLandingPads` otherwise) and this crate's own `to_mir.rs` producer
+/// emits the post-removal `UnwindAction::Continue` normal form. Wiring it added
+/// no checking — the pad holds no statement, no `Drop`, no obligation — while
+/// injecting an `Undef bool` demonic selector that makes the whole body
+/// uninterpretable for the `mir_built` differential (`UndefClass::Live` ⇒
+/// `not-run`). Regression for the 38 `agreed` verdicts that loss cost.
+#[test]
+fn test_noop_landing_pad_is_not_wired_and_leaves_no_havoc() {
+    let func = VerifiableFunction {
+        name: "noop_pad".to_string(),
+        def_path: "test::noop_pad".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u64(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("x".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Cleanup(BlockId(2)),
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        func: "mycrate::may_unwind".to_string(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                // The lone-`resume` pad.
+                TrustBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Resume },
+            ],
+            arg_count: 1,
+            return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("no-op-pad body must lower");
+    // Still a well-formed module: the pad is not wired AND not lowered, so it
+    // cannot be left behind as the orphan block canonical validation rejects.
+    assert_valid_module(&module);
+    let f = &module.functions[0];
+    assert!(
+        !f.blocks.iter().flat_map(|b| b.body.iter()).any(|node| matches!(
+            node.inst,
+            Inst::Undef { ty: TrustIrTy::Bool }
+        )),
+        "a no-op landing pad must not mint a demonic `Undef bool` selector"
+    );
+    assert!(
+        !f.blocks
+            .iter()
+            .flat_map(|b| b.body.iter())
+            .any(|node| matches!(node.inst, Inst::CondBr { .. })),
+        "a no-op landing pad must not mint a two-way unwind branch"
+    );
+    // The call's own panic obligation is untouched — declining to model the pad
+    // removes no check.
+    assert!(
+        module
+            .proof_obligations
+            .iter()
+            .any(|o| o.kind == trust_ir::ObligationKind::PanicFreedom),
+        "the may-unwind call must keep its panic-freedom obligation"
+    );
+}
+
+#[test]
+fn test_closure_bearing_total_name_keeps_its_cleanup_edge() {
+    let closure_ty = Ty::Closure {
+        name: "test::panicking_pattern".into(),
+        upvars: vec![],
+        call: None,
+    };
+    let func = VerifiableFunction {
+        name: "closure_cleanup_edge".into(),
+        def_path: "test::closure_cleanup_edge".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("receiver".into()) },
+                LocalDecl { index: 2, ty: closure_ty, name: Some("pattern".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Cleanup(BlockId(2)),
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        // The flat spelling is recognized, but the closure
+                        // operand makes this call higher-order and may-panic.
+                        func: "core::str::<impl str>::contains::<char>".into(),
+                        args: vec![
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                // A working landing pad (one statement), so the test measures the
+                // closure-pattern decision and not the no-op-pad exemption.
+                TrustBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(1),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Resume,
+                },
+            ],
+            arg_count: 2,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("higher-order call lowers fail-soft");
+    assert_valid_module(&module);
+    let entry = &module.functions[0].blocks[0];
+    assert!(entry.body.iter().any(|node| matches!(
+        node.inst,
+        Inst::CondBr { then_target, else_target, .. }
+            if [then_target.index(), else_target.index()].contains(&2)
+                && [then_target.index(), else_target.index()].contains(&1)
+    )));
+    assert!(
+        module.proof_obligations.iter().any(|obligation| obligation.kind
+            == trust_ir::ObligationKind::PanicFreedom),
+        "the closure-bearing call must retain its panic obligation"
     );
 }
 
@@ -10768,6 +12163,7 @@ fn test_expected_absent_call_emits_site_and_counted_function_carrier() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -10848,6 +12244,7 @@ fn assumed_total_absent_call_is_marked_and_expected_absent_wins() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -10865,6 +12262,12 @@ fn assumed_total_absent_call_is_marked_and_expected_absent_wins() {
         &assumed,
         // the `?`-desugar compiler-total set: only compiler-facing entry
         // points supply it; this public-API test passes the empty set.
+        &empty,
+        // the `dyn` virtual-call discharge set: likewise compiler-only, so a
+        // public-API caller gets the empty set and every `dyn` call keeps its
+        // fail-closed obligation.
+        &empty,
+        // Bundled-destructor authority is compiler-only as well.
         &empty,
     )
     .expect("assumed-total boundary should lower");
@@ -10885,6 +12288,12 @@ fn assumed_total_absent_call_is_marked_and_expected_absent_wins() {
         // the `?`-desugar compiler-total set: only compiler-facing entry
         // points supply it; this public-API test passes the empty set.
         &empty,
+        // the `dyn` virtual-call discharge set: likewise compiler-only, so a
+        // public-API caller gets the empty set and every `dyn` call keeps its
+        // fail-closed obligation.
+        &empty,
+        // Bundled-destructor authority is compiler-only as well.
+        &empty,
     )
     .expect("combined boundary should lower");
     assert!(both.proof_obligations.iter().any(|obligation| {
@@ -10897,6 +12306,128 @@ fn assumed_total_absent_call_is_marked_and_expected_absent_wins() {
             .description
             .starts_with(trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX)
     }));
+}
+
+/// Trust (assumption-root gate — the compiler-side census coupling depends on this
+/// row having NO counted whole-function carrier).
+///
+/// `lower_function`'s aggregate-carrier block gives a counted
+/// `mir-assertions:<fn>:panic-freedom` obligation to the absent-callee,
+/// expected-absent, drop-glue and coroutine-resume prefixes.
+/// `ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX` is deliberately NOT in that list, and
+/// the sibling test above pins the expected-absent case getting one — so the two
+/// together show the difference is a decision, not an oversight.
+///
+/// WHY A TEST AND NOT A COMMENT. The previous revision of this comment said the
+/// compiler-side census is "sound because the `assumed_total` SET is the only
+/// channel a user axiom has into a verdict". That is FALSE and the compiler's own
+/// probe output refutes it: on the fn-pointer program X2 the census printed
+/// `user_axiom_keys=1, assumed_total=0` — an axiom recorded by a channel that
+/// touches no bridge set at all.
+///
+/// What is true and measured: the census has TWO channels, and NEITHER is complete
+/// on its own.
+///
+/// * The bridge sets (`assumed_total` / `expected_absent`), written for a user
+///   declaration only by `insert_user_axiom_absent_call_identity`, which records
+///   the census key in the same statement. This is the channel that also changes
+///   how the call LOWERS.
+/// * The census-only keys written by `collect_user_axiom_value_mentions` and
+///   `census_user_axioms_in_constant_memory` — a reified `fn` pointer, or a
+///   function pointer sitting in a `static`'s evaluated allocation. These change no
+///   lowering and reach no bridge set, so nothing about `assumed_total` sees them.
+///
+/// Both are read by `bundle_census_is_axiom_free`, which additionally fails closed
+/// when the DefId walk or the constant-memory walk could not read what it needed.
+/// Adding the assumed-total prefix to the aggregate-carrier list HERE would open a
+/// THIRD channel — a counted caller-side obligation — that neither census site
+/// gates, and a bundle could then publish `axiom_free` while resting on the axiom.
+/// That change may well be the right one to make; it is not right to make it
+/// WITHOUT re-measuring the census. Landing it turns this test red, which is the
+/// point.
+#[test]
+fn assumed_total_row_gets_no_counted_carrier_the_axiom_census_would_not_gate() {
+    let callee = "test::audited_wrapper";
+    let caller = VerifiableFunction {
+        name: "calls_audited_wrapper".to_string(),
+        def_path: "test::calls_audited_wrapper".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u64(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("x".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        func: callee.to_string(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let empty = std::collections::HashSet::<String>::new();
+    let assumed = std::collections::HashSet::from([callee.to_string()]);
+    let module = lower_to_trust_ir_functions_with_assumed_total_context(
+        "assumed_total_carrier",
+        std::slice::from_ref(&caller),
+        &empty,
+        &empty,
+        &empty,
+        &assumed,
+        &empty,
+        &empty,
+        &empty,
+    )
+    .expect("assumed-total boundary should lower");
+
+    // The per-site assumed-total row is present — without it this test would pass
+    // vacuously on a module that lowered nothing.
+    assert!(
+        module.proof_obligations.iter().any(|obligation| {
+            obligation
+                .description
+                .starts_with(trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX)
+        }),
+        "the assumed-total per-site row must exist for this test to mean anything"
+    );
+
+    let aggregate_source_ids = module
+        .proof_obligations
+        .iter()
+        .filter(|obligation| obligation.kind == trust_ir::ObligationKind::PanicFreedom)
+        .filter_map(|obligation| obligation.formula.as_ref())
+        .filter_map(|formula| serde_json::from_str::<serde_json::Value>(&formula.payload).ok())
+        .filter_map(|payload| {
+            payload.get("source_id").and_then(|value| value.as_str()).map(str::to_string)
+        })
+        .filter(|source_id| source_id.starts_with("mir-assertions:"))
+        .collect::<Vec<_>>();
+    assert!(
+        aggregate_source_ids.is_empty(),
+        "an assumed-total row must not acquire a counted whole-function carrier; the \
+         assumption-root census in rustc_mir_transform gates the `assumed_total` SET channel \
+         and does NOT gate this one. Re-measure `bundle_census_is_axiom_free`'s coupling \
+         before landing that change. Got: {aggregate_source_ids:?}"
+    );
 }
 
 /// Trust (str char-boundary marker, 3f93cbb5bd regression): a str RANGE-slice
@@ -10962,6 +12493,7 @@ fn test_marked_str_range_index_keeps_gap3_recognition() {
             ],
             arg_count: 2,
             return_ty: ref_u8_slice.clone(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11099,6 +12631,7 @@ fn test_absent_callee_allowlist_discharges_panic_obligation() {
             ],
             arg_count: 1,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11194,6 +12727,7 @@ fn test_round5_thin_tail_flat_entries_discharge_and_controls_keep() {
             ],
             arg_count: 1,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11297,6 +12831,7 @@ fn test_build3_absent_callee_discharge() {
             ],
             arg_count: 1,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11348,6 +12883,7 @@ fn test_build3_absent_callee_discharge() {
             ],
             arg_count: 3,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11504,6 +13040,7 @@ fn test_build3_absent_callee_discharge() {
             ],
             arg_count: 3,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11664,6 +13201,7 @@ fn test_f6_bigint_arith_discharges_but_primitive_and_div_keep() {
                 ],
                 arg_count: if is_neg { 1 } else { 2 },
                 return_ty: dest_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -11884,6 +13422,7 @@ fn test_f8_ratio_new_from_primitive_discharges_conditionally() {
             ],
             arg_count: 2,
             return_ty: ty_ratio(ty_bigint()),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -11961,6 +13500,7 @@ fn test_f8_ratio_new_iszero_guarded_discharges_conditionally() {
             ],
             arg_count: 2,
             return_ty: ty_ratio(ty_bigint()),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12173,6 +13713,7 @@ fn test_f8_ratio_new_iszero_guard_real_mir_shape_keeps_blanket_fail_closed() {
             ],
             arg_count: 2,
             return_ty: opt_ratio,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12228,6 +13769,7 @@ fn test_f8_ratio_new_unknown_denom_keeps_obligation() {
             ],
             arg_count: 2,
             return_ty: ty_ratio(ty_bigint()),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12306,6 +13848,7 @@ fn test_f8_ratio_new_reassigned_primitive_keeps_obligation() {
             ],
             arg_count: 2,
             return_ty: ty_ratio(ty_bigint()),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12420,6 +13963,7 @@ fn test_round4_ratio_recip_iszero_guarded_discharges_conditionally() {
             ],
             arg_count: 1,
             return_ty: ty_ratio(ty_bigint()),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12477,6 +14021,7 @@ fn test_round4_ratio_recip_unguarded_keeps_obligation() {
             ],
             arg_count: 1,
             return_ty: ty_ratio(ty_bigint()),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12525,6 +14070,7 @@ fn f6ext_one_call(func: &str, recv_ty: Ty, dest_ty: Ty) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -12767,7 +14313,7 @@ fn test_f6ext_ratio_new_const_nonzero_denom_fully_discharges() {
             name: "rat".to_string(),
             def_path: "test::rat".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 2, return_ty: ratio_ty },
+            body: VerifiableBody { locals, blocks, arg_count: 2, return_ty: ratio_ty, datatype_defs: Default::default() },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -12881,6 +14427,7 @@ fn test_round4_literal_shift_in_range_discharges_and_fail_closed_keeps() {
             ],
             arg_count: 5,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13097,6 +14644,7 @@ fn test_build4_bigint_overflow_assert_discharges_but_primitive_keeps() {
             ],
             arg_count: 2,
             return_ty: op_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13251,6 +14799,7 @@ fn test_build1_collect_clone_refcell_discharge_and_keep() {
             ],
             arg_count: 1,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13408,6 +14957,7 @@ fn test_round6_clone_datatype_and_closure_receivers() {
             ],
             arg_count: 1,
             return_ty: dest_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13529,6 +15079,7 @@ fn test_round6_fnonce_erased_zst_receiver_fail_soft() {
             ],
             arg_count: 0,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13615,6 +15166,7 @@ fn test_lower_dyn_callable_receiver_fail_soft() {
             ],
             arg_count: 2,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13669,9 +15221,8 @@ fn test_lower_dyn_callable_receiver_fail_soft() {
 /// fat pointer (the variant's prescribed lowering) instead of hitting the
 /// "unknown const"/"unknown operand variant" catch-alls, which ABORTED the
 /// whole-function lowering. The call here is a closure-driving consumer
-/// (`Iterator::fold`), whose arm types every argument via
-/// `operand_trust_type` (`try_resolve_hof_closure`) before falling to the
-/// conservative may-panic lowering — so lowering SUCCEEDS with the honest
+/// (`Iterator::fold`), whose conservative may-panic arm types every argument
+/// before producing its opaque result — so lowering SUCCEEDS with the honest
 /// obligation, and the OpaqueConst carries no asserted value (fail-closed
 /// precision, never a false prove).
 #[test]
@@ -13702,6 +15253,7 @@ fn test_opaque_const_call_arg_types_as_slice_fat_pointer() {
             ],
             arg_count: 0,
             return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13718,6 +15270,312 @@ fn test_opaque_const_call_arg_types_as_slice_fat_pointer() {
     assert!(
         module.proof_obligations.iter().any(|o| o.kind == trust_ir::ObligationKind::PanicFreedom),
         "the closure-driving consumer must keep its honest PanicFreedom obligation"
+    );
+}
+
+/// Faithful `ConstValue::Str` lowering: at the byte-slice fat sort the literal
+/// lowers to a DEFINED value whose one asserted fact is its exact LENGTH —
+/// `Undef [FreshSymbolicHavoc]; m = PtrMetadata(v); Assume(m == bytes.len())`
+/// — and NOTHING more. The floor-fit contract is part of the pin: the only
+/// `Undef` carries the admitted `FreshSymbolicHavoc` pair, and no
+/// `PtrData`/`PtrFromParts`/`GEP` (all outside the trust-mc proof-authority
+/// floor) is emitted. A wrong asserted length here would be a false proof
+/// seed, so the exact constant value is asserted by the test.
+#[test]
+fn test_str_constant_lowers_to_exact_length_fact_and_nothing_more() {
+    let bytes = b"abc".to_vec();
+    let func = VerifiableFunction {
+        name: "takes_str".to_string(),
+        def_path: "test::takes_str".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i64(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref {
+                        mutable: false,
+                        inner: Box::new(Ty::Slice {
+                            elem: Box::new(Ty::Int { width: 8, signed: false }),
+                        }),
+                    },
+                    name: None,
+                },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Str {
+                        bytes: bytes.clone(),
+                    })),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("a Str constant must lower");
+    assert_valid_module(&module);
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+
+    // The havoc seed survives (value/data pointer stays opaque) and carries the
+    // floor-admitted FreshSymbolicHavoc pair.
+    let undefs: Vec<_> =
+        insts.iter().filter(|n| matches!(n.inst, Inst::Undef { .. })).collect();
+    assert_eq!(undefs.len(), 1, "exactly one havoc seed for the constant value");
+    assert!(
+        undefs[0].proofs.contains(&trust_ir::ProofAnnotation::FreshSymbolicHavoc),
+        "the Str havoc seed must carry FreshSymbolicHavoc (floor-admitted pair)"
+    );
+
+    // Exactly one metadata read of the seed, one exact-length constant, one
+    // equality, one Assume — the complete asserted-fact set.
+    let seed = undefs[0].results[0];
+    let metadata: Vec<_> = insts
+        .iter()
+        .filter(|n| matches!(n.inst, Inst::PtrMetadata { ptr, .. } if ptr == seed))
+        .collect();
+    assert_eq!(metadata.len(), 1, "exactly one PtrMetadata read of the seed");
+    let m = metadata[0].results[0];
+    let expected_len = i128::try_from(bytes.len()).unwrap();
+    let len_consts: Vec<_> = insts
+        .iter()
+        .filter(|n| {
+            matches!(
+                &n.inst,
+                Inst::Const { ty: trust_ir::ty::Ty::U64, value: trust_ir::Constant::Int(v) }
+                    if *v == expected_len
+            )
+        })
+        .collect();
+    assert_eq!(len_consts.len(), 1, "exactly one exact-length constant (== bytes.len())");
+    let len_c = len_consts[0].results[0];
+    let eq_cmp: Vec<_> = insts
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.inst,
+                Inst::ICmp { op: ICmpOp::Eq, lhs, rhs, .. } if lhs == m && rhs == len_c
+            )
+        })
+        .collect();
+    assert_eq!(eq_cmp.len(), 1, "exactly one metadata == length comparison");
+    let cond = eq_cmp[0].results[0];
+    let assumes: Vec<_> =
+        insts.iter().filter(|n| matches!(n.inst, Inst::Assume { .. })).collect();
+    assert_eq!(assumes.len(), 1, "the length equality is the ONLY assumed fact");
+    assert!(
+        matches!(assumes[0].inst, Inst::Assume { cond: c } if c == cond),
+        "the Assume must bind exactly the length equality"
+    );
+
+    // Nothing outside the floor's admitted vocabulary is emitted for the
+    // constant: no data-pointer or fat-assembly facts, no address arithmetic.
+    assert!(
+        !insts.iter().any(|n| {
+            matches!(
+                n.inst,
+                Inst::PtrData { .. } | Inst::PtrFromParts { .. } | Inst::GEP { .. }
+            )
+        }),
+        "no data-pointer/provenance construct may be asserted for a Str constant"
+    );
+}
+
+/// Negative pin for the faithful-`Str` scope: `OpaqueConst` (the extractor's
+/// dyn-coercion / `&[&str]`-table model) has NO statically known length here,
+/// so it must STAY the fact-free `Undef` seed — no `FreshSymbolicHavoc`
+/// upgrade, no `PtrMetadata`, no `Assume`. Asserting a length for it would be
+/// an invented fact (the false-proof shape this lowering must never take).
+#[test]
+fn test_opaque_const_stays_fact_free_undef() {
+    let func = VerifiableFunction {
+        name: "takes_table".to_string(),
+        def_path: "test::takes_table".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i64(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref {
+                        mutable: false,
+                        inner: Box::new(Ty::Slice {
+                            elem: Box::new(Ty::Int { width: 8, signed: false }),
+                        }),
+                    },
+                    name: None,
+                },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst)),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("an OpaqueConst must lower");
+    assert_valid_module(&module);
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        insts.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
+        "OpaqueConst keeps its Undef seed"
+    );
+    assert!(
+        !insts.iter().any(|n| {
+            matches!(n.inst, Inst::Assume { .. } | Inst::PtrMetadata { .. })
+        }),
+        "OpaqueConst must not acquire any asserted fact (no Assume, no metadata lane)"
+    );
+}
+
+/// A bundled closure does not make an absent higher-order std wrapper equivalent
+/// to one invocation of that closure. Iterator consumers may execute user `next`;
+/// Option/Result/slice wrappers may execute argument drop glue; and wrappers such
+/// as `map_or_else` carry more than one closure. Reducing any of them to one direct
+/// call erases independent panic paths. Keep the honest may-panic marker even when
+/// the closure body is bundled (and even when its environment ABI is by-reference).
+#[test]
+fn test_bundled_hof_closure_does_not_erase_wrapper_panic_paths() {
+    let closure_name = "test::hof::{closure#0}".to_string();
+    let closure_ty = Ty::Closure {
+        name: closure_name.clone(),
+        upvars: vec![Ty::u32()],
+        call: None,
+    };
+    let caller = VerifiableFunction {
+        name: "hof_caller".into(),
+        def_path: "test::hof_caller".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: closure_ty.clone(), name: Some("f".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("out".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: "core::option::Option::<u32>::map::<{closure#0}>".into(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(2),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        atomic: None,
+                    },
+                },
+                TrustBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let closure_body = VerifiableFunction {
+        name: closure_name.clone(),
+        def_path: closure_name.clone(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(closure_ty) },
+                    name: Some("self".into()),
+                },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("value".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir_functions("hof_by_ref_env", &[caller, closure_body])
+        .expect("bundling a closure must preserve fail-closed wrapper lowering");
+    assert_valid_module(&module);
+    let closure_id = module
+        .functions
+        .iter()
+        .find(|function| function.name == closure_name)
+        .expect("closure body bundled")
+        .id;
+    let caller = module
+        .functions
+        .iter()
+        .find(|function| function.name == "hof_caller")
+        .expect("caller bundled");
+    let caller_nodes: Vec<_> = caller.blocks.iter().flat_map(|block| &block.body).collect();
+    assert!(
+        !caller_nodes
+            .iter()
+            .any(|node| matches!(&node.inst, Inst::Call { callee, .. } if *callee == closure_id)),
+        "an absent wrapper must not collapse to a single closure invocation"
+    );
+    assert!(
+        caller_nodes.iter().any(|node| {
+            matches!(node.inst, Inst::Assert { .. })
+                && node.proofs.contains(&trust_ir::ProofAnnotation::NoPanic)
+        }),
+        "the wrapper must remain visibly may-panic in TrustIr"
+    );
+    assert!(
+        module.proof_obligations.iter().any(|obligation| {
+            obligation.kind == trust_ir::ObligationKind::PanicFreedom
+                && obligation.description.contains("closure-driving call")
+        }),
+        "the formula lane must retain the wrapper's panic-freedom obligation"
     );
 }
 
@@ -13759,6 +15617,7 @@ fn test_lower_f32_floatbits_constant_bit_exact_non_nan() {
                 }],
                 arg_count: 0,
                 return_ty: Ty::Float { width: 32 },
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -13797,6 +15656,7 @@ fn test_lower_f32_floatbits_constant_bit_exact_non_nan() {
             }],
             arg_count: 0,
             return_ty: Ty::Float { width: 32 },
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13865,6 +15725,7 @@ fn test_fn_def_callable_receiver_resolves_direct_call() {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13891,6 +15752,7 @@ fn test_fn_def_callable_receiver_resolves_direct_call() {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -13996,6 +15858,7 @@ fn test_fn_def_callable_item_const_receiver_resolves_direct_call() {
             ],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14022,6 +15885,7 @@ fn test_fn_def_callable_item_const_receiver_resolves_direct_call() {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14113,6 +15977,7 @@ fn test_fn_def_callable_item_const_receiver_unbundled_fail_closed() {
             ],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14206,6 +16071,7 @@ fn test_closure_callable_item_const_receiver_resolves_direct_call() {
             ],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14234,6 +16100,7 @@ fn test_closure_callable_item_const_receiver_resolves_direct_call() {
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14327,6 +16194,7 @@ fn test_closure_callable_item_const_receiver_unbundled_fail_closed() {
             ],
             arg_count: 0,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14395,6 +16263,7 @@ fn test_pre_mono_alias_marker_lowers_to_opaque_zero_field_struct() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14441,6 +16310,7 @@ fn test_pre_mono_alias_marker_feeding_arith_fails_closed() {
             }],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14489,6 +16359,7 @@ fn test_monomorphic_alias_details_still_fail_type_mapping() {
             }],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14568,6 +16439,7 @@ fn test_round3_absent_callee_gates_engine() {
                 ],
                 arg_count,
                 return_ty: dest_ty,
+                datatype_defs: Default::default(),
             },
             contracts: vec![],
             preconditions: vec![],
@@ -14608,11 +16480,11 @@ fn test_round3_absent_callee_gates_engine() {
     let ty_str = || Ty::Slice { elem: Box::new(Ty::Int { width: 8, signed: false }) };
     let u128_uns = || Ty::Int { width: 128, signed: false };
 
-    const KEYED_COLLECT: &str = "<std::iter::Map<std::collections::btree_map::Iter<'_, std::string::String, rational::Rat>, {closure@crates/ny-cert/src/selfcheck.rs:99:57: 99:65}> as std::iter::Iterator>::collect::<std::collections::BTreeMap<std::string::String, rational::Rat>>::<__trust_elem_bytes_72>";
-    const KEYED_COLLECT_USER_KEY: &str = "<It as std::iter::Iterator>::collect::<std::collections::BTreeMap<my_crate::PanickyKey, u64>>::<__trust_elem_bytes_8>";
-    const RESULT_VEC_COLLECT: &str = "<std::iter::Map<std::slice::Iter<'_, rational::Rat>, {closure@crates/ny-cert/src/schema.rs:200:14: 200:17}> as std::iter::Iterator>::collect::<std::result::Result<std::vec::Vec<std::string::String>, rational::RatError>>::<__trust_elem_bytes_16>";
-    const RESULT_BTREE_COLLECT: &str = "<It as std::iter::Iterator>::collect::<std::result::Result<std::collections::BTreeMap<std::string::String, rational::Rat>, rational::RatError>>::<__trust_elem_bytes_72>";
-    const RESULT_BTREE_COLLECT_USER_KEY: &str = "<It as std::iter::Iterator>::collect::<std::result::Result<std::collections::BTreeMap<my_crate::PanickyKey, rational::Rat>, rational::RatError>>::<__trust_elem_bytes_72>";
+    const KEYED_COLLECT: &str = "<std::iter::Map<std::collections::btree_map::Iter<'_, std::string::String, rational::Rat>, {closure@crates/ny-cert/src/selfcheck.rs:99:57: 99:65}> as std::iter::Iterator>::collect::<std::collections::BTreeMap<std::string::String, rational::Rat>>::<__trust_elem_bytes@72>";
+    const KEYED_COLLECT_USER_KEY: &str = "<It as std::iter::Iterator>::collect::<std::collections::BTreeMap<my_crate::PanickyKey, u64>>::<__trust_elem_bytes@8>";
+    const RESULT_VEC_COLLECT: &str = "<std::iter::Map<std::slice::Iter<'_, rational::Rat>, {closure@crates/ny-cert/src/schema.rs:200:14: 200:17}> as std::iter::Iterator>::collect::<std::result::Result<std::vec::Vec<std::string::String>, rational::RatError>>::<__trust_elem_bytes@16>";
+    const RESULT_BTREE_COLLECT: &str = "<It as std::iter::Iterator>::collect::<std::result::Result<std::collections::BTreeMap<std::string::String, rational::Rat>, rational::RatError>>::<__trust_elem_bytes@72>";
+    const RESULT_BTREE_COLLECT_USER_KEY: &str = "<It as std::iter::Iterator>::collect::<std::result::Result<std::collections::BTreeMap<my_crate::PanickyKey, rational::Rat>, rational::RatError>>::<__trust_elem_bytes@72>";
 
     // (callee, arg types, const-arg overrides, dest, expect_discharged, label)
     #[allow(clippy::type_complexity)]
@@ -14841,6 +16713,7 @@ fn test_round3_display_fmt_resolves_local_impl() {
             ],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14868,6 +16741,7 @@ fn test_round3_display_fmt_resolves_local_impl() {
             }],
             arg_count: 2,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -14989,6 +16863,7 @@ fn test_round3_bundle_context_probe() {
             ],
             arg_count: 1,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -15016,6 +16891,7 @@ fn test_round3_bundle_context_probe() {
             }],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -15114,6 +16990,7 @@ fn test_round3_range_iterator_next_discharges() {
             ],
             arg_count: 1,
             return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -15179,6 +17056,721 @@ fn test_round3_range_iterator_next_discharges() {
             absent_callee_obligations(&module) == 0,
             discharged,
             "{label}: discharge expectation mismatch"
+        );
+    }
+}
+
+// ─── copy_nonoverlapping ────────────────────────────────────────────────────
+//
+// rustc's `LowerIntrinsics` pass rewrites `copy_nonoverlapping(src, dst, count)`
+// into `NonDivergingIntrinsic::CopyNonOverlapping` before Trust ever sees a body,
+// so this is the spelling EVERY std body carries (`ptr::read`,
+// `MaybeUninit::assume_init`, `mem::replace`, `RawVecInner::with_capacity_in`,
+// `alloc::fmt::format`, …). It used to reach the bridge as
+// `Statement::Unsupported` and abort the WHOLE function's lowering with
+// "memory copy side effects require explicit memory-model lowering".
+
+/// Build `fn f(src: *const T, dst: *mut T) { copy_nonoverlapping(src, dst, count) }`.
+fn copy_nonoverlapping_func(elem_ty: Ty, count: Operand) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "cno".to_string(),
+        def_path: "test::cno".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(elem_ty.clone()) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(elem_ty.clone()) },
+                    name: Some("dst".into()),
+                },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::CopyNonOverlapping {
+                    src: Operand::Copy(Place::local(1)),
+                    dst: Operand::Copy(Place::local(2)),
+                    count,
+                    elem_ty,
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+fn count_insts(module: &trust_ir::Module, mut pred: impl FnMut(&Inst) -> bool) -> usize {
+    module
+        .functions
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.body.iter())
+        .filter(|node| pred(&node.inst))
+        .count()
+}
+
+/// A constant-count copy lowers into the ORDINARY memory model — one `Load` and
+/// one `Store` per element — instead of aborting the function.
+///
+/// The `Store` count is the load-bearing assertion, and it is exactly the
+/// anti-staleness property: the real copy overwrites all `count` elements, so a
+/// model that emitted FEWER stores would leave the elements it skipped holding
+/// their pre-copy value and let a later read of the destination return a stale
+/// one. (That is the shape the `GEP`-derived-store audit found in
+/// `translate_chc.rs`: a dropped write with a surviving precise cell.)
+#[test]
+fn copy_nonoverlapping_const_count_lowers_to_one_load_store_per_element() {
+    for count in [1u128, 2, 5] {
+        let func =
+            copy_nonoverlapping_func(Ty::u32(), Operand::Constant(ConstValue::Uint(count, 64)));
+        let module = lower_to_trust_ir(&func)
+            .unwrap_or_else(|e| panic!("count={count} must lower, not Err: {e:?}"));
+        assert_valid_module(&module);
+
+        let loads = count_insts(&module, |i| matches!(i, Inst::Load { .. }));
+        let stores = count_insts(&module, |i| matches!(i, Inst::Store { .. }));
+        assert_eq!(loads, count as usize, "count={count}: one Load per element");
+        assert_eq!(
+            stores, count as usize,
+            "count={count}: one Store per element — a missing store is a stale destination read"
+        );
+        // Element 0 addresses the base pointer directly; every later element
+        // needs its own `GEP`, on BOTH sides.
+        let geps = count_insts(&module, |i| matches!(i, Inst::GEP { .. }));
+        assert_eq!(geps, 2 * (count as usize - 1), "count={count}: GEP per non-zero element");
+    }
+}
+
+/// Every element is LOADED before any element is STORED, so the modeled
+/// post-state is the copy-through-a-temporary one. That agrees with the real
+/// intrinsic on its documented (non-overlapping) domain WITHOUT depending on the
+/// non-overlap obligation having been discharged first.
+#[test]
+fn copy_nonoverlapping_loads_all_elements_before_storing_any() {
+    let func = copy_nonoverlapping_func(Ty::u32(), Operand::Constant(ConstValue::Uint(3, 64)));
+    let module = lower_to_trust_ir(&func).expect("must lower");
+    let kinds: Vec<&'static str> = module
+        .functions
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.body.iter())
+        .filter_map(|node| match &node.inst {
+            Inst::Load { .. } => Some("load"),
+            Inst::Store { .. } => Some("store"),
+            _ => None,
+        })
+        .collect();
+    let first_store = kinds.iter().position(|k| *k == "store").expect("a store must be emitted");
+    let last_load = kinds.iter().rposition(|k| *k == "load").expect("a load must be emitted");
+    assert!(
+        last_load < first_store,
+        "all loads must precede all stores, got {kinds:?}"
+    );
+}
+
+/// FAIL-CLOSED, and this is the soundness core of the lowering. A symbolic count
+/// writes an unbounded region and neither backend has a bulk region-havoc
+/// primitive: the BMC lane's memory is an SMT array, so a single `Store` at a
+/// symbolic index leaves every OTHER index holding its pre-copy value. Modeling
+/// fewer elements than are written is a false-proof generator, so an unbounded
+/// count must keep aborting the lowering rather than emit a partial model.
+#[test]
+fn copy_nonoverlapping_symbolic_count_fails_closed() {
+    let mut func = copy_nonoverlapping_func(Ty::u32(), Operand::Copy(Place::local(3)));
+    func.body.locals.push(LocalDecl {
+        index: 3,
+        ty: Ty::usize(),
+        name: Some("count".into()),
+    });
+    func.body.arg_count = 3;
+    let err = lower_to_trust_ir(&func)
+        .expect_err("a symbolic element count must not be partially modeled");
+    let BridgeError::UnsupportedOp(detail) = &err else {
+        panic!("expected UnsupportedOp, got {err:?}");
+    };
+    assert!(
+        detail.contains("stale"),
+        "the refusal must name the staleness hazard it is protecting: {detail}"
+    );
+}
+
+/// The unroll budget is a real bound, not decoration: past it the lowering fails
+/// closed rather than inflating one statement into thousands of instructions.
+#[test]
+fn copy_nonoverlapping_over_budget_count_fails_closed() {
+    let func = copy_nonoverlapping_func(Ty::u8(), Operand::Constant(ConstValue::Uint(4096, 64)));
+    let err = lower_to_trust_ir(&func).expect_err("an over-budget count must fail closed");
+    assert!(matches!(err, BridgeError::UnsupportedOp(_)), "expected UnsupportedOp, got {err:?}");
+}
+
+/// Trust: body-less intrinsics can never be bundled, so an absent-callee obligation
+/// on one is permanent — a model is the only route. `orca-provider-backoff` verified
+/// clean, then regressed to 2 errors on `core::intrinsics::saturating_sub::<u32>`
+/// alone, in a function already hand-rewritten once to dodge an absent callee.
+#[test]
+fn saturating_intrinsics_are_total_but_unchecked_ones_are_not() {
+    use crate::lower::total_no_panic_call_summary;
+    const P: &str = trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX;
+
+    // Saturating clamps at the type bound instead of overflowing — total by definition.
+    for name in ["saturating_add", "saturating_sub", "saturating_mul"] {
+        let callee = format!("{P}core::intrinsics::{name}::<u32>");
+        assert!(
+            total_no_panic_call_summary(&callee),
+            "{name} clamps rather than overflowing and must be total"
+        );
+    }
+
+    // Pure functions of the bit pattern; no partial cases.
+    for name in ["ctpop", "ctlz", "cttz", "bswap", "bitreverse"] {
+        let callee = format!("{P}core::intrinsics::{name}::<u64>");
+        assert!(total_no_panic_call_summary(&callee), "{name} is total");
+    }
+
+    // The fail-closed half. Each of these carries a precondition a caller can
+    // violate, so modeling it total would launder UB into a proof.
+    for name in [
+        "unchecked_add",
+        "unchecked_sub",
+        "unchecked_mul",
+        "unchecked_shl",
+        "ctlz_nonzero",
+        "cttz_nonzero",
+        "arith_offset",
+        "ptr_offset_from_unsigned",
+        "assume",
+        "unreachable",
+    ] {
+        let callee = format!("{P}core::intrinsics::{name}::<u32>");
+        assert!(
+            !total_no_panic_call_summary(&callee),
+            "{name} has a precondition and must NOT be assumed total"
+        );
+    }
+
+    // The marker is what admits these; a same-named user path must not ride in.
+    assert!(!total_no_panic_call_summary("mycrate::intrinsics::saturating_sub"));
+
+    // Codegen hints run no code at all. `cold_path` is what surfaced once
+    // `saturating_sub` was modeled — one absent callee hiding behind another.
+    for hint in [
+        "core::intrinsics::cold_path",
+        "core::intrinsics::likely",
+        "core::intrinsics::unlikely",
+        "core::hint::black_box",
+        "core::hint::spin_loop",
+    ] {
+        assert!(total_no_panic_call_summary(hint), "{hint} runs no code");
+    }
+}
+
+/// A VIRTUAL (`dyn`-receiver) call must be refused with a reason that names the
+/// receiver, and must NOT be described as a missing body: no MIR-encoding flag,
+/// bundle-cap raise, or crate-filter widening can supply a body for a vtable
+/// slot, so that wording sends every reader after a fix that cannot exist.
+///
+/// Every non-`dyn` absent callee keeps its previous wording byte-for-byte —
+/// this is a per-site refusal, not a reclassification of the absent-callee arm.
+#[test]
+fn dyn_receiver_absent_callee_reason_names_the_receiver() {
+    use crate::lower::{absent_callee_reason, dyn_receiver_of_virtual_callee};
+
+    // The two floors measured in the fmt chain.
+    for (callee, receiver) in [
+        ("<dyn core::fmt::Write as core::fmt::Write>::write_str", "dyn core::fmt::Write"),
+        ("<dyn core::fmt::Debug as core::fmt::Debug>::fmt", "dyn core::fmt::Debug"),
+    ] {
+        assert_eq!(dyn_receiver_of_virtual_callee(callee), Some(receiver));
+        let reason = absent_callee_reason(callee);
+        assert!(reason.contains(receiver), "reason must name the receiver: {reason}");
+        assert!(
+            !reason.contains("body not in the lowered bundle"),
+            "a vtable slot has no body to be missing: {reason}"
+        );
+    }
+
+    // Not virtual: a concrete impl, a still-generic receiver, and a free fn all
+    // keep the original text.
+    for callee in [
+        "core::num::u32::pow",
+        "<u32 as core::ops::Add>::add",
+        "<T as core::fmt::Write>::write_str",
+        "<dynamo::Thing as dynamo::Trait>::go", // `dyn`-prefixed NAME, not a dyn receiver
+    ] {
+        assert_eq!(dyn_receiver_of_virtual_callee(callee), None, "{callee}");
+        assert_eq!(absent_callee_reason(callee), "body not in the lowered bundle", "{callee}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust (coroutine resume-state contract): the lowering-side pins. The model
+// fixture mirrors rustc's zero-await `async fn` resume body — entry dispatch
+// `_3 = discriminant((*_1)); switchInt(_3) -> [0: body, 1: sink, 2: sink,
+// otherwise: unreachable]` with the extractor's `exhaustive_enum_unreachable`
+// certificate set — plus the two `ResumedAfter*` self-loop protocol sinks.
+// What the stage2 run must additionally confirm (cannot run here): the counted
+// carrier surfaces the sentinel obligations, the native lane PROVES them under
+// `-Ztrust-policy=certify`, and the compiler publishes exactly one
+// `contract:coroutine-resume-state` row for the proved fixture.
+// ---------------------------------------------------------------------------
+
+fn coroutine_resume_fixture(certified: bool) -> VerifiableFunction {
+    use trust_types::AssertMessage;
+    let frame_ty = Ty::Ref {
+        mutable: true,
+        inner: Box::new(Ty::Coroutine {
+            name: "fixture::f::{closure#0}".into(),
+            upvars: vec![Ty::u8()],
+        }),
+    };
+    let sentinel = |id: usize, msg: AssertMessage| TrustBlock {
+        id: BlockId(id),
+        stmts: vec![],
+        terminator: Terminator::Assert {
+            cond: Operand::Constant(ConstValue::Bool(false)),
+            expected: true,
+            msg,
+            // rustc emits the protocol sink as a SELF-LOOP.
+            target: BlockId(id),
+            span: SourceSpan::default(),
+            unwind: UnwindEdge::Unreachable,
+        },
+    };
+    VerifiableFunction {
+        name: "fixture::f::{closure#0}".to_string(),
+        def_path: "fixture::f::{closure#0}".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u16(), name: None },
+                LocalDecl { index: 1, ty: frame_ty, name: Some("self".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: None },
+                LocalDecl { index: 3, ty: Ty::u32(), name: None },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::Discriminant(Place {
+                            local: 1,
+                            projections: vec![Projection::Deref],
+                        }),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(3)),
+                        targets: vec![(0, BlockId(1)), (1, BlockId(2)), (2, BlockId(3))],
+                        otherwise: BlockId(4),
+                        exhaustive_enum_unreachable: certified,
+                        span: SourceSpan::default(),
+                    },
+                },
+                TrustBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(1, 16))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+                sentinel(2, AssertMessage::ResumedAfterReturn),
+                sentinel(3, AssertMessage::ResumedAfterPanic),
+                TrustBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Unreachable },
+            ],
+            arg_count: 2,
+            return_ty: Ty::u16(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// Under the recognized entry contract, the dispatch read gains exactly one
+/// `Assume(selector == 0)` (zero-await live set {0}) and the sentinels become
+/// REFUTABLE `Inst::Assert`s carrying marker-stamped PanicFreedom obligations
+/// plus the whole-function counted carrier.
+#[test]
+fn coroutine_contract_entry_read_emits_live_state_assume_and_refutable_sentinels() {
+    let func = coroutine_resume_fixture(true);
+    let module = lower_to_trust_ir(&func).expect("contract fixture must lower");
+    let f = &module.functions[0];
+
+    let entry = &f.blocks[0];
+    let assumes: Vec<_> =
+        entry.body.iter().filter(|n| matches!(&n.inst, Inst::Assume { .. })).collect();
+    // TWO assumes, from two independent lanes: the live-state contract Assume
+    // at the dispatch read (this lane) plus the pre-existing exhaustive-switch
+    // case-set Assume the `exhaustive_enum_unreachable` SwitchInt lowering
+    // emits for its Unreachable otherwise arm. The uncertified twin below pins
+    // zero, so the delta attributable to the certificate is exactly these two.
+    assert_eq!(assumes.len(), 2, "live-state Assume + exhaustive-switch case Assume");
+    assert!(
+        entry.body.iter().any(|n| matches!(&n.inst, Inst::ICmp { op: ICmpOp::Eq, .. })),
+        "the live-state Assume must be built from an equality against the live state"
+    );
+
+    // Sentinel blocks: refutable Assert, NOT the by-construction Assume(false).
+    let sink_blocks: Vec<_> =
+        f.blocks.iter().filter(|b| b.id.0 == 2 || b.id.0 == 3).collect();
+    assert_eq!(sink_blocks.len(), 2);
+    for bb in sink_blocks {
+        assert!(
+            bb.body.iter().any(|n| matches!(&n.inst, Inst::Assert { .. })),
+            "protocol sink block {} must carry a refutable Assert under the contract",
+            bb.id.0
+        );
+        assert!(
+            !bb.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+            "protocol sink block {} must not keep the Assume(false) pruning",
+            bb.id.0
+        );
+    }
+
+    // Marker-stamped sentinel obligations with the exact state set.
+    let marked: Vec<_> = module
+        .proof_obligations
+        .iter()
+        .filter(|ob| {
+            ob.description.starts_with(
+                trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
+            )
+        })
+        .collect();
+    assert_eq!(marked.len(), 2, "one obligation per ResumedAfter* sentinel");
+    for ob in &marked {
+        let (states, _sentinel) =
+            trust_types::assumption::parse_coroutine_resume_contract_obligation_description(
+                &ob.description,
+            )
+            .expect("marker description must round-trip");
+        assert_eq!(states, vec![0], "zero-await live set is exactly {{0}}");
+    }
+
+    // The counted whole-function carrier must exist: without it the sentinel
+    // rows would live only in module.proof_obligations (the R3 fail-open).
+    assert!(
+        module
+            .proof_obligations
+            .iter()
+            .any(|ob| ob.description.ends_with(": all assertions hold")),
+        "contract-lowered coroutine must emit the whole-function panic-freedom carrier"
+    );
+}
+
+/// Without the extractor's exhaustiveness certificate the contract lane must
+/// not engage: byte-for-byte today's fail-closed shape (havoc'd selector, no
+/// Assume at the read, Assume(false)-pruned sinks, zero marker obligations).
+#[test]
+fn coroutine_without_certificate_keeps_fail_closed_pruning() {
+    let func = coroutine_resume_fixture(false);
+    let module = lower_to_trust_ir(&func).expect("uncertified fixture must still lower");
+    let f = &module.functions[0];
+
+    let entry = &f.blocks[0];
+    assert!(
+        !entry.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+        "no contract => the havoc'd selector must carry no Assume"
+    );
+    let sink_blocks: Vec<_> = f.blocks.iter().filter(|b| b.id.0 == 2 || b.id.0 == 3).collect();
+    for bb in sink_blocks {
+        assert!(
+            bb.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+            "protocol sink block {} must keep the fail-closed Assume(false) pruning",
+            bb.id.0
+        );
+        assert!(
+            !bb.body.iter().any(|n| matches!(&n.inst, Inst::Assert { .. })),
+            "no contract => no refutable sentinel Assert (it would falsely refute)",
+            
+        );
+    }
+    assert!(
+        !module.proof_obligations.iter().any(|ob| {
+            ob.description.starts_with(
+                trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
+            )
+        }),
+        "no contract => no marker obligations"
+    );
+    assert_eq!(
+        crate::lower::coroutine_resume_contract_module_evidence(&func, &module),
+        None,
+        "no contract => no module evidence"
+    );
+}
+
+/// The module-evidence extractor returns the exact state set and sentinel
+/// count for a contract lowering, and fails closed on state-set drift.
+#[test]
+fn coroutine_contract_module_evidence_extracts_states_and_count() {
+    let func = coroutine_resume_fixture(true);
+    let module = lower_to_trust_ir(&func).expect("contract fixture must lower");
+    let evidence = crate::lower::coroutine_resume_contract_module_evidence(&func, &module)
+        .expect("contract lowering must yield evidence");
+    assert_eq!(evidence.function_def_path, "fixture::f::{closure#0}");
+    assert_eq!(evidence.live_states, vec![0]);
+    assert_eq!(evidence.sentinel_obligation_count, 2);
+
+    // Drift probe: a module whose marker obligations name a DIFFERENT state
+    // set than the recognizer's decision must poison the extraction. Simulate
+    // by re-extracting against a target whose recognized live set differs
+    // (one-await shape {0,3} vs the module's lowered {0}).
+    let mut one_await = coroutine_resume_fixture(true);
+    let Terminator::SwitchInt { targets, .. } = &mut one_await.body.blocks[0].terminator else {
+        unreachable!()
+    };
+    targets.push((3, BlockId(1)));
+    assert_eq!(
+        crate::lower::coroutine_resume_contract_module_evidence(&one_await, &module),
+        None,
+        "state-set drift between recognizer and module must fail closed"
+    );
+}
+
+/// A one-await coroutine (live set {0,3}) lowers its entry Assume as the
+/// disjunction of BOTH live states and stamps the set into the marker.
+#[test]
+fn coroutine_contract_one_await_live_set_is_a_disjunction() {
+    let mut func = coroutine_resume_fixture(true);
+    let Terminator::SwitchInt { targets, .. } = &mut func.body.blocks[0].terminator else {
+        unreachable!()
+    };
+    targets.push((3, BlockId(1)));
+    let module = lower_to_trust_ir(&func).expect("one-await fixture must lower");
+    let f = &module.functions[0];
+    let entry = &f.blocks[0];
+    assert_eq!(
+        entry.body.iter().filter(|n| matches!(&n.inst, Inst::Assume { .. })).count(),
+        2,
+        "live-state Assume + exhaustive-switch case Assume (see the zero-await pin)"
+    );
+    assert!(
+        entry
+            .body
+            .iter()
+            .any(|n| matches!(&n.inst, Inst::BinOp { op: TrustIrBinOp::Or, .. })),
+        "a two-state live set must join its equalities with Or"
+    );
+    let evidence = crate::lower::coroutine_resume_contract_module_evidence(&func, &module)
+        .expect("one-await lowering must yield evidence");
+    assert_eq!(evidence.live_states, vec![0, 3]);
+}
+
+/// An in-bundle direct call to a contract-conditional coroutine resume body
+/// (a poll/resume site) must carry the WIRED caller-side encoding — the
+/// audited absent-callee may-panic shape, the bridge's only encoding that
+/// verifiably reaches a published row: (a) an in-body `Assert(false)` marker
+/// at the poll site (whole-caller panic-freedom unprovable through it), (b) a
+/// `PanicFreedom` obligation stamped with the precondition prefix, and (c) the
+/// whole-function counted carrier for the caller. This is the fail-closed
+/// callsite lane that keeps a hand-rolled executor (well-behaved or not) from
+/// verifying clean until a caller-side discharge lane exists.
+#[test]
+fn coroutine_resume_callsite_mints_unprovable_precondition_obligation() {
+    let coroutine = coroutine_resume_fixture(true);
+    let frame_ty = Ty::Ref {
+        mutable: true,
+        inner: Box::new(Ty::Coroutine {
+            name: "fixture::f::{closure#0}".into(),
+            upvars: vec![Ty::u8()],
+        }),
+    };
+    let executor = VerifiableFunction {
+        name: "fixture::poll_once".to_string(),
+        def_path: "fixture::poll_once".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u16(), name: None },
+                LocalDecl { index: 1, ty: frame_ty, name: Some("frame".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: "fixture::f::{closure#0}".to_string(),
+                        args: vec![
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(0, 32)),
+                        ],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::u16(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir_functions("bundle", &[executor, coroutine])
+        .expect("executor + coroutine bundle must lower");
+    let precondition_rows: Vec<_> = module
+        .proof_obligations
+        .iter()
+        .filter(|ob| {
+            ob.description
+                .starts_with(trust_types::assumption::COROUTINE_RESUME_PRECONDITION_PREFIX)
+        })
+        .collect();
+    assert_eq!(
+        precondition_rows.len(),
+        1,
+        "exactly one callsite precondition obligation for the single poll site"
+    );
+    // PanicFreedom, not Precondition: the bridge's private Precondition
+    // obligations are cleared at the public-bundle boundary and never surface
+    // (the dead-lane defect) — the panic-freedom carrier machinery is the
+    // encoding that verifiably reaches a row.
+    assert_eq!(precondition_rows[0].kind, trust_ir::ObligationKind::PanicFreedom);
+    assert!(
+        precondition_rows[0].description.contains("fixture::f::{closure#0}"),
+        "the obligation must name the resumed coroutine"
+    );
+
+    // (a) the in-body Assert(false) marker at the poll site: the caller's
+    // whole-function panic-freedom must stay unprovable through it.
+    let caller = module
+        .functions
+        .iter()
+        .find(|f| f.name == "fixture::poll_once")
+        .expect("caller must be in the lowered module");
+    assert!(
+        caller.blocks[0].body.iter().any(|n| matches!(&n.inst, Inst::Assert { .. })),
+        "the poll site must carry the reachable Assert(false) may-panic marker"
+    );
+
+    // (c) the whole-function counted carrier for the CALLER: without it the
+    // marked obligation would live only in module.proof_obligations and be
+    // silently dropped at the public-bundle reset (the R3 fail-open class).
+    assert!(
+        module
+            .proof_obligations
+            .iter()
+            .any(|ob| ob.description == "fixture::poll_once: all assertions hold"),
+        "the caller must emit the whole-function panic-freedom carrier"
+    );
+}
+
+/// The gen-family shapes must keep the pre-lane fail-closed path end to end:
+/// rustc lowers their RETURNED=1 arm to LEGAL REACHABLE code (`gen` returns
+/// `None` after exhaustion; `async gen` returns `Poll::Ready`; async-drop has
+/// a plain ready block), so the recognizer declines, the entry read stays pure
+/// havoc (no live-state Assume), the remaining ResumedAfter* sink keeps its
+/// Assume(false) pruning (no refutable assert over an unconstrained selector),
+/// no marker obligation is minted, and no module evidence exists — byte-for-
+/// byte the behavior from before the contract lane existed.
+#[test]
+fn coroutine_gen_family_legal_returned_arm_declines_contract_end_to_end() {
+    // Three legal RETURNED=1 arm shapes standing in for gen / async gen /
+    // async-drop (rustc's insert_none_ret_block / insert_poll_ready_block /
+    // ready block).
+    let legal_returned_arms: Vec<(&str, TrustBlock)> = vec![
+        (
+            "gen none-return",
+            TrustBlock {
+                id: BlockId(2),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 16))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            },
+        ),
+        (
+            "async-gen poll-ready",
+            TrustBlock {
+                id: BlockId(2),
+                stmts: vec![Statement::SetDiscriminant {
+                    place: Place::local(0),
+                    variant_index: 0,
+                }],
+                terminator: Terminator::Return,
+            },
+        ),
+        (
+            "async-drop ready",
+            TrustBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+        ),
+    ];
+    for (shape, returned_arm) in legal_returned_arms {
+        let mut func = coroutine_resume_fixture(true);
+        func.body.blocks[2] = returned_arm;
+        assert_eq!(
+            trust_types::coroutine_resume_state_contract(&func.body),
+            None,
+            "{shape}: a legal RETURNED=1 arm must decline the recognizer"
+        );
+        let module = lower_to_trust_ir(&func).expect("gen-family fixture must lower");
+        let f = &module.functions[0];
+        // Exactly ONE entry Assume: the exhaustive-switch case-set Assume (a
+        // separate, certificate-backed lane that engages whenever the
+        // `exhaustive_enum_unreachable` flag is set). The contract's
+        // LIVE-STATE Assume must be absent — the contract-minting twin
+        // (`coroutine_contract_entry_read_emits_live_state_assume_and_
+        // refutable_sentinels`) pins TWO for the same certificate, so the
+        // delta attributable to the declined contract is exactly one.
+        assert_eq!(
+            f.blocks[0].body.iter().filter(|n| matches!(&n.inst, Inst::Assume { .. })).count(),
+            1,
+            "{shape}: only the exhaustive-switch Assume may remain — a live-state Assume \
+             over a dispatch with a LEGAL reserved arm prunes reachable code"
+        );
+        // The remaining ResumedAfterPanic sink (block 3) must keep the
+        // fail-closed Assume(false) pruning, never a refutable Assert.
+        let sink = f.blocks.iter().find(|b| b.id.0 == 3).expect("panic sink block");
+        assert!(
+            sink.body.iter().any(|n| matches!(&n.inst, Inst::Assume { .. })),
+            "{shape}: the ResumedAfter* sink must keep Assume(false) pruning"
+        );
+        assert!(
+            !sink.body.iter().any(|n| matches!(&n.inst, Inst::Assert { .. })),
+            "{shape}: no refutable sentinel Assert without the contract"
+        );
+        // No marker obligations, no evidence: the publish seam sees nothing.
+        assert!(
+            !module.proof_obligations.iter().any(|ob| {
+                ob.description.starts_with(
+                    trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
+                )
+            }),
+            "{shape}: no contract => no marker obligations"
+        );
+        assert_eq!(
+            crate::lower::coroutine_resume_contract_module_evidence(&func, &module),
+            None,
+            "{shape}: no contract => no module evidence"
         );
     }
 }

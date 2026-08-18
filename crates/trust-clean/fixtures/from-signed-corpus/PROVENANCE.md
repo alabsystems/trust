@@ -1,11 +1,24 @@
 # from-signed-corpus — provenance
 
-Twenty-eight files, copied byte-for-byte (never hand-transcribed) from
+Twenty-eight files, selected by `def_path` and copied byte-for-byte (never
+hand-transcribed) from
 `crates/trust-clean/fixtures/census-rung2-2026-07-07/cast/` — itself real
 `TRUST_DUMP_MIR` output from the real, unmodified `cast` 0.3.0 crates.io
 source (see that directory's own `PROVENANCE.md`/`regenerate.sh` for the full
 compile provenance: `~/.cargo/registry/src/**/cast-0.3.0/src/lib.rs`,
-`--edition 2018`, prebuilt stage2 `trustc`).
+`--edition 2018`, prebuilt stage2 `trustc`). The readable filenames here remain
+stable; the authenticated `def_path` inside each JSON is authoritative.
+
+## Re-frozen 2026-08-11
+
+Re-copied the same 28 selected functions byte-for-byte from the source cast
+corpus's 2026-07-29 compiler re-freeze. The old derivative rows predated
+first-class `core::result::Result::{Ok, Err}` variant metadata, so the strict
+`aggregate_variant_discriminant` gate correctly declined them after its
+legacy-layout compatibility path was retired. The replacement rows carry the
+producer-emitted variant names, discriminants, fields, and enum-kind evidence;
+no fixture metadata was synthesized. Every destination file was checked with
+`cmp` against its source row after the copy.
 
 This is the mission's gap-queue #2 follow-up #1 (`reports/honesty-and-ladder-2026-07-07.md`,
 `fixtures/adt-return-corpus/PROVENANCE.md`'s own "out of scope" accounting): the

@@ -30,7 +30,7 @@ pub use pred_vocab::{
     checker_core_semantics, is_checker_core_pred, is_valid_pred, pred_arg_sorts,
 };
 pub use smtlib::escape_smtlib_symbol;
-pub use sort::{RoundingMode, Sort, SortFromTy};
+pub use sort::{RoundingMode, Sort, SortFromTy, sort_from_ty_with_defs};
 pub use temporal::*;
 pub use vc::*;
 pub use vc_kind::*;

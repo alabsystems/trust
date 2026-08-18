@@ -1,0 +1,17 @@
+[package]
+name = "native-invariant"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace on purpose: this harness executes candidate instructions
+# natively and must be buildable and runnable without dragging the compiler
+# workspace along.
+[workspace]
+
+[dependencies]
+trust-disasm = { path = "../.." }
+trust-machine-sem = { path = "../../../trust-machine-sem" }
+
+[profile.release]
+debug-assertions = false

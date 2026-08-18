@@ -58,7 +58,7 @@ pub enum SpecExpr {
     /// Keep this distinct from [`SpecExpr::Field`]. Rust permits both a field
     /// `x.len` and a method `x.len()`, and the executable Formula parser gives
     /// them deliberately different meanings (`x.len` versus the modeled
-    /// collection-length leaf `x_len`).
+    /// collection-length leaf `x__len`).
     MethodCall {
         base: Box<SpecExpr>,
         method: String,
@@ -936,12 +936,9 @@ mod tests {
             "_0",
             "_2",
             "old_x",
-            "xs_len",
-            "x_discr",
-            "x_value",
-            "x_sign",
             "priv_dropped",
             "s__slice_len",
+            "xs__len",
             "__trust_constparam_0_N",
         ] {
             for source in
@@ -955,6 +952,15 @@ mod tests {
                     "synthetic binder must be rejected: {source}",
                 );
             }
+        }
+        // Single-underscore projection-suffixed spellings are ordinary
+        // bindings: minted leaves are namespaced (`xs.len()` -> `xs__len`).
+        for name in ["xs_len", "x_discr", "x_value", "x_sign", "max_len"] {
+            let source = format!("forall {name}: u64, true");
+            assert!(
+                parse_spec_attr("invariant", &source).is_ok(),
+                "plain binder must be admitted: {source}",
+            );
         }
     }
 
@@ -981,7 +987,7 @@ mod tests {
             "exists",
             "priv_dropped",
             "old_x",
-            "xs_len",
+            "xs__len",
             "_0",
             "_2",
             "s__slice_len",
@@ -1006,7 +1012,7 @@ mod tests {
             "exists",
             "priv_dropped",
             "old_x",
-            "xs_len",
+            "xs__len",
             "_0",
             "_2",
             "s__slice_len",
@@ -1029,7 +1035,6 @@ mod tests {
         for source in [
             "priv_dropped == priv_dropped",
             "old_x == old_x",
-            "xs_len == xs_len",
             "_2 == _2",
             "forall + 1 == 2",
             "exists + 1 == 2",
@@ -1037,6 +1042,10 @@ mod tests {
             assert!(require_formula(source).is_err());
             assert!(crate::parse_spec_expr_result(source).is_err());
         }
+        // `xs_len` is a plain binding (the minted projection is `xs__len`), so
+        // referencing it is ordinary — and genuinely reflexive here.
+        assert!(require_formula("xs_len == xs_len").is_ok());
+        assert!(crate::parse_spec_expr_result("xs_len == xs_len").is_ok());
     }
 
     #[test]
@@ -1275,7 +1284,7 @@ mod tests {
             panic!("expected equality Formula");
         };
         assert_eq!(*lhs, Formula::Var("x.len".into(), Sort::Int));
-        assert_eq!(*rhs, Formula::Var("x_len".into(), Sort::Int));
+        assert_eq!(*rhs, Formula::Var("x__len".into(), Sort::Int));
         assert_ne!(lhs, rhs, "field syntax and method syntax must not collapse");
     }
 

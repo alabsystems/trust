@@ -66,6 +66,7 @@ fn shift_loop(op: BinOp, count: i128) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Decreases,

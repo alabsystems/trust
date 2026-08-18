@@ -98,6 +98,7 @@ fn try_from_unwrap_or_fn(
             ],
             arg_count: 1,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

@@ -1,5 +1,6 @@
-//! This test checks if Internal Compilation Error (ICE) dump files `rustc-ice*.txt` work as
-//! expected.
+//! This test checks if Internal Compilation Error (ICE) dump files `trustc-ice*.txt` work as
+//! expected. (Trust names its dumps after `install_ice_hook`'s default compiler, `trustc`,
+//! whatever argv[0] says — see `trust_invoked_binary` in `rustc_driver_impl`.)
 //!
 //! - Basic sanity checks on a default ICE dump.
 //! - Get the number of lines from the dump files without any `RUST_BACKTRACE` options, then check
@@ -12,6 +13,9 @@
 //!       is placed under `PATH`.
 //!     - When `RUSTC_ICE=RUSTC_ICE_PATH` and `-Zmetrics-dir=METRICS_PATH` are both provided, check
 //!       that `RUSTC_ICE_PATH` takes precedence and no ICE dump is emitted under `METRICS_PATH`.
+//! - Check that with neither `RUSTC_ICE` nor `-Zmetrics-dir`, an explicit `--out-dir` receives
+//!   the ICE dump instead of the invocation cwd (the cargo case: dumps belong in the target
+//!   dir, not the checked-in package root).
 //!
 //! See <https://github.com/rust-lang/rust/pull/108714>.
 //!
@@ -71,10 +75,10 @@ fn assert_ice_len_equals(left: &IceDump, right: &IceDump) {
 }
 
 fn find_ice_dumps_in_dir<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
-    shallow_find_files(dir, |path| has_prefix(path, "rustc-ice") && has_extension(path, "txt"))
+    shallow_find_files(dir, |path| has_prefix(path, "trustc-ice") && has_extension(path, "txt"))
 }
 
-// Assert only one `rustc-ice*.txt` ICE file exists, and extract the ICE message from the ICE file.
+// Assert only one `trustc-ice*.txt` ICE file exists, and extract the ICE message from the ICE file.
 #[track_caller]
 fn extract_exactly_one_ice_file<P: AsRef<Path>>(name: &'static str, dir: P) -> IceDump {
     let ice_files = find_ice_dumps_in_dir(dir);
@@ -106,6 +110,7 @@ fn main() {
     test_ice_dump_disabled();
 
     test_metrics_dir(default_ice_dump);
+    test_out_dir_fallback(default_ice_dump);
 }
 
 #[track_caller]
@@ -201,6 +206,28 @@ fn test_flag_and_env(baseline: &IceDump) {
         assert!(cwd_ice_files.is_empty(), "RUSTC_ICE should override -Zmetrics-dir");
 
         let dump = extract_exactly_one_ice_file("RUSTC_ICE overrides -Zmetrics-dir", real_dir);
+        assert_ice_len_equals(baseline, &dump);
+    });
+}
+
+#[track_caller]
+fn test_out_dir_fallback(baseline: &IceDump) {
+    // Neither `RUSTC_ICE` nor `-Zmetrics-dir`: `--out-dir` receives the dump, so
+    // cargo-driven builds keep ICE dumps inside the target dir, not the package cwd.
+    run_in_tmpdir(|| {
+        let out_dir = cwd().join("build-out");
+        rfs::create_dir(&out_dir);
+        rustc()
+            .env_remove("RUSTC_ICE") // prevent interference from environment
+            .input("lib.rs")
+            .arg("-Ztreat-err-as-bug=1")
+            .out_dir(&out_dir)
+            .run_fail();
+
+        let cwd_ice_files = find_ice_dumps_in_dir(cwd());
+        assert!(cwd_ice_files.is_empty(), "ICE dump should land in --out-dir, not the cwd");
+
+        let dump = extract_exactly_one_ice_file("--out-dir fallback", out_dir);
         assert_ice_len_equals(baseline, &dump);
     });
 }

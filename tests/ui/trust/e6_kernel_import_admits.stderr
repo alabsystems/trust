@@ -1,5 +1,5 @@
 note: Clean island kernel-checked: 1 declaration(s) registered (triv)
-  --> $DIR/e6_kernel_import_admits.rs:45:5
+  --> $DIR/e6_kernel_import_admits.rs:51:5
    |
 LL |     theorem triv : True := True.intro
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -8,37 +8,38 @@ LL |     theorem triv : True := True.intro
 === Trust Verification Report (e6_kernel_import_admits) ===
 
 note: Trust verification: 0 proved, 1 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-  --> $DIR/e6_kernel_import_admits.rs:64:1
+  --> $DIR/e6_kernel_import_admits.rs:70:1
    |
 LL | fn not_pure(x: u64) -> u64 { x + 1 }
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = note: [overflow:add] FAILED (trust-full-verifier); counterexample: verified_counterexample = true
+   = note: [overflow:add] FAILED (ay-in-process); counterexample: _0 = 0, x = 18446744073709551615
 
 error: Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::not_pure`: 1 obligation(s) were not proved
-  --> $DIR/e6_kernel_import_admits.rs:64:1
+  --> $DIR/e6_kernel_import_admits.rs:70:1
    |
 LL | fn not_pure(x: u64) -> u64 { x + 1 }
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
    = note: Level 0 summary: 1 failed, 0 unknown or timed out, 0 runtime-checked, 0 skipped
-   = note: native verifier status: Failed; requested=1, proved=0, failed=1, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+   = note: native verifier status: Inconclusive; requested=1, proved=0, failed=0, unknown=1, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
    = help: guidance — must hold: the `Add` result must fit in its integer type. | fix: use `checked_*`/`saturating_*`/`try_into` and handle the overflow case, or constrain the operands with a precondition.
 
 error: Trust strict verification failed for `e6_kernel_import_admits::not_pure`: 1 obligation(s) were not fully verified
-  --> $DIR/e6_kernel_import_admits.rs:64:1
+  --> $DIR/e6_kernel_import_admits.rs:70:1
    |
 LL | fn not_pure(x: u64) -> u64 { x + 1 }
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: summary: 0 trusted, 0 certified, 1 failed, 0 unknown, 0 runtime-checked, 0 skipped out of 1
    = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
-   = note: native full verifier status: Failed; requested=1, proved=0, failed=1, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:cc6e4ec51cf4ca9fc053e39f6fd4cec8a6207aafd6621a8fbf1a56b8a4da423f requests=2
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:d436a5073fe933447ecc24edf225dcd375ccabde7f7fc8f454612b8ab77568f6
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:00dd94c68b52f65ec5e1c2b71cf4bc0284b0f1db1c7a7c99db2b17ade8eb98bb
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=2 elapsed_ms=$TIME worker_threads=unbounded
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: native full verifier status: Inconclusive; requested=1, proved=0, failed=0, unknown=1, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=2
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=2 elapsed_ms=$TIME worker_threads=unbounded
    = note: native full verifier evidence `vc:e6_kernel_import_admits__not_pure:arithmetic_safety:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-0-proof-0, function=not_pure, kind=ArithmeticSafety, relations=1, clauses=1
    = note: native full verifier evidence `vc:e6_kernel_import_admits__not_pure:arithmetic_safety:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-0-proof-0
    = note: native full verifier evidence `vc:e6_kernel_import_admits__not_pure:arithmetic_safety:0`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-0-proof-0; refusing to emit proof evidence
@@ -48,7 +49,7 @@ LL | fn not_pure(x: u64) -> u64 { x + 1 }
    = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
-  --> $DIR/e6_kernel_import_admits.rs:68:1
+  --> $DIR/e6_kernel_import_admits.rs:74:1
    |
 LL | / fn c_const(x: u64) -> u64
 LL | |
@@ -62,7 +63,7 @@ LL | | { x }
    = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `answer() <= x`
 
 error: Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::c_const`: 2 obligation(s) were not proved
-  --> $DIR/e6_kernel_import_admits.rs:68:1
+  --> $DIR/e6_kernel_import_admits.rs:74:1
    |
 LL | / fn c_const(x: u64) -> u64
 LL | |
@@ -77,7 +78,7 @@ LL | | { x }
    = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
 
 error: Trust strict verification failed for `e6_kernel_import_admits::c_const`: 2 obligation(s) were not fully verified
-  --> $DIR/e6_kernel_import_admits.rs:68:1
+  --> $DIR/e6_kernel_import_admits.rs:74:1
    |
 LL | / fn c_const(x: u64) -> u64
 LL | |
@@ -91,18 +92,18 @@ LL | | { x }
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:3bdae828a319f5f99910f73c37cf2f717289975e382db1b4ee378eaacb8f638b requests=1
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:ddeeee41e83f580df833dbeb96d7231cc1612a45169d41d72afaaddb39872f98
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
    = note: native full verifier evidence `unsupported:e6_kernel_import_admits__c_const:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `answer() <= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `answer() <= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
-  --> $DIR/e6_kernel_import_admits.rs:75:1
+  --> $DIR/e6_kernel_import_admits.rs:81:1
    |
 LL | / fn c_proj(x: u64, y: u64) -> u64
 LL | |
@@ -116,7 +117,7 @@ LL | | { x }
    = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `fst(x, y) <= x`
 
 error: Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::c_proj`: 2 obligation(s) were not proved
-  --> $DIR/e6_kernel_import_admits.rs:75:1
+  --> $DIR/e6_kernel_import_admits.rs:81:1
    |
 LL | / fn c_proj(x: u64, y: u64) -> u64
 LL | |
@@ -131,7 +132,7 @@ LL | | { x }
    = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
 
 error: Trust strict verification failed for `e6_kernel_import_admits::c_proj`: 2 obligation(s) were not fully verified
-  --> $DIR/e6_kernel_import_admits.rs:75:1
+  --> $DIR/e6_kernel_import_admits.rs:81:1
    |
 LL | / fn c_proj(x: u64, y: u64) -> u64
 LL | |
@@ -145,18 +146,18 @@ LL | | { x }
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:00db4f3fee6978c5f906d15f7d535cb4ebd517262401e8ed699dbb1920eb4548 requests=1
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:e6823d7d644b6790c9f4625d13934991b8d9c6534928650e5cd4709876a5431a
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
    = note: native full verifier evidence `unsupported:e6_kernel_import_admits__c_proj:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `fst(x, y) <= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `fst(x, y) <= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
-  --> $DIR/e6_kernel_import_admits.rs:82:1
+  --> $DIR/e6_kernel_import_admits.rs:88:1
    |
 LL | / fn c_select(x: u64, y: u64) -> u64
 LL | |
@@ -170,7 +171,7 @@ LL | | { if x < y { x } else { y } }
    = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `min2(x, y) <= x`
 
 error: Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::c_select`: 2 obligation(s) were not proved
-  --> $DIR/e6_kernel_import_admits.rs:82:1
+  --> $DIR/e6_kernel_import_admits.rs:88:1
    |
 LL | / fn c_select(x: u64, y: u64) -> u64
 LL | |
@@ -185,7 +186,7 @@ LL | | { if x < y { x } else { y } }
    = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
 
 error: Trust strict verification failed for `e6_kernel_import_admits::c_select`: 2 obligation(s) were not fully verified
-  --> $DIR/e6_kernel_import_admits.rs:82:1
+  --> $DIR/e6_kernel_import_admits.rs:88:1
    |
 LL | / fn c_select(x: u64, y: u64) -> u64
 LL | |
@@ -199,18 +200,18 @@ LL | | { if x < y { x } else { y } }
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:be4001f5876cc7cca0bad319f2b8841cec3141f40dbeeb3cfecf4e0c13f75772 requests=1
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:2dc85250150ee1c97301e3818fade7481e95410d1cf3a67104e84f1f5211f36f
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
    = note: native full verifier evidence `unsupported:e6_kernel_import_admits__c_select:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `min2(x, y) <= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `min2(x, y) <= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
-  --> $DIR/e6_kernel_import_admits.rs:89:1
+  --> $DIR/e6_kernel_import_admits.rs:95:1
    |
 LL | / fn c_arith(x: u64) -> u64
 LL | |
@@ -224,7 +225,7 @@ LL | | { x }
    = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `winc(x) >= x`
 
 error: Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::c_arith`: 2 obligation(s) were not proved
-  --> $DIR/e6_kernel_import_admits.rs:89:1
+  --> $DIR/e6_kernel_import_admits.rs:95:1
    |
 LL | / fn c_arith(x: u64) -> u64
 LL | |
@@ -239,7 +240,7 @@ LL | | { x }
    = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
 
 error: Trust strict verification failed for `e6_kernel_import_admits::c_arith`: 2 obligation(s) were not fully verified
-  --> $DIR/e6_kernel_import_admits.rs:89:1
+  --> $DIR/e6_kernel_import_admits.rs:95:1
    |
 LL | / fn c_arith(x: u64) -> u64
 LL | |
@@ -253,18 +254,18 @@ LL | | { x }
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:495102ea10fcdfb5c4983df93170026726d5dece2e4fcc45200b82f076b55c84 requests=1
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:ee615fffaaa0dfe68795123e6afa5b8bad3e64ec8dd734ad5131eaf15b4c40c4
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
    = note: native full verifier evidence `unsupported:e6_kernel_import_admits__c_arith:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `winc(x) >= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `winc(x) >= x`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
-  --> $DIR/e6_kernel_import_admits.rs:96:1
+  --> $DIR/e6_kernel_import_admits.rs:102:1
    |
 LL | / fn c_not_pure(x: u64, y: u64) -> u64
 LL | |
@@ -278,7 +279,7 @@ LL | | { y }
    = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `not_pure(x) <= y`
 
 error: Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::c_not_pure`: 2 obligation(s) were not proved
-  --> $DIR/e6_kernel_import_admits.rs:96:1
+  --> $DIR/e6_kernel_import_admits.rs:102:1
    |
 LL | / fn c_not_pure(x: u64, y: u64) -> u64
 LL | |
@@ -293,7 +294,7 @@ LL | | { y }
    = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
 
 error: Trust strict verification failed for `e6_kernel_import_admits::c_not_pure`: 2 obligation(s) were not fully verified
-  --> $DIR/e6_kernel_import_admits.rs:96:1
+  --> $DIR/e6_kernel_import_admits.rs:102:1
    |
 LL | / fn c_not_pure(x: u64, y: u64) -> u64
 LL | |
@@ -307,18 +308,18 @@ LL | | { y }
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:e89bd7534ef3116796612fcc6f93ca765edf3bd16cfe24ad8a7332d729dadcf2 requests=1
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:9a7e07dfa4f585b1bee3b1f181fde380376f9c5609f0be4ec70294f9821ead35
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
    = note: native full verifier evidence `unsupported:e6_kernel_import_admits__c_not_pure:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `not_pure(x) <= y`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `not_pure(x) <= y`
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 error: citation `triv` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), Const(Name { depth: 1, suffix: [\"trust_import_e6_kernel_import_ad\"…], lean4_hash: 659d77b52c253a02 }, []))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(0)))), inferred: Const(Name { depth: 1, suffix: [\"True\"], lean4_hash: a4bb0d768367154e }, []), location: None }" }]
-  --> $DIR/e6_kernel_import_admits.rs:71:30
+  --> $DIR/e6_kernel_import_admits.rs:77:30
    |
 LL |     ensures answer() <= x by triv
    |                              ^^^^
@@ -326,7 +327,7 @@ LL |     ensures answer() <= x by triv
    = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
 
 error: citation `triv` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), App(App(Const(Name { depth: 1, suffix: [\"trust_import_e6_kernel_import_ad\"…], lean4_hash: 8c0c1fb70f588629 }, []), BVar(1)), BVar(0)))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(1))))), inferred: Const(Name { depth: 1, suffix: [\"True\"], lean4_hash: a4bb0d768367154e }, []), location: None }" }]
-  --> $DIR/e6_kernel_import_admits.rs:78:31
+  --> $DIR/e6_kernel_import_admits.rs:84:31
    |
 LL |     ensures fst(x, y) <= x by triv
    |                               ^^^^
@@ -334,7 +335,7 @@ LL |     ensures fst(x, y) <= x by triv
    = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
 
 error: citation `triv` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), App(App(Const(Name { depth: 1, suffix: [\"trust_import_e6_kernel_import_ad\"…], lean4_hash: 87bee31b3bfcddd4 }, []), BVar(1)), BVar(0)))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(1))))), inferred: Const(Name { depth: 1, suffix: [\"True\"], lean4_hash: a4bb0d768367154e }, []), location: None }" }]
-  --> $DIR/e6_kernel_import_admits.rs:85:32
+  --> $DIR/e6_kernel_import_admits.rs:91:32
    |
 LL |     ensures min2(x, y) <= x by triv
    |                                ^^^^
@@ -342,7 +343,7 @@ LL |     ensures min2(x, y) <= x by triv
    = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
 
 error: citation `triv` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(0))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), App(Const(Name { depth: 1, suffix: [\"trust_import_e6_kernel_import_ad\"…], lean4_hash: 6538a2fa1331983b }, []), BVar(0))))), inferred: Const(Name { depth: 1, suffix: [\"True\"], lean4_hash: a4bb0d768367154e }, []), location: None }" }]
-  --> $DIR/e6_kernel_import_admits.rs:92:29
+  --> $DIR/e6_kernel_import_admits.rs:98:29
    |
 LL |     ensures winc(x) >= x by triv
    |                             ^^^^
@@ -350,7 +351,7 @@ LL |     ensures winc(x) >= x by triv
    = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
 
 error: citation `triv` cannot be validated because this clause is outside the exact statement fragment: at least one E6 structural facet of `not_pure` is not established: NoPanic (not established: reachable assert; structural NoPanic requires an assert-free body (the L0 whole-function aggregate certifies proved asserts)); public facet findings are diagnostic only and no sealed, item-bound kernel admission exists, so the call fails closed
-  --> $DIR/e6_kernel_import_admits.rs:99:33
+  --> $DIR/e6_kernel_import_admits.rs:105:33
    |
 LL |     ensures not_pure(x) <= y by triv
    |                                 ^^^^

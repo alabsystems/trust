@@ -357,12 +357,27 @@ impl Step for Rustc {
         rustc_cargo(builder, &mut cargo, target, &build_compiler, &self.crates);
         self.build_compiler.configure_cargo(&mut cargo);
 
-        // Explicitly pass -p for all compiler crates -- this will force cargo
-        // to also check the tests/benches/examples for these crates, rather
-        // than just the leaf crate.
+        // Explicitly pass -p for all compiler crates, so cargo checks each
+        // named crate rather than just the leaf.
         for krate in &*self.crates {
             cargo.arg("-p").arg(krate);
         }
+
+        // Trust: `-p` alone does NOT reach test targets. The comment this
+        // replaced claimed it did ("this will force cargo to also check the
+        // tests/benches/examples"), and that claim was false: `cargo check -p
+        // foo` checks foo's lib and bins, never its `#[cfg(test)]` module.
+        // Measured — with a deliberate `let _: u32 = "not a u32";` planted in
+        // `rustc_mir_transform`'s test module, `x.py check --stage 1
+        // compiler/rustc_mir_transform` exited 0 and reported no error.
+        //
+        // That is why the trust_verify test target silently rotted through six
+        // separate signature changes: `x.py build` compiles only the lib, and
+        // `x.py check` was believed to cover the rest. `--tests` is what
+        // actually reaches them. (Deliberately not `--all-targets`, which the
+        // tool path uses — that also drags in benches and examples, a surface
+        // this repo has never kept green.)
+        cargo.arg("--tests");
 
         let _guard = builder.msg(
             Kind::Check,

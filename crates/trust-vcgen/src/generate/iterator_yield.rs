@@ -60,12 +60,15 @@ pub(super) fn vc_strip_generics(callee: &str) -> String {
     out.split("::").filter(|seg| !seg.is_empty()).collect::<Vec<_>>().join("::")
 }
 
-/// Parse the QUALIFIED impl spelling `<Recv as TraitPath>::method[::<…>]`,
-/// returning `(TraitPath, method)`. The trait path may itself contain `::` and
-/// nested `<…>`; the receiver/trait split is the LAST top-level-within-the-
-/// qualifier ` as `, and the method is everything after the qualifier's closing
-/// `>::` (trailing turbofish stripped by the caller via [`vc_strip_generics`]).
-pub(super) fn vc_qualified_trait_method(callee: &str) -> Option<(String, String)> {
+/// Split a QUALIFIED callee spelling into its qualifier group and its method:
+/// `<Recv as TraitPath>::method[::<…>]` -> `("Recv as TraitPath", "method…")`,
+/// `<Recv>::method` -> `("Recv", "method…")`. `None` for an unqualified path.
+///
+/// ONE parser for the qualified spelling. Both [`vc_qualified_trait_method`]
+/// (which needs the TRAIT half) and [`vc_qualified_self_ty`] (which needs the
+/// SELF half) route through it, so the two halves can never disagree about where
+/// the qualifier ends.
+fn vc_qualifier_group(callee: &str) -> Option<(&str, &str)> {
     let rest = callee.strip_prefix('<')?;
     // Find the matching top-level close of the opening `<`.
     let mut depth = 1usize;
@@ -84,9 +87,13 @@ pub(super) fn vc_qualified_trait_method(callee: &str) -> Option<(String, String)
         }
     }
     let close = close?;
-    let inner = &rest[..close];
     let method = rest[close + 1..].strip_prefix("::")?;
-    // Split `Recv as TraitPath` on the last depth-0 ` as ` inside the qualifier.
+    Some((&rest[..close], method))
+}
+
+/// Byte offset of the LAST depth-0 ` as ` inside a qualifier group, i.e. the
+/// receiver/trait split point.
+fn vc_qualifier_as_split(inner: &str) -> Option<usize> {
     let mut depth = 0usize;
     let bytes = inner.as_bytes();
     let mut split = None;
@@ -100,8 +107,81 @@ pub(super) fn vc_qualified_trait_method(callee: &str) -> Option<(String, String)
         }
         i += 1;
     }
-    let split = split?;
+    split
+}
+
+/// Parse the QUALIFIED impl spelling `<Recv as TraitPath>::method[::<…>]`,
+/// returning `(TraitPath, method)`. The trait path may itself contain `::` and
+/// nested `<…>`; the receiver/trait split is the LAST top-level-within-the-
+/// qualifier ` as `, and the method is everything after the qualifier's closing
+/// `>::` (trailing turbofish stripped by the caller via [`vc_strip_generics`]).
+pub(super) fn vc_qualified_trait_method(callee: &str) -> Option<(String, String)> {
+    let (inner, method) = vc_qualifier_group(callee)?;
+    let split = vc_qualifier_as_split(inner)?;
     Some((inner[split + 4..].to_string(), method.to_string()))
+}
+
+/// The SELF (receiver) type of a qualified callee spelling — the OTHER half of
+/// [`vc_qualified_trait_method`]'s split, and the half that carries the identity
+/// of the value the method is called ON.
+///
+/// `<alloc::vec::Vec<u8> as core::iter::…::IntoIterator>::into_iter` -> `alloc::vec::Vec<u8>`
+/// `<[u8]>::iter` (a qualifier with no ` as `) -> `[u8]`
+/// `core::slice::<impl [u8]>::iter` (unqualified) -> `None`
+///
+/// WHY THIS EXISTS. `trust_types::path_root_is_authenticated_sysroot_crate` is a
+/// ROOT test and says so: *a caller holding a qualified spelling must split it*.
+/// A caller that instead anchors the RAW qualified string refuses every
+/// `<Self as Trait>::m` callee out of hand, because such a string starts with
+/// `<` — and `.into_iter()` is ALWAYS that spelling. Anchoring the TRAIT half
+/// is not a substitute for anchoring the SELF half and vice versa: for
+/// `<mycrate::Endless as core::iter::…::IntoIterator>::into_iter` the trait half
+/// authenticates perfectly while the receiver is a user type, and for
+/// `<alloc::vec::Vec<u8> as mycrate::MyTrait>::into_iter` it is the other way
+/// round. Each caller anchors the half its own claim is about.
+pub(super) fn vc_qualified_self_ty(callee: &str) -> Option<&str> {
+    let (inner, _) = vc_qualifier_group(callee)?;
+    Some(match vc_qualifier_as_split(inner) {
+        Some(i) => &inner[..i],
+        None => inner,
+    })
+}
+
+/// Peel the reference/raw-pointer prefixes rustc renders in front of a type
+/// (`&`, `&'a `, `&mut `, `&'a mut `, `*const `, `*mut `), so the ROOT of
+/// `&'a alloc::vec::Vec<u8>` is read from `alloc::vec::Vec<u8>`.
+///
+/// A reference's collection/iterator identity is its pointee's — `(&vec)
+/// .into_iter()` yields the vec's elements — so peeling is exactly the
+/// normalization the receiver anchor needs, and it is the same rule
+/// `alloc_vcs::ty_is_authenticated_std_iterator` applies to `Ty::Ref`.
+pub(super) fn vc_peel_reference_prefixes(ty: &str) -> &str {
+    let mut ty = ty.trim();
+    loop {
+        let next = if let Some(r) = ty.strip_prefix('&') {
+            let r = r.trim_start();
+            // an explicit lifetime, e.g. `&'a T` / `&'_ T`
+            let r = match r.strip_prefix('\'') {
+                Some(after) => match after.find(char::is_whitespace) {
+                    Some(i) => after[i..].trim_start(),
+                    None => "",
+                },
+                None => r,
+            };
+            r.strip_prefix("mut ").map_or(r, str::trim_start)
+        } else if let Some(r) = ty.strip_prefix("*const ") {
+            r
+        } else if let Some(r) = ty.strip_prefix("*mut ") {
+            r
+        } else {
+            return ty;
+        };
+        let next = next.trim();
+        if next == ty {
+            return ty;
+        }
+        ty = next;
+    }
 }
 
 /// Authenticate a std ITERATOR-PROTOCOL trait method across every spelling the

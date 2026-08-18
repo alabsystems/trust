@@ -15,6 +15,7 @@ fn main() {
 
     // Ordinary production MIR must preserve the authored TailCall.
     cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
         .arg("--crate-type=lib")
@@ -37,6 +38,7 @@ fn main() {
     // Only the authenticated test artifact expands it into
     // Call -> ensures monitor -> Return.
     cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
         .arg("--test")
@@ -65,6 +67,7 @@ fn main() {
     // normally if the recursive-edge E5 check disappeared, so the runtime
     // failure below cannot be supplied by an ensures-only helper.
     let bad_tail_report = cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .env("TRUST_MONITOR_REPORT", "1")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
@@ -104,6 +107,7 @@ fn main() {
 
     let executable = bin_name("tail-monitor");
     cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
         .arg("--test")
@@ -116,6 +120,7 @@ fn main() {
 
     let bad_executable = bin_name("tail-decrease-fail");
     cmd(&trustc)
+        .env_remove("TRUST_NO_VERIFY")
         .arg("-Ztrust-verify=on")
         .arg("-Ztrust-policy=advisory")
         .arg("--test")

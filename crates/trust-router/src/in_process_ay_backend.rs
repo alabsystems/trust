@@ -50,6 +50,7 @@ use trust_types::{
 
 // Trust: scoped suppression of solver-internal tracing diagnostics (see ay_log.rs).
 use crate::ay_log::with_ay_diagnostics_policy;
+use crate::ay_symbol_namespace;
 use crate::backend_trait::unsupported_mir_unknown;
 use crate::{BackendRole, VerificationBackend, smt2_export};
 
@@ -92,8 +93,57 @@ pub struct InProcessAyBackend {
 /// `formula` may digest these bytes as the solve's solver-transcript evidence
 /// artifact (the same text the Carcara N-version cross-check replays). It is a
 /// pure function of the formula — it never invents solver output.
+///
+/// Trust: variable symbols are rendered in Trust's ay namespace
+/// (`ay_symbol_namespace`), EXACTLY as `build_program` declares them natively.
+/// Both renderers apply the same pure map to the same raw formula, so the
+/// transcript keeps naming the symbols ay actually decided — which is what
+/// makes the Carcara cross-check (problem text vs. ay's Alethe proof) and the
+/// revalidation digest agree.
+/// Canonically flatten the TOP-LEVEL conjunction spine: `And[a, And[b, c]]`
+/// becomes `And[a, b, c]`, recursively along And-children only. Pure
+/// associativity — child order is preserved and nothing under `Or`/`Not`/`Ite`
+/// is touched — so the result is logically equivalent by construction.
+///
+/// WHY (falsification regression 2026-08-11): ay 0.6 (c25240fc9) made Alethe
+/// surface rendering REQUIRED for the strict UNSAT artifact, and its `and_pos`
+/// surface printer indexes conjuncts against the FLATTENED surface — a nested
+/// `(and A (and B C D))` then fails "and_pos indexed conjunct is absent from
+/// its effective source", the whole artifact export fails, and ay publishes
+/// `unknown` for a formula it PROVED. Trust's vcgen emits nested And-trees
+/// (block-defs conjoined onto the violation), so previously-proving rows
+/// (measured: charindices_slice_tail's slice-bounds VC) silently lost their
+/// proof. Handing ay the flat spelling side-steps the printer gap with zero
+/// logical change. Applied identically in `problem_smt2` and `build_program`,
+/// AFTER the symbol escape, so the textual transcript, the Carcara cross-check
+/// and the revalidation digest keep describing the exact program ay decided.
+#[must_use]
+fn flatten_conjunction_spine(formula: &Formula) -> Formula {
+    fn splice(formula: &Formula, out: &mut Vec<Formula>) {
+        match formula {
+            Formula::And(terms) => {
+                for term in terms {
+                    splice(term, out);
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    match formula {
+        Formula::And(_) => {
+            let mut flat = Vec::new();
+            splice(formula, &mut flat);
+            Formula::And(flat)
+        }
+        _ => formula.clone(),
+    }
+}
+
 #[must_use]
 pub fn problem_smt2(formula: &Formula) -> String {
+    let formula = &flatten_conjunction_spine(&ay_symbol_namespace::escape_formula_user_symbols(
+        formula,
+    ));
     let mut out = String::new();
     out.push_str(&format!("(set-logic {})\n", smt2_export::detect_logic(formula)));
     for decl in smt2_export::emit_declarations(formula) {
@@ -223,7 +273,23 @@ impl InProcessAyBackend {
 
     /// Build an [`AYProgram`] for the VC's violation formula with proof
     /// production enabled and every free variable declared.
+    ///
+    /// Trust: every VARIABLE symbol is first mapped into Trust's ay namespace
+    /// (`ay_symbol_namespace`). VC variable names are raw Rust identifiers from
+    /// MIR `var_debug_info`, and ay REFUSES to declare one that spells a builtin
+    /// theory operator (`fp`, `default`, `select`, …) — a refusal it raises by
+    /// panicking inside `declare_const`, i.e. a compiler ICE. The map is an
+    /// injective relabeling applied to binders and occurrences alike, so the
+    /// program ay decides is alpha-equivalent to the VC: it can neither create
+    /// nor destroy a model. `problem_smt2` applies the same map, so the textual
+    /// transcript names the same symbols.
     fn build_program(&self, formula: &Formula) -> AYProgram {
+        // Kept in lockstep with `problem_smt2`: same escape, same conjunction-
+        // spine flatten (see `flatten_conjunction_spine` for why), so the
+        // transcript and the executed program stay byte-equivalent.
+        let formula = &flatten_conjunction_spine(
+            &ay_symbol_namespace::escape_formula_user_symbols(formula),
+        );
         let mut program = AYProgram::new();
 
         // Enable proof production. Without this option the executor produces no
@@ -747,6 +813,29 @@ impl InProcessAyBackend {
                 ),
             };
         }
+        // Last gate before ay executes: no symbol in the program may be one ay
+        // REFUSES to declare. Variable symbols are namespaced away by
+        // `build_program`/`problem_smt2` (`ay_symbol_namespace`) and cannot trip
+        // this; what can are the symbols deliberately left un-namespaced —
+        // `Pred`/`FnApp` names and datatype member names, where a collision may
+        // mean the VC intended ay's builtin, so re-spelling could manufacture a
+        // spurious SAT witness. The question is asked of ay's OWN
+        // `is_reserved_symbol`, so the gate tracks ay's table with no local copy
+        // to drift. DECLINE (sound: neither a proof nor a refutation) instead of
+        // handing ay a declaration it answers with a panic — which unwinds into
+        // the embedding compiler and prints an ICE report.
+        if let Some(name) = ay_symbol_namespace::reserved_symbol_handed_to_ay(
+            &ay_symbol_namespace::escape_formula_user_symbols(formula),
+        ) {
+            return VerificationResult::Unknown {
+                solver: SOLVER_NAME.into(),
+                time_ms: 0,
+                reason: format!(
+                    "in-process ay declined: symbol '{name}' is a reserved ay builtin \
+                     theory-operator name and cannot be declared"
+                ),
+            };
+        }
         let program = self.build_program(formula);
         let start = Instant::now();
 
@@ -927,6 +1016,34 @@ impl VerificationBackend for InProcessAyBackend {
                 // backstop: it can only turn a fail-closed Unknown into a
                 // strict-UNSAT-checked Proved.
                 | VcKind::Postcondition
+                // Trust (falsification regression 2026-08-13): the UNREACHABLE trap
+                // obligation (`unreachable_unchecked` / a partial `match`'s
+                // `_ => unreachable!()`). trust-vcgen emits its violation formula as the
+                // ordinary reachability goal (`And([Not(Eq(x,0)), Not(Eq(x,1)), 0<=x<=255])`
+                // for a `u8` match on {0,1}) — squarely the QF_LIA/QF_BV fragment ay
+                // decides, and the same shape every L0 safety kind above admits. Its
+                // absence here was an oversight, not a decision: every other classifier
+                // already groups `Unreachable` with the L0 safety kinds
+                // (`has_runtime_fallback`, `vc_kind_is_memory_safe_panic`,
+                // `classify_property`).
+                //
+                // WHY IT MATTERS NOW: the typed-CHC lane used to be this kind's ONLY
+                // refutation channel, and `fix(semantics): fail closed on unattested
+                // refinement edges` correctly began demoting refutations that carry no
+                // positive producer-fidelity attestation — which is every row on the
+                // flattened single-formula lane, including the EXACT ACYCLIC ones. Two
+                // falsification mutants (`partial_int_unreachable`,
+                // `enum_partial_unreachable`) stopped being refuted as a result: real
+                // reachable UB traps shipping as `runtime-checked`.
+                //
+                // SOUNDNESS: the v1/ay bridge substitutes ONLY a `Failed` for this kind
+                // (refute-only, mirroring the `Postcondition` asymmetry in the opposite
+                // direction), so it grants NO proof authority — a genuinely dead trap is
+                // still discharged by `promote_structurally_dead_unreachable`, which runs
+                // AFTER the bridge and only upgrades Unknown/Timeout. The two cannot
+                // conflict: `promote` fires only on a propositionally-UNSAT formula, on
+                // which ay cannot return SAT.
+                | VcKind::Unreachable
         );
         kind_ok && execute_direct::is_available()
     }
@@ -946,10 +1063,20 @@ impl VerificationBackend for InProcessAyBackend {
 /// the model in `ExecuteCounterexample::model` (with `values` as the explicitly
 /// requested subset); we prefer the full model and fall back to `values`. Assignments
 /// are sorted for deterministic output.
+/// Trust: ay reports the model under the NAMESPACED symbol names
+/// `build_program` declared, so each binding is mapped back to its source
+/// spelling (`ay_symbol_namespace::unescape_user_symbol`). Counterexamples are
+/// read by humans and by the refutation machinery, both of which know the VC's
+/// own variable names; a namespaced name would be a witness nobody can match to
+/// a local.
 fn counterexample_from_ay_model(cex: &ExecuteCounterexample) -> Counterexample {
     let src = if cex.model.is_empty() { &cex.values } else { &cex.model };
-    let mut assignments: Vec<(String, CounterexampleValue)> =
-        src.iter().map(|(name, v)| (name.clone(), model_value_to_cex(v))).collect();
+    let mut assignments: Vec<(String, CounterexampleValue)> = src
+        .iter()
+        .map(|(name, v)| {
+            (ay_symbol_namespace::unescape_user_symbol(name), model_value_to_cex(v))
+        })
+        .collect();
     assignments.sort_by(|a, b| a.0.cmp(&b.0));
     Counterexample::new(assignments)
 }
@@ -2248,6 +2375,137 @@ mod tests {
         }
     }
 
+    /// Regression (reserved-symbol ICE, the `fp` class): a VC VARIABLE whose
+    /// name spells an ay builtin theory operator must be SOLVED, not declined
+    /// and not panicked on.
+    ///
+    /// VC variable names are raw Rust identifiers from MIR `var_debug_info`, so
+    /// `let fp = …` handed ay the reserved name `fp` (SMT-LIB's FloatingPoint
+    /// literal constructor); ay's refusal to declare it surfaced as a panic in
+    /// `ay_dpll::api::terms::declare_const` and a full ICE report. Before the
+    /// namespace map this returned Unknown ("in-process ay solve panicked …")
+    /// and printed an ICE; the same formula over a variable named `x` proved.
+    /// A variable name carries no semantics, so the verdict must not depend on
+    /// its spelling.
+    #[test]
+    fn test_reserved_named_variable_is_solved_with_the_same_verdict_as_any_other_name() {
+        if !execute_direct::is_available() {
+            return;
+        }
+        let backend = InProcessAyBackend::new();
+        // Unsatisfiable: no value is both > 10 and < 5, so the violation is
+        // refuted and the obligation is Proved.
+        let unsat = |name: &str| {
+            Formula::And(vec![
+                Formula::Gt(boxed(int_var(name)), boxed(Formula::Int(10))),
+                Formula::Lt(boxed(int_var(name)), boxed(Formula::Int(5))),
+            ])
+        };
+        let baseline = backend.verify(&safety_vc(unsat("x")));
+        assert!(
+            matches!(baseline, VerificationResult::Proved { .. }),
+            "baseline: an UNSAT violation over a plainly-named variable must be Proved, \
+             got {baseline:?}"
+        );
+        for name in ["fp", "default", "select", "store", "concat", "extract", "repeat", "RNE"] {
+            let result = backend.verify(&safety_vc(unsat(name)));
+            assert!(
+                matches!(result, VerificationResult::Proved { .. }),
+                "a variable named `{name}` must reach the solver and get the same verdict \
+                 as `x` (no panic, no decline), got {result:?}"
+            );
+        }
+    }
+
+    /// The ay BOUNDARY itself must never panic on a reserved name — the
+    /// namespace map means Trust no longer sends one, but a declaration ay
+    /// refuses is a recoverable input error for ANY embedder and must arrive as
+    /// an `ExecuteError`. This bypasses the backend's own gate and hands
+    /// `execute_direct` a program that declares the reserved name `fp`
+    /// directly: before `ay-bindings` checked the name, this call panicked
+    /// inside `ay_dpll::api::terms::declare_const` and unwound into the caller
+    /// (in trustc, one ICE report per obligation).
+    #[test]
+    fn test_execute_direct_reserved_declaration_returns_error_not_panic() {
+        if !execute_direct::is_available() {
+            return;
+        }
+        let mut program = AYProgram::new();
+        program.set_logic("QF_LIA");
+        let fp = program.declare_const("fp", AYSort::int());
+        program.assert(fp.eq(ay_bindings::Expr::int_const(0)));
+        program.check_sat();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_direct::execute_incremental(&program)
+        }));
+        match outcome {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("reserved"),
+                "the rejection must name the reserved-symbol cause: {error}"
+            ),
+            Ok(Ok(outcomes)) => {
+                panic!("ay must refuse to declare the reserved name `fp`, got {outcomes:?}")
+            }
+            Err(_) => panic!(
+                "declaring a reserved symbol must surface as an ExecuteError, never a panic \
+                 that unwinds into the embedding compiler"
+            ),
+        }
+    }
+
+    /// The namespaced solve still reports a counterexample under the SOURCE
+    /// variable name, not the internal `__trust_u_` spelling ay saw: a witness
+    /// nobody can match back to a local is a lost witness.
+    #[test]
+    fn test_reserved_named_variable_counterexample_uses_the_source_spelling() {
+        if !execute_direct::is_available() {
+            return;
+        }
+        let backend = InProcessAyBackend::new();
+        // Satisfiable: 2 < fp < 9 has witnesses, so the obligation is refuted.
+        let formula = Formula::And(vec![
+            Formula::Gt(boxed(int_var("fp")), boxed(Formula::Int(2))),
+            Formula::Lt(boxed(int_var("fp")), boxed(Formula::Int(9))),
+        ]);
+        match backend.verify(&safety_vc(formula)) {
+            VerificationResult::Failed { counterexample: Some(cex), .. } => {
+                let names: Vec<&str> =
+                    cex.assignments.iter().map(|(name, _)| name.as_str()).collect();
+                assert!(
+                    names.contains(&"fp"),
+                    "the witness must name the source variable `fp`, got {names:?}"
+                );
+                assert!(
+                    !names.iter().any(|name| name.starts_with(ay_symbol_namespace::AY_USER_SYMBOL_PREFIX)),
+                    "no namespaced spelling may leak into a counterexample: {names:?}"
+                );
+            }
+            other => panic!("a satisfiable violation over `fp` must be refuted, got {other:?}"),
+        }
+    }
+
+    /// The two ay-facing renderers must agree symbol-for-symbol: the textual
+    /// transcript (`problem_smt2`, which feeds the revalidation digest and the
+    /// Carcara cross-check) declares exactly the namespaced symbols the native
+    /// program declares. If only one of them mapped, the Alethe proof ay
+    /// produced would reference symbols the transcript never declares.
+    #[test]
+    fn test_problem_smt2_declares_the_same_namespaced_symbol_the_program_declares() {
+        let formula = Formula::Gt(boxed(int_var("fp")), boxed(Formula::Int(10)));
+        let text = problem_smt2(&formula);
+        let program = InProcessAyBackend::new().build_program(&formula).to_string();
+        let namespaced = format!("{}fp", ay_symbol_namespace::AY_USER_SYMBOL_PREFIX);
+        assert!(text.contains(&namespaced), "transcript must declare `{namespaced}`: {text}");
+        assert!(
+            !text.contains("declare-const fp ") && !text.contains("declare-fun fp "),
+            "transcript must not declare the reserved bare name `fp`: {text}"
+        );
+        assert!(
+            program.contains(&namespaced),
+            "native program must declare `{namespaced}`: {program}"
+        );
+    }
+
     /// Defense in depth (#int2bv-ice): a panic ANYWHERE inside the in-process
     /// solve must be contained by `run`'s unwind boundary and degrade to
     /// fail-closed Unknown instead of aborting the embedding compiler. The
@@ -2751,9 +3009,16 @@ mod certification_transport_gate_tests {
             Box::new(Formula::BitVec { value: 7, width: 8 }),
         );
         let problem = problem_smt2(&formula);
+        // Trust: the transcript declares the symbol in Trust's ay namespace —
+        // the same spelling `build_program` declares natively — so a `SymVar`
+        // named like an ay builtin can never collide. Exactly one declaration.
+        let declared = format!("{}s1_bits", ay_symbol_namespace::AY_USER_SYMBOL_PREFIX);
         assert!(problem.starts_with("(set-logic QF_BV)\n"), "{problem}");
-        assert!(problem.contains("(declare-fun s1_bits () (_ BitVec 8))\n"), "{problem}");
-        assert_eq!(problem.matches("declare-fun s1_bits").count(), 1);
+        assert!(
+            problem.contains(&format!("(declare-fun {declared} () (_ BitVec 8))\n")),
+            "{problem}"
+        );
+        assert_eq!(problem.matches(&format!("declare-fun {declared}")).count(), 1);
     }
 
     /// An unsatisfiable violation formula (`x > 10 ∧ x < 5`): the fresh solve

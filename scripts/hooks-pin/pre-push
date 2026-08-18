@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# Trust PIN-ONLY pre-push hook — the narrow gate.
+#
+# Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
+#
+# WHY THIS EXISTS SEPARATELY FROM scripts/hooks/pre-push
+# ------------------------------------------------------
+# `core.hooksPath` is all-or-nothing: it names ONE directory, and every hook in
+# it fires. So "turn on the pin gate" and "turn on the full pre-push gate" were
+# the same switch, and the full gate is not a switch a single lane may flip on a
+# shared machine. Measured 2026-08-13 at 352aa0306d:
+#
+#   fast.pr-gate            11.60s   GREEN
+#   fast.pin-coherence       0.49s   RED (first-party/trust-cg, first-party/trust-vc)
+#   fast.bridge-pin          0.44s   GREEN
+#   scoped.compiler-check   `python3 x.py check --stage 1`, self-documented
+#                           ~9-11 min, fires whenever the pushed diff touches
+#                           compiler/ crates/ src/bootstrap/ targo-trust/ or
+#                           first-party/ — 32 of the last 60 commits on main
+#                           (53.3%) touch those paths.
+#
+# and `tests/trust-comprehensive/divergences.toml` has NO row for
+# `fast.pin-coherence`, so that RED is not quarantined. Installing the full
+# hooks directory today would therefore have blocked every push from every lane
+# on this machine on a condition none of them caused, whose only remedy is
+# moving two DIVERGENT submodule pointers that the standing safety rules forbid
+# anyone to move. That is how a gate teaches people `--no-verify`.
+#
+# This directory is the pin gate WITHOUT that blast radius. It runs exactly one
+# checker, `scripts/check_pin_coherence.sh` (0.49s measured), and nothing else.
+# No pr_gate. No bridge replay. No x.py. No build of any kind.
+#
+# BLOCKING, not advisory — and why that is safe here
+# --------------------------------------------------
+# An advisory pin notice already exists (the post-merge/post-rewrite/post-checkout
+# hooks beside this file) and advisory is the right shape at pull time, when the
+# drift is created and the operation is not the lane's fault. Push is the last
+# moment before drift becomes everyone's, so this one blocks.
+#
+# It is safe to block because the verdict is scoped per submodule, not per repo:
+# a path listed in `pin-waivers.txt` with an unexpired date is reported and
+# stepped over, so PRE-EXISTING drift someone else owns cannot hold your push
+# hostage, while any NEW drift blocks immediately. That is the whole recurrence
+# class. Mirroring the quarantine philosophy of scripts/hooks/pre-push, a waiver
+# that has become unnecessary FAILS the push and asks to be deleted, so it
+# cannot outlive the problem it documents, and an expired waiver stops applying.
+#
+# NEVER MUTATES. This hook does not run `git submodule update`, does not check
+# anything out, and does not move a pointer. It reads and reports. Restoring a
+# worktree is a deliberate act (`scripts/submodule_sync.sh`), never a side
+# effect of a push.
+#
+# Escape hatch is git's own: `git push --no-verify`, which shows up in the
+# reflog rather than in a habit. There is no environment variable.
+set -uo pipefail
+
+# pre-push is fed "<local-ref> <local-sha> <remote-ref> <remote-sha>" lines on
+# stdin. Drain them so git never sees EPIPE. The verdict does not depend on
+# which refs are being pushed: an incoherent pin is incoherent for all of them.
+cat >/dev/null 2>&1 || true
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "pin-hook: not inside a git worktree" >&2
+  exit 1
+}
+
+# Git exports repository-local variables (notably GIT_DIR) while running a hook.
+# Leaving them set makes every nested `git -C first-party/<repo> ...` inside the
+# checker inspect the SUPERPROJECT object store instead, which reports healthy
+# siblings as unresolvable. scripts/hooks/pre-push learned this the hard way in
+# a linked worktree; the same unset is mandatory here.
+for git_local_var in $(git rev-parse --local-env-vars); do
+  unset "$git_local_var"
+done
+cd "$REPO_ROOT" || exit 1
+
+CHECKER="scripts/check_pin_coherence.sh"
+WAIVERS="scripts/hooks-pin/pin-waivers.txt"
+
+if [ ! -f "$CHECKER" ]; then
+  echo "pin-hook: $CHECKER is missing — refusing to certify pins" >&2
+  exit 1
+fi
+
+out="$(bash "$CHECKER" 2>&1)"
+rc=$?
+
+TODAY="$(date -u +%Y-%m-%d)"
+
+# ---------------------------------------------------------------- waiver table
+# Format, one row per line, `|`-separated:
+#     <submodule path> | <expires YYYY-MM-DD> | <owner> | <reason>
+# Blank lines and lines whose first non-space character is `#` are comments.
+W_PATH=()
+W_EXPIRES=()
+W_OWNER=()
+W_REASON=()
+if [ -f "$WAIVERS" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Strip leading whitespace, then judge the FIRST character. (A `#` anywhere
+    # else is ordinary text: reasons routinely contain issue numbers.)
+    lead="${line%%[![:space:]]*}"
+    trimmed="${line#"$lead"}"
+    case "$trimmed" in
+      ''|'#'*) continue ;;
+    esac
+    case "$line" in
+      *'|'*) ;;
+      *) continue ;;
+    esac
+    w_path="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$1); print $1}')"
+    w_exp="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}')"
+    w_own="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')"
+    w_rea="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$4); print $4}')"
+    [ -z "$w_path" ] && continue
+    W_PATH[${#W_PATH[@]}]="$w_path"
+    W_EXPIRES[${#W_EXPIRES[@]}]="$w_exp"
+    W_OWNER[${#W_OWNER[@]}]="$w_own"
+    W_REASON[${#W_REASON[@]}]="$w_rea"
+  done < "$WAIVERS"
+fi
+
+# Index of the waiver row for a path, or -1. ISO-8601 dates compare correctly as
+# strings, so no date arithmetic (and no python) is needed.
+waiver_index() {
+  local want="$1" i=0
+  while [ "$i" -lt "${#W_PATH[@]}" ]; do
+    if [ "${W_PATH[$i]}" = "$want" ]; then printf '%s' "$i"; return 0; fi
+    i=$((i + 1))
+  done
+  printf '%s' "-1"
+}
+
+# ------------------------------------------------------- classify the findings
+BLOCKING=()
+STEPPED_OVER=()
+STALE_WAIVERS=()
+PROBLEM_ROWS=0
+
+while IFS= read -r row; do
+  case "$row" in
+    '  - '*) ;;
+    *) continue ;;
+  esac
+  PROBLEM_ROWS=$((PROBLEM_ROWS + 1))
+  kind="$(printf '%s' "$row" | awk '{print $2}')"
+  path="$(printf '%s' "$row" | awk '{print $3}')"
+  finding="${row#  - }"
+  idx="$(waiver_index "$path")"
+  if [ "$idx" = "-1" ]; then
+    BLOCKING[${#BLOCKING[@]}]="$finding"
+    continue
+  fi
+  exp="${W_EXPIRES[$idx]}"
+  if [ -z "$exp" ] || [[ "$exp" < "$TODAY" ]]; then
+    BLOCKING[${#BLOCKING[@]}]="$finding
+      waiver for $path EXPIRED on ${exp:-<no date>} (owner ${W_OWNER[$idx]}) — it no longer applies"
+    continue
+  fi
+  STEPPED_OVER[${#STEPPED_OVER[@]}]="$kind $path  waived until $exp by ${W_OWNER[$idx]} :: ${W_REASON[$idx]}"
+done <<<"$out"
+
+# A waiver whose subject is coherent again is dead weight that silently widens
+# the gate. Same rule scripts/hooks/pre-push applies to quarantine rows: GREEN
+# under an active waiver FAILS, and the fix is to delete one line.
+i=0
+while [ "$i" -lt "${#W_PATH[@]}" ]; do
+  wp="${W_PATH[$i]}"
+  we="${W_EXPIRES[$i]}"
+  if [ -n "$we" ] && [[ ! "$we" < "$TODAY" ]]; then
+    case "$out" in
+      *"ok  $wp  @"*)
+        STALE_WAIVERS[${#STALE_WAIVERS[@]}]="$wp is at its recorded pin again — delete its line from $WAIVERS"
+        ;;
+    esac
+  fi
+  i=$((i + 1))
+done
+
+# The checker failed but produced nothing we recognise as a finding: fail closed
+# rather than guess. A checker whose output we cannot read is not a green one.
+if [ "$rc" -ne 0 ] && [ "$PROBLEM_ROWS" -eq 0 ]; then
+  echo "pin-hook: $CHECKER exited $rc with no parseable finding — failing closed." >&2
+  printf '%s\n' "$out" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------------------ the report
+echo "=== pin-coherence (pin-only hook; no pr_gate, no bridge replay, no x.py) ==="
+
+if [ "${#STEPPED_OVER[@]}" -gt 0 ]; then
+  echo
+  echo "WAIVED — pre-existing drift this push did not cause:"
+  for s in "${STEPPED_OVER[@]}"; do echo "  ~ $s"; done
+fi
+
+if [ "${#BLOCKING[@]}" -eq 0 ] && [ "${#STALE_WAIVERS[@]}" -eq 0 ]; then
+  echo
+  echo "PIN GATE: GREEN — no unwaived submodule pin drift."
+  exit 0
+fi
+
+if [ "${#STALE_WAIVERS[@]}" -gt 0 ]; then
+  echo
+  echo "FAIL: a pin waiver is no longer needed."
+  for s in "${STALE_WAIVERS[@]}"; do echo "  x $s"; done
+fi
+
+if [ "${#BLOCKING[@]}" -gt 0 ]; then
+  echo
+  echo "FAIL: submodule pin drift that nothing waives."
+  for b in "${BLOCKING[@]}"; do echo "  x $b"; done
+  echo
+  echo "This hook never moves a pointer. Classify the drift first —"
+  echo "BEHIND is restorable, AHEAD holds commits the pin does not:"
+  echo
+  echo "    scripts/submodule_sync.sh              # classify (read-only)"
+  echo "    scripts/submodule_sync.sh --restore    # BEHIND, plus AHEAD/DIVERGENT"
+  echo "                                           # whose every unique commit is"
+  echo "                                           # held by a durable ref (ANCHORED)"
+  echo
+  echo "Do NOT run a blanket 'git submodule update'. If the drift is someone"
+  echo "else's and genuinely not yours to resolve, add an owned, expiring row to"
+  echo "    $WAIVERS"
+fi
+
+echo
+echo "PIN GATE: RED. 'git push --no-verify' skips this hook and leaves no record of why."
+exit 1

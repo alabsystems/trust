@@ -1090,8 +1090,17 @@ pub(crate) fn sem_two_call_chain_of_mir(
         match &blk.terminator {
             Terminator::Return => break,
             Terminator::Goto(g) => cur = *g,
-            Terminator::Call { func: callee, args, dest, target, atomic, is_foreign, .. } => {
-                if *is_foreign || atomic.is_some() {
+            Terminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                ..
+            } => {
+                if *is_foreign || *is_unsafe_sig || atomic.is_some() {
                     return None;
                 }
                 walked.push((blk.id, callee, args, dest, *target));
@@ -1157,7 +1166,9 @@ pub(crate) fn sem_two_call_chain_of_mir(
     {
         return None;
     }
-    if fact_in.arg_count != args_in.len() || fact_out.arg_count != args_out.len() {
+    if !crate::mirsem::callee_signature_matches(func, args_in, dest_in, fact_in)
+        || !crate::mirsem::callee_signature_matches(func, args_out, dest_out, fact_out)
+    {
         return None;
     }
     if args_in.is_empty() || args_out.is_empty() {
@@ -1306,21 +1317,60 @@ pub(crate) fn sem_call_then_project_of_mir(
     let mut call = None;
     for block in &body.blocks {
         match &block.terminator {
-            Terminator::Call { func: callee, args, dest, target, atomic, is_foreign, .. } => {
+            Terminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                ..
+            } => {
                 if call.is_some() {
                     return None;
                 }
-                call = Some((block.id, callee, args, dest, *target, atomic, *is_foreign));
+                call = Some((
+                    block.id,
+                    callee,
+                    args,
+                    dest,
+                    *target,
+                    atomic,
+                    *is_foreign,
+                    *is_unsafe_sig,
+                ));
             }
             Terminator::Goto(_) | Terminator::Return => {}
             _ => return None,
         }
     }
-    let (call_block_id, callee_str, args, dest, target, atomic, is_foreign) = call?;
-    if is_foreign || atomic.is_some() {
+    let (call_block_id, callee_str, args, dest, target, atomic, is_foreign, is_unsafe_sig) = call?;
+    if is_foreign || is_unsafe_sig || atomic.is_some() {
         return None;
     }
     let target = target?;
+
+    // Trust: audit (2026-08-17) — ENTRY REACHABILITY, the walk every sibling call
+    // recognizer already carries (`sem_call_return_of_mir` et al.): the call block
+    // must be reached from `BlockId(0)` through Gotos only. Without it a body
+    // whose call block hangs off an unreachable or non-linear region could pin
+    // the claim to a call the entry path never executes.
+    {
+        let mut cur = trust_types::BlockId(0);
+        let mut steps = 0usize;
+        while cur != call_block_id {
+            let blk = body.blocks.iter().find(|b| b.id == cur)?;
+            match &blk.terminator {
+                Terminator::Goto(t) => cur = *t,
+                _ => return None,
+            }
+            steps += 1;
+            if steps > body.blocks.len() {
+                return None;
+            }
+        }
+    }
 
     // Dest `_t`: a BARE, non-`_0`, non-parameter TUPLE temp.
     if !dest.projections.is_empty() {
@@ -1339,7 +1389,7 @@ pub(crate) fn sem_call_then_project_of_mir(
     if resolved == func.def_path || *callee_str == func.def_path {
         return None;
     }
-    if fact.arg_count != args.len() || args.is_empty() {
+    if !crate::mirsem::callee_signature_matches(func, args, dest, fact) || args.is_empty() {
         return None;
     }
     let mut sem_args = Vec::with_capacity(args.len());

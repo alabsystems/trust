@@ -29,11 +29,177 @@ use crate::errors::{
 };
 use crate::exp;
 
+/// Trust: classify one Clean surface declaration for the AST payload of a
+/// `clean { … }` island, and intern the name it declares (`sym::empty` when the
+/// command declares none).
+///
+/// The match is EXHAUSTIVE on purpose. `clean_parser::SurfaceDecl` is not
+/// `#[non_exhaustive]`, so when Clean grows a surface command this stops
+/// compiling and someone decides how rustc should classify it — rather than a
+/// wildcard arm quietly filing it under something it is not.
+///
+/// Nested declarations (`namespace`/`section`/`mutual` bodies, `open … in`,
+/// `set_option … in`) are NOT flattened: this payload records what the island
+/// contains at top level, and it is not the input to elaboration.
+fn clean_decl_kind_and_name(decl: &clean_parser::SurfaceDecl) -> (CleanDeclKind, Symbol) {
+    use clean_parser::SurfaceDecl as D;
+
+    let named = |kind, name: &str| (kind, Symbol::intern(name));
+    let opt_named =
+        |kind, name: &Option<String>| (kind, name.as_deref().map_or(sym::empty, Symbol::intern));
+    let anon = |kind| (kind, sym::empty);
+
+    match decl {
+        D::Def { name, .. } => named(CleanDeclKind::Def, name),
+        D::Theorem { name, .. } => named(CleanDeclKind::Theorem, name),
+        D::Axiom { name, .. } => named(CleanDeclKind::Axiom, name),
+        D::Opaque { name, .. } => named(CleanDeclKind::Opaque, name),
+        D::Inductive { name, .. } => named(CleanDeclKind::Inductive, name),
+        D::Coinductive { name, .. } => named(CleanDeclKind::Coinductive, name),
+        D::Codata { name, .. } => named(CleanDeclKind::Codata, name),
+        D::Codef { name, .. } => named(CleanDeclKind::Codef, name),
+        D::Structure { name, .. } => named(CleanDeclKind::Structure, name),
+        D::Class { name, .. } => named(CleanDeclKind::Class, name),
+        D::Instance { name, .. } => opt_named(CleanDeclKind::Instance, name),
+        D::Example { .. } => anon(CleanDeclKind::Example),
+        D::Import { .. } => anon(CleanDeclKind::Import),
+        D::Namespace { name, .. } => named(CleanDeclKind::Namespace, name),
+        D::Section { name, .. } => opt_named(CleanDeclKind::Section, name),
+        D::UniverseDecl { .. } => anon(CleanDeclKind::UniverseDecl),
+        D::Variable { .. } => anon(CleanDeclKind::Variable),
+        D::Open { .. } => anon(CleanDeclKind::Open),
+        D::Export { .. } => anon(CleanDeclKind::Export),
+        D::DerivingInstance { .. } => anon(CleanDeclKind::DerivingInstance),
+        D::Check { .. } => anon(CleanDeclKind::Check),
+        D::Eval { .. } => anon(CleanDeclKind::Eval),
+        D::Print { name, .. } => named(CleanDeclKind::Print, name),
+        D::Mutual { .. } => anon(CleanDeclKind::Mutual),
+        D::Syntax { name, .. } => opt_named(CleanDeclKind::Syntax, name),
+        D::DeclareSyntaxCat { name, .. } => named(CleanDeclKind::DeclareSyntaxCat, name),
+        D::Macro { .. } => anon(CleanDeclKind::Macro),
+        D::MacroRules { name, .. } => opt_named(CleanDeclKind::MacroRules, name),
+        D::Notation { .. } => anon(CleanDeclKind::Notation),
+        D::Elab { .. } => anon(CleanDeclKind::Elab),
+        D::RawDecl { .. } => anon(CleanDeclKind::RawDecl),
+        D::Attribute { .. } => anon(CleanDeclKind::Attribute),
+        D::SetOption { name, .. } => named(CleanDeclKind::SetOption, name),
+        D::DeclareAesopRuleSets { .. } => anon(CleanDeclKind::DeclareAesopRuleSets),
+        D::LibraryNote { title, .. } => named(CleanDeclKind::LibraryNote, title),
+    }
+}
+
 impl<'a> Parser<'a> {
     /// Parses a source module as a crate. This is the main entry point for the parser.
     pub fn parse_crate_mod(&mut self) -> PResult<'a, ast::Crate> {
         let (attrs, items, spans) = self.parse_mod(exp!(Eof))?;
         Ok(ast::Crate { attrs, items, spans, id: DUMMY_NODE_ID, is_placeholder: false })
+    }
+
+    /// Trust: parse a `clean { … }` PARSER ISLAND (ruling v7/D1; v3(4) "a true
+    /// parser island — real Clean parser, source maps — not a macro").
+    ///
+    /// The island body is consumed as a token tree so rustc's delimiter
+    /// matching still frames it, then the body TEXT is handed to the real
+    /// `clean_parser`. A Clean *parse* error is reported right here, as an
+    /// ordinary rustc parse-time diagnostic spanned INSIDE the island.
+    ///
+    /// **A parse-time success does not imply kernel authority.** This function
+    /// links `clean-parser` only: no elaborator, no environment, no CIC
+    /// kernel is reachable from the parser. Registration and kernel checking
+    /// happen exactly where they did before — in the verify pass, in authored
+    /// order, with the same `trust_import_*` deferral and taint semantics.
+    fn parse_clean_island(&mut self) -> ItemKind {
+        self.bump(); // `clean`
+        let tree = self.parse_token_tree();
+        let rustc_ast::tokenstream::TokenTree::Delimited(dspan, _, _, ref inner) = tree else {
+            unreachable!("parse_token_tree at an open delimiter returns Delimited");
+        };
+        let content_span = match (inner.iter().next(), inner.iter().last()) {
+            (Some(first), Some(last)) => first.span().to(last.span()),
+            _ => dspan.entire().shrink_to_lo(),
+        };
+
+        // The island text is the ground truth for both this parse and the
+        // later elaboration, so capture the exact bytes once and carry them.
+        // If the source is unavailable (no real `SourceFile` behind the span)
+        // there is nothing to parse; stay silent and let the verify pass emit
+        // its existing "could not be recovered from the source map" error
+        // rather than reporting the same defect twice with two wordings.
+        let Ok(text) = self.psess.source_map().span_to_snippet(content_span) else {
+            return ItemKind::CleanIsland(Box::new(CleanIsland {
+                content_span,
+                text: sym::empty,
+                decls: ThinVec::new(),
+            }));
+        };
+
+        // Map a Clean island-relative byte range onto rustc coordinates. Same
+        // arithmetic the verify pass uses for Clean's own diagnostics, so a
+        // parse-time span and a kernel-time span point at the same bytes.
+        let remap = |start: usize, end: usize| -> Span {
+            let start = start.min(text.len());
+            let end = end.max(start).min(text.len());
+            let lo = content_span.lo() + rustc_span::BytePos(start as u32);
+            let mut hi = content_span.lo() + rustc_span::BytePos(end as u32);
+            if hi == lo && lo < content_span.hi() {
+                hi = lo + rustc_span::BytePos(1);
+            }
+            content_span.with_lo(lo).with_hi(hi)
+        };
+
+        // `parse_file_with_tactics_located` is the same strict entry point the
+        // verify pass uses: it rejects parser-recovery placeholders (a proof
+        // consumer must never mistake a recovered `RawDecl` for accepted
+        // source) and reports one unambiguous absolute byte offset.
+        //
+        // The tactic-pattern table is EMPTY here, whereas the verify pass
+        // passes `clean_elab`'s builtin table. That is deliberate: pulling the
+        // whole Clean elaborator into `rustc_parse` to share the table is not
+        // a dependency this crate should carry. The table only affects how
+        // argument-pattern-aware named tactics inside `by …` blocks are split,
+        // so the two parses can disagree on tactic-heavy proofs. This lane is
+        // therefore SYNTAX-ONLY in both directions: the decls recorded here
+        // are not what the kernel sees, and the verify pass re-parses with its
+        // own table regardless of what happened here.
+        let patterns = clean_parser::TacticPatterns::new();
+        let parsed = match clean_parser::parse_file_with_tactics_located(&text, &patterns) {
+            Ok(decls) => decls,
+            Err(err) => {
+                let span = remap(err.byte_offset, err.byte_offset);
+                self.dcx()
+                    .struct_span_err(span, format!("Clean island failed to parse: {err}"))
+                    .with_note(
+                        "`clean { … }` is a real parser island: the body is Clean (Lean) \
+                         source and is parsed by the Clean parser during rustc's own parse, \
+                         so this is a syntax error, not a failed proof"
+                            .to_string(),
+                    )
+                    .with_help(
+                        "options: fix the Clean syntax at the marked position; move the \
+                         declaration into a `.clean` file and `import` it; or, if the text is \
+                         meant to be Rust, drop the `clean` keyword so it parses as ordinary \
+                         items"
+                            .to_string(),
+                    )
+                    .emit();
+                Vec::new()
+            }
+        };
+
+        let decls = parsed
+            .iter()
+            .map(|decl| {
+                let (kind, name) = clean_decl_kind_and_name(decl);
+                let span = decl.span();
+                CleanIslandDecl { kind, name, span: remap(span.start, span.end) }
+            })
+            .collect();
+
+        ItemKind::CleanIsland(Box::new(CleanIsland {
+            content_span,
+            text: Symbol::intern(&text),
+            decls,
+        }))
     }
 
     /// Parses a `mod <foo> { ... }` or `mod <foo>;` item.
@@ -386,27 +552,16 @@ impl<'a> Parser<'a> {
             && self.token.is_ident_named(sym::clean)
             && self.look_ahead(1, |t| t.kind.open_delim() == Some(token::Delimiter::Brace))
         {
-            // Trust: `clean { … }` PARSER ISLAND (two-language design E10) —
-            // an item-position grammar form vanilla Rust rejects ("expected
-            // item"), so no valid program changes meaning; `clean!{…}` macro
-            // invocations are untouched (guarded by `isnt_macro_invocation`
-            // plus the missing `!`). The island body is Clean (Lean) source:
-            // only its SPAN is stored — never name-resolved, def-collected,
-            // or type-checked by rustc. The verify pass recovers the text
-            // through the source map, parses it with the real Clean parser,
-            // registers the declarations, and kernel-checks them; a rejected
-            // island fails the build with a source-spanned diagnostic.
-            self.bump(); // `clean`
-            let tree = self.parse_token_tree();
-            let rustc_ast::tokenstream::TokenTree::Delimited(dspan, _, _, ref inner) = tree
-            else {
-                unreachable!("parse_token_tree at an open delimiter returns Delimited");
-            };
-            let content_span = match (inner.iter().next(), inner.iter().last()) {
-                (Some(first), Some(last)) => first.span().to(last.span()),
-                _ => dspan.entire().shrink_to_lo(),
-            };
-            ItemKind::CleanIsland(content_span)
+            // Trust: `clean { … }` PARSER ISLAND (two-language design E10,
+            // ruling v7/D1) — an item-position grammar form vanilla Rust
+            // rejects ("expected item"), so no valid program changes meaning;
+            // `clean!{…}` macro invocations are untouched (guarded by
+            // `isnt_macro_invocation` plus the missing `!`). The island body
+            // is Clean (Lean) source: it is REALLY PARSED here, by the real
+            // Clean parser, and never name-resolved, def-collected, or
+            // type-checked by rustc. Elaboration and CIC kernel checking stay
+            // in the verify pass.
+            self.parse_clean_island()
         } else if self.isnt_macro_invocation()
             && (self.token.is_ident_named(sym::import)
                 || self.token.is_ident_named(sym::using)

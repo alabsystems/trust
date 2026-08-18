@@ -226,6 +226,7 @@ fn rebuild_func(post: Formula) -> VerifiableFunction {
         ],
         arg_count: 1,
         return_ty: btree_dt(),
+        datatype_defs: Default::default(),
     };
     VerifiableFunction {
         name: "rebuild".to_string(),

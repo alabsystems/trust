@@ -83,8 +83,8 @@ id = "upstream.trust-compat.2026-05-07.stage-sysroot-skew"
 gate_id = "upstream.trust-compat"
 status = "active"
 owner = "@trust-release"
-reason = "The strict stage2 upstream-compat lane contains stage/sysroot skew in the rustc_private preparation used by ui-fulldeps + rustc_private tool tests. Treat as harness/bootstrap skew unless reproduced as public Trust behavior."
-issue = "local:reports/trust-comprehensive/upstream.trust-compat#sysroot"
+reason = "NARROWED 2026-08-10 to the rustc_private TOOL builds (rustdoc/parser). The ui-fulldeps half of this row is RETIRED: `94446ac500` fixed the root cause on 2026-07-11 (`-Lall=` not `-Ldependency=`), and a fresh lane on 2026-08-10 ran 76 ui-fulldeps tests with 0 FAILED, its `verify_rustc_private_sysroot_dirs` control firing twice. The tool builds were NOT exercised by that run and remain unmeasured, which is the only reason this row is still active."
+issue = "local:reports/artifacts/2026-08-10-ui-fulldeps-lane.log"
 reviewed_on = "2026-07-11"
 expires_on = "2026-10-01"
 note = "2026-07-11 re-review on the rust-1.99 release-evidence run (reports/upstream-rust/2026-07-11-rust199-evidence-a0129195797): the prepared rustc-private-sysroot (build/host/rustc-private-sysroots/ui-fulldeps-*) is assembled INCOHERENTLY — dylib-only, missing librustc_driver, carrying stale artifact hashes that skew against the stage2 compiler — so `extern crate rustc_*` fails E0463 ('can't find crate') / E0460 ('found possibly newer version') across all 71 ui-fulldeps tests plus the rustdoc/parser rustc_private tool builds. This is a HARNESS/bootstrap gap in prepare_rustc_private_sysroot (a fragile Trust-modified bootstrap area per CLAUDE.md), NOT a trustc compiler regression and NOT introduced by the 1.99 migration (this row pre-dates it; no full-proof domination run has ever produced a green fulldeps lane). trustc compiles these tests correctly given a coherent -Ldependency set (verified: force-feeding the exact rustc_macros dylib via --extern advances resolution to the next crate). required_action stands: assemble a coherent stage2-compatible rustc_private sysroot for the fulldeps invocation."
@@ -95,7 +95,7 @@ allowed_patterns = [
 ]
 classification = "stage_sysroot_skew"
 compatibility_status = "harness_blocker"
-required_action = "Make the upstream test invocation use a coherent stage2 Trust sysroot without environment side paths."
+required_action = "Run the rustdoc/parser rustc_private TOOL builds on a strict stage2 lane and either retire this row or replace it with per-tool entries carrying real diff text. The ui-fulldeps invocation this row also used to cover is fixed and measured; do not re-litigate it."
 
 [[divergences]]
 id = "upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"

@@ -75,6 +75,7 @@ fn guarded_index_bounds_vc_formula_carries_dominating_guard() {
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

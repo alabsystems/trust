@@ -15,10 +15,184 @@
 //!   before assuming; a found witness is a model, so the check cannot
 //!   false-positive.
 //!
+//! The shadow check is about SOURCE bindings. A debug name in the contract
+//! lowerer's own reserved namespace (`__ret` from `#[ensures]`, `__old_*`, `_0`,
+//! …) is NOT one: `build_debug_name_map` demotes that whole family, so it never
+//! names a local in the extracted body and can never be what a formula variable
+//! resolves to. Copy-propagation routinely parks such an entry on a parameter
+//! local, and reading that as a user shadow dropped true, caller-proved
+//! preconditions and turned provable postconditions into refutations. See
+//! `reserved_synthetic_debug_name` — the exemption is confined to the alias
+//! scan; a predicate that REFERENCES a reserved spelling is still rejected.
+//!
 //! Gate failure NEVER rejects the function — it only drops the assumption
 //! (assume nothing), which can only weaken PROVE toward FAIL/UNKNOWN. The
 //! call-site Precondition VCs are generated from a separate re-parse and are
 //! deliberately NOT gated: callers must prove the full declared predicate.
+//!
+//! # The FORCED PARAMETER RESTATEMENT (`forced_parameter_alias`)
+//!
+//! One shape reaching the drops above is not an ambiguity at all — it is ONE
+//! entity under TWO spellings. For
+//!
+//! ```ignore
+//! #[requires(n >= 0)] #[ensures(|r| *r >= 0)] fn f(n: i32) -> i32 { let x = n; x }
+//! ```
+//!
+//! MIR copy-propagation makes the body's `x` an alias of the parameter local, so
+//! BOTH `n` and `x` are `var_debug_info` names on `_1`, and the last-write-wins
+//! collapse in `build_debug_name_map` names local 1 `"x"`. The clause is written
+//! in the SOURCE's namespace, the body's VCs in the BODY's; the two disagree,
+//! every check above reads that as a shadow, and a TRUE, caller-proved
+//! precondition is dropped. **`n` is parameter position 1; `x` is what the body
+//! calls that same local.** When the correspondence between the two namespaces is
+//! FORCED, this gate RESTATES the clause in the body's spelling and keeps it,
+//! instead of dropping the set.
+//!
+//! THIS IS THE ONE PLACE IN THIS FILE THAT CAN MINT A `PROVE`, so the conditions
+//! are stated as a proof, not as a heuristic. Write `p` for the target parameter
+//! POSITION, `_p` for its local, `s` for the clause's spelling and `b` for the
+//! body's. A `var_debug_info` entry is called a ROW; `build_debug_name_multimap`
+//! pushes one vector element per row and never dedups, so row MULTIPLICITY is
+//! visible here even though `build_debug_name_map`'s collapse hides it.
+//!
+//! **(I) A parameter position has exactly one body local.** `rustc_mir_build`'s
+//! `Builder::args_and_body` allocates one local per parameter, in declaration
+//! order, immediately after the return place (`Local::arg(index)`), so locals
+//! `1..=arg_count` ARE the parameters in declaration order. `extract_body`
+//! preserves `LocalDecl::index` (`validate_codegen_fidelity` rejects any body
+//! whose local order changed), so position ↔ local is a bijection in the
+//! extracted model too.
+//!
+//! **(II) The map is UNIQUE and TOTAL, not a preference.** The restatement fires
+//! only when EXACTLY ONE clause spelling is unbindable in the body namespace and
+//! EXACTLY ONE parameter position is not already named by the clause. With `k` of
+//! either there are `k!` candidate maps and no ground to prefer one, so the gate
+//! declines and DROPS exactly as before. Same for an unnamed or non-identifier
+//! parameter position (it could be the position the clause means), a
+//! reserved/synthetic `s`, a sort the clause does not use consistently or that
+//! `p`'s declared type does not admit, and any quantifier (`rename_var` is
+//! syntactic and does not respect binders, so a rename could capture).
+//!
+//! **(III) NO CONTRACT-BEARING FUNCTION HAS A PARAMETER IN THE RESERVED FAMILY.**
+//! This is the POSITIVE fact the whole identification rests on, and it is a
+//! compiler admission gate, not an inference from what happens to be visible:
+//!
+//!   * `trust_contract_query::trust_contracts` calls
+//!     `reject_unrepresentable_contract_parameter_names` BEFORE lowering a single
+//!     clause; any parameter-pattern binding for which
+//!     `source_contract_synthetic_name_collision` is `Some` gets a hard
+//!     `span_err` and the query returns `TrustContractBundle::empty`;
+//!   * `extract_contracts` repeats the check (`first_synthetic_contract_parameter`
+//!     → `reject_contracts_for_synthetic_parameter`) on BOTH of its sources — the
+//!     compiler bundle and the HIR-attribute compatibility seam — because that
+//!     seam can run with `compiler_contracts == None`.
+//!
+//! So a function with a reserved-family parameter name has NO contracts at all,
+//! `parse_contract_specs_with_typed` yields no preconditions, and this gate
+//! returns on its first line. (The extractor's own check is keyed on
+//! `def_id.as_local()`, but a NON-local definition's bundle was produced by the
+//! `trust_contracts` query in its OWN crate, where the query-level gate above
+//! already ran — so the invariant is crate-independent.) Consequently, for every function that can reach the
+//! restatement: **the parameter's own source name is NOT demoted by
+//! `build_debug_name_map`**, i.e. it participates in the last-write-wins collapse
+//! rather than vanishing from it. (That is also the load-bearing premise of the
+//! PRE-EXISTING `reserved_synthetic_debug_name` exemption in the alias scan: a
+//! `__` row on a parameter local can only be an artifact of Trust's own lowering
+//! or a reserved-spelled BODY binding, never the parameter's own name.)
+//!
+//! **(IV) `s` really is parameter `p`'s SOURCE name — CHECKED, not argued.** A
+//! clause identifier is resolved in the function's SIGNATURE scope, so it is
+//! either a parameter of this function or a non-parameter item (a
+//! `const`/`static`); it can never be a body `let`, which is not in scope there.
+//! Assuming a `const`'s predicate about a parameter would be a false PROVE — the
+//! exploit this condition exists to exclude is a module `const n` plus a body
+//! `let n = …;` whose row copy-props onto `_p`, which makes `s` LOOK corroborated
+//! while denoting something else.
+//!
+//! The identification is made by ASKING HIR, in one equality:
+//!
+//! ```text
+//!     hir_parameter_source_names(tcx, body)[p - 1] == Some(s)
+//! ```
+//!
+//! `hir_parameter_source_names` (`crates/trust-mir-extract/src/lib.rs`) yields
+//! one entry per HIR parameter in declaration order, `Some(name)` iff that
+//! parameter's pattern is a plain by-value binding of a simple identifier. So the
+//! equality says exactly what the restatement needs — *MIR argument `_p` was
+//! declared in source as a simple binding spelled `s`* — with no appeal to row
+//! ordering, to `var_debug_info` at all, or to any premise living in another
+//! crate. When the vector is absent (no local HIR body) or its length disagrees
+//! with `body.arg_count`, the gate declines: an unanswerable question is not a
+//! yes.
+//!
+//! **This replaces a MIR-row ORDERING argument that was unsound.** The previous
+//! text closed the identification by claiming a parameter's row precedes every
+//! body binding's row on `_p`, so the first non-demoted row on `_p` had to be
+//! `s`'s. That step silently presumed `_p` carries a row of the parameter's own,
+//! and for a `ref`-bound parameter it does not: `args_and_body`
+//! (`compiler/rustc_mir_build/src/builder/mod.rs`) emits an argument's debug row
+//! only under `pat.simple_ident()`, which is `None` for `ref q`, while `CopyProp`'s
+//! `Replacer::visit_local` still rewrites BODY bindings' rows onto `_p`. The
+//! companion claim — that a borrowed local cannot be a merge head — was false
+//! twice over: `ssa.rs`'s `borrowed_locals` test applies to the copy's
+//! DESTINATION, and an immutably-borrowed `Freeze` local (every integer type) is
+//! deliberately kept SSA. The concrete exploit was
+//!
+//! ```rust,ignore
+//! const n: i32 = 5;                                  // TRUE clause
+//! #[trust::requires(n >= 0)] #[ensures(|r: &i32| *r >= 0)]
+//! fn f(ref q: i32) -> i32 { let n = *q; let x = n; x }   // f(-7) == -7
+//! ```
+//!
+//! where the census saw exactly two non-demoted names on `_1` (`n` and `x`, both
+//! ordinary body `let`s), restated `n >= 0` as `x >= 0`, and PROVED a false
+//! postcondition. The HIR equality above refuses it at the first step, because
+//! `ref q` is not a simple by-value binding and its entry is `None`. `_` and
+//! `q @ sub` are refused by the same entry for the same reason, so the three
+//! pattern cases that the old text handled with three separate MIR-pass arguments
+//! now collapse into one check that cannot silently rot when a MIR pass changes.
+//!
+//! The row-census conditions below are RETAINED, but their job is now narrower:
+//! they establish that the assumed fact lands on a name the VC actually reads,
+//! and they refuse ambiguity. They no longer carry the identification.
+//!
+//!   1. `s` has EXACTLY ONE row, and it is on `_p`;
+//!   2. `b` has EXACTLY ONE row, and it is on `_p`; and `b` names exactly one
+//!      EXTRACTED local, or `place_to_var_name` would demote it to the
+//!      `_<local>` fallback and the assumed fact would bind nothing the VC reads;
+//!   3. every OTHER row on `_p` carries a name that is BOTH demoted and one of
+//!      the finite spellings Trust's own contract lowering mints — see
+//!      `trust_lowered_contract_debug_name` — and each such name has exactly one
+//!      row on `_p`.
+//!
+//! **(V) The restatement cannot capture or steal a binding.** `b` is chosen from
+//! the parameter positions the clause does NOT mention, so the rename never merges
+//! two distinct clause variables; `s` is not a body-namespace spelling, so nothing
+//! in the body binds it; and no clause carries a quantifier.
+//!
+//! **(VI) The entry fact cannot go STALE — and the protection follows the RENAMED
+//! name, not the source one.** `trust-vcgen` conjoins preconditions through
+//! `conjoin_preconditions_versioned`, which version-renames every PLACE variable
+//! of the VC body to its value at the read point (`version_rename_at` /
+//! `StmtVersionCtx::version_token_at`) and leaves the preconditions at the bare
+//! ENTRY spelling. A precondition about a place the body reassigned therefore
+//! names a different SMT variable from the renamed read and cannot constrain it —
+//! the retired `formula_survives_redefs` kill's drop, achieved by
+//! name-disjointness (`flip_matches_kill_stmt` is the statement-granular
+//! equivalence witness). That machinery is keyed on the names `place_to_var_name`
+//! mints, i.e. on `b` — so restating the clause as `b` puts it INSIDE the
+//! staleness discipline, whereas the source spelling `s` is not a place name at
+//! all and would receive none of it. The rename is what makes the protection
+//! apply, and the assumed fact is about `_p`'s ENTRY value, which is the caller's
+//! argument by (I) whatever the body later does to `_p`.
+//!
+//! **(VII) Everything else is unchanged.** The restatement runs BEFORE the checks
+//! above and the renamed set then passes through ALL of them (shadow scan,
+//! multiplicity, ground witness); only `s` itself is exempted from the alias scan,
+//! and only because (IV) established it is the same entity as `b`, never a
+//! competing binding. Any failure of any condition returns `None` and the set
+//! drops byte-identically to before.
 
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{Formula, Rvalue, Statement, Terminator, Ty, VerifiableBody};
@@ -75,6 +249,7 @@ pub fn gate_contract_preconditions(
     preconditions: &mut Vec<Formula>,
     body: &VerifiableBody,
     debug_name_locals: &FxHashMap<String, Vec<usize>>,
+    hir_param_source_names: Option<&[Option<String>]>,
 ) -> Vec<AssumeSkipReason> {
     if preconditions.is_empty() {
         return Vec::new();
@@ -111,7 +286,7 @@ pub fn gate_contract_preconditions(
     //     slice parameter's canonical length var, and
     //   * `__trust_constparam_{index}_{name}` — a const-generic array parameter's
     //     length (`&[T; N]`, `[T; N]` with N a const param).
-    // Exact source parsing lowers `arr.len()` to the projection leaf `arr_len`.
+    // Exact source parsing lowers `arr.len()` to the projection leaf `arr__len`.
     // That leaf is NEVER admitted as an independent free variable: for one
     // unique, length-stable runtime-slice parameter only, `admissible_lengths`
     // rebinds it to canonical `arr__slice_len` before validation and witness
@@ -135,6 +310,29 @@ pub fn gate_contract_preconditions(
         }
     }
     let length_syms = lengths.canonical;
+
+    // Trust (forced parameter restatement): the clause and the body are two
+    // SPELLINGS of one entity whenever copy-propagation plus the last-write-wins
+    // debug-name collapse renamed a parameter out from under the source. Restate
+    // the clause in the body's own spelling when — and ONLY when — the
+    // correspondence is FORCED; see the module header (I)–(VII) for the full
+    // argument, whose load-bearing step is (III): a contract-bearing function
+    // provably has no reserved-family parameter name, so the parameter's own
+    // `var_debug_info` row survives the collapse and the row census below pins it
+    // to `source`. On `None` nothing is rewritten and the checks below run
+    // byte-identically to before, so a genuine ambiguity still drops.
+    let forced = forced_parameter_alias(
+        preconditions,
+        body,
+        debug_name_locals,
+        &length_syms,
+        hir_param_source_names,
+    );
+    if let Some(alias) = &forced {
+        for formula in preconditions.iter_mut() {
+            *formula = formula.rename_var(&alias.source, &alias.body_spelling);
+        }
+    }
 
     let mut reasons = Vec::new();
     let mut referenced: FxHashSet<String> = FxHashSet::default();
@@ -223,6 +421,39 @@ pub fn gate_contract_preconditions(
         if referenced.contains(name) {
             continue;
         }
+        // Trust (synthetic-alias over-rejection, 2026-08-06): a name in the
+        // contract lowerer's RESERVED namespace is not a user binding and cannot
+        // be the alias that steals a referenced parameter's spelling. See
+        // `reserved_synthetic_debug_name`: `build_debug_name_map` demotes exactly
+        // this family, so such a name NEVER becomes any local's name in the
+        // extracted `VerifiableBody` — it is not in the formula namespace at all,
+        // and no formula variable can resolve to it. `#[ensures]` lowering mints
+        // `__ret`, and copy-propagation lands its `var_debug_info` entry on the
+        // parameter local of `fn f(n: i32) -> i32 { n }`; treating that as a shadow
+        // dropped the authored `n >= 0` and made a TRUE postcondition refute.
+        // NOTE the asymmetry that makes this the right place to fix it: the raw
+        // multimap fed to this gate is deliberately UNFILTERED (it needs
+        // multiplicity), while the collapsed name map the body is built from is
+        // filtered — so only this scan ever sees a reserved name.
+        // A reserved name that the predicate itself REFERENCES is untouched: it is
+        // rejected by the first loop above (it cannot be in `param_names`, since
+        // demotion left the local unnamed) and never reaches this `continue`.
+        if reserved_synthetic_debug_name(name) {
+            continue;
+        }
+        // Trust (forced parameter restatement): the SOURCE spelling we just
+        // restated is NOT a competing binding on the parameter local — module
+        // header (IV) established that it is that parameter's own source name,
+        // i.e. the SAME entity the referenced body spelling denotes. Reporting it
+        // as a shadow would drop the very assumption the restatement exists to
+        // keep. The exemption is exactly one name, is minted only when
+        // `forced_parameter_alias` returned `Some`, and that function already
+        // pinned `source` to a SINGLE row on the target parameter local and
+        // required every OTHER row there to be one of the finite spellings
+        // Trust's own contract lowering mints — so no user binding rides in on it.
+        if forced.as_ref().is_some_and(|alias| alias.source == *name) {
+            continue;
+        }
         for local in locals {
             if *local >= 1 && *local <= body.arg_count {
                 // Another name aliases a param local; if any referenced name
@@ -244,6 +475,370 @@ pub fn gate_contract_preconditions(
         preconditions.clear();
     }
     reasons
+}
+
+/// Whether `name` is a MIR debug name in the contract lowerer's own reserved
+/// synthetic namespace — `__ret` from `#[ensures]` lowering, `__old_*`, the
+/// positional `_0`/`_1` spellings, `<p>__slice_len`, `__trust_constparam_*`, the
+/// modeled-accessor `__len`/`__discr`/`__value`/`__sign` leaves, and every
+/// future addition to the `__` family (`source_contract_synthetic_name_collision`
+/// reserves the whole family "rather than chasing a perpetually incomplete
+/// prefix list").
+///
+/// **`build_debug_name_map` filters on a superset of this, and that containment
+/// is the soundness argument for skipping such a name in the alias scan.** The
+/// extracted body's parameter names come from that map, which drops the whole
+/// reserved family; so a `__` name is never a `LocalDecl::name` at an index the
+/// gate reads, never a `place_to_var_name` render, and therefore never a
+/// spelling a Formula variable can resolve to. It cannot change which local the
+/// user's `n` denotes — it can only be an artifact of contract lowering plus
+/// copy-propagation parking a compiler-generated debug entry on a parameter
+/// local.
+///
+/// PRECISION ON THAT CLAIM (it was first written too strongly): `LocalDecl::name`
+/// is not literally written in one place. `cell_threading::Fx::fresh_local` also
+/// writes one, with reserved spellings (`__thread_payload`, `__thread_rem`).
+/// Those are appended POST-extraction at indices above `arg_count`, and this
+/// gate reads the raw MIR `var_debug_info` multimap, which cannot contain them —
+/// so the exemption still holds. The invariant that carries it is the narrower
+/// one: no local at index <= `arg_count` in an `extract_body`-produced body
+/// carries a reserved name.
+///
+/// Keep the two call sites on this one function: if the reserved family and the
+/// demotion filter ever diverge, a name could be BOTH a live body spelling and
+/// exempt from the shadow scan, which is exactly the false-PROVE shape this gate
+/// exists to reject.
+pub(crate) fn reserved_synthetic_debug_name(name: &str) -> bool {
+    // NARROWED to `GeneratedMetadata` — the `__` family — deliberately, and NOT
+    // widened to "any reserved spelling". `source_contract_synthetic_name_
+    // collision` also reserves `result`, `_0`/`_<digits>`, the predicate
+    // vocabulary, and `old_*`. The `old_*` group is ORDINARY LEGAL RUST
+    // BINDINGS: `old_count`, `old_n`. Exempting it from the alias scan would
+    // make a genuine user shadow invisible to this gate and let an ambiguous
+    // entry fact be assumed — a false-PROVE, i.e. the one direction this gate
+    // exists to prevent. Only `__` is a namespace Trust's own MIR/Formula producers
+    // own outright, and only `__ret` (parked on a parameter local by
+    // `#[ensures]` lowering plus copy-propagation) is the artifact this
+    // exemption is for.
+    matches!(
+        trust_types::source_contract_synthetic_name_collision(name),
+        Some(trust_types::SourceContractSyntheticNameCollision::GeneratedMetadata)
+    )
+}
+
+/// The one restatement that puts a contract-derived precondition into the BODY's
+/// own namespace: the clause's spelling of a parameter, and the body's spelling
+/// of that same parameter local.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForcedParameterAlias {
+    /// The clause's spelling — established to be the parameter's SOURCE name.
+    source: String,
+    /// The body's spelling of that same parameter local — the name
+    /// `place_to_var_name` mints for every read of it, and therefore the name the
+    /// staleness/versioning discipline is keyed on.
+    body_spelling: String,
+}
+
+/// The FORCED `(source spelling → body spelling)` restatement for `preconditions`,
+/// or `None` whenever the correspondence is not uniquely determined — in which
+/// case nothing is rewritten and the gate's existing checks drop the set exactly
+/// as before.
+///
+/// **The full soundness argument is the module header (I)–(VII); read it before
+/// changing any condition here.** In one line: MIR pins a parameter POSITION to
+/// one local; the uniqueness conditions make the position↔name map total and
+/// singular; the compiler's own parameter-name admission gate proves the
+/// parameter's source name cannot be demoted; and the ROW census below (exactly
+/// one row per spelling, every other row on that local one Trust's contract
+/// lowering minted) plus "parameter rows are emitted first" force `source` to be
+/// that parameter's own source name rather than a same-named `const`/`static` or
+/// a body binding.
+///
+/// This is the crate-local twin of `trust_vcgen::generate::entry_hypothesis::
+/// forced_parameter_alias`, which recovers the SAME positional correspondence for
+/// the dropped-entry-hypothesis tripwire. The two crates share no dependency, so
+/// the conditions are duplicated deliberately — but note the asymmetry: that one
+/// can only ever REFUSE to emit a refutable row (it returns names, and the only
+/// renamed formula is local to a `bool`-returning function), while THIS one mints
+/// an assumption. Hence the raw-debug corroborations below, which the vcgen twin
+/// does not need and does not have the inputs for.
+fn forced_parameter_alias(
+    preconditions: &[Formula],
+    body: &VerifiableBody,
+    debug_name_locals: &FxHashMap<String, Vec<usize>>,
+    length_syms: &FxHashSet<String>,
+    hir_param_source_names: Option<&[Option<String>]>,
+) -> Option<ForcedParameterAlias> {
+    if body.arg_count == 0 || preconditions.is_empty() {
+        return None;
+    }
+
+    // (0) The HIR parameter spellings, in declaration order — module header (IV).
+    // This is the ONLY thing that identifies a clause variable as a parameter's
+    // own source name, so its absence is a decline rather than a fallback to an
+    // inference over MIR rows. A length disagreement with MIR's `arg_count` means
+    // the two views of the signature do not correspond position-for-position
+    // (e.g. a lowering that splits or synthesizes an argument), and indexing it
+    // by a MIR local would then be reading the wrong parameter.
+    let hir_param_source_names = hir_param_source_names?;
+    if hir_param_source_names.len() != body.arg_count {
+        return None;
+    }
+
+    // (1) The parameter list in DECLARATION ORDER, with the body spelling, the
+    // declared type and the local index of each position. A position missing from
+    // `locals`, unnamed, or carrying a non-identifier spelling makes the whole
+    // correspondence undetermined — it could be the position the clause means —
+    // so all three decline for the WHOLE function, not for that position alone.
+    // The unnamed case is also what excludes a `_` or `ref`-bound parameter, whose
+    // local can carry no body row at all (module header (IV), last paragraph).
+    let mut parameters: Vec<(&str, &Ty, usize)> = Vec::with_capacity(body.arg_count);
+    for index in 1..=body.arg_count {
+        let decl = body.locals.iter().find(|local| local.index == index)?;
+        let name = decl.name.as_deref()?;
+        if !plain_source_binding(name) {
+            return None;
+        }
+        parameters.push((name, &decl.ty, index));
+    }
+
+    // (2) Only clauses this gate could assume at all, and no binder anywhere:
+    // `rename_var` is a SYNTACTIC rewrite with no binder awareness, so a
+    // quantified clause could capture. (`in_assumable_fragment` already rejects
+    // `Forall`/`Exists` via its catch-all; the explicit check keeps the reason
+    // legible and survives any future widening of the fragment.)
+    for clause in preconditions {
+        if !in_assumable_fragment(clause) || formula_binds_a_variable(clause) {
+            return None;
+        }
+    }
+
+    // (3) EXACTLY ONE clause spelling the body namespace cannot bind. The body
+    // namespace is the extracted locals' names plus the admitted length symbols
+    // (which are canonical solver leaves, already rebound by the caller). Two
+    // unbindable spellings leave `k!` orderings and no ground to pick one.
+    let body_names: FxHashSet<&str> =
+        body.locals.iter().filter_map(|local| local.name.as_deref()).collect();
+    let mut clause_vars: FxHashSet<String> = FxHashSet::default();
+    for clause in preconditions {
+        clause_vars.extend(clause.free_variables());
+    }
+    let mut unresolved = clause_vars
+        .iter()
+        .filter(|name| !body_names.contains(name.as_str()) && !length_syms.contains(name.as_str()));
+    let source = unresolved.next()?;
+    if unresolved.next().is_some() {
+        return None;
+    }
+    // A model term or a projection (`a*`, `self.0`, `a[_i]`, `x#3`) is not a
+    // parameter's own name, and a reserved/synthetic spelling is not a source
+    // binding this gate may resolve — `build_debug_name_map` demotes that whole
+    // family, so it names nothing in the extracted body either.
+    if !plain_source_binding(source)
+        || trust_types::source_contract_synthetic_name_collision(source).is_some()
+    {
+        return None;
+    }
+
+    // (4) EXACTLY ONE parameter position the clause does not already name in the
+    // body's own spelling. Choosing the target from the UNMENTIONED positions is
+    // also what makes the rename collision-free: `body_spelling` cannot already
+    // occur in the clause, so two distinct clause variables can never merge.
+    let mut unclaimed =
+        parameters.iter().copied().filter(|(name, _, _)| !clause_vars.contains(*name));
+    let (body_spelling, declared_ty, param_local) = unclaimed.next()?;
+    if unclaimed.next().is_some() {
+        return None;
+    }
+
+    // (4b) THE IDENTIFICATION — module header (IV). HIR must say that MIR argument
+    // `_param_local` was declared in source as a plain by-value binding spelled
+    // `source`. Everything else in this function establishes that the restatement
+    // is unambiguous and lands on a name the VC reads; THIS is what establishes
+    // that the clause was talking about that parameter in the first place.
+    //
+    // `param_local` is a MIR local index (arguments are `1..=arg_count`), so the
+    // declaration-ordered HIR vector is indexed at `param_local - 1`. A `None`
+    // entry (`ref q`, `_`, `q @ sub`) is a refusal: for those patterns `_p` carries
+    // no row of the parameter's own, so any row found there belongs to a body
+    // binding and `source` cannot be corroborated from MIR at all.
+    if hir_param_source_names.get(param_local - 1)?.as_deref() != Some(source.as_str()) {
+        return None;
+    }
+
+    // (5) The sort must be unambiguous in the clause AND admitted by the
+    // parameter's declared type: a clause reading an `Int` is not a restatement of
+    // a `bool`/`f64`/`&[T]` parameter. (`retype_contract_formulas_for_body` runs
+    // BEFORE this gate and can only retype a name the body binds, so a Bool
+    // parameter whose body spelling diverged keeps the parser's `Int` sentinel
+    // here and is declined — fail-closed.) Admitting only `Int`/`Bool` scalars is
+    // ALSO what bounds the parameter-pattern case analysis in module header (IV):
+    // an integer/boolean parameter's pattern is a binding, `_`, `ref`, or `x @ …`,
+    // and nothing else is irrefutable at that type.
+    let sort = sole_var_sort(preconditions, source)?;
+    if !parameter_ty_admits_sort(declared_ty, &sort) {
+        return None;
+    }
+
+    // (6) RAW `var_debug_info` corroboration WITH ROW MULTIPLICITY — module
+    // header (IV.1–2). MIR's own record must say that the source binding `source`
+    // occupies exactly ONE row and that row is on this parameter's local, and the
+    // same for the body spelling. Counting distinct locals is NOT enough: for
+    // `fn f(x: i32) { let n = x; let x = n; x }` the parameter `x` and the body's
+    // second `let x` are TWO rows that both land on `_1`, the collapse still names
+    // it `x`, and a distinct-locals test would see `x -> [1]` and wrongly conclude
+    // that the FIRST non-demoted row is `n`'s. It is not — it is the parameter's —
+    // and restating a clause about a same-named module `const` onto that parameter
+    // would be a false PROVE.
+    //
+    // The `body_spelling` bound is the one the proof NEEDS (its single row must be
+    // the LAST non-demoted row on `_p`). The `source` bound is deliberately
+    // STRICTER than the proof needs — once `body_spelling` is pinned to one row,
+    // the first non-demoted row on `_p` is a `source` row whatever `source`'s
+    // multiplicity — because a spelling that names two MIR bindings is exactly the
+    // ambiguity this gate exists to refuse, and declining costs only reach.
+    let source_rows = debug_name_locals.get(source.as_str())?;
+    if source_rows.len() != 1 || source_rows[0] != param_local {
+        return None;
+    }
+    let body_rows = debug_name_locals.get(body_spelling)?;
+    if body_rows.len() != 1 || body_rows[0] != param_local {
+        return None;
+    }
+    // ... and the body spelling must name exactly one EXTRACTED local, or
+    // `place_to_var_name` demotes it to the `_<local>` fallback and the assumed
+    // fact would bind nothing the VC reads.
+    if body.locals.iter().filter(|local| local.name.as_deref() == Some(body_spelling)).count() != 1
+    {
+        return None;
+    }
+
+    // (7) The row census on the parameter local — module header (IV.3). Every row
+    // there that is neither `source`'s nor `body_spelling`'s must carry a name
+    // that TRUST'S OWN contract lowering mints, and must be the only row of that
+    // name on this local. Two distinct failures are being excluded:
+    //   * an ordinary user binding parked on `_p` (a second `let` in a copy chain,
+    //     a genuine shadow) would be a third non-demoted row, so `source` need not
+    //     be the earliest one — which is exactly the step that identifies it as
+    //     the parameter's own name;
+    //   * a reserved-SPELLED user binding (`let __tmp = n;`) is invisible to the
+    //     collapse, so it cannot be read off `body.locals` at all. It cannot be
+    //     the parameter's own name (module header (III) — the compiler refuses
+    //     contracts for such a parameter), but declining is still the honest
+    //     answer: this gate does not get to assume a fact whose provenance it
+    //     cannot name, and the allowlist keeps the restatement standing on
+    //     spellings Trust itself produced rather than on a name-shape family a
+    //     user may occupy.
+    for (name, locals) in debug_name_locals {
+        if name == source || name == body_spelling {
+            continue;
+        }
+        let rows_here = locals.iter().filter(|local| **local == param_local).count();
+        if rows_here == 0 {
+            continue;
+        }
+        if rows_here != 1 || !trust_lowered_contract_debug_name(name) {
+            return None;
+        }
+    }
+
+    Some(ForcedParameterAlias { source: source.clone(), body_spelling: body_spelling.to_string() })
+}
+
+/// A spelling that TRUST'S OWN CONTRACT LOWERING mints and that copy-propagation
+/// can park on a parameter local. The list is CLOSED and enumerated from the
+/// lowering itself (`compiler/rustc_ast_lowering/src/contract.rs`), which mints
+/// exactly three binder spellings:
+///   * `__ret` — `inject_ensures_check`'s `let __ret = { body };`, one per
+///     `#[ensures]` clause at each return point; this is the one observed on a
+///     parameter local, via copy-propagation of the returned value;
+///   * `__requires_checker` — `lower_precond`'s per-`requires` checker binding;
+///   * `__ensures_checker`, `__ensures_checker1`, … — `wrap_body_with_contract_checks`'
+///     per-`ensures` checker bindings.
+///
+/// DELIBERATELY A CLOSED LIST, not a prefix family, and deliberately NARROWER
+/// than [`reserved_synthetic_debug_name`] (the whole `__` namespace). The census
+/// in `forced_parameter_alias` uses it to answer "is this row an artifact of OUR
+/// lowering?", and a user CAN legally write `let __tmp = n;` or (outside a
+/// contract-bearing function) `fn f(__x: i32)`. A prefix family such as
+/// `__trust_*` would read an arbitrary user spelling as an artifact — the exact
+/// hole a review found in the first version of this restatement, where a
+/// parameter spelled `__trust_v` was demoted out of `body.locals`, skipped by the
+/// census as "ours", and let a module `const`'s FALSE clause be restated onto the
+/// parameter.
+///
+/// `__awaitee` (async lowering) and the post-extraction `cell_threading` spellings
+/// (`__thread_payload`, `__thread_rem`) are NOT contract lowering and are NOT
+/// listed: a row carrying one of them on a parameter local makes this restatement
+/// decline, which is the fail-closed direction. If Trust starts minting a new
+/// CONTRACT spelling that lands on a parameter local, adding it here restores the
+/// restatement; omitting it only costs reach.
+fn trust_lowered_contract_debug_name(name: &str) -> bool {
+    match name {
+        "__ret" | "__requires_checker" | "__ensures_checker" => true,
+        _ => name
+            .strip_prefix("__ensures_checker")
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())),
+    }
+}
+
+/// A plain source-binding spelling: identifier characters only. Rejects every
+/// place-rendering shape `place_to_var_name` can produce — the deref suffix `a*`,
+/// field/index projections `self.0` / `a[_i]`, and the `x#3` statement-version
+/// token — none of which is a parameter's own name. (Twin of
+/// `trust_vcgen::generate::entry_hypothesis::plain_source_binding`.)
+fn plain_source_binding(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether any node of `formula` binds a variable. `Formula::rename_var` is a
+/// syntactic rename with no binder awareness, so a quantified clause is refused
+/// outright rather than risking capture.
+fn formula_binds_a_variable(formula: &Formula) -> bool {
+    let mut found = false;
+    formula.visit(&mut |node| {
+        if matches!(node, Formula::Forall(..) | Formula::Exists(..)) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The single sort `name` carries across `formulas`, or `None` when it carries
+/// none or more than one — an ambiguity this gate refuses to resolve.
+fn sole_var_sort(formulas: &[Formula], name: &str) -> Option<trust_types::Sort> {
+    let mut sort: Option<trust_types::Sort> = None;
+    let mut ambiguous = false;
+    for formula in formulas {
+        formula.visit(&mut |node| {
+            let found = match node {
+                Formula::Var(var, var_sort) if var == name => var_sort,
+                Formula::SymVar(symbol, var_sort) if symbol.as_str() == name => var_sort,
+                _ => return,
+            };
+            match &sort {
+                Some(existing) if existing != found => ambiguous = true,
+                Some(_) => {}
+                None => sort = Some(found.clone()),
+            }
+        });
+    }
+    if ambiguous { None } else { sort }
+}
+
+/// Whether a parameter of type `ty` can be what a clause variable of sort `sort`
+/// denotes. Deliberately narrow — only the sorts a scalar entry fact can carry,
+/// against the types that actually carry them. `Ty::Char` is NOT an integer
+/// parameter for this purpose, and every aggregate/reference/float type declines,
+/// so a restatement is never proposed across a type boundary.
+fn parameter_ty_admits_sort(ty: &Ty, sort: &trust_types::Sort) -> bool {
+    match (ty, sort) {
+        (Ty::Int { .. } | Ty::PtrSizedInt { .. }, trust_types::Sort::Int) => true,
+        (Ty::Bool, trust_types::Sort::Bool) => true,
+        _ => false,
+    }
 }
 
 /// The parameter a precondition free variable is caller-bound to, if any:
@@ -425,12 +1020,12 @@ fn admissible_lengths(
         if name_count.get(name).copied().unwrap_or(0) != 1 || !raw_is_unique_parameter {
             continue;
         }
-        // Runtime source `<p>.len()` becomes `<p>_len`, then is rebound to the
+        // Runtime source `<p>.len()` becomes `<p>__len`, then is rebound to the
         // one canonical `<p>__slice_len` term (INV-1: length-stable).
         if ty_is_runtime_slice_param(&local.ty) && slice_param_length_is_stable(body, local.index) {
             let canonical_name = format!("{name}__slice_len");
             canonical.insert(canonical_name.clone());
-            source_rebindings.push((format!("{name}_len"), canonical_name));
+            source_rebindings.push((format!("{name}__len"), canonical_name));
         }
     }
     AdmissibleLengths { canonical, source_rebindings }
@@ -982,6 +1577,7 @@ mod tests {
             blocks: Vec::new(),
             arg_count,
             return_ty: trust_types::Ty::Int { width: 64, signed: true },
+            datatype_defs: Default::default(),
         }
     }
 
@@ -994,6 +1590,7 @@ mod tests {
             blocks: Vec::new(),
             arg_count: 1,
             return_ty: trust_types::Ty::unit_ty(),
+            datatype_defs: Default::default(),
         }
     }
 
@@ -1006,6 +1603,48 @@ mod tests {
 
     fn multimap(entries: &[(&str, &[usize])]) -> FxHashMap<String, Vec<usize>> {
         entries.iter().map(|(name, locals)| (name.to_string(), locals.to_vec())).collect()
+    }
+
+    /// Test shim for every test that is NOT about the forced restatement: the
+    /// ORDINARY case, where optimized MIR still carries each parameter's own
+    /// source name, so the HIR parameter vector equals the body spellings.
+    ///
+    /// This is deliberately not `None`. `None` would make the restatement decline
+    /// at condition (0) and every "restatement declines because …" test below
+    /// would pass vacuously, testing nothing. With the body spellings, condition
+    /// (4b) is genuinely evaluated and simply does not hold — the restatement's
+    /// `source` is by construction a name the body does NOT bind, so it can never
+    /// equal a body spelling — which is the honest reason these functions see no
+    /// restatement.
+    fn gate_contract_preconditions(
+        preconditions: &mut Vec<Formula>,
+        body: &VerifiableBody,
+        debug_name_locals: &FxHashMap<String, Vec<usize>>,
+    ) -> Vec<AssumeSkipReason> {
+        let hir: Vec<Option<String>> = (1..=body.arg_count)
+            .map(|index| {
+                body.locals.iter().find(|local| local.index == index).and_then(|l| l.name.clone())
+            })
+            .collect();
+        super::gate_contract_preconditions(preconditions, body, debug_name_locals, Some(&hir))
+    }
+
+    /// Test shim for the forced restatement: `hir` states the HIR parameter
+    /// spellings in DECLARATION ORDER — the positive parameter-hood fact module
+    /// header (IV) checks. An EMPTY string means that position has no plain
+    /// by-value simple-ident binding, i.e. `ref q`, `_`, or `q @ sub`, which is
+    /// exactly the shape that carries no debug row of the parameter's own.
+    fn gate_restating(
+        preconditions: &mut Vec<Formula>,
+        body: &VerifiableBody,
+        debug_name_locals: &FxHashMap<String, Vec<usize>>,
+        hir: &[&str],
+    ) -> Vec<AssumeSkipReason> {
+        let hir: Vec<Option<String>> = hir
+            .iter()
+            .map(|n| if n.is_empty() { None } else { Some((*n).to_string()) })
+            .collect();
+        super::gate_contract_preconditions(preconditions, body, debug_name_locals, Some(&hir))
     }
 
     #[test]
@@ -1047,17 +1686,40 @@ mod tests {
     }
 
     #[test]
-    fn alias_on_param_local_drops_assumption() {
-        // A non-referenced name ("w") aliasing the referenced param's local
-        // makes the binding ambiguous — drop honestly instead of staying
-        // silently inert.
+    fn alias_on_param_local_is_restated_not_dropped() {
+        // EXPECTATION CHANGED (forced parameter restatement). This is the minimal
+        // form of the copy-propagated-parameter shape: the clause names `x`, MIR's
+        // own `var_debug_info` puts the source binding `x` on the parameter local
+        // 1 in exactly one row, and the last-write-wins collapse named that same
+        // local `w`. Exactly one clause spelling is unbindable, exactly one
+        // parameter position is unclaimed, and `_1` carries no third row — the
+        // correspondence is FORCED, so the clause is restated as a fact about `w`
+        // and KEPT. It used to drop as an ambiguity; see the module header
+        // (I)–(VII) and the `..._still_drops` siblings below, which pin every way
+        // it can fail to be forced.
         let body = body_with(vec![(0, None), (1, Some("w"))], 1);
         let names = multimap(&[("x", &[1]), ("w", &[1])]);
         let mut pres = vec![bounded("x", 0, 10)];
-        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        let reasons = gate_restating(&mut pres, &body, &names, &["x"]);
+        assert!(reasons.is_empty(), "the forced restatement must be kept: {reasons:?}");
+        assert_eq!(pres, vec![bounded("w", 0, 10)], "the clause must be restated in `w`");
+    }
+
+    #[test]
+    fn extra_user_binding_on_the_param_local_still_drops() {
+        // SOUNDNESS TWIN of the test above, and the half of the old expectation
+        // that must survive: a THIRD, ordinary user binding parked on the
+        // parameter local breaks the row census in condition (7). `source` is then
+        // no longer forced to be the earliest row on `_1` — i.e. no longer forced
+        // to be the parameter's own source name — so the restatement declines and
+        // the whole set drops, exactly as before.
+        let body = body_with(vec![(0, None), (1, Some("w"))], 1);
+        let names = multimap(&[("x", &[1]), ("w", &[1]), ("t", &[1])]);
+        let mut pres = vec![bounded("x", 0, 10)];
+        let reasons = gate_restating(&mut pres, &body, &names, &["x"]);
         assert!(
             reasons.iter().any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(_))),
-            "{reasons:?}"
+            "an unexplained third binding on the param local must still drop: {reasons:?}"
         );
         assert!(pres.is_empty());
     }
@@ -1228,6 +1890,7 @@ mod tests {
             blocks: Vec::new(),
             arg_count: 1,
             return_ty: trust_types::Ty::Int { width: 32, signed: false },
+            datatype_defs: Default::default(),
         }
     }
 
@@ -1291,6 +1954,7 @@ mod tests {
             blocks: Vec::new(),
             arg_count: 2,
             return_ty: trust_types::Ty::unit_ty(),
+            datatype_defs: Default::default(),
         }
     }
 
@@ -1326,12 +1990,12 @@ mod tests {
 
     #[test]
     fn source_length_precond_normalizes_to_canonical_slice_symbol() {
-        // Exact source `arr.len()` lowers to `arr_len`, but body bounds VCs and
+        // Exact source `arr.len()` lowers to `arr__len`, but body bounds VCs and
         // modular σ summaries use `arr__slice_len`. Admission must rewrite to
         // that canonical leaf, never merely whitelist an independent variable.
         let body = fill_body();
         let names = multimap(&[("arr", &[1]), ("n", &[2])]);
-        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr_len")))];
+        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__len")))];
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert!(reasons.is_empty(), "source slice length must be admitted: {reasons:?}");
         assert_eq!(
@@ -1339,7 +2003,7 @@ mod tests {
             vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__slice_len")),)],
             "source and bounds formulas must share the canonical length leaf",
         );
-        assert!(!pres[0].free_variables().contains("arr_len"));
+        assert!(!pres[0].free_variables().contains("arr__len"));
     }
 
     #[test]
@@ -1390,12 +2054,12 @@ mod tests {
     fn source_length_of_resliced_slice_param_rejected() {
         let body = resliced_fill_body();
         let names = multimap(&[("arr", &[1]), ("n", &[2])]);
-        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr_len")))];
+        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__len")))];
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert!(
             reasons
                 .iter()
-                .any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "arr_len")),
+                .any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "arr__len")),
             "unstable source length must not be rebound or admitted: {reasons:?}",
         );
         assert!(pres.is_empty());
@@ -1465,12 +2129,12 @@ mod tests {
             name: Some("arr".into()),
         });
         let names = multimap(&[("arr", &[1, 3]), ("n", &[2])]);
-        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr_len")))];
+        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__len")))];
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert!(
             reasons
                 .iter()
-                .any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "arr_len")),
+                .any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "arr__len")),
             "shadowed source length must not be rebound or admitted: {reasons:?}",
         );
         assert!(pres.is_empty());
@@ -1799,6 +2463,7 @@ mod tests {
             blocks: Vec::new(),
             arg_count: names.len(),
             return_ty: trust_types::Ty::unit_ty(),
+            datatype_defs: Default::default(),
         }
     }
 
@@ -1882,6 +2547,692 @@ mod tests {
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert!(reasons.is_empty(), "-(near-far) >= 1e-6 must find a witness: {reasons:?}");
         assert_eq!(pres.len(), 1);
+    }
+
+    // ---- Trust: the contract lowerer's OWN synthetic locals are not user shadows ----
+    //
+    // Measured on stage2 (2026-08-06, `-Ztrust-dump=mir-only`) for
+    //   #[requires(n >= 0)] #[ensures(|ret| *ret >= 0)] fn f(n: i32) -> i32 { n }
+    // the emitted body has ONE named param local — `{"index": 1, "name": "n"}` — and
+    // `preconditions` carrying ONLY the synthetic i32 range fact: the authored
+    // `n >= 0` was dropped, and the postcondition then refuted with
+    // `verified_counterexample = true`. The sole gate reason was
+    // ShadowedParamName("__ret"): `#[ensures]` lowering mints the local `__ret` and
+    // copy-propagation parks its `var_debug_info` entry on `_1`.
+
+    /// `__ret` must be classified by the SHARED classifier, not an ad-hoc prefix
+    /// test — but the alias-scan exemption is the `GeneratedMetadata` (`__`)
+    /// family ONLY, a strict subset of what that classifier reserves.
+    #[test]
+    fn contract_lowering_locals_are_reserved_synthetic_names() {
+        for reserved in ["__ret", "__old_x", "__trust_constparam_0_N", "arr__slice_len"] {
+            assert!(reserved_synthetic_debug_name(reserved), "`{reserved}` must be reserved");
+        }
+        for ordinary in ["n", "x", "self", "tmp", "older", "payload_length", "n_len", "max_len"] {
+            assert!(!reserved_synthetic_debug_name(ordinary), "`{ordinary}` must be ordinary");
+        }
+        // RESERVED BY THE CLASSIFIER, BUT DELIBERATELY NOT EXEMPT HERE. These are
+        // spellings a user can legally bind (`_0` is also the MIR return place,
+        // and `old_n` is a plain identifier). The alias scan must keep
+        // gating on them: exempting a name a user can actually write would hide a
+        // real shadow and let an ambiguous entry fact be assumed — a false-PROVE.
+        for classified_but_not_exempt in ["_0", "_1", "old_n", "result"] {
+            assert!(
+                trust_types::source_contract_synthetic_name_collision(classified_but_not_exempt)
+                    .is_some(),
+                "`{classified_but_not_exempt}` is still reserved by the classifier",
+            );
+            assert!(
+                !reserved_synthetic_debug_name(classified_but_not_exempt),
+                "`{classified_but_not_exempt}` must NOT be exempt from the alias scan",
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_contract_local_aliasing_param_does_not_gate() {
+        // pA, exactly as dumped: param `n` at local 1, plus the `#[ensures]`
+        // lowerer's `__ret` copy-propagated onto that same local. `__ret` is
+        // demoted by `build_debug_name_map`, so it names nothing in the extracted
+        // body and cannot steal `n`'s binding — the authored `n >= 0` must survive.
+        let body = body_with(vec![(0, None), (1, Some("n"))], 1);
+        let names = multimap(&[("n", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert!(
+            reasons.is_empty(),
+            "the contract lowerer's own local is not a shadow: {reasons:?}"
+        );
+        assert_eq!(pres, vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))]);
+    }
+
+    #[test]
+    fn synthetic_alias_exemption_is_the_generated_metadata_family_only() {
+        // EXEMPT: the `__` namespace, which Trust's own MIR/Formula producers
+        // own outright. `__ret` is the artifact this exists for.
+        for reserved in ["__ret", "__old_n", "__trust_constparam_0"] {
+            let body = body_with(vec![(0, None), (1, Some("n"))], 1);
+            let names = multimap(&[("n", &[1]), (reserved, &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+            let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+            assert!(reasons.is_empty(), "`{reserved}` must not gate: {reasons:?}");
+            assert_eq!(pres.len(), 1, "`{reserved}` must not drop the assumption");
+        }
+        // NOT EXEMPT, and this is the soundness half. Ordinary legal Rust
+        // bindings — `old_n`, `n_len`, `buf_len`, `max_value`, `x_sign`, `_0` —
+        // must still gate whether or not the classifier reserves them.
+        // Exempting a name a user can write would hide a genuine shadow from
+        // this gate and let an ambiguous entry fact be assumed, which is a
+        // false-PROVE: the one direction this gate exists to prevent.
+        for user_binding in ["old_n", "n_len", "buf_len", "max_value", "x_sign", "_0"] {
+            let body = body_with(vec![(0, None), (1, Some("n"))], 1);
+            let names = multimap(&[("n", &[1]), (user_binding, &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+            let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+            assert!(
+                !reasons.is_empty(),
+                "`{user_binding}` is a legal source binding aliasing the param local \
+                 and MUST still gate",
+            );
+            assert!(pres.is_empty(), "`{user_binding}` must drop the assumption");
+        }
+    }
+
+    #[test]
+    fn copy_propagated_parameter_is_restated_beside_a_synthetic_alias() {
+        // EXPECTATION CHANGED (forced parameter restatement) — pE, exactly as
+        // dumped on stage2 for
+        //   #[requires(n >= 0)] #[ensures(|r| *r >= 0)] fn f(n: i32) -> i32 { let x = n; x }
+        // (`arg_count = 1`, `locals[1] = {"index":1,"name":"x"}`). `{ let x = n; x }`
+        // copy-props `x` onto the parameter local, the last-write-wins collapse
+        // names local 1 `"x"` rather than `"n"`, and `#[ensures]` lowering parks
+        // `__ret` there too. This used to drop the authored, caller-proved
+        // `n >= 0`, leaving the true postcondition an honest UNKNOWN.
+        //
+        // `n` and `x` are ONE entity — parameter position 1 — and here the
+        // correspondence is FORCED: every parameter position is named with a plain
+        // identifier; `n` is the only clause spelling the body namespace cannot
+        // bind; `x` is the only parameter position the clause does not name; `n`
+        // is a plain, non-reserved identifier carrying one sort the `i32`
+        // parameter admits; MIR's own debug record gives `n` and `x` exactly ONE
+        // row each, both on local 1; and the only other row there is Trust's own
+        // `__ret`. So the clause is RESTATED as `x >= 0` and kept, and the
+        // postcondition discharges. `__ret` must still not be reported as a shadow.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(reasons.is_empty(), "the forced restatement must be kept: {reasons:?}");
+        assert_eq!(
+            pres,
+            vec![Formula::Ge(Box::new(var("x")), Box::new(int(0)))],
+            "the entry hypothesis must speak the BODY's spelling of parameter 1",
+        );
+    }
+
+    #[test]
+    fn user_shadow_beside_the_restated_pair_still_gates() {
+        // SOUNDNESS TWIN of the test above, and the half of the old
+        // `user_shadow_on_a_param_local_still_gates_beside_a_synthetic_alias`
+        // expectation that must survive. `t` is an ordinary user binding on the
+        // parameter local that is neither the clause's spelling nor the body's, so
+        // the row census in condition (7) fails: with three user rows on `_1`,
+        // nothing forces `n` to be the earliest one — i.e. nothing forces it to be
+        // the parameter's own source name rather than a body binding or a
+        // same-named `const`. The restatement declines and the whole assumption
+        // set drops, reported as a shadow exactly as before.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("t", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(
+            reasons.iter().any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(n) if n == "n")),
+            "an unforced correspondence must still gate: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(n) if n == "t")),
+            "a genuine user shadow on the param local must still gate: {reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(n) if n == "__ret")),
+            "the lowerer's own local must not be reported as a shadow: {reasons:?}"
+        );
+        assert!(pres.is_empty(), "a real ambiguity must still drop the assumption");
+    }
+
+    // ---- Trust: the forced parameter restatement — every decline condition ----
+    //
+    // The restatement is the ONLY thing in this file that can turn a drop into a
+    // kept assumption, i.e. the only thing here that can mint a PROVE. Each test
+    // below removes exactly one of the conditions in `forced_parameter_alias` and
+    // pins that the set drops. Removing a condition without deleting its test is
+    // therefore impossible.
+
+    /// **THE REVIEWED FALSE PROOF — the explicit negative this restatement was
+    /// once rejected for admitting.** For
+    ///
+    /// ```ignore
+    /// #[allow(non_upper_case_globals)] const n: i32 = -1;
+    /// #[requires(n >= 0)] #[ensures(|r: &i32| *r >= 0)]
+    /// pub fn f(__trust_v: i32) -> i32 { let n = __trust_v; let x = n; x }
+    /// ```
+    ///
+    /// the clause's `n` resolves in SIGNATURE scope to the module `const`, which
+    /// is `-1`; the body's `let n` is a different entity that merely shares the
+    /// spelling, and copy-propagation parks its row on the parameter local. The
+    /// parameter is spelled `__trust_v`, which
+    /// `source_contract_synthetic_name_collision` demotes, so it contributes NO
+    /// name to `body.locals` and BOTH visible rows on `_1` are body `let`s. The
+    /// first version of this restatement skipped `__trust_v` as "a spelling Trust
+    /// mints" (it matched a `__trust_*` PREFIX family), every condition passed,
+    /// the FALSE clause was restated as `x >= 0`, and `*ret >= 0` proved for a
+    /// function where `f(-5) == -5`.
+    ///
+    /// Two independent things now stop it, and this test pins the LOCAL one:
+    /// `trust_lowered_contract_debug_name` is a CLOSED list of the spellings
+    /// `rustc_ast_lowering`'s contract lowering actually mints, and `__trust_v` is
+    /// not one — so the row census in condition (7) declines and the set drops.
+    /// (The other is module header (III): the compiler refuses contracts outright
+    /// for a function with a reserved-family parameter name, so this program does
+    /// not even reach the gate. Both must hold; neither is allowed to be the only
+    /// one.)
+    #[test]
+    fn a_demoted_parameter_name_on_the_param_local_declines() {
+        for demoted_parameter in ["__trust_v", "__x", "__tmp", "a__b", "__awaitee"] {
+            let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+            let names =
+                multimap(&[(demoted_parameter, &[1]), ("n", &[1]), ("x", &[1]), ("__ret", &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+            let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+            assert!(
+                !reasons.is_empty(),
+                "`{demoted_parameter}` is not a spelling Trust's contract lowering mints, \
+                 so it may be the parameter's own name and the restatement must decline: \
+                 {reasons:?}"
+            );
+            assert!(
+                pres.is_empty(),
+                "a clause that may name a module `const` must never be restated onto a \
+                 parameter (`{demoted_parameter}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_row_of_the_body_spelling_on_the_param_local_declines() {
+        // THE MULTIPLICITY HAZARD, and the reason condition (6) counts ROWS rather
+        // than distinct locals. For
+        //   `const n: i32 = -1;`
+        //   `#[requires(n >= 0)] fn f(x: i32) -> i32 { let n = x; let x = n; x }`
+        // the parameter `x` and the body's second `let x` are TWO rows that both
+        // land on `_1`; the collapse still names it `x`, so a distinct-locals test
+        // sees `x -> [1]` and would conclude that `n`'s row is the earliest — it is
+        // not, the parameter's is, and `n` is a body `let` shadowing the `const`.
+        // Restating here would be a false PROVE, so the second row must decline.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1, 1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(!reasons.is_empty(), "a doubled body-spelling row must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn a_second_row_of_the_clause_spelling_declines() {
+        // The mirror of the case above: two rows named `n`, so `n` is not pinned
+        // to a single MIR binding and the "earliest row" step has nothing to bite
+        // on. Fail closed.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1, 1]), ("x", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(!reasons.is_empty(), "a doubled clause-spelling row must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn a_second_trust_minted_row_on_the_param_local_declines() {
+        // A user parameter spelled `__ret` would sit on `_1` ALONGSIDE the
+        // `#[ensures]` lowering's own `__ret`, giving that name two rows there.
+        // Module header (III) already makes such a function contract-less, but the
+        // census refuses it locally too: an allowlisted spelling is credited for
+        // exactly ONE row, so a duplicate cannot be laundered as "ours".
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("__ret", &[1, 1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(!reasons.is_empty(), "a doubled `__ret` row must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_when_two_parameter_positions_are_unclaimed() {
+        // Two parameters, and the clause names NEITHER body spelling: `n` could be
+        // position 1 or position 2 and there is no ground to prefer either
+        // (condition (4) — `k` unclaimed positions leave `k!` maps). Drop.
+        let body = body_with(vec![(0, None), (1, Some("x")), (2, Some("y"))], 2);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("y", &[2])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n", "y"]);
+        assert!(!reasons.is_empty(), "an ambiguous position must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_when_two_clause_spellings_are_unresolved() {
+        // Two unbindable clause spellings and one unclaimed position: there is no
+        // total map at all (condition (3)). Drop.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("m", &[1]), ("x", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(var("m")))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(!reasons.is_empty(), "two unresolved spellings must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_when_a_parameter_position_is_unnamed() {
+        // Parameter position 2 carries no name, so it could be the position the
+        // clause means and there would be no spelling to restate into
+        // (condition (1)). This is ALSO the shape a `_` or `ref`-bound parameter
+        // takes — the local carries no row of its own, so the "the parameter's row
+        // is the earliest row on `_p`" step would have no row to point at. Drop.
+        let body = body_with(vec![(0, None), (1, Some("x")), (2, None)], 2);
+        let names = multimap(&[("n", &[1]), ("x", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n", "y"]);
+        assert!(!reasons.is_empty(), "an unnamed position must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_for_a_clause_name_with_no_debug_entry() {
+        // THE `const`/`static` HAZARD in its bare form, and the reason condition
+        // (6) exists. A clause identifier is resolved in the SIGNATURE's scope, so
+        // it can be a module item rather than a parameter. `LIMIT` has no
+        // `var_debug_info` row anywhere, so nothing corroborates that it denotes
+        // parameter 1 — and assuming `LIMIT >= 0` as a fact about `x` would be a
+        // FALSE PROVE (`#[requires(LIMIT >= 0)] #[ensures(*ret >= 0)]
+        // fn f(n: i32) -> i32 { let x = n; x }` is unprovable: `n` may be
+        // negative). Drop.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("x", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("LIMIT")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "LIMIT")),
+            "an uncorroborated clause name must decline: {reasons:?}"
+        );
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_when_the_clause_name_is_not_on_the_target_local() {
+        // The clause's `n` is a debug name, but on a NON-parameter local (3): MIR
+        // says it is not this parameter, so nothing forces the correspondence
+        // (condition (6)). Drop.
+        let body = body_with(vec![(0, None), (1, Some("x")), (3, Some("n"))], 1);
+        let names = multimap(&[("n", &[3]), ("x", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(
+            !reasons.is_empty(),
+            "a clause name off the target local must decline: {reasons:?}"
+        );
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_when_the_clause_name_is_multi_local() {
+        // `n` resolves to TWO locals in the raw multimap — the copy-propagated
+        // shadow shape. Which one the clause means is undetermined, so the
+        // corroboration in condition (6) fails. Drop.
+        let body = body_with(vec![(0, None), (1, Some("x")), (2, Some("y"))], 2);
+        let names = multimap(&[("n", &[1, 2]), ("x", &[1]), ("y", &[2])]);
+        let mut pres = vec![Formula::And(vec![
+            Formula::Ge(Box::new(var("n")), Box::new(int(0))),
+            Formula::Ge(Box::new(var("y")), Box::new(int(0))),
+        ])];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n", "y"]);
+        assert!(!reasons.is_empty(), "a multi-local clause name must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_across_a_type_boundary() {
+        // The clause carries the parser's `Int` sentinel but the target parameter
+        // is `bool`: a restatement across the sort boundary would be ill-sorted
+        // and could not be what the clause says (condition (5)). Drop.
+        let body = body_with_param_ty("b", trust_types::Ty::Bool);
+        let names = multimap(&[("flag", &[1]), ("b", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("flag")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["flag"]);
+        assert!(!reasons.is_empty(), "a cross-sort restatement must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_declines_for_a_reserved_clause_spelling() {
+        // A reserved/synthetic spelling is not a source binding this gate may
+        // resolve to a parameter — `build_debug_name_map` demotes that whole
+        // family, so it names nothing in the extracted body (condition (3)). Drop.
+        for reserved in ["__ret", "_0", "old_n", "n_len"] {
+            let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+            let names = multimap(&[(reserved, &[1]), ("x", &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var(reserved)), Box::new(int(0)))];
+            let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+            assert!(!reasons.is_empty(), "`{reserved}` must decline: {reasons:?}");
+            assert!(pres.is_empty(), "`{reserved}` must drop the assumption");
+        }
+    }
+
+    #[test]
+    fn restatement_does_not_bypass_the_vacuity_check() {
+        // The restatement runs BEFORE the rest of the gate, so the RESTATED set
+        // still faces every existing check. An unsatisfiable predicate would
+        // vacuously verify the body, and must still be refused — the restatement
+        // may never be a way around the witness discipline.
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::And(vec![
+            Formula::Gt(Box::new(var("n")), Box::new(int(10))),
+            Formula::Lt(Box::new(var("n")), Box::new(int(5))),
+        ])];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert_eq!(reasons, vec![AssumeSkipReason::NoSatisfiableWitness]);
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn restatement_does_not_bypass_the_type_range_witness_check() {
+        // Same discipline, one sort over: the restated `x` inherits the TARGET
+        // PARAMETER's declared `u8` range, so an out-of-range hypothesis is still
+        // impossible and still refused.
+        let body = body_with_param_ty("x", trust_types::Ty::Int { width: 8, signed: false });
+        let names = multimap(&[("n", &[1]), ("x", &[1])]);
+        let mut pres = vec![Formula::Gt(Box::new(var("n")), Box::new(int(300)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert_eq!(reasons, vec![AssumeSkipReason::NoSatisfiableWitness]);
+        assert!(pres.is_empty(), "the impossible hypothesis must not reach any body VC");
+    }
+
+    #[test]
+    fn restatement_declines_for_a_projection_or_deref_clause_term() {
+        // Only a parameter's OWN name can be restated. A projection/deref term is
+        // a place rendering, not a parameter spelling, and rewriting its head
+        // would need prefix-aware surgery this gate does not do (condition (3)).
+        for term in ["n*", "n.0", "n[0]", "n.0[1].2"] {
+            let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+            let names = multimap(&[("n", &[1]), ("x", &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var(term)), Box::new(int(0)))];
+            let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+            assert!(!reasons.is_empty(), "`{term}` must decline: {reasons:?}");
+            assert!(pres.is_empty(), "`{term}` must drop the assumption");
+        }
+    }
+
+    #[test]
+    fn restatement_is_inert_when_the_clause_already_speaks_the_body_spelling() {
+        // No unbindable spelling ⇒ nothing to restate ⇒ byte-identical to the
+        // pre-change behaviour.
+        let body = body_with(vec![(0, None), (1, Some("n")), (2, Some("tmp"))], 1);
+        let names = multimap(&[("n", &[1]), ("tmp", &[2])]);
+        let mut pres = vec![bounded("n", -10, 10)];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert!(reasons.is_empty(), "{reasons:?}");
+        assert_eq!(pres, vec![bounded("n", -10, 10)], "an already-bound clause is untouched");
+    }
+
+    #[test]
+    fn restatement_resolves_one_position_beside_an_already_named_one() {
+        // The productive multi-parameter case: the clause names `m` (which the
+        // body still spells `m`) and `n` (which copy-propagation renamed to `x`).
+        // Exactly one spelling is unbindable and exactly one position unclaimed,
+        // so the map is the unique total one and `n` restates to `x`.
+        let body = body_with(vec![(0, None), (1, Some("x")), (2, Some("m"))], 2);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("m", &[2])]);
+        let mut pres = vec![Formula::And(vec![
+            Formula::Ge(Box::new(var("n")), Box::new(int(0))),
+            Formula::Ge(Box::new(var("m")), Box::new(int(0))),
+        ])];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n", "m"]);
+        assert!(reasons.is_empty(), "the forced restatement must be kept: {reasons:?}");
+        assert_eq!(
+            pres,
+            vec![Formula::And(vec![
+                Formula::Ge(Box::new(var("x")), Box::new(int(0))),
+                Formula::Ge(Box::new(var("m")), Box::new(int(0))),
+            ])],
+            "only the unbindable spelling is restated",
+        );
+    }
+
+    #[test]
+    fn restatement_target_is_never_a_spelling_the_clause_already_uses() {
+        // Capture guard: the target is drawn from the positions the clause does
+        // NOT name, so a rename can never merge two distinct clause variables.
+        // Here `x` IS named by the clause, so position 1 is claimed and position 2
+        // (`y`) is the only candidate — but `y`'s local does not carry `n`, so the
+        // corroboration fails and the set drops rather than restating `n` onto a
+        // parameter it does not denote.
+        let body = body_with(vec![(0, None), (1, Some("x")), (2, Some("y"))], 2);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("y", &[2])]);
+        let mut pres = vec![Formula::And(vec![
+            Formula::Ge(Box::new(var("n")), Box::new(int(0))),
+            Formula::Ge(Box::new(var("x")), Box::new(int(0))),
+        ])];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n", "y"]);
+        assert!(!reasons.is_empty(), "a mis-targeted restatement must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    /// **THE `ref`-PATTERN FALSE PROOF — the reviewed exploit that killed the row
+    /// ORDERING argument.** Module header (IV) used to close the identification by
+    /// claiming a parameter's own debug row precedes every body binding's row on
+    /// `_p`, so the first non-demoted row there had to be the clause spelling's.
+    /// That silently presumed `_p` carries a parameter row at all. For
+    ///
+    /// ```rust,ignore
+    /// const n: i32 = 5;                                    // TRUE clause
+    /// #[trust::requires(n >= 0)] #[ensures(|r: &i32| *r >= 0)]
+    /// fn f(ref q: i32) -> i32 { let n = *q; let x = n; x }  // f(-7) == -7
+    /// ```
+    ///
+    /// `args_and_body` emits an argument's row only under `pat.simple_ident()`,
+    /// which is `None` for `ref q`, so `_1` carries NO row of the parameter's own —
+    /// while `CopyProp` still rewrites the BODY bindings' rows onto it. The census
+    /// then sees exactly two non-demoted names on `_1` (`n` and `x`, both ordinary
+    /// `let`s), every multiplicity condition passes, and the TRUE clause about the
+    /// module `const` is restated as `x >= 0` — proving a postcondition that
+    /// `f(-7)` violates.
+    ///
+    /// The multiplicity conditions cannot see this: the debug multimap is
+    /// `{"q":[2], "n":[1], "x":[1]}`, which is byte-for-byte the shape of the
+    /// LEGITIMATE pE case. Only HIR distinguishes them, which is why condition (4b)
+    /// asks HIR rather than reasoning about rows.
+    #[test]
+    fn a_ref_bound_parameter_carrying_no_row_of_its_own_declines() {
+        // The exploit's multimap EXACTLY: `q` (the `ref` binding) on its own local
+        // 2, and the two body `let`s both collapsed onto the parameter local 1.
+        let body = body_with(vec![(0, None), (1, Some("x")), (2, Some("q"))], 1);
+        let names = multimap(&[("q", &[2]), ("n", &[1]), ("x", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        // HIR reports NO simple by-value binding at position 1 — that is what a
+        // `ref q` pattern yields, and it is the whole defence.
+        let reasons = gate_restating(&mut pres, &body, &names, &[""]);
+        assert!(
+            !reasons.is_empty(),
+            "a `ref`-bound parameter has no row of its own, so `n` may be a module \
+             `const` and the restatement must decline: {reasons:?}"
+        );
+        assert!(
+            pres.is_empty(),
+            "the module `const`'s clause must never become a fact about the caller's argument"
+        );
+
+        // CONTROL: the identical multimap with a plain by-value parameter spelled
+        // `n` IS the legitimate pE case and still restates. This is what pins that
+        // the test above discriminates on HIR and not on the row census.
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n"]);
+        assert!(reasons.is_empty(), "the legitimate restatement must survive: {reasons:?}");
+        assert_eq!(pres, vec![Formula::Ge(Box::new(var("x")), Box::new(int(0)))]);
+    }
+
+    /// The second shape the ordering argument admitted: a plain by-value parameter
+    /// whose own name is NOT the clause spelling. `fn f(p: i32) { let n = p; let x
+    /// = n; x }` beside `const n: i32 = -1;` puts `n` and `x` on `_1` with one row
+    /// each, and the census cannot tell that `p`'s row is the earliest.
+    #[test]
+    fn a_clause_spelling_that_is_not_this_parameters_hir_name_declines() {
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["p"]);
+        assert!(
+            !reasons.is_empty(),
+            "`n` is not parameter 1's source name, so it is a module item: {reasons:?}"
+        );
+        assert!(pres.is_empty());
+    }
+
+    /// An unanswerable parameter-hood question is a DECLINE, never a fallback to
+    /// the row census. This is the state the two `trust_verify.rs` proposer lanes
+    /// pass, and the state any future caller without HIR would pass.
+    #[test]
+    fn an_absent_hir_parameter_vector_declines_the_restatement() {
+        let body = body_with(vec![(0, None), (1, Some("x"))], 1);
+        let names = multimap(&[("n", &[1]), ("x", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = super::gate_contract_preconditions(&mut pres, &body, &names, None);
+        assert!(!reasons.is_empty(), "no HIR evidence must mean no restatement: {reasons:?}");
+        assert!(pres.is_empty());
+
+        // A vector whose length disagrees with MIR's `arg_count` is equally
+        // unusable: the positions do not correspond, so indexing it would read the
+        // wrong parameter.
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_restating(&mut pres, &body, &names, &["n", "extra"]);
+        assert!(!reasons.is_empty(), "a length mismatch must decline: {reasons:?}");
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn trust_lowered_contract_names_are_a_closed_subset_of_the_reserved_family() {
+        // The census in condition (7) asks "is this row an artifact of TRUST'S OWN
+        // CONTRACT LOWERING?". The answer must come from a CLOSED list read off
+        // `rustc_ast_lowering/src/contract.rs`, never from a name-shape family: a
+        // user can legally write `let __tmp = n;`, and (outside a contract-bearing
+        // function) `fn f(__x: i32)`. Reading such a name as an artifact is
+        // exactly the reviewed false proof — a parameter spelled `__trust_v` was
+        // skipped as "ours" and a module `const`'s false clause was restated onto
+        // the parameter. Every accepted spelling must also be in the demoted
+        // family, so it can never simultaneously be a live body spelling.
+        for minted in ["__ret", "__requires_checker", "__ensures_checker", "__ensures_checker7"] {
+            assert!(trust_lowered_contract_debug_name(minted), "`{minted}` is Trust-minted");
+            assert!(
+                reserved_synthetic_debug_name(minted),
+                "`{minted}` must also be in the reserved family (containment)",
+            );
+        }
+        for not_ours in [
+            // Spellings a user can bind, including the reviewed exploit's.
+            "__trust_v",
+            "__trust_constparam_0_N",
+            "__old_n",
+            "__x",
+            "__tmp",
+            "__",
+            "n",
+            "x",
+            "old_n",
+            // Minted by OTHER lowerings, not the contract lowering.
+            "__awaitee",
+            "__thread_payload",
+            "__thread_rem",
+            // Near-misses on the `__ensures_checker` family.
+            "__ensures_checker_",
+            "__ensures_checkerN",
+            "__ret2",
+        ] {
+            assert!(
+                !trust_lowered_contract_debug_name(not_ours),
+                "`{not_ours}` is not minted by Trust's CONTRACT lowering and must not read as an \
+                 artifact",
+            );
+        }
+    }
+
+    #[test]
+    fn plain_user_shadow_on_referenced_name_still_gates() {
+        // SOUNDNESS twin, minimal form: an ORDINARY body binding `t` parked on the
+        // referenced parameter's local is untouched by the exemption (build #32's
+        // copy-propagated-shadow shape with the shadow's own spelling).
+        let body = body_with(vec![(0, None), (1, Some("n"))], 1);
+        let names = multimap(&[("n", &[1]), ("t", &[1]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert_eq!(
+            reasons,
+            vec![AssumeSkipReason::ShadowedParamName("t".to_string())],
+            "exactly the user shadow, and nothing about `__ret`"
+        );
+        assert!(pres.is_empty());
+    }
+
+    #[test]
+    fn referenced_synthetic_name_still_gates() {
+        // SOUNDNESS twin: the exemption lives ONLY in the alias scan. A predicate
+        // that itself REFERENCES a reserved spelling is still rejected by the first
+        // loop — `__ret` cannot be in `param_names` (demotion left that local
+        // unnamed under this spelling), so it is not caller-bound.
+        for reserved in ["__ret", "_0", "old_n"] {
+            let body = body_with(vec![(0, None), (1, Some("n"))], 1);
+            // The reserved name aliases the param local: the sharper
+            // ShadowedParamName classification, and it must NOT be exempted.
+            let names = multimap(&[("n", &[1]), (reserved, &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var(reserved)), Box::new(int(0)))];
+            let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(n) if n == reserved)),
+                "a referenced reserved name must still gate: {reserved} {reasons:?}"
+            );
+            assert!(pres.is_empty());
+
+            // And with no debug entry at all it is simply not a parameter.
+            let names = multimap(&[("n", &[1])]);
+            let mut pres = vec![Formula::Ge(Box::new(var(reserved)), Box::new(int(0)))];
+            let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == reserved)),
+                "an unbound reserved name must still gate: {reserved} {reasons:?}"
+            );
+            assert!(pres.is_empty());
+        }
+    }
+
+    #[test]
+    fn synthetic_alias_on_a_second_param_still_gates_a_multi_local_name() {
+        // SOUNDNESS twin: the exemption only ever skips the ALIAS scan. It cannot
+        // rescue a referenced name that is itself ambiguous — `n` on two locals is
+        // still caught by the first loop, whatever else sits on those locals.
+        let body = body_with(vec![(0, None), (1, Some("n")), (2, Some("n"))], 2);
+        let names = multimap(&[("n", &[1, 2]), ("__ret", &[1])]);
+        let mut pres = vec![Formula::Ge(Box::new(var("n")), Box::new(int(0)))];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert!(
+            reasons.iter().any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(n) if n == "n")),
+            "a referenced name on two locals must still gate: {reasons:?}"
+        );
+        assert!(pres.is_empty());
     }
 
     #[test]

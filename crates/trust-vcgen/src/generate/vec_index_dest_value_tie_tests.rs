@@ -75,6 +75,7 @@ fn two_index_call_func() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],

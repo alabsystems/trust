@@ -364,6 +364,29 @@ def check_exemptions() -> list[str]:
     return problems
 
 
+def same_day_clusters(report: Report, limit: int) -> list[tuple[date, int]]:
+    """Dates on which MORE THAN `limit` still-active entries expire together.
+
+    Trust (2026-08-10): a cliff is a different failure from an expiry. One expired
+    row blocks pushes until one row is reviewed; seventy-three expiring on one date
+    blocks every push until seventy-three are reviewed, and a reviewer facing that
+    on a deadline renews the batch. That is exactly how the 71 `sysroot-skew` rows
+    came to waive a defect that had already been fixed — one label, one copy-pasted
+    reason, one date, no re-measurement.
+
+    Counts only entries that still lie ahead (`ok` + `expiring_soon`). Already-expired
+    rows are the other check's business and would double-report here.
+    """
+    if limit <= 0:
+        return []
+    counts: dict[date, int] = {}
+    for es in [*report.ok, *report.expiring_soon]:
+        if es.expires_on is None:
+            continue
+        counts[es.expires_on] = counts.get(es.expires_on, 0) + 1
+    return sorted(((d, n) for d, n in counts.items() if n > limit), key=lambda t: t[0])
+
+
 def build_report(as_of: date, warn_days: int) -> Report:
     report = Report()
     for path, list_key, id_field in LEDGERS:
@@ -480,6 +503,14 @@ def parse_args() -> argparse.Namespace:
         help="Return exit code 2 when entries are expiring soon (default: don't fail).",
     )
     p.add_argument(
+        "--max-same-day",
+        type=int,
+        default=0,
+        help="Fail when more than N ACTIVE entries share one `expires_on` (0 = off). "
+        "A cluster all expiring on one date blocks every push at once and so forces "
+        "the mass rubber-stamp renewal this gate exists to prevent.",
+    )
+    p.add_argument(
         "--self-check-json-contract",
         action="store_true",
         help="Validate the machine-readable JSON shape without reading ledger files.",
@@ -512,7 +543,20 @@ def main() -> int:
         for problem in exemption_problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
+    clusters = same_day_clusters(report, args.max_same_day)
+    if clusters:
+        print("EXPIRY CLIFF — too many active rows share one date:", file=sys.stderr)
+        for when, count in clusters:
+            print(
+                f"  {when.isoformat()}: {count} entries (limit {args.max_same_day}). "
+                f"On that date every push blocks until all {count} are reviewed, which "
+                f"is how a batch gets renewed unexamined. Stagger them by cluster, each "
+                f"with its own review question.",
+                file=sys.stderr,
+            )
     if report.expired or report.no_expiry:
+        return 1
+    if clusters:
         return 1
     if args.strict_warn and report.expiring_soon:
         return 2

@@ -927,14 +927,60 @@ class BuildBootstrap(unittest.TestCase):
 
 class TrustBootstrapCompilerPolicy(unittest.TestCase):
     def test_stock_driver_is_left_untouched(self):
+        # A driver the probe ANSWERED FOR, advertising neither spelling, is
+        # stock upstream: no Trust machinery, nothing to disable. Note the
+        # probe must be recorded as having succeeded — "answered, no Trust
+        # flags" and "could not ask" are different facts, and only the first
+        # one licenses leaving the environment alone.
         env = {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2"}
         with patch.object(
             bootstrap, "rustc_supports_trust_bootstrap_no_verify", return_value=False
         ), patch.object(
             bootstrap, "rustc_advertises_retired_no_verify", return_value=False
+        ), patch.object(
+            bootstrap, "stage0_trust_surface_available", return_value=True
         ):
             self.assertFalse(bootstrap.apply_trust_bootstrap_compiler_policy("rustc", env))
         self.assertEqual(env, {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2"})
+
+    def test_unanswerable_probe_fails_closed_via_the_env_transport(self):
+        # REGRESSION, measured 2026-08-04. `stage0_z_help` returning None means
+        # "could not ask" — a subprocess with a 10s timeout against a binary
+        # x.py may be extracting concurrently. That used to fall through to the
+        # stock-upstream path and apply NO policy, so a batteries-on Trust seed
+        # then verified the whole third-party bootstrap dependency tree: one
+        # `--stage 2` run burned 1:18:20 and 582,226 log lines inside "Building
+        # bootstrap" and died on `memchr` with 694 verification errors without
+        # reaching a single compiler step.
+        #
+        # The fallback must be the ENV transport, never an argv spelling: the
+        # current and retired `-Z` spellings each abort the other's vintage
+        # with `unknown unstable option`, whereas an unknown env var is inert
+        # for a stock driver.
+        env = {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2"}
+        with patch.object(
+            bootstrap, "rustc_supports_trust_bootstrap_no_verify", return_value=False
+        ), patch.object(
+            bootstrap, "rustc_advertises_retired_no_verify", return_value=False
+        ), patch.object(
+            bootstrap, "stage0_trust_surface_available", return_value=False
+        ):
+            self.assertFalse(
+                bootstrap.apply_trust_bootstrap_compiler_policy("rustc", env)
+            )
+        self.assertEqual(env["TRUST_NO_VERIFY"], "1")
+        self.assertEqual(env["RUSTFLAGS_BOOTSTRAP"], "-Zthreads=2")
+        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", env)
+
+    def test_probe_availability_distinguishes_silence_from_failure(self):
+        answered = subprocess.CompletedProcess(["rustc", "-Z", "help"], 0, stdout="-Z threads=val")
+        failed = subprocess.CompletedProcess(["rustc", "-Z", "help"], 1, stdout="")
+        with patch.object(bootstrap.subprocess, "run", return_value=answered):
+            self.assertTrue(bootstrap.stage0_trust_surface_available("rustc", {}))
+        with patch.object(bootstrap.subprocess, "run", return_value=failed):
+            self.assertFalse(bootstrap.stage0_trust_surface_available("rustc", {}))
+        with patch.object(bootstrap.subprocess, "run", side_effect=OSError("boom")):
+            self.assertFalse(bootstrap.stage0_trust_surface_available("rustc", {}))
 
     def test_pre_rename_trust_seed_gets_the_env_transport(self):
         # A Trust seed OLDER than the flag rename advertises only the retired

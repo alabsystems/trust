@@ -112,6 +112,7 @@ fn buggy_midpoint_mir() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![],
@@ -193,6 +194,7 @@ fn safe_midpoint_mir_with_precondition() -> VerifiableFunction {
             ],
             arg_count: 2,
             return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
         },
         contracts: vec![],
         preconditions: vec![

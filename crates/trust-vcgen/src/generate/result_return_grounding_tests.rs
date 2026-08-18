@@ -1,6 +1,6 @@
 //! Result-return grounding (F3): the gate (`enum_return_grounded_model_vars`)
-//! and the pin loop must agree, and the pinned `_0_discr` must follow the
-//! PARSER convention (`is_ok ⟹ _0_discr != 0` — `spec_parse::map_method_call`),
+//! and the pin loop must agree, and the pinned `_0__discr` must follow the
+//! PARSER convention (`is_ok ⟹ _0__discr != 0` — `spec_parse::map_method_call`),
 //! which is INVERTED vs Result's machine variant order (Ok = variant 0).
 //! A sign flip here is a simultaneous false-PROVE (`is_err()` of an Ok
 //! return) and false-FAIL (`is_ok()` of an Ok return), so BOTH polarities
@@ -87,6 +87,7 @@ fn enum_return_fn(ret_ty: Ty, enum_name: &str, variant: usize, payload: Operand,
             }],
             arg_count: 0,
             return_ty: ret_ty,
+            datatype_defs: Default::default(),
         },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
@@ -101,7 +102,7 @@ fn enum_return_fn(ret_ty: Ty, enum_name: &str, variant: usize, payload: Operand,
 
 /// `<name> == <int>` conjuncts on the AND-SPINE only — deliberately NOT
 /// descending under `Not`: the negated obligation itself contains
-/// `_0_discr == 0` atoms (`is_ok` parses to `!(_0_discr == 0)`), and mixing
+/// `_0__discr == 0` atoms (`is_ok` parses to `!(_0__discr == 0)`), and mixing
 /// those with the pins would blind the polarity assertions.
 fn and_spine_int_pins(formula: &Formula, name: &str, out: &mut Vec<i128>) {
     match formula {
@@ -131,7 +132,7 @@ fn postcondition_vcs(func: &VerifiableFunction) -> Vec<trust_types::Verification
 #[test]
 fn gate_credits_result_discr_and_int_payload() {
     // Result<i64, i64>, in-body Ok construction on the only return path:
-    // both `_0_discr` and `_0_value` become groundable.
+    // both `_0__discr` and `_0__value` become groundable.
     let func = enum_return_fn(
         std_result_ty(i64_ty()),
         "core::result::Result",
@@ -140,14 +141,14 @@ fn gate_credits_result_discr_and_int_payload() {
         "result.is_ok()",
     );
     let grounded = enum_return_grounded_model_vars(&func);
-    assert!(grounded.contains("_0_discr"), "Result discr must be credited: {grounded:?}");
-    assert!(grounded.contains("_0_value"), "Int Ok-payload must be credited: {grounded:?}");
+    assert!(grounded.contains("_0__discr"), "Result discr must be credited: {grounded:?}");
+    assert!(grounded.contains("_0__value"), "Int Ok-payload must be credited: {grounded:?}");
 }
 
 #[test]
 fn gate_credits_result_discr_only_for_opaque_payload() {
     // Result<Rat, i64> (the ny-cert selfcheck/crown payload shape): the
-    // discriminant grounds, the payload must NOT (its `_0_value*` terms
+    // discriminant grounds, the payload must NOT (its `_0__value*` terms
     // must keep routing to the fail-closed SpecModelUngrounded Unknown).
     let func = enum_return_fn(
         std_result_ty(opaque_payload_ty()),
@@ -157,8 +158,8 @@ fn gate_credits_result_discr_only_for_opaque_payload() {
         "result.is_ok()",
     );
     let grounded = enum_return_grounded_model_vars(&func);
-    assert!(grounded.contains("_0_discr"), "{grounded:?}");
-    assert!(!grounded.contains("_0_value"), "opaque payload must stay ungrounded: {grounded:?}");
+    assert!(grounded.contains("_0__discr"), "{grounded:?}");
+    assert!(!grounded.contains("_0__value"), "opaque payload must stay ungrounded: {grounded:?}");
 }
 
 #[test]
@@ -194,13 +195,13 @@ fn gate_option_behavior_unchanged() {
         "result.is_some()",
     );
     let grounded = enum_return_grounded_model_vars(&func);
-    assert!(grounded.contains("_0_discr") && grounded.contains("_0_value"), "{grounded:?}");
+    assert!(grounded.contains("_0__discr") && grounded.contains("_0__value"), "{grounded:?}");
 }
 
 #[test]
 fn ok_return_pins_model_discr_one_never_machine_index_zero() {
     // POLARITY (is_ok case): `_0 = Ok(5)` is MACHINE variant 0 but must pin
-    // the PARSER-convention `_0_discr == 1` (`is_ok ⟹ _0_discr != 0`).
+    // the PARSER-convention `_0__discr == 1` (`is_ok ⟹ _0__discr != 0`).
     // Pinning the raw variant index 0 would refute a TRUE `is_ok()`
     // postcondition and vacuously prove a FALSE `is_err()` one.
     let func = enum_return_fn(
@@ -213,18 +214,18 @@ fn ok_return_pins_model_discr_one_never_machine_index_zero() {
     let vcs = postcondition_vcs(&func);
     assert_eq!(vcs.len(), 1, "one return path -> one body-aware Postcondition VC: {vcs:#?}");
     let mut discr_pins = Vec::new();
-    and_spine_int_pins(&vcs[0].formula, "_0_discr", &mut discr_pins);
+    and_spine_int_pins(&vcs[0].formula, "_0__discr", &mut discr_pins);
     assert_eq!(discr_pins, vec![1], "Ok must pin the MODEL discr 1: {:#?}", vcs[0].formula);
     let mut value_pins = Vec::new();
-    and_spine_int_pins(&vcs[0].formula, "_0_value", &mut value_pins);
-    assert_eq!(value_pins, vec![5], "Ok payload must pin _0_value: {:#?}", vcs[0].formula);
+    and_spine_int_pins(&vcs[0].formula, "_0__value", &mut value_pins);
+    assert_eq!(value_pins, vec![5], "Ok payload must pin _0__value: {:#?}", vcs[0].formula);
 }
 
 #[test]
 fn err_return_pins_model_discr_zero_and_leaves_payload_free() {
     // POLARITY (is_err case): `_0 = Err(7)` is MACHINE variant 1 but must
-    // pin `_0_discr == 0` (`is_err ⟹ _0_discr == 0`), and must NOT pin
-    // `_0_value` (the Ok-payload term has no denotation on the Err path;
+    // pin `_0__discr == 0` (`is_err ⟹ _0__discr == 0`), and must NOT pin
+    // `_0__value` (the Ok-payload term has no denotation on the Err path;
     // leaving it free is the sound direction).
     let func = enum_return_fn(
         std_result_ty(i64_ty()),
@@ -236,17 +237,17 @@ fn err_return_pins_model_discr_zero_and_leaves_payload_free() {
     let vcs = postcondition_vcs(&func);
     assert_eq!(vcs.len(), 1, "{vcs:#?}");
     let mut discr_pins = Vec::new();
-    and_spine_int_pins(&vcs[0].formula, "_0_discr", &mut discr_pins);
+    and_spine_int_pins(&vcs[0].formula, "_0__discr", &mut discr_pins);
     assert_eq!(discr_pins, vec![0], "Err must pin the MODEL discr 0: {:#?}", vcs[0].formula);
     let mut value_pins = Vec::new();
-    and_spine_int_pins(&vcs[0].formula, "_0_value", &mut value_pins);
-    assert!(value_pins.is_empty(), "Err must not pin _0_value: {:#?}", vcs[0].formula);
+    and_spine_int_pins(&vcs[0].formula, "_0__value", &mut value_pins);
+    assert!(value_pins.is_empty(), "Err must not pin _0__value: {:#?}", vcs[0].formula);
 }
 
 #[test]
 fn opaque_payload_predicate_stays_fail_closed_unknown() {
-    // The ny selfcheck shape under F3: `_0_discr` grounds, but the guard's
-    // `_0_value_sign` does not — the WHOLE predicate must keep routing to
+    // The ny selfcheck shape under F3: `_0__discr` grounds, but the guard's
+    // `_0__value__sign` does not — the WHOLE predicate must keep routing to
     // the non-refutable SpecModelUngrounded Unknown (grounding the discr
     // alone must never flip these rows to a refutable, false-FAILing VC).
     let func = enum_return_fn(
@@ -271,7 +272,7 @@ fn opaque_payload_predicate_stays_fail_closed_unknown() {
     assert_eq!(rows.len(), 1, "exactly one fail-closed row: {vcs:#?}");
     let VcKind::UnsupportedMir { detail, .. } = &rows[0].kind else { unreachable!() };
     assert!(
-        detail.contains("_0_value_sign") && !detail.contains("_0_discr"),
+        detail.contains("_0__value__sign") && !detail.contains("_0__discr"),
         "the leftover ungrounded term is the sign var (discr is now groundable): {detail}"
     );
 }
@@ -285,8 +286,8 @@ fn crown_style_len_guard_text_parses_and_routes_fail_closed() {
     // after the pat-binding substitution (`c` -> `result.unwrap()`, fields
     // by positional index) and the `len` allow-list addition. Pins the
     // compiler->parser handshake: the text PARSES (the row leaves
-    // SpecEnsuresUnparseable), the minted `_0_value.<i>.<j>_len` names
-    // classify as SPEC-MODEL terms, and — with `_0_discr` groundable via
+    // SpecEnsuresUnparseable), the minted `_0__value.<i>.<j>_len` names
+    // classify as SPEC-MODEL terms, and — with `_0__discr` groundable via
     // the Result return — the predicate still routes to the non-refutable
     // SpecModelUngrounded Unknown (the len terms have no body pin yet),
     // never to a refutable havoc'd VC.
@@ -317,9 +318,9 @@ fn crown_style_len_guard_text_parses_and_routes_fail_closed() {
     assert_eq!(rows.len(), 1, "exactly one fail-closed Unknown row: {vcs:#?}");
     let VcKind::UnsupportedMir { detail, .. } = &rows[0].kind else { unreachable!() };
     assert!(
-        detail.contains("_0_value.0.1_len")
-            && detail.contains("_0_value.0.2_len")
-            && !detail.contains("_0_discr"),
+        detail.contains("_0__value.0.1__len")
+            && detail.contains("_0__value.0.2__len")
+            && !detail.contains("_0__discr"),
         "leftover ungrounded terms are the len vars (discr groundable): {detail}"
     );
 }

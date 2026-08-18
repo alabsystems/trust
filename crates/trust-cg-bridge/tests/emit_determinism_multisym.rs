@@ -111,6 +111,7 @@ fn make_leaf(name: &str) -> VerifiableFunction {
             }],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }
@@ -158,6 +159,7 @@ fn make_caller(name: &str, callee: &str) -> VerifiableFunction {
             ],
             arg_count: 1,
             return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
         },
     )
 }

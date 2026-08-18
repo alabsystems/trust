@@ -1,0 +1,12 @@
+[package]
+name = "build_makes_the_solver"
+version = "0.1.0"
+publish = false
+
+[workspace]
+
+# The build produces the tool the proof script reaches for, so this package is
+# working on that tool and its SMT files are the tool's own material.
+[[bin]]
+name = "ay"
+path = "src/main.rs"

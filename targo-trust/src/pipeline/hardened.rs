@@ -155,6 +155,25 @@ impl GateDecision {
 /// whose wire outcome claims Proved or RuntimeChecked — is fail-closed to
 /// `unknown` (never proof credit) and reported as a transport defect. When in
 /// doubt, a row is `unknown`, never `assumed`.
+/// Exact shape check for a `contract:coroutine-resume-state` row: the
+/// compiler-pinned solver label, the exact pinned reason, a description whose
+/// state set round-trips through the shared trust-types parser, and no
+/// counterexample. Anything else is a defect — a row cannot claim the kind and
+/// green without the full compiler-minted shape.
+fn verification_result_is_coroutine_resume_contract_row(
+    result: &crate::types::VerificationResult,
+) -> bool {
+    result.kind == trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND
+        && result.backend == trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_SOLVER
+        && result.reason.as_deref()
+            == Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON)
+        && result.counterexample.is_none()
+        && trust_types::assumption::parse_coroutine_resume_contract_row_description(
+            &result.message,
+        )
+        .is_some()
+}
+
 pub(crate) fn partition_outcome_counts(
     results: &[VerificationResult],
 ) -> (OutcomeCounts, Vec<String>) {
@@ -180,6 +199,46 @@ pub(crate) fn partition_outcome_counts(
                 ));
             } else {
                 counts.assumed += 1;
+            }
+            continue;
+        }
+
+        // Trust (coroutine resume-state contract): the compiler-published
+        // exported-contract row for a coroutine resume body whose ResumedAfter*
+        // sentinels were solver-proved under the resume-state entry
+        // precondition (verified-modulo-callers). Deliberately NOT an
+        // `assumption:*` row — the sentinels carry real proofs — but for
+        // COUNTING it is conditional evidence exactly like the assumption
+        // ledger (the proof is conditional on callers), so a well-formed row
+        // shares the `assumed` bucket; the distinct kind string preserves its
+        // identity in every rendered row. Fail-closed twice over: a row
+        // claiming Proved/RuntimeChecked would launder the contract into proof
+        // credit, and a row that fails the exact shape check (compiler-pinned
+        // solver + reason + parseable state set) is a DEFECT lacking the
+        // bridge-evidence provenance — both count as genuine unknowns.
+        if result.kind == trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND {
+            let subject = if result.function.is_empty() {
+                result.kind.as_str()
+            } else {
+                result.function.as_str()
+            };
+            if result.outcome.is_proved() || result.outcome.is_runtime_checked() {
+                counts.unknown += 1;
+                defects.push(format!(
+                    "transport defect: `{}` row for `{subject}` claims {} — a published contract \
+                     is conditional evidence and carries no proof; counting it as a genuine unknown",
+                    result.kind,
+                    result.outcome.label(),
+                ));
+            } else if verification_result_is_coroutine_resume_contract_row(result) {
+                counts.assumed += 1;
+            } else {
+                counts.unknown += 1;
+                defects.push(format!(
+                    "transport defect: `{}` row for `{subject}` lacks the compiler's exact \
+                     contract-row shape (solver/reason/state-set); counting it as a genuine unknown",
+                    result.kind,
+                ));
             }
             continue;
         }

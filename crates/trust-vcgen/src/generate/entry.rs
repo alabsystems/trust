@@ -306,6 +306,13 @@ pub(super) fn generate_vcs_impl(
     // SOUNDNESS: DROP-ONLY — see `crate::place_ty` / `gen_work`.
     let _gen_work_scope = crate::gen_work_scope();
 
+    // Trust (BLOCKER 2 — callee effect summaries): install the MIR-derived callee
+    // write-sets for the whole obligation walk. `summaries = None` (every legacy
+    // entry, including the bare `generate_vcs`) installs an EMPTY map, which is
+    // byte-identical to the pre-existing conservative call havoc — the refinement
+    // exists only where a callee's own extracted body proves it.
+    let _write_sets = callee_write_set::enter_callee_write_sets(summaries);
+
     // verifier-perf (whole-function VC-gen gate): a function whose recursive-datatype
     // `Expr`/`Level`/`Name` aggregates make it exceed the VC-generation work budget (the
     // `whnf`/`def_eq`/`inductive_builder`/`fmt`/`clone` cluster — HUNDREDS of
