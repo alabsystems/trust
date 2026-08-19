@@ -2112,6 +2112,42 @@ fn convert_rvalue<'tcx>(
                 {
                     Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty))
                 }
+                // Trust (vtable slice 1, oracle side): `&T -> &dyn Trait` /
+                // `*const T -> *const dyn Trait` (trait-object POINTER unsize).
+                //
+                // Superseding the wholly-opaque model one arm below for the POINTER
+                // shapes: the coercion is an infallible vtable attach, and its DATA
+                // lane is exactly the source pointer. Spelling the result
+                // `Use(OpaqueConst)` threw that away — the bridge minted a fully
+                // fact-free fresh symbolic fat pointer, so the oracle claimed nothing
+                // about a lane it knows precisely.
+                //
+                // The precise spelling needs no new `Rvalue`/`ConstValue` variant: an
+                // `Rvalue::Cast` to the coercion's TARGET type carries both facts the
+                // bridge needs — the source operand (the thin data pointer) and, via
+                // `Ty::Dynamic { trait_name }`, the principal's def path that
+                // `trust_ir::stable_trait_object_id` mints the shared `FatPtr(
+                // TraitObject { trait_id })` identity from. This is byte-identical in
+                // shape to the slice-unsize arm directly above, which is the same
+                // coercion with a length metadata lane instead of a vtable one.
+                //
+                // SOUNDNESS: strictly more precise, never more permissive. The bridge
+                // assembles `PtrFromParts { data: <the real source pointer>, metadata:
+                // <fresh unconstrained Ptr> }`. The asserted fact (the fat pointer's
+                // data lane IS the source address) is TRUE of every real execution;
+                // the vtable stays a fresh symbol, so every metadata/vtable-dependent
+                // obligation is exactly as unprovable as it was under `OpaqueConst`.
+                //
+                // SCOPE — pointer targets only. `Box<T> -> Box<dyn Trait>` keeps the
+                // opaque model below: a `Box` maps to a nominal ADT (`Ty::Adt`, hence
+                // `TrustIrTy::Struct`), not to a fat pointer, so there is no data lane
+                // to write the source pointer into and a `Cast` into it would be
+                // ill-typed. Widening to `Box` is a separate, layout-bearing claim.
+                mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _)
+                    if unsize_target_is_trait_object_pointer(*ty) =>
+                {
+                    Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty))
+                }
                 // `&T -> &dyn Trait` (trait-object unsize): an infallible vtable
                 // attach (no panic/overflow/alloc). The vtable + pointee contents are
                 // not modeled, so lower the RESULT to the same sound `OpaqueConst`
@@ -2121,6 +2157,9 @@ fn convert_rvalue<'tcx>(
                 // unblocks the derived `Debug::fmt`/`Hash`/… boilerplate that dominates
                 // the gap. (Slice unsize above stays a precise cast — it carries the
                 // length; only trait objects, whose metadata we don't use, go opaque.)
+                //
+                // Trust (vtable slice 1): reached ONLY by `Box<T> -> Box<dyn Trait>`
+                // now — the `&dyn`/`*dyn` pointer shapes take the precise arm above.
                 mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _)
                     if unsize_target_is_trait_object_ref(*ty) =>
                 {
@@ -2333,6 +2372,48 @@ fn unsize_target_is_slice_ref(ty: rustc_middle::ty::Ty<'_>) -> bool {
 /// the value stay Unknown/Failed (never falsely Proved); obligations that don't (the
 /// derived `Debug::fmt` boilerplate dominating the gap) become reachable.
 fn unsize_target_is_trait_object_ref(ty: rustc_middle::ty::Ty<'_>) -> bool {
+    let inner = match ty.kind() {
+        ty::TyKind::Ref(_, inner, _) => *inner,
+        ty::TyKind::RawPtr(inner, _) => *inner,
+        // Trust (wave-UB): `Box<T> -> Box<dyn Trait>`. A `Box` is a pointer with an owned
+        // allocation, and the unsize attaches a vtable exactly as the `&`/`*` cases do — the
+        // metadata is the same vtable nobody here models, so the SAME opaque over-approximation
+        // applies for the SAME reason, and by the same argument it can never falsely Prove
+        // (an unconstrained value only ever produces more unknowns, never fewer).
+        //
+        // Measured: after the `&dyn`/`*dyn` half landed, the residual
+        // `Unsize(non-slice target)` bucket is dominated by `Box::new(..) as Box<dyn Trait>`.
+        // Refusing it wedged the whole obligation at `unsupported_mir`, which is precisely what
+        // the trait-object arm below exists to avoid.
+        //
+        // `is_box()` only — deliberately NOT a general "ADT with an unsized dyn tail". A
+        // user-defined `CoerceUnsized` wrapper (`Signal(&1i32) as Signal<dyn Any>`) puts the
+        // vtable at an arbitrary field offset rather than in the pointer itself, so its opacity
+        // is a different claim; it stays fail-closed until someone prices it.
+        ty::TyKind::Adt(def, args) if def.is_box() => args.type_at(0),
+        _ => return false,
+    };
+    matches!(inner.kind(), ty::TyKind::Dynamic(..))
+}
+
+/// Trust (vtable slice 1): the strict POINTER subset of
+/// [`unsize_target_is_trait_object_ref`] — a reference or raw pointer whose pointee
+/// is a trait object (`&dyn Trait`, `&mut dyn Trait`, `*const dyn Trait`,
+/// `*mut dyn Trait`), and deliberately NOT `Box<dyn Trait>`.
+///
+/// This is the set of unsize targets whose trust-types spelling IS a pointer, so the
+/// coercion's result has a DATA lane the source operand can be written into (the
+/// bridge assembles `PtrFromParts { data, metadata: fresh }` for the fat spelling and
+/// a value-preserving pointer cast for the thin one). `Box<dyn Trait>` maps to a
+/// nominal ADT, which has no such lane; it keeps the wholly-opaque model.
+///
+/// The refusal-vs-precision boundary is the same one the `Ty::Ref`/`Ty::RawPtr` arms
+/// of the bridge's `map_type` already draw: a SHARED ref or a raw pointer to a trait
+/// object with a real principal is `FatPtr(TraitObject)` on both sides; `&mut dyn`
+/// and the principal-less `dyn` sentinel are thin `Ptr` on both sides. Both are
+/// handled — the fat one gains a real data lane, the thin one is exactly the source
+/// address — so this predicate does not need to re-derive that split.
+fn unsize_target_is_trait_object_pointer(ty: rustc_middle::ty::Ty<'_>) -> bool {
     let inner = match ty.kind() {
         ty::TyKind::Ref(_, inner, _) => *inner,
         ty::TyKind::RawPtr(inner, _) => *inner,

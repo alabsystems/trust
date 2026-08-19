@@ -1,20 +1,20 @@
 schema = "trust.trust-clean.trustir-oleans.manifest.v1"
 
 [provenance]
-trustir_commit = "12e1f87085433c56dc3d518eaac4a5d4fbbd6940"
+trustir_commit = "d637878fb6be83f3b527ff313753a97225a26172"
 # The first-party/clean revision these bytes are staged against — the olean
 # reader that decodes them and the kernel that admits the decoded declarations
 # both live there, so a clean pin bump changes what "the bridge replays" means
 # just as surely as a trust-ir bump changes what it replays. Kept equal to the
 # indexed gitlink by scripts/check_bridge_pin.sh; the replay itself is
 # validated by crates/trust-clean/tests/lean_clean_bridge.rs.
-clean_commit = "756b82a1732549619ba99a18c511f2b174f9e924"
+clean_commit = "5fae88baab4c304167708b54ce80a69b195bc329"
 lean_toolchain = "leanprover/lean4:v4.8.0"
-lean_version = "Lean (version 4.8.0, aarch64-unknown-linux-gnu, commit df668f00e6c0, Release)"
+lean_version = "Lean (version 4.8.0, aarch64-apple-darwin, commit df668f00e6c0, Release)"
 root_module = "TrustIr.Semantics.Arith"
 source_subdir = "lean/trust_ir-semantics"
 build_command = "lake build (unmodified sources at trustir_commit; toolchain pinned by lean-toolchain)"
-built_on = "2026-08-17"
+built_on = "2026-08-18"
 # Minimal module closure of root_module: computed by loading the root with
 # clean-olean load_module_with_deps and vendoring exactly the visited TrustIr
 # modules. Regenerate + audit with scripts/regen-trustir-oleans.sh.

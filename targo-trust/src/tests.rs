@@ -16529,15 +16529,34 @@ fn test_verifier_suite_statuses_probe_in_process_adapters() {
     assert_eq!(suites.len(), 3);
     for suite in &suites {
         assert!(suite.adapter_compiled, "{} adapter should be compiled", suite.name);
+        // Public `verify_with_context` deliberately never mints `Proved` for
+        // native candidates without a deliverable live receipt, so no suite's
+        // smoke can honestly reach proof-grade "available" today.
         assert!(
             !suite.in_process_available,
-            "{} placeholder adapter must not be reported as proof-grade available",
+            "{} smoke must not be reported as proof-grade available",
             suite.name
         );
-        assert_eq!(suite.in_process_status, "unavailable");
         assert!(
-            suite.in_process_detail.is_some(),
-            "{} unavailable suite should explain why proof-grade smoke evidence is unavailable",
+            matches!(suite.in_process_status, "unsupported" | "unavailable"),
+            "{} smoke status must be an honest decline, got {:?}",
+            suite.name,
+            suite.in_process_status
+        );
+        let detail = suite.in_process_detail.as_deref().unwrap_or_default();
+        assert!(
+            !detail.is_empty(),
+            "{} declined suite should explain why proof-grade smoke evidence is unavailable",
+            suite.name
+        );
+        // The pre-fix probe sent a NON-canonical request (obligation missing
+        // from the bundle inventory), so the hardened wrapper fail-closed
+        // before the engine ran and every suite reported this misleading
+        // envelope message. The request is canonical now: the engine always
+        // runs and the detail is the engine's own reason.
+        assert!(
+            !detail.contains("one-obligation run envelope"),
+            "{} smoke must report the engine's verdict, not an envelope failure: {detail}",
             suite.name
         );
         assert_eq!(suite.manifest.name, suite.name);
@@ -16723,10 +16742,28 @@ fn test_doctor_report_json_exposes_native_reporting_contract() {
             "capability_available must equal manifest-declares-Supported for suite {i}"
         );
     }
-    assert_eq!(json["verifier_suites"][0]["in_process_status"], "unavailable");
-    assert_eq!(json["verifier_suites"][1]["in_process_status"], "unavailable");
-    assert_eq!(json["verifier_suites"][2]["in_process_status"], "unavailable");
-    assert!(json["verifier_suites"][0]["in_process_detail"].is_string());
+    // The smoke request is canonical (the bundle carries its one obligation),
+    // so the engine always runs and reports its own honest decline: either an
+    // "unsupported" support-level/evidence verdict or an "unavailable"
+    // non-proof-grade result — never the pre-fix envelope failure, and never
+    // "available" while public dispatch withholds `Proved` from receipts-less
+    // native candidates.
+    for i in 0..3 {
+        let status = json["verifier_suites"][i]["in_process_status"]
+            .as_str()
+            .expect("in_process_status must be a string");
+        assert!(
+            matches!(status, "unsupported" | "unavailable"),
+            "verifier_suites[{i}].in_process_status must be an honest decline, got {status:?}"
+        );
+        let detail = json["verifier_suites"][i]["in_process_detail"]
+            .as_str()
+            .expect("in_process_detail must be a string");
+        assert!(
+            !detail.contains("one-obligation run envelope"),
+            "verifier_suites[{i}] must report the engine's verdict, not an envelope failure: {detail}"
+        );
+    }
     assert_eq!(json["verifier_suites"][0]["manifest"]["name"], "trust-mc");
     assert_eq!(json["verifier_suites"][1]["manifest"]["name"], "trust-wp");
     assert_eq!(json["verifier_suites"][2]["manifest"]["name"], "trust-vc");

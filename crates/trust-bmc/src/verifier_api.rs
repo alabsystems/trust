@@ -35,8 +35,8 @@ use trust_verifier_api::{
     EngineKind, EngineManifest, EvidenceArtifact, EvidenceArtifactKind,
     EvidenceArtifactMaterialization, EvidenceArtifactReference, EvidencePublicationMetadata,
     EvidenceStatus, MetadataEntry, ObligationEvidence, ObligationKind, ProofStrength,
-    ReasoningKind, SupportLevel, TrustContract, TrustContractBundle, TrustObligation,
-    ValidatedVerificationRequest, VerificationEngine,
+    ReasoningKind, SourceLocation, SupportLevel, TrustContract, TrustContractBundle,
+    TrustObligation, ValidatedVerificationRequest, VerificationEngine,
 };
 
 use crate::{TrustMcConfig, TrustMcProofMode};
@@ -8454,6 +8454,267 @@ fn trust_mc_manifest() -> EngineManifest {
     manifest
 }
 
+// ---------------------------------------------------------------------------
+// targo-trust doctor smoke bundle
+// ---------------------------------------------------------------------------
+
+/// Public obligation id of the targo-trust doctor's canonical in-process
+/// trust-mc smoke request (see [`doctor_smoke_bundle`]).
+pub const DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID: &str = "vc:targo-trust:doctor:trust-mc:smoke:0";
+const DOCTOR_SMOKE_NATIVE_REQUEST_ID: u32 = 1;
+const DOCTOR_SMOKE_PROOF_OBLIGATION_ID: u32 = 0;
+// Synthetic doctor-smoke provenance digests (64 lowercase hex chars). The
+// bundle's subject is a doctor artifact, not a program: these digests bind the
+// bundle's own records to each other exactly the way the compiler's real
+// source/VC digests would, and never stand for any source or VC outside this
+// bundle. The bundle can therefore never be mistaken for (or replayed as)
+// compiler output for a real function.
+const DOCTOR_SMOKE_SOURCE_DIGEST: &str =
+    "ad0cad0cad0cad0cad0cad0cad0cad0cad0cad0cad0cad0cad0cad0cad0cad0c";
+const DOCTOR_SMOKE_VC_DIGEST: &str =
+    "bd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0cbd0c";
+
+/// Canonical one-obligation typed-CHC bundle for the targo-trust doctor's
+/// in-process trust-mc smoke probe.
+///
+/// CONSTRUCTION ONLY. This function builds data and routes through no
+/// verification path: it mints no evidence, no receipt, and no authority.
+/// The doctor verifies the returned request exclusively through the public,
+/// validated [`VerificationEngine::verify_with_context`] boundary, so the
+/// smoke result carries exactly the authority that public dispatch grants a
+/// caller-submitted bundle — today that is a validated NON-definitive
+/// candidate (public dispatch never mints `Proved` for typed CHC/PDR without
+/// a deliverable live receipt; see
+/// `evidence_and_fresh_exact_direct_receipt_from_typed_chc_pdr_obligation`).
+///
+/// The bundle is the compiler-canonical pre-build-pivot shape (public
+/// canonical contract + authenticated native marker contract, cf. the
+/// `compiler_canonical_trust_mc_bundle` test fixture): one ArithmeticSafety
+/// obligation over a trivially safe typed CHC — `entry(false)` with
+/// `error :- entry(ok), ok` — whose `error` query is unreachable, so a
+/// compiled-in native solver genuinely solves it in-process.
+#[must_use]
+pub fn doctor_smoke_bundle() -> (TrustContractBundle, TrustObligation) {
+    let native_obligation_id = format!(
+        "trust_ir-native-trust_mc-request-{DOCTOR_SMOKE_NATIVE_REQUEST_ID}-proof-{DOCTOR_SMOKE_PROOF_OBLIGATION_ID}"
+    );
+    let marker_contract_id = format!("contract:trust-mc-typed-chc:{native_obligation_id}");
+    let canonical_contract_id = format!(
+        "contract:trust-mc-typed-chc-public:{DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID}"
+    );
+
+    // Trivially safe typed CHC: entry(false); error :- entry(ok), ok.
+    let ok_var = serde_json::json!({ "kind": "var", "name": "ok", "sort": { "kind": "bool" } });
+    let mut marker_value = serde_json::json!({
+        "schema_version": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION,
+        "origin": "mir_derived",
+        "obligation_id": native_obligation_id,
+        "function_name": "targo_trust_doctor::smoke",
+        "query": { "target": "error" },
+        "vars": [
+            { "name": "ok", "sort": { "kind": "bool" } }
+        ],
+        "relations": [
+            { "name": "entry", "arg_sorts": [{ "kind": "bool" }] },
+            { "name": "error" }
+        ],
+        "rules": [
+            {
+                "head": {
+                    "name": "entry",
+                    "args": [ { "kind": "bool_const", "value": false } ]
+                },
+            },
+            {
+                "head": { "name": "error" },
+                "body": {
+                    "relation": { "name": "entry", "args": [ ok_var.clone() ] },
+                    "constraints": [ ok_var ]
+                },
+            }
+        ],
+    });
+    let native_digest = |seed: u8| {
+        trust_mc_core::NativeArtifactDigest::new("sha256", format!("{seed:02x}").repeat(32))
+    };
+    let native_metadata = trust_mc_core::NativeTypedChcObligationMetadata::new(
+        "Trust",
+        "rust-mir",
+        Some(native_digest(0x11)),
+        native_digest(0x22),
+        trust_mc_core::NativeArtifactDigest::new("trust_ir-stable-v1", "33".repeat(32)),
+        DOCTOR_SMOKE_NATIVE_REQUEST_ID,
+        "chc",
+        9,
+        vec![DOCTOR_SMOKE_PROOF_OBLIGATION_ID],
+        vec![0],
+    )
+    .with_compiler_facts(
+        trust_mc_core::NativeArtifactDigest::new("trust_ir-stable-v1", "44".repeat(32)),
+        trust_mc_core::NativeCompilerFactCounts {
+            monomorphizations: 1,
+            obligation_sources: 1,
+            ..trust_mc_core::NativeCompilerFactCounts::default()
+        },
+        vec![trust_mc_core::NativeObligationCompilerFacts {
+            proof_obligation_id: DOCTOR_SMOKE_PROOF_OBLIGATION_ID,
+            function_id: Some(9),
+            span: Some(trust_mc_core::NativeSourceSpanMetadata { file: 0, line: 10, col: 3 }),
+            cause: trust_mc_core::NativeObligationCauseMetadata::Translation,
+            monomorphization_id: Some(0),
+            fact_refs: vec![trust_mc_core::NativeCompilerFactReference::new(
+                trust_mc_core::NativeCompilerFactKind::Monomorphization,
+                0,
+            )],
+        }],
+    )
+    .with_replay_metadata(
+        trust_mc_core::NativeReplayIdentityMetadata {
+            engine: "trust-mc".to_string(),
+            invocation: format!("trust-mc native request {DOCTOR_SMOKE_NATIVE_REQUEST_ID}"),
+            transcript_digest: native_digest(0x55),
+        },
+        trust_mc_core::NativeReplayContextMetadata {
+            atoms: vec![trust_mc_core::NativeReplayAtomMetadata {
+                atom_id: 0,
+                kind: trust_mc_core::NativeReplayAtomKindMetadata::Assertion,
+                formula_schema: "smtlib2".to_string(),
+                payload_digest: trust_mc_core::NativeArtifactDigest::new(
+                    "trust_ir-stable-v1",
+                    "66".repeat(32),
+                ),
+                proof_obligation_id: Some(DOCTOR_SMOKE_PROOF_OBLIGATION_ID),
+                assertion_id: Some(7),
+                span: Some(trust_mc_core::NativeSourceSpanMetadata { file: 0, line: 10, col: 3 }),
+            }],
+            unsupported_modes: Vec::new(),
+        },
+    );
+    marker_value["native_metadata"] = serde_json::to_value(native_metadata)
+        .expect("doctor smoke native metadata serializes");
+
+    let synthetic_digest = trust_mc_typed_chc_value_digest(&marker_value)
+        .expect("doctor smoke typed CHC digests");
+    let binding = serde_json::json!({
+        "schema_version": TRUST_MC_TYPED_CHC_BINDING_SCHEMA_VERSION,
+        "typed_chc_schema": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION,
+        "public_obligation_id": DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID,
+        "native_obligation_id": native_obligation_id,
+        "synthetic_contract_id": marker_contract_id,
+        "source_digest": { "algorithm": "sha256", "value": DOCTOR_SMOKE_SOURCE_DIGEST },
+        "vc_digest": { "algorithm": "sha256", "value": DOCTOR_SMOKE_VC_DIGEST },
+        "synthetic_chc_digest": { "algorithm": "sha256", "value": synthetic_digest },
+    });
+    let binding_json =
+        serde_json::to_string(&binding).expect("doctor smoke binding metadata serializes");
+    let typed_chc_binding_entries = [
+        MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY.to_string(),
+            value: DOCTOR_SMOKE_SOURCE_DIGEST.to_string(),
+        },
+        MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY.to_string(),
+            value: DOCTOR_SMOKE_VC_DIGEST.to_string(),
+        },
+        MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY.to_string(),
+            value: synthetic_digest,
+        },
+        MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY.to_string(),
+            value: binding_json,
+        },
+    ];
+
+    let marker = TrustContract {
+        contract_id: marker_contract_id.clone(),
+        kind: ContractKind::Asserts,
+        predicate: ContractPredicate::MathIr {
+            schema: TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA.to_string(),
+            value: marker_value.clone(),
+        },
+        source: SourceLocation::default(),
+        metadata: std::iter::once(MetadataEntry {
+            key: "trust-mc.typed-chc-obligation.source".to_string(),
+            value: "compiler-native-trust-ir-trust-spec-vc".to_string(),
+        })
+        .chain(typed_chc_binding_entries.iter().cloned())
+        .collect(),
+    };
+
+    let mut canonical_value = marker_value;
+    canonical_value["obligation_id"] = serde_json::json!(DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID);
+    canonical_value
+        .as_object_mut()
+        .expect("doctor smoke typed CHC payload is an object")
+        .remove("native_metadata");
+    let canonical = TrustContract {
+        contract_id: canonical_contract_id.clone(),
+        kind: ContractKind::Asserts,
+        predicate: ContractPredicate::MathIr {
+            schema: TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA.to_string(),
+            value: canonical_value,
+        },
+        source: SourceLocation::default(),
+        metadata: vec![MetadataEntry {
+            key: "trust-trust-mc.typed-chc-obligation.source".to_string(),
+            value: "compiler-public-trust-spec-vc".to_string(),
+        }],
+    };
+
+    let obligation = TrustObligation {
+        obligation_id: DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID.to_string(),
+        kind: ObligationKind::ArithmeticSafety,
+        contract_id: Some(canonical_contract_id),
+        proof_item_id: None,
+        source: SourceLocation::default(),
+        description: "targo-trust doctor in-process trust-mc canonical typed-CHC smoke"
+            .to_string(),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: [
+            MetadataEntry {
+                key: TRUST_SOURCE_DIGEST_METADATA_KEY.to_string(),
+                value: DOCTOR_SMOKE_SOURCE_DIGEST.to_string(),
+            },
+            MetadataEntry {
+                key: TRUST_VC_DIGEST_METADATA_KEY.to_string(),
+                value: DOCTOR_SMOKE_VC_DIGEST.to_string(),
+            },
+            MetadataEntry {
+                key: TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY.to_string(),
+                value: "trust-mc".to_string(),
+            },
+            MetadataEntry {
+                key: TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY.to_string(),
+                value: DOCTOR_SMOKE_NATIVE_REQUEST_ID.to_string(),
+            },
+            MetadataEntry {
+                key: TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY.to_string(),
+                value: DOCTOR_SMOKE_PROOF_OBLIGATION_ID.to_string(),
+            },
+            MetadataEntry {
+                key: TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY.to_string(),
+                value: marker_contract_id,
+            },
+        ]
+        .into_iter()
+        .chain(typed_chc_binding_entries)
+        .collect(),
+    };
+
+    let mut bundle = TrustContractBundle::empty(
+        "targo-trust-doctor-trust-mc-smoke-bundle",
+        BundleSubject::Artifact {
+            name: "trust-mc".to_string(),
+            kind: "doctor-smoke".to_string(),
+        },
+    );
+    bundle.contracts = vec![canonical, marker];
+    bundle.obligations = vec![obligation.clone()];
+    (bundle, obligation)
+}
+
 #[cfg(test)]
 mod tests {
     use trust_verifier_api::{
@@ -11625,6 +11886,96 @@ mod tests {
             trust_mc_typed_chc_contract_input_digest(canonical_contract)
                 .expect("canonical input digest")
         );
+    }
+
+    /// The PROMOTED doctor smoke constructor (used by `targo trust doctor` for
+    /// the in-process trust-mc probe) must stay a valid compiler-canonical
+    /// direct typed-CHC request: the bundle validates, the request is
+    /// canonical (the bundle carries its one obligation), and the direct lane
+    /// constructs proof input from it.
+    #[test]
+    fn doctor_smoke_bundle_is_canonical_direct_typed_chc_request() {
+        let (bundle, obligation) = doctor_smoke_bundle();
+        bundle.validate().expect("doctor smoke bundle validates");
+        bundle
+            .validate_requested_obligations(std::slice::from_ref(&obligation))
+            .expect("doctor smoke request is canonical");
+        assert_eq!(bundle.obligations.as_slice(), std::slice::from_ref(&obligation));
+        assert_eq!(obligation.obligation_id, DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID);
+
+        let adapter = TrustMcVerifierApiAdapter::default();
+        assert!(adapter.supports(&obligation).is_supported());
+        let input = adapter
+            .typed_chc_pdr_obligation_for(&bundle, &obligation)
+            .expect("doctor smoke canonical lane must validate")
+            .expect("doctor smoke bundle must construct direct proof input");
+        assert_eq!(
+            input.trust_mc_obligation.obligation_id,
+            "trust_ir-native-trust_mc-request-1-proof-0"
+        );
+    }
+
+    /// End-to-end PUBLIC dispatch of the doctor smoke request. Public
+    /// `verify_with_context` deliberately keeps native CHC/PDR candidates
+    /// NON-definitive (`Proved` requires a deliverable live receipt from the
+    /// fresh-exact-replay dispatch entries), so the doctor probe observes a
+    /// valid one-obligation envelope whose evidence is a validated
+    /// non-definitive candidate — never `Proved`, never `Failed` (the CHC is
+    /// trivially safe), and never the empty envelope the pre-fix probe
+    /// produced. If this test ever starts seeing `Proved`, the doctor's
+    /// trust-mc smoke gains an honest "available": update the targo-trust
+    /// doctor expectations together with this test.
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn doctor_smoke_bundle_public_dispatch_returns_validated_nondefinitive_candidate() {
+        let (bundle, obligation) = doctor_smoke_bundle();
+        let adapter = TrustMcVerifierApiAdapter::default();
+        let context = VerifierExecutionContext::new("targo-trust-doctor-trust-mc-smoke");
+
+        let result =
+            adapter.verify_with_context(&bundle, std::slice::from_ref(&obligation), &context);
+
+        assert_eq!(result.run_id, "targo-trust-doctor-trust-mc-smoke");
+        assert_eq!(result.bundle_id, bundle.bundle_id);
+        assert_eq!(result.summary.requested_obligations, 1);
+        assert_eq!(result.evidence.len(), 1);
+        assert_eq!(result.evidence[0].obligation_id, obligation.obligation_id);
+        assert_ne!(result.status, VerificationRunStatus::Empty);
+        assert_ne!(
+            result.evidence[0].status,
+            EvidenceStatus::Failed,
+            "the trivially safe doctor CHC must never be refuted: {:?}",
+            result.evidence[0].diagnostics
+        );
+        assert_eq!(
+            result.evidence[0].status,
+            EvidenceStatus::Unknown,
+            "unexpected doctor smoke evidence status: {:?}",
+            result.evidence[0].diagnostics
+        );
+        assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("constructed typed trust_mc ChcVc")
+        }));
+    }
+
+    /// Without the native solver the doctor smoke request must fail closed
+    /// with the actionable "solving is disabled" diagnostic — not an invalid
+    /// envelope.
+    #[cfg(not(feature = "trust-mc-native-solver"))]
+    #[test]
+    fn doctor_smoke_bundle_without_native_solver_fails_closed_with_actionable_reason() {
+        let (bundle, obligation) = doctor_smoke_bundle();
+        let adapter = TrustMcVerifierApiAdapter::default();
+        let context = VerifierExecutionContext::new("targo-trust-doctor-trust-mc-smoke");
+
+        let result =
+            adapter.verify_with_context(&bundle, std::slice::from_ref(&obligation), &context);
+
+        assert_eq!(result.evidence.len(), 1);
+        assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
+        assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("native typed CHC/PDR solving is disabled")
+        }));
     }
 
     #[test]

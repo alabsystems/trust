@@ -211,3 +211,4 @@ tests/trust-falsification/*.mir
 # Publish tool work area
 publish/.out/
 .buildlogs/
+crates/trust-disasm/harness/x86-decode-differential/target/

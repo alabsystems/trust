@@ -95,6 +95,112 @@ enum ConcreteValue {
     Bv { value: u128, width: u32 },
 }
 
+/// Exact widening of an IEEE-754 binary16 bit pattern to `f32`.
+///
+/// Every f16 value is exactly representable in f32, so this is a bijection
+/// onto its range; NaN payloads ride in the top fraction bits and are QUIETED,
+/// which is what AArch64 does on every conversion and arithmetic use (FPCR.DN
+/// at its default of 0 propagates the payload; the quiet bit is forced).
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = (u32::from(h) & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1F;
+    let frac = u32::from(h & 0x3FF);
+    let bits = match exp {
+        0 => {
+            if frac == 0 {
+                sign
+            } else {
+                // Subnormal: value = frac * 2^-24. Normalise.
+                // value = frac * 2^-24. After k normalising shifts the
+                // significand is 1.xxx * 2^(-14-k), so the biased f32 exponent
+                // is 113 - k — which the loop computes directly. (A first cut
+                // subtracted one more here; the exhaustive round-trip test
+                // caught 2^-24 widening to 2^-25 on its first run.)
+                let mut e: u32 = 113; // biased f32 exponent of 2^-14
+                let mut f = frac;
+                while f & 0x400 == 0 {
+                    f <<= 1;
+                    e -= 1;
+                }
+                sign | (e << 23) | ((f & 0x3FF) << 13)
+            }
+        }
+        0x1F => {
+            if frac == 0 {
+                sign | 0x7F80_0000
+            } else {
+                // NaN: payload widened, quiet bit forced.
+                sign | 0x7F80_0000 | 0x0040_0000 | (frac << 13)
+            }
+        }
+        _ => sign | ((u32::from(exp) + 112) << 23) | (frac << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// Round an `f32` to an IEEE-754 binary16 bit pattern, ties-to-even.
+///
+/// Handles subnormals (with correct rounding of the shifted-out bits),
+/// overflow to infinity, and NaN (quiet bit forced, top nine payload bits
+/// kept — ARM's FPConvertNaN). Rounding carries propagate naturally: a
+/// mantissa that rounds up past its width bumps the exponent, and the largest
+/// finite value rounding up lands exactly on the infinity encoding.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        return if frac == 0 {
+            sign | 0x7C00
+        } else {
+            sign | 0x7C00 | 0x0200 | ((frac >> 13) as u16 & 0x1FF)
+        };
+    }
+    let e16 = exp - 112; // rebias 127 -> 15
+    if e16 >= 0x1F {
+        return sign | 0x7C00; // overflow -> infinity
+    }
+    if e16 <= 0 {
+        // Result is subnormal (or underflows to zero). The significand with
+        // its hidden bit is shifted right; everything shifted out rounds.
+        if e16 < -10 {
+            return sign; // magnitude below half the smallest subnormal
+        }
+        let m = frac | 0x80_0000;
+        let shift = (14 - e16) as u32;
+        let val = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let rounded =
+            val + u32::from(rem > half || (rem == half && (val & 1) == 1));
+        return sign | rounded as u16;
+    }
+    let val = frac >> 13;
+    let rem = frac & 0x1FFF;
+    let mut out = ((e16 as u32) << 10) | val;
+    if rem > 0x1000 || (rem == 0x1000 && (val & 1) == 1) {
+        out += 1;
+    }
+    sign | out as u16
+}
+
+/// Sign-extend a `width`-bit value to i128.
+fn sign_extend_i128(value: u128, width: u32) -> i128 {
+    if width == 0 || width >= 128 {
+        return value as i128;
+    }
+    let shift = 128 - width;
+    ((value as i128) << shift) >> shift
+}
+
+/// A concretely evaluated scalar float, format carried by the variant.
+#[derive(Clone, Copy)]
+enum FpVal {
+    F32(f32),
+    F64(f64),
+}
+
 impl Default for ConcreteState {
     fn default() -> Self {
         Self::new()
@@ -555,6 +661,168 @@ impl ConcreteState {
             // The ONE FP shape the AArch64 semantics emit. See
             // `eval_fp_binop_round_trip` for what this does and does not settle.
             Formula::FpToIeeeBv(inner) => self.eval_fp_binop_round_trip(inner),
+            // FCMP's NZCV predicates. Rust's `<` / `==` on floats are IEEE
+            // `fp.lt` / `fp.eq` exactly: false on any NaN operand, and
+            // -0.0 == +0.0. Shape-restricted like everything FP here — the
+            // operands must be `FpFromBits` of one matching format, or the node
+            // is refused rather than approximated.
+            Formula::FpLt(a, b) => {
+                let (x, y) = self.eval_fp_pair(a, b)?;
+                Ok(ConcreteValue::Bool(match (x, y) {
+                    (FpVal::F32(x), FpVal::F32(y)) => x < y,
+                    (FpVal::F64(x), FpVal::F64(y)) => x < y,
+                    _ => unreachable!("eval_fp_pair enforces matching formats"),
+                }))
+            }
+            Formula::FpEq(a, b) => {
+                let (x, y) = self.eval_fp_pair(a, b)?;
+                Ok(ConcreteValue::Bool(match (x, y) {
+                    (FpVal::F32(x), FpVal::F32(y)) => x == y,
+                    (FpVal::F64(x), FpVal::F64(y)) => x == y,
+                    _ => unreachable!("eval_fp_pair enforces matching formats"),
+                }))
+            }
+            // The five conversion nodes. Rust's casts are EXACTLY the
+            // semantics being modeled: float -> int `as` saturates with
+            // NaN -> 0 (the AArch64 FCVTZ* behaviour the nodes are DEFINED to
+            // have — they are total, unlike SMT's fp.to_sbv), int -> float
+            // rounds RNE, and f64 -> f32 `as` rounds RNE with overflow to
+            // infinity. Same is-the-operation-itself caveat as the arithmetic.
+            Formula::FpToSbv { rm, value, width, .. } => {
+                if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RTZ)) {
+                    return Err(ConcreteError::UnsupportedFormula(
+                        "FP-to-int rounding mode other than RTZ",
+                    ));
+                }
+                let (bits, fmt) = self.eval_fp_from_bits(value)?;
+                let wide: i128 = match fmt {
+                    (5, 11) => f16_bits_to_f32(bits as u16) as i128,
+                    (8, 24) => f32::from_bits(bits as u32) as i128,
+                    (11, 53) => f64::from_bits(bits as u64) as i128,
+                    _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+                };
+                let (min, max) = match width {
+                    32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+                    64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+                    _ => return Err(ConcreteError::UnsupportedFormula("FCVTZS width outside 32/64")),
+                };
+                let clamped = wide.clamp(min, max);
+                let mask = if *width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+                Ok(ConcreteValue::Bv { value: (clamped as u128) & mask, width: *width })
+            }
+            Formula::FpToUbv { rm, value, width, .. } => {
+                if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RTZ)) {
+                    return Err(ConcreteError::UnsupportedFormula(
+                        "FP-to-int rounding mode other than RTZ",
+                    ));
+                }
+                let (bits, fmt) = self.eval_fp_from_bits(value)?;
+                let wide: u128 = match fmt {
+                    (5, 11) => f16_bits_to_f32(bits as u16) as u128,
+                    (8, 24) => f32::from_bits(bits as u32) as u128,
+                    (11, 53) => f64::from_bits(bits as u64) as u128,
+                    _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+                };
+                let max = match width {
+                    32 => u128::from(u32::MAX),
+                    64 => u128::from(u64::MAX),
+                    _ => return Err(ConcreteError::UnsupportedFormula("FCVTZU width outside 32/64")),
+                };
+                Ok(ConcreteValue::Bv { value: wide.min(max), width: *width })
+            }
+            Formula::FpFromSbv { rm, value, eb, sb }
+            | Formula::FpFromUbv { rm, value, eb, sb } => {
+                if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RNE)) {
+                    return Err(ConcreteError::UnsupportedFormula(
+                        "int-to-FP rounding mode other than RNE",
+                    ));
+                }
+                let signed = matches!(formula, Formula::FpFromSbv { .. });
+                let (int_bits, int_width) = self.eval_bv_any(value)?;
+                let result_bits: u128 = match (eb, sb) {
+                    (5, 11) => {
+                        // Via f32: the intermediate's 24 significand bits meet
+                        // Figueroa's 2p+2 bound for p = 11, so the double
+                        // rounding is exact.
+                        let x: f32 = if signed {
+                            (sign_extend_i128(int_bits, int_width)) as f32
+                        } else {
+                            int_bits as f32
+                        };
+                        u128::from(f32_to_f16_bits(x))
+                    }
+                    (8, 24) => {
+                        let x: f32 = if signed {
+                            (sign_extend_i128(int_bits, int_width)) as f32
+                        } else {
+                            int_bits as f32
+                        };
+                        u128::from(x.to_bits())
+                    }
+                    (11, 53) => {
+                        let x: f64 = if signed {
+                            (sign_extend_i128(int_bits, int_width)) as f64
+                        } else {
+                            int_bits as f64
+                        };
+                        u128::from(x.to_bits())
+                    }
+                    _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+                };
+                // The node's sort is Float; wrap back to bits only via
+                // FpToIeeeBv, which arrives here as the parent. Represent the
+                // float VALUE by its bit pattern at the format's width.
+                Ok(ConcreteValue::Bv { value: result_bits, width: eb + sb })
+            }
+            Formula::FpConvert { rm, value, eb, sb } => {
+                if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RNE)) {
+                    return Err(ConcreteError::UnsupportedFormula(
+                        "FP format conversion rounding mode other than RNE",
+                    ));
+                }
+                let (bits, fmt) = self.eval_fp_from_bits(value)?;
+                let result_bits: u128 = match (fmt, (*eb, *sb)) {
+                    ((8, 24), (11, 53)) => {
+                        u128::from((f64::from(f32::from_bits(bits as u32))).to_bits())
+                    }
+                    ((11, 53), (8, 24)) => {
+                        u128::from((f64::from_bits(bits as u64) as f32).to_bits())
+                    }
+                    // f16 widenings are exact; narrowings go via f32, which is
+                    // Figueroa-safe for p = 11 (see the binop lane).
+                    ((5, 11), (8, 24)) => {
+                        u128::from(f16_bits_to_f32(bits as u16).to_bits())
+                    }
+                    ((5, 11), (11, 53)) => {
+                        u128::from(f64::from(f16_bits_to_f32(bits as u16)).to_bits())
+                    }
+                    ((8, 24), (5, 11)) => {
+                        u128::from(f32_to_f16_bits(f32::from_bits(bits as u32)))
+                    }
+                    ((11, 53), (5, 11)) => {
+                        u128::from(f32_to_f16_bits(f64::from_bits(bits as u64) as f32))
+                    }
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula(
+                            "FP conversion outside f32<->f64",
+                        ))
+                    }
+                };
+                Ok(ConcreteValue::Bv { value: result_bits, width: eb + sb })
+            }
+            Formula::FpIsNaN(a) => {
+                let (bits, fmt) = self.eval_fp_from_bits(a)?;
+                Ok(ConcreteValue::Bool(match fmt {
+                    (5, 11) => f16_bits_to_f32(bits as u16).is_nan(),
+                    (8, 24) => f32::from_bits(bits as u32).is_nan(),
+                    (11, 53) => f64::from_bits(bits as u64).is_nan(),
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula(
+                            "FP format outside f32/f64",
+                        ))
+                    }
+                }))
+            }
             Formula::Int(_)
             | Formula::UInt(_)
             | Formula::Implies(..)
@@ -655,6 +923,39 @@ impl ConcreteState {
             Mul,
             Div,
         }
+        // The int->FP and format conversions produce a FLOAT value that this
+        // evaluator represents by its bit pattern, which is exactly what
+        // `FpToIeeeBv` asks for — so they route straight through.
+        if matches!(
+            inner,
+            Formula::FpFromSbv { .. } | Formula::FpFromUbv { .. } | Formula::FpConvert { .. }
+        ) {
+            return self.eval_formula(inner);
+        }
+        // FSQRT: unary, same round-trip discipline. Rust's `sqrt` lowers to
+        // the host's `fsqrt`, which IEEE-754 requires to be correctly rounded —
+        // the same is-the-operation-itself caveat as the binops below.
+        if let Formula::FpSqrt(rm, a) = inner {
+            if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RNE)) {
+                return Err(ConcreteError::UnsupportedFormula("FP rounding mode other than RNE"));
+            }
+            let (a_bits, a_fmt) = self.eval_fp_from_bits(a)?;
+            return match a_fmt {
+                (5, 11) => Ok(ConcreteValue::Bv {
+                    value: u128::from(f32_to_f16_bits(f16_bits_to_f32(a_bits as u16).sqrt())),
+                    width: 16,
+                }),
+                (8, 24) => Ok(ConcreteValue::Bv {
+                    value: u128::from(f32::from_bits(a_bits as u32).sqrt().to_bits()),
+                    width: 32,
+                }),
+                (11, 53) => Ok(ConcreteValue::Bv {
+                    value: u128::from(f64::from_bits(a_bits as u64).sqrt().to_bits()),
+                    width: 64,
+                }),
+                _ => Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+            };
+        }
         let (op, rm, a, b) = match inner {
             Formula::FpAdd(rm, a, b) => (Op::Add, rm, a, b),
             Formula::FpSub(rm, a, b) => (Op::Sub, rm, a, b),
@@ -674,6 +975,22 @@ impl ConcreteState {
             return Err(ConcreteError::UnsupportedFormula("mixed FP formats in one operation"));
         }
         let (value, width) = match a_fmt {
+            // binary16, computed in f32 and narrowed. EXACT, not approximate:
+            // performing a +,-,*,/ (or sqrt) in precision q and then rounding
+            // to precision p is identical to rounding the true result directly
+            // to p whenever q >= 2p+2 (Figueroa); f32's 24 significand bits
+            // meet the bound for p = 11 exactly.
+            (5, 11) => {
+                let x = f16_bits_to_f32(a_bits as u16);
+                let y = f16_bits_to_f32(b_bits as u16);
+                let r = match op {
+                    Op::Add => x + y,
+                    Op::Sub => x - y,
+                    Op::Mul => x * y,
+                    Op::Div => x / y,
+                };
+                (u128::from(f32_to_f16_bits(r)), 16)
+            }
             (8, 24) => {
                 let x = f32::from_bits(a_bits as u32);
                 let y = f32::from_bits(b_bits as u32);
@@ -699,6 +1016,31 @@ impl ConcreteState {
             _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
         };
         Ok(ConcreteValue::Bv { value, width })
+    }
+
+    /// Evaluate two `FpFromBits` operands of ONE matching scalar format.
+    fn eval_fp_pair(&self, a: &Formula, b: &Formula) -> Result<(FpVal, FpVal), ConcreteError> {
+        let (a_bits, a_fmt) = self.eval_fp_from_bits(a)?;
+        let (b_bits, b_fmt) = self.eval_fp_from_bits(b)?;
+        if a_fmt != b_fmt {
+            return Err(ConcreteError::UnsupportedFormula("mixed FP formats in one comparison"));
+        }
+        match a_fmt {
+            // Exact widening: comparison in f32 is the f16 comparison.
+            (5, 11) => Ok((
+                FpVal::F32(f16_bits_to_f32(a_bits as u16)),
+                FpVal::F32(f16_bits_to_f32(b_bits as u16)),
+            )),
+            (8, 24) => Ok((
+                FpVal::F32(f32::from_bits(a_bits as u32)),
+                FpVal::F32(f32::from_bits(b_bits as u32)),
+            )),
+            (11, 53) => Ok((
+                FpVal::F64(f64::from_bits(a_bits as u64)),
+                FpVal::F64(f64::from_bits(b_bits as u64)),
+            )),
+            _ => Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+        }
     }
 
     /// Evaluate an `FpFromBits` operand, returning `(bits, (eb, sb))`.
@@ -1234,5 +1576,77 @@ mod sync_and_atomic_oracle_contract_tests {
                 "{enc:#010x} emitted more than a boundary and a PC advance: {effects:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod f16_primitive_tests {
+    use super::*;
+
+    /// The whole f16 space, round-tripped: widening is exact and every f16
+    /// value is exactly representable in f32, so `pack(unpack(h)) == h` — with
+    /// ONE principled exception: a signaling NaN comes back with its quiet bit
+    /// set, which is exactly what AArch64 does on any conversion or arithmetic
+    /// use of it (FPCR.DN=0 propagates the payload and forces quiet).
+    ///
+    /// 65,536 cases; exhaustive, not sampled.
+    #[test]
+    fn every_f16_round_trips_exactly() {
+        for h in 0..=u16::MAX {
+            let widened = f16_bits_to_f32(h);
+            let back = f32_to_f16_bits(widened);
+            let exp = (h >> 10) & 0x1F;
+            let frac = h & 0x3FF;
+            let is_snan = exp == 0x1F && frac != 0 && (frac & 0x200) == 0;
+            let expected = if is_snan { h | 0x200 } else { h };
+            assert_eq!(
+                back, expected,
+                "f16 {h:#06x} widened to {widened} ({:#010x}) and came back {back:#06x}",
+                widened.to_bits()
+            );
+        }
+    }
+
+    /// Widening preserves VALUE for every finite f16: check a few exact
+    /// anchors against hand-computed constants, including subnormals and the
+    /// extremes.
+    #[test]
+    fn f16_widening_hits_known_values() {
+        let cases: &[(u16, f32)] = &[
+            (0x3C00, 1.0),
+            (0xBC00, -1.0),
+            (0x3555, 0.333_251_95), // closest f16 to 1/3
+            (0x0001, 5.960_464_5e-8), // smallest subnormal, 2^-24
+            (0x03FF, 6.097_555_1e-5), // largest subnormal
+            (0x0400, 6.103_515_6e-5), // smallest normal, 2^-14
+            (0x7BFF, 65504.0),        // largest finite
+            (0x0000, 0.0),
+            (0x8000, -0.0),
+        ];
+        for (h, expected) in cases {
+            let got = f16_bits_to_f32(*h);
+            assert_eq!(got, *expected, "{h:#06x} must widen to {expected}");
+        }
+        assert!(f16_bits_to_f32(0x7C00).is_infinite());
+        assert!(f16_bits_to_f32(0x7E00).is_nan());
+    }
+
+    /// Narrowing rounds ties to even and saturates to infinity — the corners a
+    /// wrong shift or bias silently breaks.
+    #[test]
+    fn f16_narrowing_rounds_to_nearest_even() {
+        // 1.0 + 2^-11 is exactly halfway between 1.0 and the next f16; RNE
+        // picks the EVEN mantissa, i.e. 1.0.
+        assert_eq!(f32_to_f16_bits(1.0 + f32::powi(2.0, -11)), 0x3C00);
+        // Three quarters of the way rounds up.
+        assert_eq!(f32_to_f16_bits(1.0 + 3.0 * f32::powi(2.0, -12)), 0x3C01);
+        // Just past the largest finite f16 rounds to infinity; just below the
+        // halfway point stays finite.
+        assert_eq!(f32_to_f16_bits(65520.0), 0x7C00, "halfway to 65536 ties to even = inf");
+        assert_eq!(f32_to_f16_bits(65519.9), 0x7BFF);
+        assert_eq!(f32_to_f16_bits(-65520.0), 0xFC00);
+        // Deep underflow flushes to signed zero under RNE.
+        assert_eq!(f32_to_f16_bits(1.0e-10), 0x0000);
+        assert_eq!(f32_to_f16_bits(-1.0e-10), 0x8000);
     }
 }

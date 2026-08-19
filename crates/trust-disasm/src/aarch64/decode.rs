@@ -1011,12 +1011,19 @@ fn decode_load_literal(enc: u32, addr: u64) -> Result<Instruction, DisasmError> 
     let rt = bits(enc, 4, 0) as u8;
     let offset = sign_extend(imm19, 19) << 2;
 
-    let is_64 = opc == 0b01;
-
-    let opcode = match opc {
-        0b00 | 0b01 => Opcode::LdrLiteral,
-        0b10 => Opcode::Ldrsw,
-        0b11 => Opcode::Prfm,
+    // Trust: the transfer width comes from the SELECTED OPCODE, not from a
+    // separate test of `opc`. `is_64 = opc == 0b01` was false for `opc == 0b10`
+    // (LDRSW), so `ldrsw x0, <label>` decoded a **W** destination: the 32-bit
+    // write path never builds a `BvSignExt`, and the register was then
+    // zero-extended to 64. Measured: the literal 0xffffffff loaded as
+    // 0x00000000ffffffff instead of 0xffffffffffffffff. ARM DDI 0487, LDRSW
+    // (literal): "X[t] = SignExtend(data, 64)". The base+offset encoding at
+    // `decode.rs:1193` already pairs `(Opcode::Ldrsw, true)` correctly.
+    let (opcode, is_64) = match opc {
+        0b00 => (Opcode::LdrLiteral, false),
+        0b01 => (Opcode::LdrLiteral, true),
+        0b10 => (Opcode::Ldrsw, true),
+        0b11 => (Opcode::Prfm, false),
         _ => unreachable!("opc is a 2-bit field: all 4 values handled"),
     };
 

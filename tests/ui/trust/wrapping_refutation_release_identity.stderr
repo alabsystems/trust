@@ -1,7 +1,7 @@
 
 === Trust Verification Report (wrapping_refutation_release_identity) ===
 
-note: Trust verification: 0 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked out of 1 obligation(s)
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
   --> $DIR/wrapping_refutation_release_identity.rs:64:1
    |
 LL | / pub fn signed_literal_roundtrip(x: i32) {
@@ -9,46 +9,9 @@ LL | |     assert!(x.wrapping_add(1).wrapping_sub(1) == x);
 LL | | }
    | |_^
    |
-   = note: [assert] runtime-checked: solver trust-full-verifier reported Proved without exact kernel/native proof authority
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
-warning: Trust Level 0 safety verification incomplete for `wrapping_refutation_release_identity::signed_literal_roundtrip`: 1 obligation(s) were not proved
-  --> $DIR/wrapping_refutation_release_identity.rs:64:1
-   |
-LL | / pub fn signed_literal_roundtrip(x: i32) {
-LL | |     assert!(x.wrapping_add(1).wrapping_sub(1) == x);
-LL | | }
-   | |_^
-   |
-   = note: this run uses an explicit nonfatal Trust policy: Level 0 obligations are reported without proof credit
-   = note: Level 0 summary: 0 failed, 0 unknown or timed out, 1 runtime-checked, 0 skipped
-   = note: native verifier status: Proved; requested=1, proved=1, failed=0, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
-
-warning: Trust verification advisory for `wrapping_refutation_release_identity::signed_literal_roundtrip`: 1 obligation(s) were not fully verified
-  --> $DIR/wrapping_refutation_release_identity.rs:64:1
-   |
-LL | / pub fn signed_literal_roundtrip(x: i32) {
-LL | |     assert!(x.wrapping_add(1).wrapping_sub(1) == x);
-LL | | }
-   | |_^
-   |
-   = note: every unproved obligation here either keeps the runtime check rustc already emits or reports a defined IEEE-754 outcome (infinity/NaN, never panic or UB), so the compiled program has vanilla Rust semantics; reported rather than failed under the default policy. `-Z trust-policy=certify` demands full static discharge and fails on these
-   = note: summary: 0 trusted, 0 certified, 0 failed, 1 unknown, 0 runtime-checked, 0 skipped out of 1
-   = note: native proof-authority validation failed: vc:wrapping_refutation_release_identity__signed_literal_roundtrip:assertion:panic-freedom:0 was grounded by the compiler but its exact grounded row is absent, changed, or lacks private proof authority
-   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
-   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
-   = note: native full verifier status: Proved; requested=1, proved=1, failed=0, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=2
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:$DIGEST
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=2 elapsed_ms=$TIME worker_threads=unbounded
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__signed_literal_roundtrip:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__signed_literal_roundtrip:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__signed_literal_roundtrip:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__signed_literal_roundtrip:assertion:panic-freedom:0`: native trust_mc typed CHC/PDR proof accepted from a live opaque native-bundle authority, with exact typed-CHC/request binding and digest-backed artifacts; the serialized transport remains diagnostic-only
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__signed_literal_roundtrip:assertion:panic-freedom:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::pdr-proof, request_id=1, proof_id=Some(1), native_id=trust_ir-native-trust_mc-request-1-proof-1, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__signed_literal_roundtrip:assertion:panic-freedom:0`: private acyclic direct-SMT exhaustive derivation found a COMPLETE-encoding obligation SAFE; public ChcValidity evidence remains a candidate
-
-note: Trust verification: 0 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked out of 1 obligation(s)
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
   --> $DIR/wrapping_refutation_release_identity.rs:68:1
    |
 LL | / pub fn usize_roundtrip(x: usize, n: usize) {
@@ -56,43 +19,4 @@ LL | |     assert!(x.wrapping_add(n).wrapping_sub(n) == x);
 LL | | }
    | |_^
    |
-   = note: [assert] runtime-checked: solver trust-full-verifier reported Proved without exact kernel/native proof authority
-
-warning: Trust Level 0 safety verification incomplete for `wrapping_refutation_release_identity::usize_roundtrip`: 1 obligation(s) were not proved
-  --> $DIR/wrapping_refutation_release_identity.rs:68:1
-   |
-LL | / pub fn usize_roundtrip(x: usize, n: usize) {
-LL | |     assert!(x.wrapping_add(n).wrapping_sub(n) == x);
-LL | | }
-   | |_^
-   |
-   = note: this run uses an explicit nonfatal Trust policy: Level 0 obligations are reported without proof credit
-   = note: Level 0 summary: 0 failed, 0 unknown or timed out, 1 runtime-checked, 0 skipped
-   = note: native verifier status: Proved; requested=1, proved=1, failed=0, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
-
-warning: Trust verification advisory for `wrapping_refutation_release_identity::usize_roundtrip`: 1 obligation(s) were not fully verified
-  --> $DIR/wrapping_refutation_release_identity.rs:68:1
-   |
-LL | / pub fn usize_roundtrip(x: usize, n: usize) {
-LL | |     assert!(x.wrapping_add(n).wrapping_sub(n) == x);
-LL | | }
-   | |_^
-   |
-   = note: every unproved obligation here either keeps the runtime check rustc already emits or reports a defined IEEE-754 outcome (infinity/NaN, never panic or UB), so the compiled program has vanilla Rust semantics; reported rather than failed under the default policy. `-Z trust-policy=certify` demands full static discharge and fails on these
-   = note: summary: 0 trusted, 0 certified, 0 failed, 1 unknown, 0 runtime-checked, 0 skipped out of 1
-   = note: native proof-authority validation failed: vc:wrapping_refutation_release_identity__usize_roundtrip:assertion:panic-freedom:0 was grounded by the compiler but its exact grounded row is absent, changed, or lacks private proof authority
-   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
-   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
-   = note: native full verifier status: Proved; requested=1, proved=1, failed=0, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
-   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=2
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
-   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:$DIGEST
-   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=2 elapsed_ms=$TIME worker_threads=unbounded
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__usize_roundtrip:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__usize_roundtrip:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__usize_roundtrip:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__usize_roundtrip:assertion:panic-freedom:0`: native trust_mc typed CHC/PDR proof accepted from a live opaque native-bundle authority, with exact typed-CHC/request binding and digest-backed artifacts; the serialized transport remains diagnostic-only
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__usize_roundtrip:assertion:panic-freedom:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::pdr-proof, request_id=1, proof_id=Some(1), native_id=trust_ir-native-trust_mc-request-1-proof-1, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
-   = note: native full verifier evidence `vc:wrapping_refutation_release_identity__usize_roundtrip:assertion:panic-freedom:0`: private acyclic direct-SMT exhaustive derivation found a COMPLETE-encoding obligation SAFE; public ChcValidity evidence remains a candidate
-
-warning: 4 warnings emitted
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)

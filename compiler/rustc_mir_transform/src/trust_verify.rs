@@ -18187,6 +18187,89 @@ fn refute_full_assert_obligations(
         }
     }
 
+    // Trust: PER-PATH REFUTE-ONLY fallback (`trust_vcgen::per_path_refute`).
+    //
+    // The bidirectional lane above DECLINES any panic block whose feasibility
+    // formula carries a loop-carried value: the CFG-wide intersection leaves
+    // that value free, the formula is ungrounded, and the assert is skipped. So
+    // `while i < 4 { assert!(n != i); … }` — which panics for every `n` in
+    // `0..4` — produces no row at all.
+    //
+    // The per-path lane instead symbolically executes ENUMERATED ACYCLIC PATHS,
+    // resolving every read to the value written on THAT path. That formula
+    // UNDER-approximates, which flips the direction of every verdict:
+    //
+    //   * SAT is a WITNESS — a concrete input that drives execution down a
+    //     concrete block sequence into the panic. Sound, and stronger than the
+    //     usual SAT (nothing was over-approximated, so nothing can be spurious).
+    //   * UNSAT is NOT A PROOF — the enumeration stops at the first repeated
+    //     block, so every execution past a back edge is simply absent from the
+    //     formula. Reading it as a proof would be a false proof of exactly the
+    //     iterations the enumeration skipped.
+    //
+    // That asymmetry is NOT enforced by discipline here. `RefuteOnlyVc` never
+    // yields an owned VC, its `refute_with` consumes the raw solver result
+    // internally, and `RefuteOnlyOutcome::NoRefutation` is payload-free — a
+    // solver `Proved` and a solver `Unknown` arrive as the byte-identical value.
+    // There is no expression in this function that can turn a per-path query
+    // into a `Proved` row.
+    //
+    // GATING: this runs only when the SOUND bidirectional lane decided NOTHING
+    // for this function (no refutation, no proof). It therefore cannot perturb
+    // any function that lane already decides — in particular it cannot touch the
+    // grounded-catch-all discharge below, which fires only on `!proved_vcs
+    // .is_empty()`. A refutation found here makes `refuted > 0`, which keeps the
+    // whole-function panic-freedom catch-all open, exactly as a refutation from
+    // the bidirectional lane does.
+    if refuted_vcs.is_empty() && proved_vcs.is_empty() {
+        let per_path =
+            trust_vcgen::generate_per_path_assert_refutation_vcs_with_context(func, vcgen_context);
+        // At most ONE refutation per panic block, mirroring the bidirectional
+        // lane's one-row-per-block shape (the failed-rekey pairing downstream
+        // matches refutation COUNT against native duplicate count per span).
+        let mut refuted_blocks: FxHashSet<trust_types::BlockId> = FxHashSet::default();
+        for candidate in per_path {
+            let block = candidate.provenance().panic_block();
+            if refuted_blocks.contains(&block) {
+                continue;
+            }
+            let Some(timeout_ms) = remaining_solver_timeout_ms(
+                vc_timeout_ms(sess),
+                deadline,
+                std::time::Instant::now(),
+            ) else {
+                break;
+            };
+            let location = candidate.location().clone();
+            let outcome =
+                candidate.refute_with(trust_types::Symbol::intern("trust-perpath-refute"), |q| {
+                    let ay = trust_router::Router::deterministic_in_process_ay(timeout_ms);
+                    ay.verify_all_with_deadline(std::slice::from_ref(q), deadline)
+                        .into_iter()
+                        .next()
+                        .map(|(_, res)| res)
+                });
+            match outcome {
+                trust_types::RefuteOnlyOutcome::Refuted { vc, result, provenance } => {
+                    if debug {
+                        eprintln!(
+                            "[ASSERT_REFUTE] PER-PATH REFUTED {:?} @ {location:?} via {provenance:?}",
+                            vc.kind
+                        );
+                    }
+                    refuted_blocks.insert(block);
+                    refuted_vcs.push((vc, result));
+                }
+                // NOT a proof and NOT an unknown: the absence of a witness on
+                // the enumerated paths. It contributes nothing — in particular
+                // it does not touch `left_unknown`, so a function this lane
+                // cannot model is left exactly as the bidirectional lane left
+                // it.
+                trust_types::RefuteOnlyOutcome::NoRefutation => {}
+            }
+        }
+    }
+
     // A genuine reachable assert/panic is a real violation: always surface it.
     let refuted = refuted_vcs.len() as u32;
     for entry in refuted_vcs {
@@ -23788,6 +23871,13 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
     // three consumers spent the resulting verdict (probes Y1/Y4/Y5). Cleared where
     // that walk cannot decide; conjunct 4 of `bundle_census_is_axiom_free`.
     let mut const_memory_reads_complete = true;
+    // Trust (assumption-root gate): the TRANSITIVE half of the pointer hop. Round 4
+    // resolved a reified `fn` pointer to a DefId and read that DefId's ATTRIBUTES,
+    // but never that DefId's own value mentions, so an axiom behind a SECOND hop
+    // was censused nowhere — MEASURED as a clean build that panics; see
+    // `follow_user_axiom_pointer_hop`. Cleared where the hop cannot be read;
+    // conjunct 5 of `bundle_census_is_axiom_free`.
+    let mut pointer_hop_reads_complete = true;
     collect_expected_absent_callees(
         tcx,
         body,
@@ -23798,6 +23888,7 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
         &mut compiler_total,
         &mut user_axiom_keys,
         &mut const_memory_reads_complete,
+        &mut pointer_hop_reads_complete,
     );
     collect_structural_drop_adts(tcx, body, &mut structural_drop);
     // Trust: NEVER query `optimized_mir` for a closure member whose peek would form an
@@ -23853,6 +23944,7 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
             &mut compiler_total,
             &mut user_axiom_keys,
             &mut const_memory_reads_complete,
+            &mut pointer_hop_reads_complete,
         );
         collect_structural_drop_adts(tcx, callee_body, &mut structural_drop);
         if let Some(certificate) = paired_condvar_certificate.as_deref() {
@@ -23886,6 +23978,7 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
         &assumed_total,
         bundled_def_id_reads_complete,
         const_memory_reads_complete,
+        pointer_hop_reads_complete,
     );
     record_verdict_axiom_freedom(tcx.sess, caller_def_id, axiom_free);
     if std::env::var_os("TRUST_DYN_RELIANCE_PROBE").is_some() {
@@ -23893,6 +23986,7 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
             "TRUST_DYN_RELIANCE_PROBE: axiom census root={} axiom_free={axiom_free} \
              (defid_walk_members={}, defid_reads_complete={bundled_def_id_reads_complete}, \
              const_memory_reads_complete={const_memory_reads_complete}, \
+             pointer_hop_reads_complete={pointer_hop_reads_complete}, \
              user_axiom_keys={}, assumed_total={}, expected_absent={})",
             tcx.def_path_str(caller_def_id),
             bundled_def_ids.len(),
@@ -24692,6 +24786,13 @@ fn insert_user_axiom_absent_call_identity(
 ///    vtable, a deallocated id, or its step budget). Kept as its OWN flag rather
 ///    than folded into 3, because 3's declaration carries a hard-won and still
 ///    accurate scope statement about the DefId walk that this must not blur.
+/// 5. `pointer_hop_reads_complete == false` — the census resolved a REIFIED
+///    function pointer to a `DefId` whose own value mentions it could not read
+///    (no MIR, a stolen body with no snapshot, or the hop fuel). Its own flag for
+///    the same reason 4 is: the hop walk's scope statement is on
+///    [`follow_user_axiom_pointer_hop`] and must not be blurred into either of the
+///    two above. MEASURED to be load-bearing, unlike the four dead arms of 4 —
+///    see that function for the two-hop program that verified clean and panicked.
 ///
 /// This list is what the function CHECKS. It is not a claim that a user axiom has
 /// no other route into a verdict — three rounds have each found a route the
@@ -24708,6 +24809,7 @@ fn bundle_census_is_axiom_free(
     assumed_total: &FxHashSet<String>,
     bundled_def_id_reads_complete: bool,
     const_memory_reads_complete: bool,
+    pointer_hop_reads_complete: bool,
 ) -> bool {
     #[allow(rustc::potential_query_instability)]
     let every_bridge_axiom_was_censused =
@@ -24716,6 +24818,7 @@ fn bundle_census_is_axiom_free(
         && every_bridge_axiom_was_censused
         && bundled_def_id_reads_complete
         && const_memory_reads_complete
+        && pointer_hop_reads_complete
 }
 
 /// Trust (assumption-root gate): census every `#[trust::assume_total]` /
@@ -24745,22 +24848,80 @@ fn bundle_census_is_axiom_free(
 /// that memory holds, which is what closes `static TABLE: [fn(); 1] = [boom];
 /// (TABLE[0])()` — see [`census_user_axioms_in_constant_memory`] for that half,
 /// including the three places it cannot decide and fails closed.
+///
+/// SINCE ROUND 6 THE POINTER HOP IS TRANSITIVE. Round 4 resolved a reified pointer
+/// to a `DefId` and read that `DefId`'s ATTRIBUTES, and stopped; an axiom behind a
+/// SECOND hop was censused nowhere and a `#[trust::assume_total]` verdict
+/// discharged a caller whose ledger showed nothing. That was MEASURED as a clean
+/// build that panics — the reproducer, the fuel, the visited set and the three
+/// fail-closed arms are on [`follow_user_axiom_pointer_hop`], which also states
+/// why a DIRECT call operand is deliberately NOT a hop.
 fn collect_user_axiom_value_mentions<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     user_axiom_keys: &mut FxHashSet<String>,
     const_memory_reads_complete: &mut bool,
+    pointer_hop_reads_complete: &mut bool,
 ) {
-    struct Scan<'a, 'tcx> {
+    let mut census = UserAxiomPointerHopCensus {
+        user_axiom_keys,
+        const_memory_reads_complete,
+        pointer_hop_reads_complete,
+        visited: FxHashSet::default(),
+        fuel: TRUST_USER_AXIOM_POINTER_HOP_FUEL,
+    };
+    census.visited.insert(body.source.def_id());
+    scan_body_for_user_axiom_value_mentions(tcx, body, &mut census);
+}
+
+/// Trust (assumption-root gate): the state the transitive pointer-hop census
+/// carries across bodies — see [`follow_user_axiom_pointer_hop`].
+struct UserAxiomPointerHopCensus<'a> {
+    user_axiom_keys: &'a mut FxHashSet<String>,
+    const_memory_reads_complete: &'a mut bool,
+    pointer_hop_reads_complete: &'a mut bool,
+    /// Every `DefId` whose body this walk has already entered, INCLUDING the body
+    /// the walk was seeded with. A reified-pointer graph may be cyclic
+    /// (`fn a() { let f: fn() = b; f() } fn b() { let f: fn() = a; f() }`), so
+    /// this is what makes the walk terminate on a cycle; the fuel below is what
+    /// bounds it on an acyclic but wide one.
+    visited: FxHashSet<DefId>,
+    fuel: u32,
+}
+
+/// A hard bound on how many bodies ONE seeded pointer-hop census reads beyond the
+/// body it was handed. Reaching it is NOT a silent truncation: the walk clears
+/// `pointer_hop_reads_complete` and the bundle's verdict becomes unspendable,
+/// exactly as an unreadable hop target does.
+const TRUST_USER_AXIOM_POINTER_HOP_FUEL: u32 = 256;
+
+/// Trust (assumption-root gate): run the value-mention scan over ONE body,
+/// recursing at every REIFIED function-pointer mention.
+///
+/// Split out from [`collect_user_axiom_value_mentions`] so the recursion has a
+/// seam that carries the shared visited set and fuel; the caller's entry point
+/// keeps its signature and its per-body seeding.
+fn scan_body_for_user_axiom_value_mentions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    census: &mut UserAxiomPointerHopCensus<'_>,
+) {
+    struct Scan<'a, 'b, 'tcx> {
         tcx: TyCtxt<'tcx>,
-        user_axiom_keys: &'a mut FxHashSet<String>,
-        const_memory_reads_complete: &'a mut bool,
+        census: &'a mut UserAxiomPointerHopCensus<'b>,
         // rustc's OWN condition for "evaluating a static here may cycle", copied
         // from `rustc_middle::mir::pretty::write_allocations`: risky only while
         // looking at an early-phase body that is itself a const context.
         static_eval_may_cycle: bool,
+        // The callee `DefId` of every `Call`/`TailCall` terminator in THIS body.
+        // A `Terminator::Call`'s `func` is an ordinary `Operand`, so the visitor
+        // below sees it exactly like a reification — and following it would turn
+        // this census into a whole-call-graph walk. It is deliberately NOT
+        // followed; see `follow_user_axiom_pointer_hop` for why a DIRECT callee
+        // needs no hop and what carries it instead.
+        direct_call_targets: FxHashSet<DefId>,
     }
-    impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for Scan<'_, 'tcx> {
+    impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for Scan<'_, '_, 'tcx> {
         fn visit_operand(
             &mut self,
             operand: &Operand<'tcx>,
@@ -24776,17 +24937,39 @@ fn collect_user_axiom_value_mentions<'tcx>(
                     // The same spelling the call-operand census uses, so a body that
                     // both calls and reifies one axiom contributes one key and the
                     // `assumed_total` subset cross-check still lines up.
-                    self.user_axiom_keys
+                    self.census
+                        .user_axiom_keys
                         .insert(trust_mir_extract::func_operand_name(self.tcx, operand));
+                    // The bundle is already unspendable on conjunct 1; reading this
+                    // target's own body could only add keys to a set that is
+                    // checked for EMPTINESS.
+                    return;
                 }
+                if !self.direct_call_targets.contains(&def_id) {
+                    follow_user_axiom_pointer_hop(self.tcx, def_id, self.census);
+                }
+                return;
+            }
+            // A NON-CAPTURING closure coerced to `fn()` is the SAME hop wearing a
+            // different type: the cast is `ClosureFnPointer` and the operand is a
+            // ZST constant of type `ty::Closure`, so the `ty::FnDef` arm above
+            // never matched it. MEASURED to be a live instance of this exact
+            // exploit on pristine main — `probe/hop3.rs`, `let f: fn() = || boom();
+            // f();` in `write_str`, published `axiom_free=true` for `write_str`
+            // with `user_axiom_keys=0` and built rc=0, while the closure's OWN
+            // census in the same compilation read `axiom_free=false,
+            // user_axiom_keys=1`. A closure carries no `#[trust::assume_total]`
+            // declaration of its own, so there is no attribute arm here — only the
+            // hop into its body.
+            if let ty::Closure(def_id, _) = *constant.const_.ty().kind() {
+                follow_user_axiom_pointer_hop(self.tcx, def_id, self.census);
                 return;
             }
             census_user_axioms_in_constant_memory(
                 self.tcx,
                 constant,
                 self.static_eval_may_cycle,
-                self.user_axiom_keys,
-                self.const_memory_reads_complete,
+                self.census,
             );
         }
     }
@@ -24797,9 +24980,95 @@ fn collect_user_axiom_value_mentions<'tcx>(
             .def_id()
             .as_local()
             .is_some_and(|local| tcx.hir_body_const_context(local).is_some());
-    let mut scan =
-        Scan { tcx, user_axiom_keys, const_memory_reads_complete, static_eval_may_cycle };
+    let mut direct_call_targets = FxHashSet::default();
+    for block in body.basic_blocks.iter() {
+        if let TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } =
+            &block.terminator().kind
+            && let Some((callee_def_id, _)) = func.const_fn_def()
+        {
+            direct_call_targets.insert(callee_def_id);
+        }
+    }
+    let mut scan = Scan { tcx, census, static_eval_may_cycle, direct_call_targets };
     rustc_middle::mir::visit::Visitor::visit_body(&mut scan, body);
+}
+
+/// Trust (assumption-root gate): the POINTER HOP made transitive.
+///
+/// WHY IT EXISTS — MEASURED, on pristine main `a27d636271` (the compiler that had
+/// the one-hop value-mention census and the constant-memory walk, but resolved a
+/// function pointer to a `DefId` without reading that `DefId`'s own value
+/// mentions). Two programs, identical but for the number of hops:
+///
+/// ```text
+/// hop1.rs  <Sink as Write>::write_str reifies `boom` directly
+///          -> axiom_free=false, user_axiom_keys=1, rc=1   (refused, correct)
+/// hop2.rs  <Sink as Write>::write_str reifies `mid`;
+///          `mid` reifies the `#[trust::assume_total] fn boom() { panic!() }`
+///          -> axiom_free=TRUE, user_axiom_keys=0, rc=0    (VERIFIES CLEAN)
+/// ```
+///
+/// `t_hop2::go` builds clean and panics when run: `write!` reaches `write_str`,
+/// which calls the reified `mid`, which calls the reified `boom`. The census
+/// recorded `root=mid axiom_free=false` in the same compilation — it SAW the
+/// axiom while censusing `mid` itself — and still published `axiom_free=true` for
+/// `write_str`, because `mid` is reached through a pointer and is therefore not a
+/// member of `write_str`'s `bundled_def_ids` (`defid_walk_members=1`).
+///
+/// WHAT IS FOLLOWED, and what deliberately is NOT. A `ty::FnDef` or `ty::Closure`
+/// mention that is not the `func` operand of a `Call`/`TailCall` in the same body,
+/// plus every `GlobalAlloc::Function` the constant-memory walk reaches. That exclusion is not
+/// an optimization, it is the SAME argument the DefId walk already rests on and
+/// that is stated at `bundled_def_id_reads_complete`: a DIRECT call to a body the
+/// bundle did not walk still reaches the bridge as an ordinary absent callee, gets
+/// no assumption marker, and the resulting unproved row refuses the caller before
+/// the shared bar's conjunct 5 is consulted. An INDIRECT call through a reified
+/// pointer produces no named callee and therefore no such row — which is the whole
+/// reason the value-mention census exists — so the hop is exactly where the
+/// transitive obligation lives. Following call operands as well would turn this
+/// into a whole-call-graph walk and would decline on every MIR-less `std` callee.
+///
+/// FAIL CLOSED, in three places, all of which clear `pointer_hop_reads_complete`
+/// (conjunct 5 of [`bundle_census_is_axiom_free`]):
+///
+/// 1. the hop target has no MIR in this compilation (`!is_mir_available`) — its
+///    value mentions are not knowable here;
+/// 2. the target's `optimized_mir` would form an E0391 cycle and it has no
+///    pre-steal snapshot (the same degradation the DefId walk takes);
+/// 3. [`TRUST_USER_AXIOM_POINTER_HOP_FUEL`] is exhausted.
+///
+/// An UNEXPLORED hop is "not established", never "clean". Note the direction this
+/// costs in: clearing the flag can only make a verdict unspendable as another
+/// body's premise. It cannot fail the body itself, and it cannot mint a discharge.
+fn follow_user_axiom_pointer_hop<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    census: &mut UserAxiomPointerHopCensus<'_>,
+) {
+    if !census.visited.insert(def_id) {
+        return;
+    }
+    if census.fuel == 0 {
+        *census.pointer_hop_reads_complete = false;
+        return;
+    }
+    census.fuel -= 1;
+    if !tcx.is_mir_available(def_id) {
+        *census.pointer_hop_reads_complete = false;
+        return;
+    }
+    let body = if optimized_mir_query_would_cycle(tcx, def_id) {
+        match def_id.as_local().and_then(|local| tcx.mir_for_trust_verification(local)) {
+            Some(body) => body,
+            None => {
+                *census.pointer_hop_reads_complete = false;
+                return;
+            }
+        }
+    } else {
+        tcx.optimized_mir(def_id)
+    };
+    scan_body_for_user_axiom_value_mentions(tcx, body, census);
 }
 
 /// A hard step budget for the constant-memory walk. Reaching it is NOT a silent
@@ -24881,9 +25150,16 @@ fn census_user_axioms_in_constant_memory<'tcx>(
     tcx: TyCtxt<'tcx>,
     constant: &rustc_middle::mir::ConstOperand<'tcx>,
     static_eval_may_cycle: bool,
-    user_axiom_keys: &mut FxHashSet<String>,
-    const_memory_reads_complete: &mut bool,
+    census: &mut UserAxiomPointerHopCensus<'_>,
 ) {
+    let const_memory_reads_complete = &mut *census.const_memory_reads_complete;
+    let user_axiom_keys = &mut *census.user_axiom_keys;
+    // Every function pointer this walk finds is BY CONSTRUCTION a reified one —
+    // constant memory holds no `Call` terminator — so each is a pointer hop and
+    // is followed, subject to the same fuel and fail-closed arms as the
+    // value-mention half. Collected first and followed after the BFS so the
+    // recursion does not run while `census`'s two fields are reborrowed here.
+    let mut hop_targets: Vec<DefId> = Vec::new();
     use rustc_middle::mir::interpret::GlobalAlloc;
     use rustc_middle::mir::{Const, ConstValue};
 
@@ -24908,7 +25184,7 @@ fn census_user_axioms_in_constant_memory<'tcx>(
         steps += 1;
         if steps > TRUST_CONST_MEMORY_CENSUS_STEP_BUDGET {
             *const_memory_reads_complete = false;
-            return;
+            break;
         }
         let Some(global) = tcx.try_get_global_alloc(id) else {
             *const_memory_reads_complete = false;
@@ -24921,6 +25197,8 @@ fn census_user_axioms_in_constant_memory<'tcx>(
                     || item_has_trust_attr(tcx, def_id, "assume_total")
                 {
                     user_axiom_keys.insert(trust_mir_extract::safe_def_path_str(tcx, def_id));
+                } else {
+                    hop_targets.push(def_id);
                 }
                 continue;
             }
@@ -24963,6 +25241,9 @@ fn census_user_axioms_in_constant_memory<'tcx>(
                 todo.push(next);
             }
         }
+    }
+    for def_id in hop_targets {
+        follow_user_axiom_pointer_hop(tcx, def_id, census);
     }
 }
 
@@ -25015,12 +25296,22 @@ fn collect_expected_absent_callees<'tcx>(
     // itself, so a body whose constants could not be followed cannot be reached
     // without the flag being cleared too.
     const_memory_reads_complete: &mut bool,
+    // Trust (assumption-root gate): did the TRANSITIVE pointer-hop walk read every
+    // reified target it resolved? Cleared where it cannot — see
+    // `follow_user_axiom_pointer_hop`. Rides the same seam as the census itself.
+    pointer_hop_reads_complete: &mut bool,
 ) {
     // Trust (assumption-root gate): census the VALUE mentions of a user axiom
     // before the call walk. Called from HERE rather than from the caller's two
     // walk sites so the census and the bridge-set collection can never come to
     // cover different bodies — the caller has one seam, and both halves ride it.
-    collect_user_axiom_value_mentions(tcx, body, user_axiom_keys, const_memory_reads_complete);
+    collect_user_axiom_value_mentions(
+        tcx,
+        body,
+        user_axiom_keys,
+        const_memory_reads_complete,
+        pointer_hop_reads_complete,
+    );
     let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
     for block in body.basic_blocks.iter() {
         let (func, _) = match &block.terminator().kind {

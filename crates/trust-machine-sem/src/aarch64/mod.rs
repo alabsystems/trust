@@ -1191,7 +1191,10 @@ impl Aarch64Semantics {
         let result = if imms >= immr {
             let field_width = imms - immr + 1;
             let extracted = Formula::BvExtract { inner: Box::new(rn), high: imms, low: immr };
-            let ext_full = Formula::BvZeroExt(Box::new(extracted), width);
+            // AMOUNT, not target width: `BvExtract { high: imms, low: immr }` is
+            // `field_width` bits, so reaching `width` needs the difference.
+            let ext_full =
+                Formula::BvZeroExt(Box::new(extracted), width.saturating_sub(field_width));
             // Mask: clear bits [field_width-1:0] in existing.
             let field_mask = (1i128 << field_width) - 1;
             let width_mask: i128 = if width == 64 { -1i128 } else { (1i128 << width) - 1 };
@@ -1394,7 +1397,9 @@ impl Aarch64Semantics {
             let word_val =
                 Formula::BvExtract { inner: Box::new(rn.clone()), high: base + 31, low: base };
             let reversed = reverse_bytes(&word_val, 32, 32);
-            let ext = Formula::BvZeroExt(Box::new(reversed), width);
+            // AMOUNT, not target width: `reversed` is a 32-bit word, so reaching
+            // `width` needs `width - 32`. Passing `width` denoted BitVec(32+width).
+            let ext = Formula::BvZeroExt(Box::new(reversed), width - 32);
             if base > 0 {
                 let shifted = Formula::BvShl(
                     Box::new(ext),
@@ -1909,8 +1914,11 @@ fn extract_atomic_reg_mem(insn: &Instruction) -> Result<(u8, u32, &MemoryOperand
 /// Write to a register or the stack pointer.
 fn write_reg_or_sp(index: u8, is_sp: bool, width: u32, value: Formula) -> Effect {
     if is_sp {
-        // SP write: zero-extend to 64 bits if width < 64.
-        let val64 = if width < 64 { Formula::BvZeroExt(Box::new(value), 64) } else { value };
+        // SP write: zero-extend to 64 bits if width < 64. AMOUNT, not target
+        // width — `value` is `width` bits, so the amount is `64 - width`.
+        // Passing 64 denoted BitVec(width + 64).
+        let val64 =
+            if width < 64 { Formula::BvZeroExt(Box::new(value), 64 - width) } else { value };
         Effect::SpWrite { value: val64 }
     } else {
         Effect::RegWrite { index, width, value }
@@ -2685,6 +2693,79 @@ mod tests {
 
     fn decode(enc: u32) -> Instruction {
         decode_aarch64(&enc.to_le_bytes(), 0x1000).expect("decode AArch64 instruction")
+    }
+
+    /// EVERY formula an AArch64 instruction produces must be WELL-SORTED.
+    ///
+    /// Nothing on this path sort-checks, which is exactly why seven instances of
+    /// one mistake shipped: `Formula::BvZeroExt`'s second field is the extension
+    /// AMOUNT (`check_formula_sort` returns `BitVec(inner + extra)`, and the
+    /// printer emits SMT-LIB `((_ zero_extend n) ..)`), but seven sites passed
+    /// the TARGET WIDTH, so a 32-bit value "extended to 64" denoted `BitVec(96)`.
+    ///
+    /// This is a general guard, not a per-bug assertion: any future site that
+    /// confuses an amount for a width fails here regardless of which instruction
+    /// introduces it. The identical defect in `trust-lift`'s `byte_load_formula`
+    /// is pinned by its own sort check (commit ebe5b0ef95).
+    #[test]
+    fn every_effect_formula_is_well_sorted() {
+        // (encoding, mnemonic) — each exercises a width-changing path.
+        let words: &[(u32, &str)] = &[
+            (0xDAC0_0820, "rev32 x0, x1"),
+            (0xDAC0_0C20, "rev x0, x1"),
+            (0x3300_1C20, "bfi w0, w1, #0, #8"),
+            (0xB340_1C20, "bfi x0, x1, #0, #8"),
+            (0x1100_041F, "add wsp, w0, #1"),
+            (0x9100_07FF, "add sp, sp, #1"),
+            (0x8B01_0020, "add x0, x1, x1"),
+            (0x0B01_0020, "add w0, w1, w1"),
+            (0xD280_0020, "mov x0, #1"),
+            (0xF900_0020, "str x0, [x1]"),
+            (0xB900_0020, "str w0, [x1]"),
+            (0x3900_0020, "strb w0, [x1]"),
+            (0xF940_0020, "ldr x0, [x1]"),
+            (0xB940_0020, "ldr w0, [x1]"),
+            (0x3940_0020, "ldrb w0, [x1]"),
+            (0xB980_0020, "ldrsw x0, [x1]"),
+        ];
+
+        for (encoding, mnemonic) in words {
+            let Ok(insn) = decode_aarch64(&encoding.to_le_bytes(), 0x1000) else { continue };
+            let state = MachineState::symbolic();
+            // Instructions this semantics deliberately refuses are not a failure
+            // here — only a formula it DOES build and mis-sorts is.
+            let Ok(effects) = Aarch64Semantics.effects(&state, &insn) else { continue };
+            for effect in &effects {
+                for (label, formula) in effect_formulas(effect) {
+                    let sort = trust_types::check_formula_sort(formula);
+                    assert!(
+                        sort.is_ok(),
+                        "{mnemonic} (0x{encoding:08x}) produced an ill-sorted {label}: \
+                         {sort:?}\n  formula: {formula:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every `Formula` an `Effect` carries, with a label for diagnostics.
+    fn effect_formulas(effect: &Effect) -> Vec<(&'static str, &Formula)> {
+        match effect {
+            Effect::RegWrite { value, .. } => vec![("RegWrite.value", value)],
+            Effect::SpWrite { value } => vec![("SpWrite.value", value)],
+            Effect::PcUpdate { value } => vec![("PcUpdate.value", value)],
+            Effect::MemWrite { address, value, .. } => {
+                vec![("MemWrite.address", address), ("MemWrite.value", value)]
+            }
+            Effect::MemRead { address, .. } => vec![("MemRead.address", address)],
+            Effect::FlagUpdate { n, z, c, v } => vec![
+                ("FlagUpdate.n", n),
+                ("FlagUpdate.z", z),
+                ("FlagUpdate.c", c),
+                ("FlagUpdate.v", v),
+            ],
+            _ => vec![],
+        }
     }
 
     fn fallthrough_insn_with_opcode(encoding: u32, opcode: Opcode) -> Instruction {

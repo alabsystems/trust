@@ -107,7 +107,7 @@
       "the fault log, not a list of plausible errors."
     ],
     "corpus": "selftest.s, assembled by clang, 99 words x 3 profiles",
-    "corpus_digest": "0x0641645668b3f5fd",
+    "corpus_digest": "0x1b1051355a93252c",
     "corpus_coverage_floor": 253,
     "corpus_opcodes": 47,
     "caught": {
@@ -115,11 +115,11 @@
       "fp-write-to-gpr": 29,
       "drop-flag-update": 20,
       "swap-carry-overflow": 9,
-      "perturb-reg-value": 164,
-      "wrong-dest-reg": 165,
+      "perturb-reg-value": 170,
+      "wrong-dest-reg": 167,
       "drop-mem-write": 12,
       "perturb-fp-value": 29,
-      "perturb-pc-target": 238
+      "perturb-pc-target": 244
     }
   },
   "tiers": {
@@ -135,24 +135,16 @@
       "selector": "--words population-fast.txt",
       "population_words": 17194,
       "population_digest": "0x61abe53eafdf964b",
-      "coverage_floor": 47323,
-      "compared_observed": 46146,
+      "coverage_floor": 47320,
+      "compared_observed": 46159,
       "x18_excluded": 1161,
       "opcodes_floor": 94,
-      "mismatches": 3806,
+      "mismatches": 0,
       "scan_s": 0.0,
-      "sweep_s": 18.2,
-      "known_mismatch_opcodes": [
-        "Fcmp",
-        "Fcvt",
-        "Fcvtzs",
-        "Fcvtzu",
-        "FmovImm",
-        "Fsqrt",
-        "Scvtf",
-        "Ucvtf"
-      ],
-      "timeout_excluded": 16
+      "sweep_s": 1.2,
+      "known_mismatch_opcodes": [],
+      "timeout_excluded": 0,
+      "known_mismatch_counts": {}
     },
     "full": {
       "_comment": [
@@ -163,26 +155,18 @@
       ],
       "cap": 3000,
       "selector": "--stratify 3000",
-      "population_words": 215890,
-      "population_digest": "0x88e3922eb48babbe",
-      "coverage_floor": 590866,
-      "compared_observed": 576460,
-      "x18_excluded": 14230,
-      "opcodes_floor": 94,
-      "mismatches": 9725,
-      "scan_s": 210.8,
-      "sweep_s": 105.4,
-      "known_mismatch_opcodes": [
-        "Fcmp",
-        "Fcvt",
-        "Fcvtzs",
-        "Fcvtzu",
-        "FmovImm",
-        "Fsqrt",
-        "Scvtf",
-        "Ucvtf"
-      ],
-      "timeout_excluded": 176
+      "population_words": 216037,
+      "population_digest": "0x306d9b1eee53ee79",
+      "coverage_floor": 591298,
+      "compared_observed": 577066,
+      "x18_excluded": 14232,
+      "opcodes_floor": 95,
+      "mismatches": 0,
+      "scan_s": 7.1,
+      "sweep_s": 7.9,
+      "known_mismatch_opcodes": [],
+      "timeout_excluded": 0,
+      "known_mismatch_counts": {}
     }
   },
   "blind_spot_ledger": {

@@ -88,6 +88,11 @@ pub use verifier_api::{
 };
 #[cfg(feature = "trust-mc-core-types")]
 pub use verifier_api::trust_mc_full_verification_verdict_metadata_entry;
+// targo-trust doctor: canonical one-obligation typed-CHC smoke request for the
+// in-process trust-mc suite. Construction only — verification of the returned
+// bundle goes through the public validated `verify_with_context` boundary.
+#[cfg(feature = "trust-mc-core-types")]
+pub use verifier_api::{DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID, doctor_smoke_bundle};
 #[cfg(feature = "trust-mc-native-solver")]
 pub use verifier_api::{
     FreshExactDirectChcPdrBundleSeal, FreshExactDirectChcPdrDispatch,

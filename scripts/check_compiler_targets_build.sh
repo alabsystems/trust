@@ -70,10 +70,53 @@ echo "running: x.py check --stage 1  (~9-11 min; includes test targets)"
 # TRUST_SKIP_PREFLIGHT is deliberately NOT set: the preflight catches submodule
 # pin drift, which is exactly failure mode #40/#41/#47 and is far cheaper to
 # report than a compile error twelve minutes later.
-if python3 x.py check --stage 1; then
+# Trust (#60, 2026-08-19): capture as well as stream. `x.py check` exits non-zero
+# for two situations that need OPPOSITE responses, and this lane used to report
+# both with "the compiler does not check":
+#
+#   1. a real compile error -- the thing this gate exists to catch;
+#   2. the PREFLIGHT REFUSING TO START -- submodule pin drift, or another x.py
+#      already running. Nothing was compiled at all.
+#
+# Measured 2026-08-17/19: three consecutive pushes tripped this lane and NONE was
+# a compile error (two pin waves from a concurrent rebase, one parallel build from
+# another session). Each cost a read of a ~4000-line log to tell which case it
+# was, because the summary line is identical. Streaming through `tee` keeps the
+# live progress an 11-minute command needs while letting us classify the failure.
+CHECK_LOG=$(mktemp -t trust-compiler-check.XXXXXX)
+trap 'rm -f "$CHECK_LOG"' EXIT
+set +e
+python3 x.py check --stage 1 2>&1 | tee "$CHECK_LOG"
+CHECK_RC=${PIPESTATUS[0]}
+set -e
+if [ "$CHECK_RC" -eq 0 ]; then
   echo "compiler and its test targets check clean"
   exit 0
 fi
+
+if grep -q "preflight found blocking problems" "$CHECK_LOG"; then
+  echo
+  echo "THE COMPILER WAS NOT CHECKED — the preflight refused to start a build."
+  echo "This is NOT a compile error: nothing was compiled, so this says NOTHING"
+  echo "about whether your change is sound. Clear the blocker and re-run."
+  echo
+  echo "the blocking preflight item(s):"
+  grep -E "^\s+FAIL " "$CHECK_LOG" | sed 's/^/  /' || true
+  echo
+  if grep -q "BUILD IS ALREADY RUNNING" "$CHECK_LOG"; then
+    echo "  -> another x.py is running (a second one corrupts both). Wait for it;"
+    echo "     do not pass TRUST_SKIP_PREFLIGHT to get around it."
+  fi
+  if grep -qE "submodule update|pin" "$CHECK_LOG"; then
+    echo "  -> submodule pin drift. Fetch each submodule FIRST so ancestry is"
+    echo "     computable, THEN restore — a restore before the fetch cannot act:"
+    echo "       for m in \$(git config -f .gitmodules --get-regexp path | awk '{print \$2}'); do"
+    echo "         git -C \"\$m\" fetch --all -q; done"
+    echo "       bash scripts/submodule_sync.sh --restore"
+  fi
+  exit 1
+fi
+
 echo
 echo "the compiler does not check. Do NOT push this."
 echo "If the break is in a first-party sibling's API, fix the sibling at source"

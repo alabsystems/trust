@@ -2615,6 +2615,8 @@ fn lower_module_inner<'tcx>(
         // Trust (totality Batch C): symbolic assoc-const ledger.
         symbolic_consts: Vec::new(),
         static_globals: Vec::new(),
+        // Trust (vtable slice 3): shared vtable-identity globals ledger.
+        vtable_globals: Vec::new(),
         // Trust (wave-SC): `&str`-const bytes-global ledger.
         str_const_globals: Vec::new(),
         param_opaque: false,
@@ -3243,6 +3245,19 @@ struct LowerCx<'a, 'tcx> {
     /// Trust (wave-SR2): one emitted global per `static` DefId read by this body, so every read
     /// of the same static resolves to the SAME `GlobalId` (read-read equality is structural).
     static_globals: Vec<(rustc_span::def_id::DefId, GlobalId)>,
+    /// Trust (vtable slice 3): one NAMED, value-less vtable-identity global per
+    /// `(principal, source)` key this body coerces (`trust_ir::stable_vtable_global_name`
+    /// — the name IS the key, verbatim-embedded and injective, so dedup by name is dedup
+    /// by key). Two coercions of one `T as dyn Tr` `GlobalAddr`+`Load` the SAME global —
+    /// read-read equality structural, exactly the `static_globals` discipline — and the
+    /// MIR-side oracle references the SAME name (minted by the same helper from the same
+    /// inputs), which is what lets the differential treat the two unconstrained vtable
+    /// lanes as one symbol. Deliberately NOT `symbolic_consts`: the identity is a model
+    /// of a real, stable runtime value (the vtable), not an unmodellable constant, so it
+    /// must not force the body SYMBOLIC. The splice still refuses the body on the
+    /// value-less global itself (`global_spliceable` → `initializer: None` → false), so
+    /// no executable module ever carries it — checked at that seam, never assumed.
+    vtable_globals: Vec<(String, GlobalId)>,
     /// Trust (wave-SC): per-body `&str`-CONST bytes-global ledger — one entry per distinct const
     /// `DefId` this body reads through [`LowerCx::lower_str_named_const`]. Two reads of ONE const
     /// in one body `GlobalAddr` the SAME global, so their data addresses are structurally equal
@@ -4900,6 +4915,42 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         }
         PointeeMeta::Unknown
+    }
+
+    /// Trust (vtable slice 2): PURE reader — would `map_ty` spell this trait-object-unsize
+    /// SOURCE as the thin `Ty::Ptr` the precise `PtrFromParts` data lane requires? The format's
+    /// `check_ptr_from_parts_operands` hardcodes `Ty::Ptr` for the data operand, so admitting a
+    /// source with any other spelling would emit an ill-typed module; and the oracle's mirror
+    /// gate (`trust-ir-bridge` lower.rs, vtable slice 1) is `map_type_ctx(src) == Ptr`, so this
+    /// is also the scope-parity condition.
+    ///
+    /// A pure reader off the rustc kind, NOT a `map_ty` probe — `map_ty` pushes `unsupported`
+    /// tags and interns into the per-body tables, and probing a source type through it tags
+    /// bodies whose own lowering succeeded (memory `map-ty-checked-mutates-never-probe-with-it`,
+    /// measured −41 clean). Mirrors `map_ty`'s pointer arms, conservatively:
+    ///   * a DST pointee (`[T]`/`str`/`dyn`, normalized) is never this lane's data pointer —
+    ///     the shared forms map FAT, the `&mut` forms are the NAMED thin postures — and no such
+    ///     pointee can be an `Unsize`-to-`dyn` source anyway (`T: Unsize<dyn Tr>` needs
+    ///     `T: Sized`), so refusing is vacuous-safe;
+    ///   * `*const [T; N]` mirrors the raw arm's three-way split on the length: only the
+    ///     concrete-`N` case is thin;
+    ///   * everything else asks the same `pointee_meta` walk `map_ty`'s catch-alls consult
+    ///     (`&self`, tag-free): thin iff the container spelling is `Ty::Ptr`. `Unknown` tails
+    ///     (a bare `ty::Param` — the generic `fn f<T: Trait>(&T) -> &dyn Trait` body) keep the
+    ///     pre-existing thin spelling, exactly as `map_ty` does.
+    fn unsize_dyn_source_is_thin_ptr(&self, src_ty: RustcTy<'tcx>) -> bool {
+        let te = ty::TypingEnv::fully_monomorphized();
+        let (pointee, is_raw) = match src_ty.kind() {
+            ty::Ref(_, pointee, _) => (*pointee, false),
+            ty::RawPtr(pointee, _) => (*pointee, true),
+            _ => return false,
+        };
+        let pointee = cycle_safe_normalize(self.tcx, te, pointee);
+        match pointee.kind() {
+            ty::Slice(_) | ty::Str | ty::Dynamic(..) => false,
+            ty::Array(_, n) if is_raw => n.try_to_target_usize(self.tcx).is_some(),
+            _ => matches!(container_pointee_ty(self.pointee_meta(pointee)), Some(Ty::Ptr)),
+        }
     }
 
     /// Trust (wave-19): PURE recursive `map_ty` fatness classifier — see [`FatShape`]. Normalizes each
@@ -15527,53 +15578,123 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     self.unsupported.push((format!("{expr_span:?}"), "Unsize(dyn upcast)"));
                     return None;
                 }
-                // Trust (wave-UD): a REAL trait-object unsize (`&T → &dyn Trait`) — MIRROR the
-                // oracle's convention instead of failing closed. `trust-mir-extract`'s
-                // `convert.rs` lowers exactly this shape to
-                // `Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst))` — a deliberate sound
-                // over-approximation, so the function PROCEEDS rather than wedging the whole
-                // obligation at `unsupported_mir`, and (its words) "never falsely Proved
-                // (unconstrained value)". The slice unsize one arm above it is lowered PRECISELY,
-                // because a slice carries its length; only trait objects go opaque, because their
-                // metadata is a vtable nobody in the modelled fragment reads — dyn DISPATCH has
-                // been forced-havoc since B2-3 slice 2.
+                // Trust (wave-UD, amended by vtable slice 2): a REAL trait-object unsize
+                // (`&T → &dyn Trait`) — MIRROR the oracle's convention instead of failing
+                // closed. Since vtable slice 1 (d806992cd4) the oracle's convention is
+                // TWO-LANE for the pointer shapes: `trust-mir-extract`'s `convert.rs` spells
+                // the coercion as a real `Rvalue::Cast` and `trust-ir-bridge` assembles
+                // `PtrFromParts { data: <the real source pointer>, metadata: <fresh
+                // unconstrained Ptr havoc> }` — a dyn coercion attaches a vtable and leaves
+                // the ADDRESS alone, so the fat pointer's data lane IS the source pointer and
+                // only the vtable lane is unknown. `Box<T> → Box<dyn Trait>` stays on the
+                // wholly-opaque `ConstValue::OpaqueConst` model there (a Box maps to a
+                // nominal ADT — no data lane to write into), and a THIN-mapped destination
+                // (`&mut dyn`, the principal-less `&dyn Send` sentinel) stays a whole-value
+                // havoc.
                 //
-                // The producer's analogue of `OpaqueConst` is the wave-CP VALUE-LESS SYMBOLIC
-                // GLOBAL (`Global { initializer: None, linkage: External }` + `GlobalAddr` +
-                // `Load`), which is why this reuses `lower_symbolic_opaque_value` rather than
-                // inventing a spelling. Registering in `symbolic_consts` marks the body SYMBOLIC
-                // through the existing `Lowered::symbolic` rule, so it is excluded from the
-                // interpretation differential and the crate splice at their own seams — which is
-                // the honest bucket for an unconstrained value and is exactly what the oracle's
-                // over-approximation means.
+                // THIS lane mirrors that split exactly — producer/oracle scope must be
+                // identical or the differential manufactures a divergence:
+                //   * FAT destination (`map_ty` = `FatPtr(TraitObject)`) with a source that
+                //     spells as a THIN data pointer — lower the SOURCE expression to get the
+                //     real data-pointer value and emit the same `PtrFromParts`, with the
+                //     vtable lane a VALUE-LESS SYMBOLIC GLOBAL at `Ty::Ptr`
+                //     (`emit_symbolic_opaque_load`): the producer may not emit `Inst::Undef`
+                //     (fail-closed by construction; tripwire at differential.rs ~303), and
+                //     the symbolic-global `Load` is this producer's sanctioned
+                //     unconstrained-value spelling. The metadata global's `symbolic_consts`
+                //     registration keeps the body SYMBOLIC exactly as before — slice 2's
+                //     deliverable is that BOTH sides spell the same two-lane value, not
+                //     coverage: these bodies stay excluded from the crate splice, and the
+                //     direct differential still skips them on the ORACLE's live vtable-lane
+                //     havoc (the `clean-skip-oracle-havoc` class).
+                //   * Everything else — a `Box<dyn>` target, a thin-mapped destination, or a
+                //     source `map_ty` would not spell thin `Ty::Ptr` — keeps the wave-CP
+                //     whole-value symbolic global, byte-identical to the slice-1 status quo.
                 //
-                // A FRESH global per coercion SITE, deliberately not deduped by target type: two
-                // `&T → &dyn Tr` coercions may yield different data pointers, so sharing one
-                // global would make them `Load`-equal and over-constrain a value the oracle leaves
-                // unconstrained. Per-site is the conservative direction.
+                // The source gate is `unsize_dyn_source_is_thin_ptr`, a PURE reader off the
+                // rustc kind (memory `map-ty-checked-mutates-never-probe-with-it`: probing
+                // the source through `map_ty` would tag bodies whose own lowering
+                // succeeded). A FRESH metadata global per coercion SITE, deliberately not
+                // deduped: two `T as dyn Tr` coercions asserting `Load`-equal vtables is
+                // slice 3's claim (a stable per-(principal, concrete-source-type) vtable
+                // identity minted by ONE shared helper, BOTH sides in one commit), not this
+                // one's. Per-site is the conservative direction while the oracle's vtable
+                // lane is a fresh havoc.
                 //
-                // DO NOT "improve" this into a structured `PtrFromParts(data, vtable_global)`. An
-                // initializer-less `Global` is a legal vtable spelling (verified: `Global.
-                // initializer` is `Option<Constant>`; `validate.rs` only shape-checks it when
-                // present), but emitting a structured fat value against an oracle that emits an
-                // opaque one is the fat-vs-thin divergence wave-RD had to move BOTH sides to
-                // avoid, wearing a new costume. Moving this lane to a real vtable means moving
-                // `convert.rs` first.
-                // The predicate is the ORACLE's, verbatim — `unsize_target_is_trait_object_ref`
-                // (convert.rs:2197) matches `Ref(_, inner, _) | RawPtr(inner, _)` with a
-                // `Dynamic` pointee. Mutability-blind on both sides (`&mut dyn` unsizes to the
-                // same opaque as `&dyn`), and RAW pointers included: the oracle already emits
-                // `OpaqueConst` for a `*const dyn` / `*mut dyn` unsize target, so leaving them
-                // fail-closed here was coverage given away, not safety bought. Keeping the two
-                // predicates textually parallel is the point — they must move together, and the
-                // reason wave-RD had to be two-sided is that they once did not.
-                let unsize_to_dyn = matches!(
-                    expr_ty.kind(),
-                    ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _)
-                        if matches!(pointee.kind(), ty::Dynamic(..))
-                );
+                // The admission predicate is the ORACLE's, verbatim —
+                // `unsize_target_is_trait_object_ref` matches `Ref(_, inner, _) |
+                // RawPtr(inner, _)` with a `Dynamic` pointee, and slice 1's
+                // `unsize_target_is_trait_object_pointer` is its strict pointer subset.
+                // Mutability-blind on both sides, RAW pointers included. Keeping the two
+                // predicates textually parallel is the point — they must move together, and
+                // the reason wave-RD had to be two-sided is that they once did not.
+                // Trust (wave-UB): the `Box<T> → Box<dyn Trait>` arm moves in LOCKSTEP with the
+                // oracle's `is_box()` arm — see the note above about keeping the two predicates
+                // textually parallel. `is_box()` only, matching the oracle exactly: a
+                // user-defined `CoerceUnsized` wrapper (`Signal(&1i32) as Signal<dyn Any>`) puts
+                // the vtable at a field offset rather than in the pointer, so it stays
+                // fail-closed on both sides.
+                let unsize_to_dyn = match expr_ty.kind() {
+                    ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => {
+                        matches!(pointee.kind(), ty::Dynamic(..))
+                    }
+                    ty::Adt(def, args) if def.is_box() => {
+                        matches!(args.type_at(0).kind(), ty::Dynamic(..))
+                    }
+                    _ => false,
+                };
                 if unsize_to_dyn {
-                    return self.lower_symbolic_opaque_value(expr_span, expr_ty, "unsize-dyn");
+                    let src_ty = self.thir.exprs[source].ty;
+                    let precise_src = matches!(expr_ty.kind(), ty::Ref(..) | ty::RawPtr(..))
+                        && self.unsize_dyn_source_is_thin_ptr(src_ty);
+                    if !precise_src {
+                        // `Box<dyn>` target, or a source whose spelling is not a thin data
+                        // pointer: the slice-1 status quo, whole-value symbolic.
+                        return self.lower_symbolic_opaque_value(expr_span, expr_ty, "unsize-dyn");
+                    }
+                    // ONE `map_ty` call on the target — the fat/Unit/thin split below reuses
+                    // it, so a fail-closed target (`&dyn Send`, trait-id collision) records
+                    // its tag exactly once, as `lower_symbolic_opaque_value` would have.
+                    let target = self.map_ty(expr_ty);
+                    return match target {
+                        Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { .. }) => {
+                            // The precise lane. Source first: a failed source lowering
+                            // fail-closes the body with the source's own tag, mirroring the
+                            // oracle side (which fails its whole lowering at operand
+                            // resolution for the same body).
+                            let data = self.lower_expr(source)?;
+                            // Trust (vtable slice 3): the vtable lane carries the STABLE
+                            // SHARED IDENTITY — a named value-less global keyed on
+                            // (principal, source type), minted by the ONE shared helper and
+                            // referenced by the SAME name on the oracle side, so the body is
+                            // no longer forced SYMBOLIC. An unmintable key (source pointee
+                            // outside the closed structural grammar — nominal types, whose
+                            // generics-erased names would merge distinct vtables) falls back
+                            // to the slice-2 per-site symbolic carrier, byte-identically.
+                            let metadata = self
+                                .emit_vtable_identity_load(expr_ty, src_ty)
+                                .unwrap_or_else(|| {
+                                    self.emit_symbolic_opaque_load(Ty::Ptr, "unsize-dyn-vtable")
+                                });
+                            let fat = self.fresh();
+                            self.push_node(
+                                InstrNode::new(Inst::PtrFromParts {
+                                    ptr_ty: target.clone(),
+                                    metadata_ty: Ty::Ptr,
+                                    data,
+                                    metadata,
+                                })
+                                .with_result(fat),
+                            );
+                            Some(fat)
+                        }
+                        // `map_ty` already pushed its precise tag on the way to `Unit`
+                        // (`&dyn Send`, trait-id collision) — decline without a second tag.
+                        Ty::Unit => None,
+                        // Thin-mapped destination (`&mut dyn`): the status-quo whole-value
+                        // symbolic global, same label, name shape and ledger entry as before.
+                        thin => Some(self.emit_symbolic_opaque_load(thin, "unsize-dyn")),
+                    };
                 }
                 // Only the `&[T; N] → &[T]` unsize is faithful here: this expr's type must be `&[T]`.
                 let is_slice_ref = matches!(
@@ -16781,6 +16902,21 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // double-count the same body in the histogram.
             return None;
         }
+        let _ = span;
+        Some(self.emit_symbolic_opaque_load(ty, label))
+    }
+
+    /// Trust (vtable slice 2): the EMISSION half of [`Self::lower_symbolic_opaque_value`], at an
+    /// ARBITRARY trust-ir type rather than the `map_ty` of a rustc one. Factored out so the
+    /// precise trait-object-unsize lane can apply the symbolic-global machinery to the METADATA
+    /// lane only (`Ty::Ptr` — the vtable slot of a `PtrFromParts`) while the data lane carries
+    /// the real lowered source value. The caller owns the well-formedness of `ty` (its two
+    /// callers pass a `map_ty` result that is not `Unit`, or the literal `Ty::Ptr`).
+    ///
+    /// Everything semantic is unchanged from the pre-factor body: fresh global per call, the
+    /// `symbolic_consts` registration that marks the body SYMBOLIC (`Lowered::symbolic` is
+    /// `!symbolic_consts.is_empty()`), and the `GlobalAddr` + `Load` value spelling.
+    fn emit_symbolic_opaque_load(&mut self, ty: Ty, label: &str) -> ValueId {
         let idx = self.pending_globals.len();
         self.pending_globals.push(Global {
             name: format!("__trust_opaque_{label}_{idx}__"),
@@ -16800,12 +16936,93 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             ty::List::empty(),
             global,
         ));
-        let _ = span;
         let ptr = self.fresh();
         self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
         let res = self.fresh();
         self.push_node(
             InstrNode::new(Inst::Load { ty, ptr, volatile: false, align: None }).with_result(res),
+        );
+        res
+    }
+
+    /// Trust (vtable slice 3): the STABLE SHARED VTABLE IDENTITY — load the metadata lane of a
+    /// trait-object unsize from the NAMED, value-less external global keyed on
+    /// `(principal trait def path, concrete source type)`, instead of a per-site symbolic
+    /// carrier.
+    ///
+    /// Identity, not value: the global has `initializer: None` (nothing on either side derives
+    /// a vtable VALUE), but its NAME is minted by `trust_ir::stable_vtable_global_name` — the
+    /// ONE shared helper — from inputs both sides derive from the same rustc facts:
+    ///   * PRINCIPAL — `sysroot_authenticated_def_path_str` of the principal trait def, the
+    ///     byte-identical spelling the oracle's extractor stamps into `Ty::Dynamic
+    ///     { trait_name }` (NOT re-derived; the `trait_object_id` drift lesson).
+    ///   * SOURCE — `trust_types::Ty::vtable_source_type_key` (the one renderer, closed
+    ///     structural grammar) applied to `trust_mir_extract::faithful_vtable_key_ty` of the
+    ///     NORMALIZED source pointee — the same converter, under the same faithful-scalars
+    ///     guard, that produced the extractor-recorded type the bridge renders.
+    /// So two coercions of one `T as dyn Tr` — in this body, and across the producer/oracle
+    /// differential pair — reference ONE symbol, and asserting their `Load`s equal is TRUE of
+    /// every real execution (a vtable is per-(type, trait), attached by the coercion).
+    ///
+    /// Deduped BY NAME per body (`vtable_globals`): the mint embeds both key components
+    /// verbatim and injectively, so name equality IS key equality — no hash-collision
+    /// tripwire needed. NOT registered in `symbolic_consts`: the identity models a real,
+    /// stable runtime value, so it does not force the body SYMBOLIC — that movement is this
+    /// slice's deliverable. The splice seam still refuses the value-less global itself
+    /// (`global_spliceable`), and the flip shim has no `GlobalAddr`/`PtrFromParts` arms, so
+    /// neither the executable module nor a flipped body can ever carry it — both checked at
+    /// their seams.
+    ///
+    /// `None` = the key is unmintable (no principal, or a source pointee outside the
+    /// renderer's closed grammar — nominal types, whose generics-erased names would merge
+    /// distinct vtables). The caller falls back to the slice-2 per-site symbolic carrier,
+    /// which keeps the body SYMBOLIC: fail-closed, never a guessed identity.
+    fn emit_vtable_identity_load(
+        &mut self,
+        target_ty: RustcTy<'tcx>,
+        src_ty: RustcTy<'tcx>,
+    ) -> Option<ValueId> {
+        let (ty::Ref(_, target_pointee, _) | ty::RawPtr(target_pointee, _)) = target_ty.kind()
+        else {
+            return None;
+        };
+        let ty::Dynamic(preds, ..) = target_pointee.kind() else {
+            return None;
+        };
+        let principal = preds.principal_def_id()?;
+        let principal_path = trust_mir_extract::sysroot_authenticated_def_path_str(self.tcx, principal);
+        let (ty::Ref(_, src_pointee, _) | ty::RawPtr(src_pointee, _)) = src_ty.kind() else {
+            return None;
+        };
+        let te = ty::TypingEnv::fully_monomorphized();
+        let src_pointee = cycle_safe_normalize(self.tcx, te, *src_pointee);
+        let key_ty = trust_mir_extract::faithful_vtable_key_ty(self.tcx, src_pointee);
+        let source_key = key_ty.vtable_source_type_key()?;
+        let name = trust_ir::stable_vtable_global_name(&principal_path, &source_key)?;
+        let global = match self.vtable_globals.iter().find(|(n, _)| *n == name) {
+            Some((_, g)) => *g,
+            None => {
+                let idx = self.pending_globals.len();
+                self.pending_globals.push(Global {
+                    name: name.clone(),
+                    ty: Ty::Ptr,
+                    mutable: false,
+                    initializer: None,
+                    linkage: Linkage::External,
+                    tls: None,
+                    align: None,
+                });
+                let g = GlobalId::new(idx as u32);
+                self.vtable_globals.push((name, g));
+                g
+            }
+        };
+        let ptr = self.fresh();
+        self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
+        let res = self.fresh();
+        self.push_node(
+            InstrNode::new(Inst::Load { ty: Ty::Ptr, ptr, volatile: false, align: None })
+                .with_result(res),
         );
         Some(res)
     }

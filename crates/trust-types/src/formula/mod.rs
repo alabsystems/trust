@@ -15,6 +15,7 @@
 pub(crate) mod borrow_encoding;
 pub(crate) mod contracts;
 pub(crate) mod pred_vocab;
+pub(crate) mod refute_only;
 pub(crate) mod smtlib;
 pub(crate) mod sort;
 pub(crate) mod temporal;
@@ -29,6 +30,7 @@ pub use pred_vocab::{
     CHECKER_CORE_PRED_VOCAB, CHECKER_CORE_SEMANTICS, CheckerCoreSemantics, PRED_VOCAB,
     checker_core_semantics, is_checker_core_pred, is_valid_pred, pred_arg_sorts,
 };
+pub use refute_only::{RefuteOnlyOutcome, RefuteOnlyProvenance, RefuteOnlyVc};
 pub use smtlib::escape_smtlib_symbol;
 pub use sort::{RoundingMode, Sort, SortFromTy, sort_from_ty_with_defs};
 pub use temporal::*;

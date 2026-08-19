@@ -9926,6 +9926,14 @@ fn transparent_unwrap_multihop_field_return_certifies() {
     let cert = function_fully_faithful_witness_with_callees(&ok, &Default::default())
         .expect("the witness must certify the synthetic post-fix get");
     assert!(cert.is_modulo_3());
+    // Trust: TRANSPARENT-UNWRAP, trust-ir twin — the SAME body certifies on the
+    // straight-line TRUST-IR lane (the nested-Index selector spelling), so the
+    // regenerated get rows count via_trustir and the teardown criterion holds
+    // through the regen.
+    assert!(
+        crate::prove::straight_line_fully_faithful_via_trustir_pub(&ok),
+        "the trust-ir twin must certify the synthetic post-fix get"
+    );
     // Additional POSITIVES (audit round): a three-hop chain and a Move operand
     // both lift and certify — the arm is hop-count- and operand-kind-agnostic.
     for variant in ["three_hop", "move_operand"] {
@@ -9956,19 +9964,39 @@ fn transparent_unwrap_multihop_field_return_certifies() {
             "{variant} must decline"
         );
     }
-    // The COMMITTED pre-fix dump still declines (Unsupported{Transmute}) — the
-    // fail-closed control until the regen follow-up.
-    let raw = std::fs::read(format!(
-        "{}/fixtures/mass-harvest2-2026-07-21/nonzero2/dumps/trust-mir-87106bd3a40768dc-be4cca3a04ea2b46.json",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .expect("committed dump");
-    let pre: VerifiableFunction = serde_json::from_slice(&raw).expect("parse");
-    assert_eq!(pre.def_path, "core::num::nonzero::NonZero::<u8>::get");
-    assert!(
-        function_fully_faithful_witness_with_callees(&pre, &Default::default()).is_none(),
-        "the pre-fix Unsupported dump stays fail-closed until regeneration"
-    );
+    // THE REGENERATED REAL DUMPS (2026-08-18, the regen slice): the committed
+    // `NonZero::<u8>::get` now reads `_0 := Copy(_1.0.0)` — the PROVENANCE
+    // control passed — and must certify on BOTH lanes; the nonmax-dir curation
+    // copy is byte-equivalent modulo spans and must too.
+    for rel in [
+        "fixtures/mass-harvest2-2026-07-21/nonzero2/dumps",
+        "fixtures/census-rung2-2026-07-07/nonmax",
+    ] {
+        let dir = format!("{}/{rel}", env!("CARGO_MANIFEST_DIR"));
+        let mut hit = 0;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("e").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let f: VerifiableFunction =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            if f.def_path != "core::num::nonzero::NonZero::<u8>::get" {
+                continue;
+            }
+            hit += 1;
+            assert!(
+                function_fully_faithful_witness_with_callees(&f, &Default::default())
+                    .is_some_and(|c| c.is_modulo_3()),
+                "{rel}: the regenerated get must certify on the mirsem witness"
+            );
+            assert!(
+                crate::prove::straight_line_fully_faithful_via_trustir_pub(&f),
+                "{rel}: the regenerated get must certify on the trust-ir lane"
+            );
+        }
+        assert_eq!(hit, 1, "{rel}: exactly one NonZero::<u8>::get dump");
+    }
 }
 
 #[test]

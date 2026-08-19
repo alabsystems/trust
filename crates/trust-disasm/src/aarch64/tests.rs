@@ -1271,3 +1271,34 @@ fn rotated_logical_immediates_reach_their_architectural_value() {
         );
     }
 }
+
+/// `ldrsw <Xt>, <label>` has a 64-bit destination.
+///
+/// The literal-load decoder derived its width from `opc == 0b01`, but LDRSW is
+/// `opc == 0b10`, so it built a **W** register. The 32-bit write path never
+/// constructs a `BvSignExt`, and the value was then zero-extended to 64 —
+/// measured, a literal of 0xffffffff loaded as 0x00000000ffffffff instead of
+/// 0xffffffffffffffff. ARM DDI 0487, LDRSW (literal): "X[t] = SignExtend(data, 64)".
+#[test]
+fn ldrsw_literal_has_a_64_bit_destination() {
+    let insn = crate::decode_aarch64(&0x9800_0040u32.to_le_bytes(), 0x1000)
+        .expect("ldrsw literal should decode");
+    assert_eq!(insn.opcode, crate::opcode::Opcode::Ldrsw);
+    let Some(crate::operand::Operand::Reg(r)) = insn.operand(0) else {
+        panic!("expected a register destination, got {:?}", insn.operand(0));
+    };
+    assert_eq!(r.width, 64, "LDRSW sign-extends INTO a 64-bit register");
+}
+
+/// The neighbouring literal loads keep their own widths — a fix that made every
+/// literal load 64-bit would break this.
+#[test]
+fn plain_literal_loads_keep_their_widths() {
+    for (word, expected_width) in [(0x1800_0040u32, 32u16), (0x5800_0040u32, 64)] {
+        let insn = crate::decode_aarch64(&word.to_le_bytes(), 0x1000).expect("literal decodes");
+        let Some(crate::operand::Operand::Reg(r)) = insn.operand(0) else {
+            panic!("expected a register destination for {word:#010x}");
+        };
+        assert_eq!(r.width, expected_width, "{word:#010x} destination width");
+    }
+}

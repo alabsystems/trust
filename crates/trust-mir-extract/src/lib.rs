@@ -185,9 +185,10 @@ pub use verifier_api::{
 /// does not newly fire on every foreign path; genuine foreign imports are routed
 /// by `is_foreign` (`tcx.is_foreign_item`), the authoritative signal.
 pub fn safe_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
+    let rendered = with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
         with_no_trimmed_paths!(tcx.def_path_str(def_id))
-    )))
+    )));
+    apply_cross_namespace_tag(tcx, def_id, rendered)
 }
 
 /// Like [`safe_def_path_str`] but renders the path with its CONCRETE
@@ -214,9 +215,186 @@ pub fn safe_def_path_str_with_args<'tcx>(
     def_id: DefId,
     args: rustc_middle::ty::GenericArgsRef<'tcx>,
 ) -> String {
-    with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
+    let rendered = with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
         with_no_trimmed_paths!(tcx.def_path_str_with_args(def_id, args))
-    )))
+    )));
+    apply_cross_namespace_tag(tcx, def_id, rendered)
+}
+
+/// Trust (§RESIDUAL 7 — the cross-NAMESPACE collision): append the namespace tag,
+/// if this `def_id`'s path has a segment that is ambiguous across namespaces.
+///
+/// # The defect, MEASURED
+///
+/// rustc's `DisambiguatedDefPathData` disambiguator counts siblings per `(parent,
+/// DefPathData)`, and `DefPathData::TypeNs(sym)` / `ValueNs(sym)` are DIFFERENT
+/// VARIANTS. A `fn S` and a `struct S` under one parent are therefore both `#0`
+/// and both render `S`, which no closure inside `print_path_with_simple` can
+/// separate — the disambiguator it prints is already the right one for the
+/// namespace it was counted in.
+///
+/// On pristine main `a27d636271`, `probe/nsclash.rs` (a fn-block `fn S(v: u32)`
+/// containing `fn m`, plus a separate block `struct S; impl S { fn m }`, both
+/// called from one `go`) produced TWO distinct bundled bodies whose bundle roots
+/// both render `t_nsclash::go::S::m` — the two `-Ztrust-dump=native-bundle`
+/// modules carry `vc:t_nsclash__go__S__m:trust_mc_default_function:0` and
+/// `vc:t_nsclash__go__S__m:arithmetic_safety:0` respectively. The measured
+/// consumer-level differential against the one-identifier control
+/// (`struct S2`) is in `go`'s OWN bundle: control renders four members
+/// `[go, S, m, m]` and ONE obligation, the clash renders three `[go, m, m]` —
+/// the `fn S` member is GONE — and TWO obligations, the extra one being
+/// `vc:t_nsclash__go:assertion:panic-freedom:0`. In that shape the alias costs
+/// credit rather than granting it, which is a LOST RECOVERY and a defect in its
+/// own right; the fail-OPEN direction of this same one-string-two-`DefId`s key is
+/// what the three witnesses on `convert::direct_call_def_path` were.
+///
+/// # Why the tag is here and not inside `print_path_with_simple`
+///
+/// The printer's segment hook is handed a `DisambiguatedDefPathData` and nothing
+/// else: no `DefId`, no parent, no sibling set. The objection recorded on
+/// `direct_call_def_path` — that separating the namespaces means tagging EVERY
+/// named segment, modules included, so every path in the identity space moves —
+/// is correct FOR THAT HOOK, and it is the reason this was left open. It is
+/// answered by moving the decision one frame out, to the seam's entry points
+/// (the two functions that turn the flag on), where the `DefId` is in hand and a
+/// sibling index can be consulted. Only a segment with an actual cross-namespace
+/// sibling is tagged.
+///
+/// # What moves
+///
+/// Nothing, unless the crate being compiled declares a name in two namespaces
+/// under one parent. Of the colliding pair only the NON-`TypeNs` side is tagged,
+/// so `TypeNs` spellings — every module, every ADT, every trait, and therefore
+/// every `core::`/`alloc::`/`std::` prefix — are byte-identical to what they were.
+/// The tag is a SUFFIX (`#ns<depth><ns-letter>`, `.`-separated for more than one
+/// segment), so ROOT-anchored classifiers are untouched; `#` cannot occur in a
+/// Rust path, exactly as for the `{extern#N}` segment and the `@`-stamp.
+///
+/// Both directions matter here and both were measured — a spelling change that
+/// stops matching an `EXACT_TOTAL` summary entry LOSES a sound recovery. Every
+/// `EXACT_TOTAL`/`def_path_pins`/`has_trusted_std_root` spelling names a
+/// `core`/`alloc`/`std` item, all of which are FOREIGN to any crate under
+/// verification and so cannot be tagged at all (see the residual below), and the
+/// definition path and the call key are rendered from the same `def_id` through
+/// these same two functions, so they move together or not at all.
+///
+/// # RESIDUAL — a FOREIGN cross-namespace collision is not detected
+///
+/// The index is built from `tcx.hir_crate_items(())`, which enumerates the LOCAL
+/// crate only; there is no cross-crate query that enumerates the children of an
+/// arbitrary foreign parent (`module_children` covers modules, not the
+/// block-scoped items inside a foreign body that reach us through inlined MIR).
+/// A foreign `def_id` is therefore never tagged. This is stated as a gap, not
+/// argued away, and it is NOT failed closed: a renderer has no fail-closed
+/// channel — it must return a string — and turning every foreign path into a
+/// refusal is a lost recovery with no measured exploit behind it. The measured
+/// reproducer is local, and so is every `#[trust::assume_total]` declaration a
+/// crate under verification can write.
+fn apply_cross_namespace_tag(tcx: TyCtxt<'_>, def_id: DefId, rendered: String) -> String {
+    match cross_namespace_tag(tcx, def_id) {
+        Some(tag) => rendered + &tag,
+        None => rendered,
+    }
+}
+
+/// The namespace letter this `DefPathData` variant contributes to the index, and
+/// the symbol it is keyed by. `Impl`/`Ctor`/`Closure`/... carry no user-chosen
+/// name in a namespace and cannot participate.
+fn def_path_data_namespace(data: rustc_hir::definitions::DefPathData) -> Option<(Symbol, char)> {
+    use rustc_hir::definitions::DefPathData;
+    match data {
+        DefPathData::TypeNs(name) => Some((name, 't')),
+        DefPathData::ValueNs(name) => Some((name, 'v')),
+        DefPathData::MacroNs(name) => Some((name, 'm')),
+        DefPathData::LifetimeNs(name) => Some((name, 'l')),
+        _ => None,
+    }
+}
+
+/// Every `(parent, symbol)` in the LOCAL crate that is declared in more than one
+/// namespace. Keyed by raw `u32`s so the cache needs no rustc lifetime.
+type CrossNamespaceIndex = Arc<FxHashSet<(u32, u32)>>;
+
+static CROSS_NAMESPACE_INDEX: std::sync::Mutex<Option<(u64, CrossNamespaceIndex)>> =
+    std::sync::Mutex::new(None);
+
+/// Build (once per compiled crate) the set of `(parent DefIndex, Symbol)` pairs
+/// that the local crate declares in two or more namespaces.
+///
+/// Cached against the local `StableCrateId` rather than a bare `OnceLock` so a
+/// process that drives `rustc_interface` more than once cannot read the previous
+/// crate's index.
+fn local_cross_namespace_collisions(tcx: TyCtxt<'_>) -> CrossNamespaceIndex {
+    let stable_crate_id = tcx.stable_crate_id(LOCAL_CRATE).as_u64();
+    // The lock is NEVER held across the `hir_crate_items` query below. Holding it
+    // would deadlock a `std::sync::Mutex` (not reentrant) if that query — or any
+    // diagnostic it emits — rendered a path through this seam. A lost race only
+    // costs a second identical computation.
+    {
+        let slot = CROSS_NAMESPACE_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_id, index)) = slot.as_ref() {
+            if *cached_id == stable_crate_id {
+                return Arc::clone(index);
+            }
+        }
+    }
+    let mut namespaces: FxHashMap<(u32, u32), u8> = FxHashMap::default();
+    for local in tcx.hir_crate_items(()).definitions() {
+        let key = tcx.def_key(local.to_def_id());
+        let Some(parent) = key.parent else { continue };
+        let Some((name, letter)) = def_path_data_namespace(key.disambiguated_data.data) else {
+            continue;
+        };
+        let bit = 1u8 << (['t', 'v', 'm', 'l'].iter().position(|c| *c == letter).unwrap_or(0));
+        *namespaces.entry((parent.as_u32(), name.as_u32())).or_default() |= bit;
+    }
+    let mut index = FxHashSet::default();
+    #[allow(rustc::potential_query_instability)]
+    for (key, mask) in namespaces {
+        if mask.count_ones() > 1 {
+            index.insert(key);
+        }
+    }
+    let index: CrossNamespaceIndex = Arc::new(index);
+    let mut slot = CROSS_NAMESPACE_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some((stable_crate_id, Arc::clone(&index)));
+    index
+}
+
+/// The tag for one `def_id`, or `None` when no segment of its path is ambiguous
+/// across namespaces. See [`apply_cross_namespace_tag`] for the argument.
+fn cross_namespace_tag(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    // Foreign paths are the documented residual, and skipping them here is also
+    // what keeps every `core::`/`alloc::`/`std::` spelling byte-identical.
+    if !def_id.is_local() {
+        return None;
+    }
+    let index = local_cross_namespace_collisions(tcx);
+    if index.is_empty() {
+        return None;
+    }
+    // Walk to the crate root so the mark can name a segment by DEPTH; a middle
+    // segment is where the measured collision sits (`go::S::m`), so tagging the
+    // last segment alone would not separate the two paths.
+    let mut chain = Vec::new();
+    let mut current = def_id;
+    while let Some(parent) = tcx.def_key(current).parent {
+        chain.push((parent.as_u32(), tcx.def_key(current).disambiguated_data.data));
+        current = DefId { krate: def_id.krate, index: parent };
+    }
+    chain.reverse();
+    let mut marks: Vec<String> = Vec::new();
+    for (depth, (parent, data)) in chain.into_iter().enumerate() {
+        let Some((name, letter)) = def_path_data_namespace(data) else { continue };
+        // Only the non-`TypeNs` side of a colliding pair moves; see the doc above.
+        if letter == 't' {
+            continue;
+        }
+        if index.contains(&(parent, name.as_u32())) {
+            marks.push(format!("{depth}{letter}"));
+        }
+    }
+    (!marks.is_empty()).then(|| format!("#ns{}", marks.join(".")))
 }
 
 /// [`safe_def_path_str`] plus the SYSROOT-IMPERSONATION stamp — the renderer for
@@ -1473,6 +1651,28 @@ pub fn extract_function_faithful<'tcx>(
 ) -> VerifiableFunction {
     let _guard = crate::ty_convert::FaithfulScalarsGuard::enable();
     extract_function(tcx, body)
+}
+
+/// Trust (vtable slice 3): FAITHFUL-lane conversion of ONE rustc type, for the
+/// vtable-identity SOURCE key.
+///
+/// The `(principal, source)` vtable identity (`trust_ir::stable_vtable_global_name`)
+/// renders its source half with `trust_types::Ty::vtable_source_type_key`, the one
+/// shared renderer. The MIR-side bridge calls that renderer on the extractor-recorded
+/// local type, which [`extract_function_faithful`] produced under the
+/// `FaithfulScalarsGuard`; the THIR producer holds a rustc type instead, and THIS is
+/// its conversion entry — the SAME `convert_ty_in_env` under the SAME guard — so the
+/// two sides render one string for one rustc source type BY CONSTRUCTION (the
+/// `trait_object_id` lesson: never a second hand-rolled producer of one identity).
+///
+/// The caller passes the coercion source's NORMALIZED pointee (the producer
+/// normalizes under `TypingEnv::fully_monomorphized()` before calling, matching its
+/// admission gate); the conversion runs under the same env. Anything the converter
+/// cannot ground (`Ty::Unsupported`, nominal types, …) simply fails the renderer's
+/// closed grammar downstream — fail-closed, never a guessed key.
+pub fn faithful_vtable_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> trust_types::Ty {
+    let _guard = crate::ty_convert::FaithfulScalarsGuard::enable();
+    crate::ty_convert::convert_ty_in_env(tcx, ty::TypingEnv::fully_monomorphized(), ty)
 }
 
 pub fn extract_function<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) -> VerifiableFunction {

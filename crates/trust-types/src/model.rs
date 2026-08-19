@@ -6212,6 +6212,70 @@ impl Ty {
         }
     }
 
+    /// Trust (vtable slice 3): the CANONICAL SOURCE-TYPE KEY of a trait-object
+    /// unsize — the `source` half of the `(principal, source)` identity that
+    /// `trust_ir::stable_vtable_global_name` mints a shared vtable global from.
+    ///
+    /// This is the ONE renderer for that identity, deliberately (the
+    /// `trait_object_id` drift lesson: a second producer of one identity
+    /// silently diverges). Both consumers call it on a `trust_types::Ty`
+    /// produced by `trust-mir-extract`'s faithful type conversion of the SAME
+    /// rustc source type — the bridge on the extractor-recorded local type, the
+    /// THIR producer on its own conversion of the coercion source — so equal
+    /// rustc types render equal strings by construction.
+    ///
+    /// CLOSED, STRUCTURAL grammar — fail-closed (`None`) outside it. Admitted:
+    /// scalar leaves (`bool`/`char`/fixed ints/`isize`/`usize`/floats), `()`,
+    /// and tuples/arrays/refs/raw-pointers over admitted types. Every admitted
+    /// spelling is canonical for the rustc type it came from, so equal keys
+    /// imply equal source types (equal vtables — the soundness direction).
+    /// REFUSED, and why:
+    ///   * `Adt`/`Datatype` — their `name` is a GENERICS-ERASED def path:
+    ///     `Vec<i32>` and `Vec<u64>` share one name, and one key for two source
+    ///     types would assert `Load`-equality of two DIFFERENT vtables. The
+    ///     fields vector cannot repair this (it is layout/context-sensitive).
+    ///   * `Closure`/`Coroutine`/`FnDef`/`FnPtr` — nominal or signature-bearing
+    ///     identities with no pinned canonical rendering here.
+    ///   * `Slice`/`Str`/`Dynamic` — unsized; never a thin-source pointee.
+    ///   * `SymArray`/`Bv`/`Never`/`Unsupported` and anything future — not
+    ///     concrete source types of a monomorphic coercion.
+    /// The emitted alphabet is `[A-Za-z0-9&*();,\[\] ]` — in particular it
+    /// NEVER contains `$`, the mint's separator, so a rendered key can never be
+    /// refused for ambiguity downstream.
+    pub fn vtable_source_type_key(&self) -> Option<String> {
+        match self {
+            Ty::Bool => Some("bool".to_string()),
+            Ty::Char => Some("char".to_string()),
+            Ty::Int { width, signed } => {
+                Some(format!("{}{width}", if *signed { "i" } else { "u" }))
+            }
+            Ty::PtrSizedInt { signed } => {
+                Some(if *signed { "isize" } else { "usize" }.to_string())
+            }
+            Ty::Float { width } => Some(format!("f{width}")),
+            Ty::Unit => Some("()".to_string()),
+            Ty::Tuple(elems) => {
+                let parts: Option<Vec<String>> =
+                    elems.iter().map(Ty::vtable_source_type_key).collect();
+                Some(format!("({})", parts?.join(", ")))
+            }
+            Ty::Array { elem, len } => {
+                Some(format!("[{}; {len}]", elem.vtable_source_type_key()?))
+            }
+            Ty::Ref { mutable, inner } => Some(format!(
+                "&{}{}",
+                if *mutable { "mut " } else { "" },
+                inner.vtable_source_type_key()?
+            )),
+            Ty::RawPtr { mutable, pointee } => Some(format!(
+                "*{} {}",
+                if *mutable { "mut" } else { "const" },
+                pointee.vtable_source_type_key()?
+            )),
+            _ => None,
+        }
+    }
+
     /// Returns the bit width for floating-point types.
     pub fn float_width(&self) -> Option<u32> {
         match self {

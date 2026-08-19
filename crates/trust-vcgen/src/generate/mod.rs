@@ -1243,6 +1243,7 @@ mod checked_vcs;
 mod float_range;
 mod float_overflow;
 mod path_defs;
+mod per_path_refute;
 pub(crate) mod callee_write_set;
 mod witness_grounding;
 mod contract_vcs;
@@ -1272,6 +1273,9 @@ pub(crate) use alloc_vcs::*;
 pub(crate) use type_ranges::*;
 pub(crate) use overflow_vc::*;
 pub use assert_refutation::*;
+pub use per_path_refute::{
+    generate_per_path_assert_refutation_vcs, generate_per_path_assert_refutation_vcs_with_context,
+};
 pub use bmc_reduction::*;
 pub(crate) use block_defs::*;
 pub(crate) use checked_vcs::*;

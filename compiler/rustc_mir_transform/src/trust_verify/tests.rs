@@ -2257,7 +2257,7 @@ fn axiom_census_decline_is_fail_closed_on_an_absent_record() {
 
 /// Trust (assumption-root gate): the census is taken over KEYS so the publish
 /// point can cross-check it against the set the bridge actually receives. Pins
-/// all four refusals of [`bundle_census_is_axiom_free`], each with the planted
+/// all five refusals of [`bundle_census_is_axiom_free`], each with the planted
 /// violation that makes it fire.
 ///
 /// Conjunct 2 is the one that has no other cover anywhere in the tree: today
@@ -2270,7 +2270,7 @@ fn axiom_census_decline_is_fail_closed_on_an_absent_record() {
 fn bundle_census_fails_closed_on_an_axiom_key_the_census_never_recorded() {
     let none: FxHashSet<String> = FxHashSet::default();
     assert!(
-        bundle_census_is_axiom_free(&none, &none, true, true),
+        bundle_census_is_axiom_free(&none, &none, true, true, true),
         "a bundle with no user axiom and a complete walk is spendable"
     );
 
@@ -2278,7 +2278,7 @@ fn bundle_census_fails_closed_on_an_axiom_key_the_census_never_recorded() {
     let censused = FxHashSet::from_iter(["mycrate::boom".to_string()]);
     let assumed = FxHashSet::from_iter(["mycrate::boom".to_string()]);
     assert!(
-        !bundle_census_is_axiom_free(&censused, &assumed, true, true),
+        !bundle_census_is_axiom_free(&censused, &assumed, true, true, true),
         "a censused user axiom must make the verdict unspendable"
     );
 
@@ -2287,13 +2287,13 @@ fn bundle_census_fails_closed_on_an_axiom_key_the_census_never_recorded() {
     // written outside `insert_user_axiom_absent_call_identity` would look like.
     let smuggled = FxHashSet::from_iter(["mycrate::smuggled".to_string()]);
     assert!(
-        !bundle_census_is_axiom_free(&none, &smuggled, true, true),
+        !bundle_census_is_axiom_free(&none, &smuggled, true, true, true),
         "an `assumed_total` key with no census record must fail CLOSED, not read as clean"
     );
 
     // (3) a member of the DefId walk could not be read at all.
     assert!(
-        !bundle_census_is_axiom_free(&none, &none, false, true),
+        !bundle_census_is_axiom_free(&none, &none, false, true, true),
         "an incomplete DefId walk must make the verdict unspendable"
     );
 
@@ -2306,7 +2306,7 @@ fn bundle_census_fails_closed_on_an_axiom_key_the_census_never_recorded() {
     // `axiom_free=true` on the compiler that had only the call-operand census.
     let mentioned_only = FxHashSet::from_iter(["mycrate::boom".to_string()]);
     assert!(
-        !bundle_census_is_axiom_free(&mentioned_only, &none, true, true),
+        !bundle_census_is_axiom_free(&mentioned_only, &none, true, true, true),
         "a censused user axiom that reached no bridge set must STILL be unspendable"
     );
 
@@ -2320,8 +2320,23 @@ fn bundle_census_fails_closed_on_an_axiom_key_the_census_never_recorded() {
     // is the same mistake in kind that let the round-3 compiler credit `static
     // TABLE: [fn(); 1] = [boom]` (there it never looked at the region at all).
     assert!(
-        !bundle_census_is_axiom_free(&none, &none, true, false),
+        !bundle_census_is_axiom_free(&none, &none, true, false, true),
         "a constant-memory region the census could not read must fail CLOSED"
+    );
+
+    // (6) THE TRANSITIVE POINTER HOP COULD NOT BE READ. Same shape as (5) and
+    // distinct from it in the same way: every set is empty and conjuncts 1-4 all
+    // read clean, so this conjunct is the only thing refusing. It is the shape
+    // `follow_user_axiom_pointer_hop` produces when a reified target has no MIR in
+    // this compilation, when its `optimized_mir` would cycle and it has no
+    // pre-steal snapshot, or when the hop fuel runs out. Reading an unexplored hop
+    // as clean is exactly the defect this round closed: MEASURED on pristine main,
+    // a two-hop `#[trust::assume_total] fn boom() { panic!() }` published
+    // `axiom_free=true` with `user_axiom_keys=0` and the program built rc=0 and
+    // panicked when run.
+    assert!(
+        !bundle_census_is_axiom_free(&none, &none, true, true, false),
+        "a pointer hop the census could not follow must fail CLOSED"
     );
 }
 

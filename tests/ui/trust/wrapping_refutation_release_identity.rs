@@ -15,49 +15,49 @@
 //! Trust verification, they become ordinary overflow-obligated arithmetic and
 //! this strict `-O` fixture fails.
 //!
-//! RE-PIN 2026-08-15 — 1 proved -> 1 runtime-checked, caused by UPSTREAM commit
-//! 983bc1a3b6 ("REMOVE the panic-freedom subsumption lane"), NOT by anything on
-//! our side. The movement is strictly stronger (more conservative): the
-//! compiler now REFUSES to credit a proof it used to credit. Nothing here was
-//! refuted before and is unrefuted now, no error vanished, and no verdict was
-//! upgraded — `-Ztrust-policy=certify` rejects this file today and accepted it
-//! before, which is the fail-closed direction.
+//! RE-PIN 2026-08-15 — 1 proved -> 1 runtime-checked, caused by UPSTREAM
+//! commit 983bc1a3b6 ("REMOVE the panic-freedom subsumption lane"), NOT by
+//! anything on our side. That movement was strictly stronger: the compiler
+//! REFUSED to credit a proof it used to credit, because the credit came from
+//! `ResultProofAuthority::WholeFunctionPanicFreedomSubsumption`, minted over a
+//! VACUOUSLY true premise conjunction (the aggregate was the sole row, so
+//! `all()` ranged over the empty set) — exactly the false-proof shape upstream
+//! 1ab7ee48f2 named and 983bc1a3b6 deleted. That deletion still stands (see
+//! the "REMOVED (2026-08-14, FALSE PROOF)" marker in `trust_verify.rs`), and
+//! the "1 proved" line below must NEVER be recovered by reviving it.
 //!
-//! MECHANISM. Each of these two functions lowers to exactly ONE compiler result
-//! row: the synthesized `assertion:panic-freedom:0` aggregate (measured — the
-//! sibling `trust_mc_default_function:0` is a default admission and returns
+//! RE-PIN 2026-08-18 — 1 runtime-checked -> 1 proved AND kernel-certified,
+//! which is the honest close the previous re-pin named as the only acceptable
+//! route. The row now carries `VerificationResult::Certified`: a clean CIC
+//! kernel re-check with ZERO trust in the SMT solver, a STRICTLY STRONGER tier
+//! than the solver-trusted `proved` the subsumption lane used to forge. The
+//! two authorities are distinguishable in the stderr itself — the certified
+//! tier prints "of which 1 kernel-certified by the clean CIC kernel", which
+//! the deleted lane never could. If a future run restores "1 proved" WITHOUT
+//! that note, treat it as the false proof returning and reject it.
+//!
+//! MEASURED on the stage2 built from 19403c8494 with this file's own
+//! compile-flags: each function reports "1 proved, 0 failed, 0 unknown,
+//! 0 timed out, 0 runtime-checked out of 1 obligation(s)" plus the
+//! kernel-certified note. The cause is UPSTREAM again, and it is the named
+//! follow-up arriving: 4309669255 dropped an unwanted ay proof-artifact
+//! demand that had made the per-branch (case-split) certificate lane abstain
+//! and decline EVERY certificate, and e7fd15b1e7 pinned clean/ay to the
+//! array-ROW case-split wave. Attributed by ancestry, not by ablation.
+//!
+//! MECHANISM (unchanged — it is what this file exists to pin). Each of these
+//! two functions lowers to exactly ONE compiler result row: the synthesized
+//! `assertion:panic-freedom:0` aggregate (measured — the sibling
+//! `trust_mc_default_function:0` is a default admission that returns
 //! Unsupported, so it is never a counted row). `refute_full_assert_obligations`
-//! still proves the assert's panic path unreachable and still re-points the
-//! aggregate at the GROUNDED residual violation — the stderr note "was grounded
-//! by the compiler" below is that lane firing, and it fires only while the
-//! `wrapping_add`/`wrapping_sub` call identities survive `-O`, so this file
-//! still pins exactly what it was written to pin. That rewrite deliberately
-//! revokes the row's public binding, so the row's only remaining route to a
-//! private authority is a Clean-kernel certificate over the grounded residual.
-//! MEASURED (`trust_certify::certify_vc` driven directly, both the pre-merge
-//! clean pin 4c61046822 and the current 6bdd47cf5f): the kernel DECLINES both
-//! residuals. The measured shape is a FORMULA-level `Ite` whose branches are
-//! themselves equations — `Ite(Lt(i32::MAX, Add(_4,-1)), Eq(_3, Add(_4,
-//! -4294967297)), Ite(Lt(Add(_4,-1), i32::MIN), Eq(_3, Add(_4, 4294967295)),
-//! Eq(_3, Add(_4,-1))))` — while `certify_vc`'s only `Ite` lane
-//! (`ite_index_branch_values`, crates/trust-certify/src/lib.rs:6649) matches
-//! `Eq(var, Ite(intlit, intlit))`, a TERM-level `Ite` over closed literals. The
-//! formula-level shape cannot reach that lane at all, so the decline is
-//! structural, not a budget or a near-miss. Before 983bc1a3b6 the row was
-//! carried past the S4 gate by `ResultProofAuthority::WholeFunctionPanicFreedom
-//! Subsumption`, minted here over a VACUOUSLY true premise conjunction (the
-//! aggregate was the sole row, so `all()` ranged over the empty set) — exactly
-//! the false-proof shape upstream 1ab7ee48f2 named and 983bc1a3b6 deleted.
-//! Restoring the "1 proved" line therefore requires restoring a deleted false
-//! proof, and must not be done.
-//!
-//! TO CLOSE HONESTLY (then re-pin back to "1 proved"): teach the Clean kernel a
-//! certificate for the wrapping-`Ite` residual — a 3-way case split per `Ite`
-//! into linear-Int contradictions — so the grounded row earns `KernelCertified`
-//! on its own. That is upstream's own named follow-up in 983bc1a3b6. Do NOT
-//! recover this by crediting the native trust-mc verdict: it is ChcValidity
-//! (Chc/SmtBacked, not kernel-rechecked) and 983bc1a3b6 explicitly evaluated and
-//! DECLINED that route for this aggregate.
+//! proves the assert's panic path unreachable and re-points the aggregate at
+//! the GROUNDED residual violation, and it fires only while the
+//! `wrapping_add`/`wrapping_sub` call identities survive `-O`. If MIR inlining
+//! erases those identities the calls become ordinary overflow-obligated
+//! arithmetic, the grounded residual changes shape, and this strict `-O`
+//! fixture fails — exactly the regression it is here to catch. Do NOT recover
+//! a lost verdict by crediting the native trust-mc verdict: it is ChcValidity
+//! (Chc/SmtBacked, not kernel-rechecked), which 983bc1a3b6 explicitly declined.
 
 #![crate_type = "lib"]
 

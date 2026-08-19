@@ -480,7 +480,18 @@ fn mem_has_register(mem: &trust_disasm::operand::MemoryOperand, reg: &Register) 
         MemoryOperand::BaseRegister { base, index, .. } => base == reg || index == reg,
         MemoryOperand::PreIndex { base, .. } => base == reg,
         MemoryOperand::PostIndex { base, .. } => base == reg,
-        MemoryOperand::PcRelative { .. } | _ => false,
+        // Trust: `BaseIndexOffset` DOES read its base and index. This arm was a
+        // wildcard (`PcRelative { .. } | _ => false`), so a new variant would
+        // have been absorbed silently and reported "reads no register" — which
+        // for a base+index address is wrong, and would have mis-answered the
+        // read-before-write analysis that infers argument registers.
+        MemoryOperand::BaseIndexOffset { base, index, .. } => {
+            base.as_ref() == Some(reg) || index == reg
+        }
+        MemoryOperand::Absolute { .. }
+        | MemoryOperand::PcRelative { .. }
+        | MemoryOperand::RipRelative { .. } => false,
+        _ => false,
     }
 }
 

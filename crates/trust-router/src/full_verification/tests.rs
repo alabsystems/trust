@@ -5131,3 +5131,90 @@ fn required_engine_policy_rejects_name_only_experimental_placeholder() {
             .any(|diagnostic| diagnostic.contains("missing: trust-vc"))
     );
 }
+
+/// Trust (#59, 2026-08-19) — the concurrency obligations MUST NOT ROUTE.
+///
+/// CLAUDE.md records why this matters, and it is not a style point:
+/// `trust-vcgen/src/data_race.rs` and `memory_ordering/checker.rs` emit
+/// `reach_a AND reach_b AND true` — the happens-before question is decided in Rust
+/// beforehand and hardcoded, so the obligation is VACUOUS. Routing a vacuous
+/// obligation to any engine manufactures a verdict about a claim nobody stated.
+///
+/// Today that cannot happen, but only INCIDENTALLY: `ObligationKind::Custom { .. }
+/// => return None` is a catch-all reached after the two privileged namespace arms,
+/// and `fallback_route` returns `None` unconditionally. Nothing anywhere asserted
+/// the intent, so the protection was a side effect of the match order rather than a
+/// stated invariant.
+///
+/// That is exactly the shape that breaks silently. v6/D2 makes `ty` the owner of
+/// concurrency, which makes "add a route for these kinds" the obvious next edit for
+/// someone who has not read the hazard note. This test makes that edit go RED
+/// instead of green.
+///
+/// THE UNBLOCK CONDITION, stated so this test is not read as a permanent veto: route
+/// these only once the emitters carry a REAL happens-before model. The gate is the
+/// formula, not this assertion.
+#[test]
+fn concurrency_obligations_are_unroutable_until_their_formula_is_real() {
+    fn custom(namespace: &str, name: &str) -> TrustObligation {
+        TrustObligation {
+            obligation_id: format!("{namespace}/{name}"),
+            kind: ObligationKind::Custom {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+            },
+            contract_id: None,
+            proof_item_id: None,
+            source: SourceLocation::default(),
+            description: "concurrency obligation".to_string(),
+            required_strength: None,
+            summary_facts: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+
+    for name in ["data_race", "insufficient_ordering"] {
+        let obligation =
+            custom(trust_verifier_api::TRUST_VC_OBLIGATION_NAMESPACE, name);
+
+        assert!(
+            super::routing::obligation_route(&obligation).is_none(),
+            "`trust.vc/{name}` MUST NOT route: its emitted formula is \
+             `reach_a AND reach_b AND true`, so any engine asked to discharge it would \
+             return a verdict about a claim nobody stated. Route it only after the \
+             emitter carries a real happens-before model."
+        );
+        assert!(
+            super::routing::fallback_route(&obligation).is_none(),
+            "`trust.vc/{name}` MUST NOT reach a fallback engine either — a second \
+             engine discharging a vacuous obligation is the same defect with a \
+             different label."
+        );
+    }
+}
+
+/// POSITIVE CONTROL for the guard above. A test that only asserts `None` can pass
+/// because routing is broken for everything, so pin that the privileged namespace
+/// DOES route — the guard is then known to discriminate.
+#[test]
+fn the_privileged_hardened_namespace_still_routes() {
+    let obligation = TrustObligation {
+        obligation_id: "hardened/probe".to_string(),
+        kind: ObligationKind::Custom {
+            namespace: trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.to_string(),
+            name: "os_path".to_string(),
+        },
+        contract_id: None,
+        proof_item_id: None,
+        source: SourceLocation::default(),
+        description: "hardened obligation".to_string(),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: Vec::new(),
+    };
+    assert!(
+        super::routing::obligation_route(&obligation).is_some(),
+        "the hardened namespace is the ONE privileged Custom namespace and must still \
+         route — without this, the unroutability guard above could pass vacuously"
+    );
+}

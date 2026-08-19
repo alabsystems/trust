@@ -323,6 +323,21 @@ impl MemoryModelChecker {
                 )),
                 Sort::Bool,
             );
+            // SOUNDNESS (#59, 2026-08-19): the third conjunct is a PLACEHOLDER,
+            // not a model — the ordering question is decided in Rust above and
+            // hardcoded, so this obligation asserts only `reach_a AND reach_b` and
+            // says nothing at all about happens-before.
+            //
+            // Inert ONLY because `trust.vc/insufficient_ordering` does not route:
+            // it is an `ObligationKind::Custom` reaching the catch-all in
+            // `trust-router`'s `obligation_route`, and `fallback_route` returns
+            // None. Pinned by
+            // `full_verification::tests::concurrency_obligations_are_unroutable_until_their_formula_is_real`.
+            //
+            // DO NOT route this kind while this conjunct is `Bool(true)`. v6/D2
+            // gives `ty` ownership of concurrency, which makes "add a route" the
+            // obvious next edit; the gate is THIS FORMULA becoming a real
+            // happens-before model, not the routing table.
             let formula = Formula::And(vec![reach_a, reach_b, Formula::Bool(true)]);
 
             vcs.push(VerificationCondition {

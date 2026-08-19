@@ -1188,6 +1188,13 @@ pub use generate::call_dest_fact_token;
 pub use generate::call_arg_fact_token;
 // `-full`-only assert refutation.
 pub use generate::generate_full_assert_refutation_vcs;
+// Trust: the PER-PATH, REFUTE-ONLY assert lane. Its formula UNDER-approximates
+// (exact symbolic execution of enumerated acyclic paths), so it may report a
+// refutation and nothing else — an asymmetry carried by the returned
+// `RefuteOnlyVc` type, not by a flag. See `generate::per_path_refute`.
+pub use generate::{
+    generate_per_path_assert_refutation_vcs, generate_per_path_assert_refutation_vcs_with_context,
+};
 /// Prospective measurement-only raw-VC rehydration; this is not a compiler
 /// verdict/cache-hit authority path and must not replace fresh VC generation.
 pub use generate::discharge_captured_raw_body_with_context;

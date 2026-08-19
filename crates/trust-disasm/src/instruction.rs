@@ -46,6 +46,18 @@ pub struct Instruction {
     operand_count: u8,
     /// Control flow classification.
     pub flow: ControlFlow,
+    /// **x86-64.** Effective operand size in BITS (8/16/32/64), when the decoder
+    /// determined it from the encoding and prefixes rather than from a register
+    /// operand's own width.
+    ///
+    /// Needed because a MEMORY operand carries no width of its own. For
+    /// `mov r/m, imm` (`C6`/`C7`) the destination width lives only in the
+    /// opcode and the REX.W / 0x66 prefixes, so a consumer that inferred it from
+    /// the source operand found an immediate and had nothing to go on:
+    /// `movb $1,(%rdi)` was modelled as an EIGHT-byte write. `None` means "not
+    /// recorded — infer as before" (AArch64 always, and x86-64 forms whose width
+    /// is already carried by a register operand).
+    pub operand_size: Option<u8>,
 }
 
 impl Instruction {
@@ -62,6 +74,7 @@ impl Instruction {
             operands: [None; MAX_OPERANDS],
             operand_count: 0,
             flow,
+            operand_size: None,
         }
     }
 
@@ -84,6 +97,7 @@ impl Instruction {
             operands: [None; MAX_OPERANDS],
             operand_count: 0,
             flow,
+            operand_size: None,
         }
     }
 
@@ -93,6 +107,15 @@ impl Instruction {
         assert!(idx < MAX_OPERANDS, "too many operands");
         self.operands[idx] = Some(op);
         self.operand_count += 1;
+    }
+
+    /// Trust: mutable operand access, for the x86-64 RIP-relative resolution
+    /// choke point in `x86_64::decoder::decode_instruction`. Deliberately
+    /// crate-internal — resolving a `MemoryOperand::RipRelative` requires the
+    /// FINAL instruction length, which only that function knows.
+    pub(crate) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
+        let count = self.operand_count as usize;
+        self.operands[..count].iter_mut().filter_map(Option::as_mut)
     }
 
     /// Number of operands.
@@ -236,5 +259,13 @@ fn mem_reads_register(mem: &crate::operand::MemoryOperand, reg: &Register) -> bo
         MemoryOperand::PreIndex { base, .. } => base == reg,
         MemoryOperand::PostIndex { base, .. } => base == reg,
         MemoryOperand::PcRelative { .. } => false,
+        // A ground address reads no register.
+        MemoryOperand::Absolute { .. } => false,
+        MemoryOperand::BaseIndexOffset { base, index, .. } => {
+            base.as_ref() == Some(reg) || index == reg
+        }
+        // Unresolved RIP-relative reads no GPR (RIP is not a GPR). It should
+        // never be observed here at all — see the variant's doc comment.
+        MemoryOperand::RipRelative { .. } => false,
     }
 }

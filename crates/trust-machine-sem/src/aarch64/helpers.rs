@@ -201,8 +201,19 @@ pub(super) fn resolve_mem_address(
             // Address = base (offset applied after, writeback handled separately).
             read_base_reg(state, base)
         }
+        // Trust: the base is THIS instruction's address, which the threaded
+        // state already holds — `trust-lift` sets `state.pc` per instruction
+        // (semantic_lift.rs). This used to build a FREE `Var("PC")`, which
+        // nothing ever binds, so the load address was unconstrained while the
+        // `PcUpdate` effect of the SAME instruction folded the ground address:
+        // the two effects disagreed about what PC is.
+        //
+        // Not a sound over-approximation. `Var("PC")` is one shared symbol, so
+        // two literal loads at different addresses with the SAME true effective
+        // address get formulas that differ by a constant for EVERY value of the
+        // symbol — the real execution is excluded from the model, not weakened.
         MemoryOperand::PcRelative { offset } => Ok(Formula::BvAdd(
-            Box::new(Formula::Var("PC".into(), trust_types::Sort::BitVec(64))),
+            Box::new(state.pc.clone()),
             Box::new(Formula::BitVec { value: *offset as i128, width: 64 }),
             64,
         )),

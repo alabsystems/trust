@@ -1,0 +1,37 @@
+{
+  "note": "Recorded 2026-08-18 (updated same day: 76 -> 1 after root-causing every family). `mismatch_counts` are a CEILING: growth means words that used to agree with the oracle no longer do. New families FAIL outright.",
+  "tiers": {
+    "corpus": {
+      "candidates": 14,
+      "compared": 14,
+      "agreed": 14,
+      "mismatch_counts": {}
+    },
+    "sweep": {
+      "candidates": 3528,
+      "compared": 3528,
+      "agreed": 3528,
+      "mismatch_counts": {}
+    },
+    "random": {
+      "candidates": 20000,
+      "compared": 6330,
+      "agreed": 6329,
+      "mismatch_counts": {
+        "instruction_length": 1
+      },
+      "seed": "0xc0ffee",
+      "limit": 20000
+    }
+  },
+  "known_open": {
+    "instruction_length": "EXACTLY ONE, adjudicated: `0f 1e /r` without F3. The SDM documents 0F 19-0F 1F as reserved hint-NOPs that EXECUTE AS NOP on real processors; our decoder accepts them as NOP (3 bytes here), LLVM prints `<unknown>` and stops after 2. This is the two-decoders-disagree case the harness doc warns about, and the HARDWARE sides with our reading — changing the decoder to match LLVM would model LLVM, not the ISA. Ceiling 1; a second word in this family means something else regressed."
+  },
+  "battery": [
+    "length",
+    "rip_base",
+    "drop_disp",
+    "drop_index",
+    "reg_rename"
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "x86-decode-differential"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace on purpose, matching the sibling harnesses: this one
+# shells out to an assembler and a disassembler and must be buildable and
+# runnable without dragging the compiler workspace along.
+[workspace]
+
+[dependencies]
+trust-disasm = { path = "../.." }
+
+[profile.release]
+debug-assertions = false

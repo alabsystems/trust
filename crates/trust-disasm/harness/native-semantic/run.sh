@@ -300,6 +300,28 @@ if tier != 'selftest':
             f'{k}={fams[k]}' for k in new) + '. A model/hardware divergence outside the '
             'recorded set. Reproduce one word with --words, then either fix the semantics '
             'or REFUSE the form. Approximating onto a neighbouring value is never acceptable.')
+    # A NEW FAMILY IS NOT THE ONLY REGRESSION SHAPE.
+    #
+    # `known_mismatch_opcodes` is a set of NAMES, so a regression INSIDE an
+    # already-open family was invisible: break `sem_fcmp` so that every `Fcmp`
+    # word disagrees with the hardware and the family is still just `Fcmp`,
+    # `new` is still empty, and this gate still passed. The counts were computed
+    # and then discarded at record time.
+    #
+    # So a known family's count is a CEILING, not a licence. Growth means words
+    # that used to agree now do not.
+    counts = tb.get('known_mismatch_counts')
+    if counts is None:
+        note.append('stage 3: this baseline predates per-family mismatch counts, so growth '
+                    'INSIDE a known-open family is not gated. Rerun with --accept to record '
+                    'them.')
+    else:
+        grew = sorted(k for k in fams if k in known and fams[k] > counts.get(k, 0))
+        if grew:
+            fail.append('stage 3: KNOWN FAMILY GREW: ' + ', '.join(
+                f'{k}={fams[k]} > {counts.get(k, 0)}' for k in grew) + '. Words that used to '
+                'AGREE with the hardware no longer do. The family being already-open is not '
+                'a licence for more of it — reproduce one of the new words with --words.')
     # COVERAGE IS GATED ON `compared + x18-excluded + timed-out`, NOT ON
     # `compared`.
     #
@@ -372,6 +394,11 @@ if accept:
             'timeout_excluded': sw['excluded']['native_timeout'],
             'opcodes_floor': sw['opcodes_compared'],
             'known_mismatch_opcodes': sorted(sw['mismatch_families']),
+            # Per-family COUNTS, so growth inside an already-open family is a
+            # regression rather than a silent pass. Names alone made a broken
+            # `sem_fcmp` — every Fcmp word diverging — indistinguishable from
+            # the recorded state.
+            'known_mismatch_counts': dict(sorted(sw['mismatch_families'].items())),
             'mismatches': sw['mismatched'],
             'scan_s': round(sw['scan_s'], 1),
             'sweep_s': round(sw['sweep_s'], 1),

@@ -4583,11 +4583,39 @@ fn x86_memory_operand_address(
                 )
             })
         }
-        MemoryOperand::PcRelative { offset } => add_signed_u64(instruction_address, *offset),
+        // Trust: already ground — the decoder resolved `[disp32]` and
+        // `[RIP + disp32]` here. This arm previously read `PcRelative` and
+        // computed `instruction_address + offset`, carrying the same defect as
+        // the symbolic lane: x86-64 RIP is the address of the NEXT instruction.
+        MemoryOperand::Absolute { address } => Ok(*address),
+        MemoryOperand::BaseIndexOffset { base, index, scale_shift, displacement } => {
+            let base = match base {
+                Some(base) => x86_concrete_register_value(concrete, base)?,
+                None => 0,
+            };
+            let index = x86_concrete_register_value(concrete, index)?;
+            let shifted = index.checked_shl(u32::from(*scale_shift)).ok_or_else(|| {
+                format!("index register shift {scale_shift} overflows target-memory address")
+            })?;
+            let sum = base.checked_add(shifted).ok_or_else(|| {
+                format!(
+                    "base/index target-memory address overflows: 0x{base:x} + (0x{index:x} << {scale_shift})"
+                )
+            })?;
+            add_signed_u64(sum, *displacement)
+        }
         MemoryOperand::PreIndex { base, offset } => {
             add_signed_u64(x86_concrete_register_value(concrete, base)?, *offset)
         }
         MemoryOperand::PostIndex { base, .. } => x86_concrete_register_value(concrete, base),
+        // `PcRelative` is AArch64's (relative to the instruction's own address)
+        // and `RipRelative` is decoder-internal; neither is legitimate on the
+        // x86-64 replay path. Refuse rather than compute a plausible-looking
+        // wrong address.
+        MemoryOperand::PcRelative { .. } | MemoryOperand::RipRelative { .. } => Err(format!(
+            "x86_64 replay must not observe a PC-relative memory operand {}",
+            x86_memory_operand_label(memory)
+        )),
         _ => Err(format!("unsupported target-memory operand {}", x86_memory_operand_label(memory))),
     }
 }
@@ -4683,6 +4711,18 @@ fn x86_memory_operand_label(memory: &MemoryOperand) -> String {
             }
         }
         MemoryOperand::PcRelative { offset } => format!("[RIP{}]", signed_offset_label(*offset)),
+        MemoryOperand::Absolute { address } => format!("[0x{address:x}]"),
+        MemoryOperand::BaseIndexOffset { base, index, scale_shift, displacement } => {
+            let base = base.map_or_else(String::new, |base| format!("{base}"));
+            format!(
+                "[{base}+{index}*{}{}]",
+                1u32 << scale_shift,
+                signed_offset_label(*displacement)
+            )
+        }
+        MemoryOperand::RipRelative { displacement } => {
+            format!("[RIP(unresolved){}]", signed_offset_label(*displacement))
+        }
         MemoryOperand::PreIndex { base, offset } => {
             format!("[{}{}]!", x86_register_label(base), signed_offset_label(*offset))
         }

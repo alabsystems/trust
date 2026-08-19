@@ -166,6 +166,42 @@
 //!    size depends on the environment, summed with buckets that do not — is
 //!    worth looking for wherever a count is called reproducible.
 //!
+//! ## A0. ARCHITECTURE — this oracle is AArch64 ONLY, and x86-64 has none
+//!
+//! Listed FIRST because it is the largest exclusion in this file and the one a
+//! reader is least likely to infer: every antecedent above says
+//! `decode_aarch64` and `Aarch64Semantics`. There is no x86-64 differential
+//! oracle anywhere in `crates/trust-disasm/harness/`. `trust_disasm::
+//! decode_x86_64` and `trust_machine_sem::X86_64Semantics` are checked by unit
+//! tests only — that is, against expectations a human wrote down, never against
+//! the hardware.
+//!
+//! This section exists because of the rule stated at the top of the inventory:
+//! *if a limitation is not listed here, the harness is claiming to cover it.*
+//! The x86-64 gap was unlisted, so this file was making exactly that claim.
+//!
+//! WHAT IT COST, measured 2026-08-18 (see
+//! `docs/audits/2026-08-18-x86-address-decoding.md` and
+//! `docs/audits/2026-08-18-binary-stack-audit.md`): sixteen defects, of which
+//! FIVE were wrong ADDRESSES coexisting in one file — RIP-relative short by
+//! `insn.size`, absolute `[disp32]` computed as PC-relative, a dropped
+//! displacement, a dropped `R12` index, and a fabricated `RBP` base — plus
+//! `mov ah` modelled as a STACK POINTER write, `movb` as an eight-byte store,
+//! and `jp`/`jnp` as unconditional branches. Every one of them is a divergence
+//! this oracle's consequent would have caught on the first word: they compare
+//! registers, flags and memory bytes against the CPU. None of them faults, so
+//! `native-invariant` beside this file could not see them either.
+//!
+//! WHY IT DOES NOT SIMPLY GENERALISE. The `--full` mode here is exhaustive over
+//! a 2^32 space because AArch64 words are fixed-width. x86-64 instructions are
+//! 1-15 bytes, so there is no space to enumerate and an x86-64 oracle needs a
+//! generator or corpus instead — a different selector, though the same
+//! consequent (compare the whole architectural post-state, count what you
+//! cannot speak about, never fold it into agreement) transfers unchanged.
+//!
+//! Until that exists, no x86-64 count anywhere may be read as differential
+//! evidence.
+//!
 //! ## E. THE SET THIS ORACLE NEVER SPOKE ABOUT — now printed, must stay empty
 //!
 //! `N opcodes compared` is a number about what the CONCRETE REPLAYER can

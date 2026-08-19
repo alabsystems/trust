@@ -11,6 +11,7 @@ use crate::instruction::ControlFlow;
 use crate::opcode::Opcode;
 use crate::operand::{Condition, MemoryOperand, Operand};
 use crate::x86_64::X86_64Decoder;
+use crate::x86_64::modrm::gpr;
 
 /// Helper: decode bytes at address 0.
 fn decode(bytes: &[u8]) -> crate::instruction::Instruction {
@@ -253,14 +254,148 @@ fn test_mov_r8_imm8() {
 #[test]
 fn test_lea_rip_relative() {
     // 48 8D 05 xx xx xx xx = LEA RAX, [RIP+disp32]
+    //
+    // This asserted `PcRelative { offset: 0x10 }` until 2026-08-18 — i.e. it
+    // PINNED the defect. x86-64 RIP-relative addressing is measured from the
+    // first byte of the NEXT instruction, so at address 0 with size 7 the
+    // effective address is 0 + 7 + 0x10 = 0x17, and the decoder now resolves it.
     let insn = decode(&[0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00]);
     assert_eq!(insn.opcode, Opcode::Lea);
     assert_eq!(insn.size, 7);
     assert!(matches!(insn.operand(0), Some(Operand::Reg(r)) if r.index == 0));
-    assert!(matches!(
+    assert_eq!(
         insn.operand(1),
-        Some(Operand::Mem(MemoryOperand::PcRelative { offset: 0x10 }))
-    ));
+        Some(&Operand::Mem(MemoryOperand::Absolute { address: 0x17 })),
+        "RIP-relative resolves against the NEXT instruction: 0 + 7 + 0x10"
+    );
+}
+
+// ==========================================================================
+// x86-64 ADDRESS CORRECTNESS
+//
+// Five defects shipped here because `MemoryOperand` is a shared, AArch64-shaped
+// enum: it had no spelling for an absolute address and none for
+// base+index+displacement, so the x86-64 decoder spelled three distinct
+// addressing forms as `PcRelative` or discarded information outright. Each test
+// below carries the byte sequence that exposed one of them.
+// ==========================================================================
+
+/// A RIP-relative operand must resolve against the NEXT instruction, INCLUDING
+/// a trailing immediate that extends it past the displacement.
+///
+/// `48 C7 05 <disp32> <imm32>` is 11 bytes, so resolving at the end of the
+/// displacement (7) is off by 4. This is why resolution lives at the decoder's
+/// choke point, where `size` is final, and not in the ModRM decoder.
+#[test]
+fn rip_relative_resolves_past_a_trailing_immediate() {
+    let insn = decode(&[0x48, 0xC7, 0x05, 0, 0, 0, 0, 0x01, 0, 0, 0]);
+    assert_eq!(insn.size, 11);
+    // The memory operand's index differs by form, so find it rather than
+    // assume a position.
+    let mem = (0..insn.operand_count()).find_map(|i| match insn.operand(i) {
+        Some(Operand::Mem(m)) => Some(*m),
+        _ => None,
+    });
+    assert_eq!(
+        mem,
+        Some(MemoryOperand::Absolute { address: 0x0B }),
+        "EA = 0 + 11 + 0; resolving at the end of the displacement would give 7"
+    );
+}
+
+/// `R12` is a legal SIB index. `Sib::decode` folds REX.X in, so `sib.index` is
+/// 12; testing the low three bits (`12 & 7 == 4`) read it as "no index" and
+/// silently dropped the register from the address.
+#[test]
+fn r12_is_a_real_sib_index_register() {
+    // 4A 8B 04 23 = movq (%rbx,%r12), %rax   (REX.W|REX.X, SIB index=100)
+    let insn = decode(&[0x4A, 0x8B, 0x04, 0x23]);
+    let Some(Operand::Mem(MemoryOperand::BaseIndexOffset { base, index, .. })) = insn.operand(1)
+    else {
+        panic!("expected a base+index address, got {:?}", insn.operand(1));
+    };
+    assert_eq!(base.map(|b| b.index), Some(3), "base is RBX");
+    assert_eq!(index.index, 12, "index is R12, not 'no index'");
+}
+
+/// The no-base SIB form contributes NO base register. It used to be spelled
+/// `BaseRegister { base: gpr(sib.base) }` — with `sib.base` being the 101
+/// "no base" encoding — under a comment claiming "Won't be used". It was used,
+/// so the address gained a phantom RBP term and lost its displacement.
+#[test]
+fn a_no_base_sib_address_has_no_base_and_keeps_its_displacement() {
+    // 48 8B 0C 85 10 00 00 00 = movq 0x10(,%rax,4), %rcx
+    let insn = decode(&[0x48, 0x8B, 0x0C, 0x85, 0x10, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        insn.operand(1),
+        Some(&Operand::Mem(MemoryOperand::BaseIndexOffset {
+            base: None,
+            index: gpr(0, 64),
+            scale_shift: 2,
+            displacement: 0x10,
+        })),
+        "EA = RAX*4 + 0x10, with no base register at all"
+    );
+}
+
+/// base + index + displacement keeps ALL THREE terms. The displacement used to
+/// be dropped and mislabelled "an over-approximation downstream consumers must
+/// handle" — an over-approximation is a WIDER address set, whereas a dropped
+/// displacement is a DIFFERENT, SPECIFIC, WRONG address.
+#[test]
+fn a_base_index_displacement_address_keeps_its_displacement() {
+    // 48 8B 54 4B 20 = movq 0x20(%rbx,%rcx,2), %rdx
+    let insn = decode(&[0x48, 0x8B, 0x54, 0x4B, 0x20]);
+    assert_eq!(
+        insn.operand(1),
+        Some(&Operand::Mem(MemoryOperand::BaseIndexOffset {
+            base: Some(gpr(3, 64)),
+            index: gpr(1, 64),
+            scale_shift: 1,
+            displacement: 0x20,
+        })),
+        "EA = RBX + RCX*2 + 0x20 — three terms, not two"
+    );
+}
+
+/// An absolute `[disp32]` is ABSOLUTE. Spelling it `PcRelative` made it resolve
+/// to `PC + disp`, which also meant the only x86 addresses that looked "ground"
+/// were exactly the mis-addressed ones.
+#[test]
+fn an_absolute_disp32_address_carries_no_pc_term() {
+    // 48 8B 04 25 34 12 00 00 = movq 0x1234, %rax
+    let insn = decode_at(&[0x48, 0x8B, 0x04, 0x25, 0x34, 0x12, 0x00, 0x00], 0x4000);
+    assert_eq!(
+        insn.operand(1),
+        Some(&Operand::Mem(MemoryOperand::Absolute { address: 0x1234 })),
+        "an absolute address must not depend on where the instruction sits"
+    );
+}
+
+/// x86-64 must never PRODUCE AArch64's `PcRelative`, whose base is the
+/// instruction's own address. The split is what makes a missed resolution fail
+/// closed instead of silently computing an AArch64-correct/x86-wrong address.
+#[test]
+fn x86_never_produces_a_pc_relative_or_unresolved_operand() {
+    for bytes in [
+        vec![0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00], // lea rax,[rip+0x10]
+        vec![0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00], // mov rax,[rip+0x10]
+        vec![0x48, 0xC7, 0x05, 0, 0, 0, 0, 0x01, 0, 0, 0], // mov qword [rip+0],1
+        vec![0x48, 0x8B, 0x04, 0x25, 0x34, 0x12, 0x00, 0x00], // mov rax,[0x1234]
+    ] {
+        let insn = decode(&bytes);
+        for i in 0..insn.operand_count() {
+            assert!(
+                !matches!(
+                    insn.operand(i),
+                    Some(Operand::Mem(
+                        MemoryOperand::PcRelative { .. } | MemoryOperand::RipRelative { .. }
+                    ))
+                ),
+                "{bytes:02x?} produced an unresolved/AArch64 PC-relative operand"
+            );
+        }
+    }
 }
 
 // ==========================================================================
@@ -1048,4 +1183,145 @@ fn test_decode_all_with_new_insns() {
     let insn3 = results[3].as_ref().expect("ret should decode");
     assert_eq!(insn3.opcode, Opcode::Ret);
     assert_eq!(insn3.address, 0x2008);
+}
+
+/// `jp` / `jnp` must NOT be modelled as unconditional branches.
+///
+/// x86 condition codes 0xA (JP/JPE, parity even) and 0xB (JNP/JPO) have no
+/// AArch64 equivalent — `Condition` is a faithful 4-bit ARM encoding with no
+/// parity member, and `MachineState`'s flags are NZCV with no parity flag. They
+/// used to map to `Condition::Al`, "always", with the comment "use Al as
+/// placeholder". That made two MUTUALLY EXCLUSIVE branches both always-taken:
+/// a model in which `jp L` and `jnp L` both jump.
+///
+/// Refusing to decode is a capability gap; an always-taken conditional branch
+/// is a wrong program.
+#[test]
+fn parity_conditions_are_refused_not_modelled_as_always() {
+    let decoder = X86_64Decoder::new();
+    // 7A 05 = jp +5 ; 7B 05 = jnp +5 ; 0F 8A/8B rel32 = the near forms.
+    for bytes in [
+        vec![0x7A, 0x05],
+        vec![0x7B, 0x05],
+        vec![0x0F, 0x8A, 0x05, 0x00, 0x00, 0x00],
+        vec![0x0F, 0x8B, 0x05, 0x00, 0x00, 0x00],
+    ] {
+        let decoded = decoder.decode(&bytes, 0x1000);
+        if let Ok(insn) = &decoded {
+            for i in 0..insn.operand_count() {
+                assert!(
+                    !matches!(insn.operand(i), Some(Operand::Cond(Condition::Al | Condition::Nv))),
+                    "{bytes:02x?} modelled a parity condition as always/never: {insn:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The converse: the NON-parity conditions must still decode, and to the right
+/// condition. A fix that refused too much would break these.
+#[test]
+fn non_parity_conditions_still_decode_correctly() {
+    let decoder = X86_64Decoder::new();
+    // (opcode, expected condition) for the rel8 Jcc forms.
+    for (op, expected) in [
+        (0x74u8, Condition::Eq),  // JE
+        (0x75, Condition::Ne),    // JNE
+        (0x72, Condition::Cs),    // JB
+        (0x77, Condition::Hi),    // JA
+        (0x7C, Condition::Lt),    // JL
+        (0x7F, Condition::Gt),    // JG
+    ] {
+        let insn = decoder.decode(&[op, 0x05], 0x1000).expect("Jcc rel8 should decode");
+        assert!(
+            (0..insn.operand_count())
+                .any(|i| matches!(insn.operand(i), Some(Operand::Cond(c)) if *c == expected)),
+            "0x{op:02x} should carry {expected:?}; got {insn:?}"
+        );
+    }
+}
+
+/// The shift group's `/6` is an UNDEFINED encoding (SDM: SAL is `/4`; `/6` is
+/// unlisted) and LLVM decodes it `<unknown>`. We ACCEPTED it as an
+/// `Opcode::Unknown` with materialised operands — the accepts-what-the-oracle-
+/// rejects class. Found by the x86-64 decode differential.
+#[test]
+fn shift_group_slash_six_is_refused() {
+    let decoder = X86_64Decoder::new();
+    // C1 /6 imm8, D1 /6, D3 /6 — register and memory forms.
+    for bytes in [
+        vec![0xC1u8, 0x77, 0x5F, 0x89], // shl-like /6 [rdi+0x5f], imm8
+        vec![0xD1, 0x76, 0x8F],         // /6 [rsi-0x71], 1
+        vec![0xD3, 0xF4],               // /6 esp, cl
+    ] {
+        assert!(
+            decoder.decode(&bytes, 0x1000).is_err(),
+            "{bytes:02x?} is an undefined encoding and must be refused"
+        );
+    }
+    // The defined members still decode: /4 SHL, /5 SHR, /7 SAR.
+    for bytes in [vec![0xD3u8, 0xE0], vec![0xD3, 0xE8], vec![0xD3, 0xF8]] {
+        assert!(decoder.decode(&bytes, 0x1000).is_ok(), "{bytes:02x?} is a real shift");
+    }
+}
+
+/// Near CALL (`FF /2`) and JMP (`FF /4`) default to 64 bits in long mode and
+/// have no 32-bit form; the operand-size prefix is ignored for near branches.
+/// The width used to be `prefixes.operand_size()`, so `callq *%rbx` decoded its
+/// target as EBX. Found by the x86-64 decode differential.
+#[test]
+fn indirect_call_and_jmp_targets_are_64_bit() {
+    let decoder = X86_64Decoder::new();
+    for (bytes, opcode) in [(vec![0xFFu8, 0xD3], Opcode::Call), (vec![0xFF, 0xE7], Opcode::Jmp)] {
+        let insn = decoder.decode(&bytes, 0x1000).expect("group-5 form decodes");
+        assert_eq!(insn.opcode, opcode);
+        let Some(Operand::Reg(r)) = insn.operand(0) else {
+            panic!("expected a register target, got {:?}", insn.operand(0));
+        };
+        assert_eq!(r.width, 64, "near branches default to 64-bit in long mode");
+    }
+}
+
+/// `PUSH`/`POP` register forms default to 64-bit; `0x66` selects 16
+/// (`pushw %ax`), and there is no 32-bit encoding at all. The width was
+/// hardcoded to 64, so `66 50` decoded as a push of RAX.
+#[test]
+fn push_pop_honour_the_operand_size_prefix() {
+    let decoder = X86_64Decoder::new();
+    let insn = decoder.decode(&[0x66, 0x50], 0x1000).expect("pushw %ax decodes");
+    let Some(Operand::Reg(r)) = insn.operand(0) else { panic!("register expected") };
+    assert_eq!((r.index, r.width), (0, 16), "66 50 is pushw %ax");
+    let insn = decoder.decode(&[0x50], 0x1000).expect("pushq %rax decodes");
+    let Some(Operand::Reg(r)) = insn.operand(0) else { panic!("register expected") };
+    assert_eq!((r.index, r.width), (0, 64), "50 is pushq %rax");
+}
+
+/// `LEA` computes an effective address, so `mod == 11` (register-direct) has
+/// nothing to compute and is invalid — LLVM decodes `8d d9` as `<unknown>`.
+/// We accepted it and produced two register operands.
+#[test]
+fn lea_with_a_register_source_is_refused() {
+    let decoder = X86_64Decoder::new();
+    assert!(decoder.decode(&[0x8D, 0xD9], 0x1000).is_err(), "LEA mod=11 is invalid");
+    assert!(decoder.decode(&[0x8D, 0x19], 0x1000).is_ok(), "LEA with memory still decodes");
+}
+
+/// `mov r/m8, r8` (`0x88`) routes its REG-field operand through the AH/SPL
+/// resolution. `decode_modrm_rm_reg` used `gpr` directly, so register 5 without
+/// REX rendered as `bpl` instead of `ch` — the fourth site of the high-byte
+/// class, found by the differential after three were fixed by hand.
+#[test]
+fn mov_rm8_r8_resolves_high_byte_registers() {
+    let decoder = X86_64Decoder::new();
+    let insn = decoder.decode(&[0x88, 0xEB], 0x1000).expect("mov %ch, %bl decodes");
+    let regs: Vec<_> = (0..insn.operand_count())
+        .filter_map(|i| match insn.operand(i) {
+            Some(Operand::Reg(r)) => Some((r.kind, r.index)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        regs.contains(&(crate::operand::RegKind::GprHighByte, 1)),
+        "reg field 5 without REX is CH (high byte of RCX); got {regs:?}"
+    );
 }

@@ -8362,6 +8362,326 @@ fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
     ));
 }
 
+/// Trust (vtable slice 1, amended by slice 3): the trait-object unsize `&T -> &dyn Trait`
+/// — spelled by the extractor as an `Rvalue::Cast` to the dyn ref type — must assemble a
+/// REAL fat pointer: the DATA lane is the coercion's source pointer, and the vtable
+/// METADATA lane is a `Load` of the NAMED, initializer-less external global minted by
+/// `trust_ir::stable_vtable_global_name` from `(principal, source type)` — the SAME name
+/// the THIR producer emits for the same coercion. No `Inst::Undef` remains in the body.
+#[test]
+fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
+    let trait_name = "core::fmt::Debug";
+    let dyn_ref_ty =
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into() }) };
+    let func = VerifiableFunction {
+        name: "unsize_to_dyn_fn".to_string(),
+        def_path: "test::unsize_to_dyn_fn".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: dyn_ref_ty.clone(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) },
+                    name: Some("thin".into()),
+                },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dyn_ref_ty.clone()),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: dyn_ref_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("trait-object unsize should lower");
+    assert_valid_module(&module);
+    let bb0 = &module.functions[0].blocks[0];
+
+    let fat_ty = TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject {
+        trait_id: trust_ir::stable_trait_object_id(trait_name),
+    });
+    let (data, metadata) = bb0
+        .body
+        .iter()
+        .find_map(|n| match &n.inst {
+            Inst::PtrFromParts { ptr_ty, metadata_ty: TrustIrTy::Ptr, data, metadata }
+                if *ptr_ty == fat_ty =>
+            {
+                Some((*data, *metadata))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a TraitObject PtrFromParts, got {:?}", bb0.body)
+        });
+    assert_ne!(data, metadata, "the data lane must not be the vtable lane");
+
+    // Trust (vtable slice 3): the vtable lane is a Load of the SHARED named identity
+    // global — value-less (initializer None), external, `Ty::Ptr`, and named EXACTLY
+    // what the shared mint derives from (principal, source) — the byte-identical name
+    // the THIR producer emits, which is the whole point.
+    let expected_name = trust_ir::stable_vtable_global_name(trait_name, "i32")
+        .expect("the (Debug, i32) key is mintable");
+    let global_idx = module
+        .globals
+        .iter()
+        .position(|g| g.name == expected_name)
+        .unwrap_or_else(|| panic!("expected global `{expected_name}`, got {:?}", module.globals));
+    let g = &module.globals[global_idx];
+    assert!(g.initializer.is_none(), "the vtable identity global carries NO value");
+    assert_eq!(g.ty, TrustIrTy::Ptr);
+    let ga = bb0
+        .body
+        .iter()
+        .find_map(|n| match &n.inst {
+            Inst::GlobalAddr { global } if global.as_usize() == global_idx => {
+                n.results.first().copied()
+            }
+            _ => None,
+        })
+        .expect("a GlobalAddr of the vtable identity global");
+    assert!(
+        bb0.body.iter().any(|n| matches!(
+            &n.inst,
+            Inst::Load { ty: TrustIrTy::Ptr, ptr, .. } if *ptr == ga
+        ) && n.results.contains(&metadata)),
+        "the metadata lane must be the Load through the identity global's address"
+    );
+
+    // Slice 3 retires the vtable-lane havoc for mintable keys: NO Undef anywhere.
+    assert!(
+        !bb0.body.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
+        "no havoc may remain once the identity is minted, got {:?}",
+        bb0.body
+    );
+}
+
+/// Trust (vtable slice 3): the IDENTITY claim, executed — two coercions of the SAME
+/// `(principal, source)` pair reference ONE global (their metadata loads are structurally
+/// read-read equal), and a different source type references a DIFFERENT global (distinct
+/// vtables never merge).
+#[test]
+fn test_trait_object_unsize_same_key_shares_one_vtable_global() {
+    let trait_name = "core::fmt::Debug";
+    let dyn_ref_ty =
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into() }) };
+    let func = VerifiableFunction {
+        name: "unsize_twice_fn".to_string(),
+        def_path: "test::unsize_twice_fn".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: dyn_ref_ty.clone(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) },
+                    name: Some("a".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::u64()) },
+                    name: Some("b".into()),
+                },
+                LocalDecl { index: 3, ty: dyn_ref_ty.clone(), name: None },
+                LocalDecl { index: 4, ty: dyn_ref_ty.clone(), name: None },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    // Same key twice: (Debug, i32) …
+                    Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dyn_ref_ty.clone()),
+                        span: SourceSpan::default(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dyn_ref_ty.clone()),
+                        span: SourceSpan::default(),
+                    },
+                    // … and a different source type: (Debug, u64).
+                    Statement::Assign {
+                        place: Place::local(4),
+                        rvalue: Rvalue::Cast(Operand::Copy(Place::local(2)), dyn_ref_ty.clone()),
+                        span: SourceSpan::default(),
+                    },
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
+            return_ty: dyn_ref_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("double trait-object unsize should lower");
+    assert_valid_module(&module);
+
+    let name_i32 = trust_ir::stable_vtable_global_name(trait_name, "i32").unwrap();
+    let name_u64 = trust_ir::stable_vtable_global_name(trait_name, "u64").unwrap();
+    let vtable_globals: Vec<&str> = module
+        .globals
+        .iter()
+        .filter(|g| g.name.starts_with("__trust_vtable__"))
+        .map(|g| g.name.as_str())
+        .collect();
+    assert_eq!(
+        vtable_globals,
+        vec![name_i32.as_str(), name_u64.as_str()],
+        "one global per DISTINCT key: the repeated (Debug, i32) coercion must reuse, \
+         the (Debug, u64) one must not"
+    );
+    let i32_idx = module.globals.iter().position(|g| g.name == name_i32).unwrap();
+    let addr_count = module.functions[0].blocks[0]
+        .body
+        .iter()
+        .filter(|n| matches!(&n.inst, Inst::GlobalAddr { global } if global.as_usize() == i32_idx))
+        .count();
+    assert_eq!(addr_count, 2, "both same-key coercions must address the ONE shared global");
+}
+
+/// Trust (vtable slice 3) — the FAIL-CLOSED half of the identity. A NOMINAL source type
+/// (`&Vec<i32> -> &dyn Trait`-shaped: the recorded pointee is a generics-erased `Ty::Adt`)
+/// is outside `vtable_source_type_key`'s closed grammar — one erased name covers many
+/// instantiations, and one key for two source types would assert `Load`-equality of two
+/// DIFFERENT vtables. The mint must decline and the vtable lane must stay the slice-1
+/// fresh unconstrained havoc.
+#[test]
+fn test_trait_object_unsize_nominal_source_declines_identity_keeps_havoc() {
+    let trait_name = "core::fmt::Debug";
+    let dyn_ref_ty =
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into() }) };
+    let adt_src = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::adt(
+            "alloc::vec::Vec".to_string(),
+            vec![("buf".to_string(), Ty::usize()), ("len".to_string(), Ty::usize())],
+        )),
+    };
+    let func = VerifiableFunction {
+        name: "unsize_nominal_fn".to_string(),
+        def_path: "test::unsize_nominal_fn".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: dyn_ref_ty.clone(), name: None },
+                LocalDecl { index: 1, ty: adt_src, name: Some("v".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dyn_ref_ty.clone()),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: dyn_ref_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("nominal-source unsize should still lower");
+    assert_valid_module(&module);
+    assert!(
+        module.globals.iter().all(|g| !g.name.starts_with("__trust_vtable__")),
+        "an unmintable key must not manufacture an identity, got {:?}",
+        module.globals
+    );
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        bb0.body
+            .iter()
+            .any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Ptr)),
+        "the vtable lane must stay the slice-1 fresh havoc when no identity is mintable"
+    );
+    assert!(
+        bb0.body.iter().any(|n| matches!(n.inst, Inst::PtrFromParts { .. })),
+        "the data lane split itself is unchanged by the decline"
+    );
+}
+
+/// Trust (vtable slice 1) — THE SCOPE LINE, executed. A `&mut dyn Trait` target maps THIN
+/// (`map_type`'s fat trait-object arm is `mutable: false` only), so it has no vtable lane,
+/// and the precise assembly deliberately does NOT apply: the coerced value stays the
+/// status-quo fact-free havoc. That is what keeps the interpreter differential's live-havoc
+/// skip in place for these bodies instead of manufacturing a verdict against a producer that
+/// still models the coercion as a value-less symbolic global.
+#[test]
+fn test_lower_thin_mut_dyn_unsize_cast_stays_a_whole_value_havoc() {
+    let dyn_mut_ref_ty = Ty::Ref {
+        mutable: true,
+        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into() }),
+    };
+    let func = VerifiableFunction {
+        name: "unsize_to_mut_dyn_fn".to_string(),
+        def_path: "test::unsize_to_mut_dyn_fn".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: dyn_mut_ref_ty.clone(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(Ty::i32()) },
+                    name: Some("thin".into()),
+                },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dyn_mut_ref_ty.clone()),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: dyn_mut_ref_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("thin dyn unsize should still lower");
+    assert_valid_module(&module);
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        bb0.body
+            .iter()
+            .any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Ptr)),
+        "a thin `&mut dyn` coercion must keep the status-quo whole-value havoc, got {:?}",
+        bb0.body
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(n.inst, Inst::PtrFromParts { .. })),
+        "a thin destination has no metadata lane to assemble"
+    );
+}
+
 #[test]
 fn test_lower_address_of_slice_subslice_preserves_metadata() {
     let slice_ptr_ty =

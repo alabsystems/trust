@@ -66,6 +66,26 @@ const MAP_EXPLOIT: &str = include_str!(
 const MAP_CONTROL: &str = include_str!(
     "../../fixtures/unbounded-sysroot-iterator-2026-08-17/map_over_rangefrom_ordinary_crate_name.json"
 );
+const COMPACTED_EXPLOIT: &str =
+    include_str!("../../fixtures/compacted-source-2026-08-18/compacted_cycle_impersonating_std.json");
+const COMPACTED_CONTROL: &str = include_str!(
+    "../../fixtures/compacted-source-2026-08-18/compacted_cycle_ordinary_crate_name.json"
+);
+const COMPOSED_EXPLOIT: &str = include_str!(
+    "../../fixtures/adaptor-over-user-iterator-2026-08-18/map_over_user_iterator_impersonating_std.json"
+);
+const COMPOSED_CONTROL: &str = include_str!(
+    "../../fixtures/adaptor-over-user-iterator-2026-08-18/map_over_user_iterator_ordinary_crate_name.json"
+);
+const BOUNDED_USER_ELEMENT: &str = include_str!(
+    "../../fixtures/adaptor-over-user-iterator-2026-08-18/cloned_slice_of_user_elements_ok.json"
+);
+const CHAINED_EXPLOIT: &str = include_str!(
+    "../../fixtures/adaptor-over-user-iterator-2026-08-18/chain_over_user_iterator_impersonating_std.json"
+);
+const CHAINED_CONTROL: &str = include_str!(
+    "../../fixtures/adaptor-over-user-iterator-2026-08-18/chain_over_user_iterator_ordinary_crate_name.json"
+);
 
 fn parse(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).unwrap_or_else(|e| panic!("parse fixture: {e}"))
@@ -274,6 +294,221 @@ fn the_map_over_rangefrom_bundles_are_gated_on_both_sides_now() {
     // The exploit is gated now, verbatim AND with the producer's type-name stamp.
     assert_eq!(unbounded_rows(&parse(MAP_EXPLOIT)), 1, "verbatim exploit");
     assert_eq!(unbounded_rows(&with_producer_stamp(MAP_EXPLOIT)), 1, "stamped exploit");
+}
+
+/// The iterator local of a `v.into_iter().collect()` / `v.iter()…collect()`
+/// bundle: the operand the collect sink reads. Read out of the bundle rather
+/// than hand-built, so a test asserting things about it is asserting things
+/// about what the compiler actually rendered.
+fn collected_operand_ty(func: &VerifiableFunction) -> &Ty {
+    let op = func
+        .body
+        .blocks
+        .iter()
+        .find_map(|b| match &b.terminator {
+            Terminator::Call { func: callee, args, .. } if is_collect_sink(callee) => args.first(),
+            _ => None,
+        })
+        .expect("the collect sink");
+    let local = operand_local(op).expect("an unprojected iterator local");
+    crate::local_ty_ref(func, local).expect("the iterator local's type")
+}
+
+// ======================================================================
+// 1b. The value side when the value is NOT FULLY RENDERED (2026-08-18)
+// ======================================================================
+
+/// FALSIFY-ONCE for the compacted source. The planted violations are asserted
+/// FIRST and they are the whole defect: on the value the compiler actually
+/// rendered, BOTH pre-existing value-side tests grant, because the extractor
+/// deleted the subtree that carried the infinity before either of them ran.
+#[test]
+fn the_compacted_source_is_refused_under_a_sysroot_iterator_root() {
+    let exploit = parse(COMPACTED_EXPLOIT);
+    let value = collected_operand_ty(&exploit);
+
+    // Non-vacuity: this really is the erasure, not a hand-built shape. The whole
+    // `StepBy<Skip<Peekable<Enumerate<Cycle<Range<u64>>>>>>` subtree is one
+    // marker whose surviving name is `core::option::Option`.
+    let Ty::Adt { name: root, fields, .. } = value else { panic!("{value:?}") };
+    assert_eq!(root, "core::iter::adapters::fuse::Fuse");
+    assert_eq!(fields.len(), 1);
+    assert!(
+        matches!(&fields[0].1, Ty::Datatype { name, variants }
+                 if name == "core::option::Option" && variants.is_empty()),
+        "the compacted marker: {:?}",
+        fields[0].1
+    );
+
+    // PLANTED VIOLATION 1: the deny-list cannot see it. Neither the root nor the
+    // only name that survived compaction is a known-unbounded sysroot iterator,
+    // and neither could ever be — `Option` is not an iterator at all.
+    assert!(unbounded_sysroot_iterator_adt_name(root).is_none());
+    assert!(unbounded_sysroot_iterator_adt_name("core::option::Option").is_none());
+    // PLANTED VIOLATION 2: the provenance authenticator grants, and is right to —
+    // `Fuse` is genuine `core`.
+    assert!(
+        ty_is_authenticated_std_iterator(value),
+        "planted violation is gone: the provenance half now refuses this value, so the \
+         boundedness refusal below is no longer what is being measured"
+    );
+
+    // The refusal.
+    assert!(ty_is_unbounded_sysroot_iterator(value));
+
+    // …and the row differential on the real bundles, through the production
+    // entry point. The two programs differ only in the aux crate's name and both
+    // allocate without bound in every execution.
+    assert_eq!(unbounded_rows(&parse(COMPACTED_CONTROL)), 1, "control must be gated");
+    assert_eq!(unbounded_rows(&exploit), 1, "the compacted exploit is gated now");
+}
+
+/// FALSIFY-ONCE for the composed source. The planted violations are the two
+/// value-side conjuncts and the receiver conjunct: all three grant this bundle,
+/// so nothing that already existed was going to refuse it.
+#[test]
+fn a_sysroot_adaptor_over_an_unauthenticated_source_is_refused() {
+    let exploit = parse(COMPOSED_EXPLOIT);
+    let value = collected_operand_ty(&exploit);
+
+    // Non-vacuity: the compiler rendered the adapted source in full, and it
+    // belongs to an ordinary third crate — NOT to the impersonator, which is the
+    // half a name test could never decide (see the fixture's PROVENANCE).
+    let Ty::Adt { name: root, fields, .. } = value else { panic!("{value:?}") };
+    assert_eq!(root, "core::iter::adapters::map::Map");
+    assert!(
+        matches!(&fields[0].1, Ty::Adt { name, .. } if name == "endcrate::Endless"),
+        "the adapted source: {:?}",
+        fields[0].1
+    );
+
+    // PLANTED VIOLATION 1: provenance grants. It is a ROOT test by design, and
+    // the root is genuine `core`.
+    assert!(ty_is_authenticated_std_iterator(value));
+    // PLANTED VIOLATION 2: the deny-list has nothing to match. It is a list of
+    // SYSROOT names and the endless type is not one.
+    assert!(unbounded_sysroot_iterator_adt_name(root).is_none());
+    assert!(unbounded_sysroot_iterator_adt_name("endcrate::Endless").is_none());
+    // PLANTED VIOLATION 3: the receiver conjunct grants too — the forged receiver
+    // reaches the bundle unstamped, so the string side is not what closes this.
+    let (_, args) = exploit
+        .body
+        .blocks
+        .iter()
+        .find_map(|b| match &b.terminator {
+            Terminator::Call { func, args, .. } if callee_tail(func) == "into_iter" => {
+                Some((func.clone(), args.clone()))
+            }
+            _ => None,
+        })
+        .expect("the `into_iter` producer call");
+    assert!(
+        producer_receiver_value_is_authenticated_sysroot(&exploit, &args),
+        "planted violation is gone: the receiver conjunct now refuses this bundle, so the \
+         value-side refusal below is no longer what is being measured"
+    );
+
+    // The refusal.
+    assert!(ty_is_unbounded_sysroot_iterator(value));
+
+    assert_eq!(unbounded_rows(&parse(COMPOSED_CONTROL)), 1, "control must be gated");
+    assert_eq!(unbounded_rows(&exploit), 1, "the composed exploit is gated now");
+}
+
+/// The composed source ONE LEVEL DOWN, inside `core`'s own `Option` — the shape
+/// the refusal above still granted while it stopped at the first non-iterator
+/// sysroot ADT. FALSIFY-ONCE: the planted violation is that `Option` is a
+/// perfectly authenticated sysroot ADT, so a rule that stops at one stops here.
+#[test]
+fn a_sysroot_adaptor_over_a_source_wrapped_in_option_is_refused() {
+    let exploit = parse(CHAINED_EXPLOIT);
+    let value = collected_operand_ty(&exploit);
+
+    let Ty::Adt { name: root, fields, .. } = value else { panic!("{value:?}") };
+    assert_eq!(root, "core::iter::adapters::chain::Chain");
+    // PLANTED VIOLATION: the adapted source is NOT a direct field — the field is
+    // `core::option::Option`, which authenticates as sysroot on every test this
+    // module has.
+    let Ty::Adt { name: wrapper, .. } = &fields[0].1 else { panic!("{:?}", fields[0].1) };
+    assert_eq!(wrapper, "core::option::Option");
+    assert!(trust_types::path_root_is_authenticated_sysroot_crate(wrapper));
+    assert!(unbounded_sysroot_iterator_adt_name(wrapper).is_none());
+    // …and the user iterator really is inside it, in both renderings the
+    // extractor emits for an enum.
+    let rendered = format!("{:?}", fields[0].1);
+    assert!(rendered.contains("endcrate::Endless"), "{rendered}");
+
+    assert!(ty_is_unbounded_sysroot_iterator(value));
+    assert_eq!(unbounded_rows(&parse(CHAINED_CONTROL)), 1, "control must be gated");
+    assert_eq!(unbounded_rows(&exploit), 1, "the chained exploit is gated now");
+}
+
+/// THE OVER-DECLINE BOUND, and the reason `adaptor_source_field_unestablished`
+/// stops at the first non-iterator sysroot ADT instead of walking the whole tree.
+///
+/// `Cloned<slice::Iter<'_, mycrate::Item>>` carries an unauthenticated ADT too —
+/// as the ELEMENT of a sysroot iterator, not as the SOURCE of a sysroot adaptor.
+/// This bundle is an ordinary crate with no forgery anywhere; it compiled exit 0
+/// with no diagnostics and must keep its grant.
+///
+/// MEASURED cost of removing the stop (the bound deleted, everything else
+/// unchanged): the 2 575 checked-in bundles fall from 8 granted collect sites to
+/// 4 and from 23 to 27 unbounded-allocation rows — four real-code grants lost.
+#[test]
+fn the_unrendered_source_refusal_stops_at_the_first_non_iterator_sysroot_adt() {
+    let func = parse(BOUNDED_USER_ELEMENT);
+    let value = collected_operand_ty(&func);
+
+    // Non-vacuity: the unauthenticated ADT really is in there, under the
+    // iterator's own pointer field.
+    let rendered = format!("{value:?}");
+    assert!(rendered.contains("core::iter::adapters::cloned::Cloned"), "{rendered}");
+    assert!(rendered.contains("core::slice::iter::Iter"), "{rendered}");
+    assert!(
+        rendered.contains("mycrate::Item"),
+        "planted violation is gone: the element type is no longer an unauthenticated ADT, \
+         so this bundle no longer exercises the bound"
+    );
+    assert!(!trust_types::path_root_is_authenticated_sysroot_crate("mycrate::Item"));
+
+    assert!(!ty_is_unbounded_sysroot_iterator(value), "over-decline: {rendered}");
+    let op = func
+        .body
+        .blocks
+        .iter()
+        .find_map(|b| match &b.terminator {
+            Terminator::Call { func: callee, args, .. } if is_collect_sink(callee) => args.first(),
+            _ => None,
+        })
+        .expect("the collect sink");
+    assert!(
+        collect_source_is_bounded_std_collection(&func, op, 0),
+        "the genuine bounded collect must keep its grant"
+    );
+    assert_eq!(unbounded_rows(&func), 0);
+}
+
+/// The compacted-name half, which the marker refusal does not subsume: when the
+/// compacted aggregate IS the deny-listed iterator, its NAME survives
+/// (`compact_oversized_field` preserves an `Adt`/`Datatype` name), so the
+/// deny-list can still refuse it — anywhere, not only under an iterator root.
+#[test]
+fn a_compacted_aggregate_is_still_refused_by_its_preserved_name() {
+    let compacted_cycle = Ty::Datatype {
+        name: "core::iter::adapters::cycle::Cycle".to_string(),
+        variants: Vec::new(),
+    };
+    assert!(ty_is_unbounded_sysroot_iterator(&compacted_cycle));
+
+    // …and a compacted aggregate that names nothing unbounded is NOT refused on
+    // its own account — the refusal above is the name, not the compaction.
+    let compacted_vec =
+        Ty::Datatype { name: "alloc::vec::Vec".to_string(), variants: Vec::new() };
+    assert!(!ty_is_unbounded_sysroot_iterator(&compacted_vec));
+    assert!(!ty_is_unbounded_sysroot_iterator(&Ty::adt(
+        "alloc::vec::into_iter::IntoIter",
+        vec![("buf".to_string(), compacted_vec)]
+    )));
 }
 
 // ======================================================================

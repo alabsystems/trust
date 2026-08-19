@@ -61,6 +61,17 @@ impl fmt::Display for Register {
                 let prefix = if self.width == 64 { 'X' } else { 'W' };
                 write!(f, "{prefix}{}", self.index)
             }
+            // AH/CH/DH/BH — bits 15:8 of the first four GPRs.
+            RegKind::GprHighByte => {
+                let name = match self.index {
+                    0 => "AH",
+                    1 => "CH",
+                    2 => "DH",
+                    3 => "BH",
+                    other => return write!(f, "H{other}?"),
+                };
+                write!(f, "{name}")
+            }
             RegKind::Sp => {
                 if self.width == 64 {
                     write!(f, "SP")
@@ -105,6 +116,17 @@ pub enum RegKind {
     Simd,
     /// System register (for MSR/MRS).
     System,
+    /// **x86-64 ONLY.** A legacy HIGH-BYTE register: `AH`, `CH`, `DH`, `BH` —
+    /// bits 15:8 of the first four GPRs. `index` is the GPR it sits inside
+    /// (0=RAX/AH, 1=RCX/CH, 2=RDX/DH, 3=RBX/BH) and `width` is always 8.
+    ///
+    /// This is a DISTINCT kind because the same encoding means two different
+    /// registers: 8-bit register numbers 4..7 are `AH/CH/DH/BH` when NO REX
+    /// prefix is present, and `SPL/BPL/SIL/DIL` when one is. Spelling `AH` as
+    /// `Gpr` index 4 made `mov ah, imm8` indistinguishable from a write to
+    /// `SPL`, and trust-machine-sem's `is_sp` test (`kind == Gpr && index ==
+    /// RSP_INDEX`) then modelled it as a write to the STACK POINTER.
+    GprHighByte,
 }
 
 /// Shift type for shifted-register operands.
@@ -266,8 +288,57 @@ pub enum MemoryOperand {
     PreIndex { base: Register, offset: i64 },
     /// `[base], #imm` — post-indexed.
     PostIndex { base: Register, offset: i64 },
-    /// PC-relative literal (LDR literal).
+    /// **AArch64 ONLY.** PC-relative literal (LDR-literal, ADR). The base is the
+    /// address of THIS instruction: EA = insn.address + offset.
+    ///
+    /// x86-64 must NEVER produce or accept this variant. x86-64 RIP-relative
+    /// addressing is relative to the address of the NEXT instruction — a
+    /// different quantity — and is resolved to [`MemoryOperand::Absolute`]
+    /// inside the x86-64 decoder before any consumer sees it. An x86-64
+    /// consumer that observes `PcRelative` must REFUSE rather than compute:
+    /// until 2026-08-18 x86-64 spelled three distinct addressing forms as this
+    /// one variant, and every one of them resolved to a wrong address.
     PcRelative { offset: i64 },
+
+    /// A GROUND absolute virtual address, already fully resolved by the decoder.
+    /// EA = `address`, with no register and no PC input.
+    ///
+    /// Produced by the x86-64 decoder for `[disp32]` (SIB, mod=00, no base, no
+    /// index) and for `[RIP + disp32]` once the instruction length is final.
+    /// `address` is the 64-bit two's-complement value: a disp32 is
+    /// sign-extended to 64 bits before being stored here.
+    Absolute { address: u64 },
+
+    /// **x86-64 ONLY.** The full SIB form:
+    /// EA = `base` + (`index` << `scale_shift`) + `displacement`.
+    ///
+    /// A `base` of `None` contributes ZERO — the mod=00 / base=101 encoding has
+    /// no base register, and nothing may be read for it. (Spelling that case as
+    /// a `BaseRegister` over a placeholder RBP fabricated a register read.)
+    /// `scale_shift` is 0/1/2/3 for scale 1/2/4/8. `displacement` is the
+    /// sign-extended disp8/disp32, or 0 when the encoding carries none.
+    ///
+    /// AArch64 never produces this variant; its register-offset form is
+    /// [`MemoryOperand::BaseRegister`], which has no displacement because
+    /// AArch64 has no such addressing mode.
+    BaseIndexOffset {
+        base: Option<Register>,
+        index: Register,
+        scale_shift: u8,
+        displacement: i64,
+    },
+
+    /// **x86-64 decoder-internal; INVALID outside `x86_64::decoder`.**
+    ///
+    /// A raw `[RIP + disp32]` whose effective address is not yet computable:
+    /// x86-64 RIP-relative addressing is relative to the first byte of the NEXT
+    /// instruction, and the instruction may still grow by a trailing immediate
+    /// (`48 C7 05 <disp32> <imm32>` is 11 bytes, so resolving at the end of the
+    /// displacement is off by 4). `decode_instruction` rewrites every occurrence
+    /// into [`MemoryOperand::Absolute`] once `size` is final, so no consumer can
+    /// legitimately observe one. A consumer that does MUST refuse: it means the
+    /// resolution choke point was bypassed.
+    RipRelative { displacement: i64 },
 }
 
 /// An instruction operand.

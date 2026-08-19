@@ -57,17 +57,24 @@
 //! against the control's TWO errors and `2 obligation(s)`. So the hole-open state
 //! is distinguishable in three independent ways, and the first is the one
 //! compiletest reads: the `Level 0 … incomplete` diagnostic is a WARNING there and
-//! an ERROR here, so the first `//~^ ERROR` annotation has no matching error and
+//! an ERROR here, so the first ERROR annotation below has no matching error and
 //! the test fails on the level mismatch. The obligation count (1 vs 2) and the
 //! missing `count-not-derivable` note are the other two.
+//!
+//! Do not spell a compiletest expectation marker literally in this prose:
+//! compiletest scans for the marker ANYWHERE in the file, comments and doc
+//! comments included, and would register the sentence as an extra expected
+//! diagnostic (measured: two such sentences here produced
+//! "2 diagnostics expected in test file but not reported").
 //!
 //! ANNOTATION PLACEMENT. Both errors' PRIMARY SPAN is the whole function item, so
 //! its `line_start` is the `pub fn boom(..)` signature line, not the expression
 //! inside — MEASURED on the shipped compiler, which reports
 //! `consumer.rs:5:1` with the caret under the entire `pub fn boom(..) { .. }`.
-//! compiletest resolves `//~^` against that start line, so the annotations sit
-//! directly under the signature, exactly as `e2_mut_prime_undischarged.rs:19` and
-//! `e9_definitional_call_undischarged.rs:14` do.
+//! compiletest resolves a preceding-line annotation against that start line, so
+//! the annotations sit directly under the signature, exactly as
+//! `e2_mut_prime_undischarged.rs:19` and `e9_definitional_call_undischarged.rs:14`
+//! do.
 #![allow(dead_code)]
 
 extern crate mycrate;

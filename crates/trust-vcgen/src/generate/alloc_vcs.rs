@@ -397,9 +397,11 @@ pub(super) fn is_collect_sink(callee: &str) -> bool {
 //     `core::iter::traits::collect::IntoIterator::into_iter::<mycrate::Endless>`,
 //     whose root anchors perfectly and whose `next` is arbitrary user code.
 //   * the VALUE at every step must not be a KNOWN-UNBOUNDED sysroot iterator
-//     ([`ty_is_unbounded_sysroot_iterator`]) — the boundedness half. It does NOT
-//     survive a total failure of provenance authentication: it is a deny-list of
-//     sysroot names, so a marker the extractor never renders is not seen (below).
+//     ([`ty_is_unbounded_sysroot_iterator`]) — the boundedness half. Two tests
+//     live there and neither subsumes the other: a deny-list of sysroot names
+//     over the rendered field tree, and (2026-08-18) a refusal of any source
+//     under a `core::iter::`/`std::iter::` root that the extractor did not render
+//     or that belongs to no authenticated sysroot crate.
 //
 // No pair of these is a substitute for another. The extractor stamps callee paths
 // AND `Ty::Adt` names (both renderers, since 2026-08-17) but stamps neither when
@@ -523,8 +525,8 @@ pub(super) fn unbounded_sysroot_iterator_adt_name(name: &str) -> Option<&'static
     if let Some(family) = range_family_adt_name(name) {
         return (!matches!(family, "Range" | "RangeInclusive")).then_some(family);
     }
-    let head = name.split('<').next().unwrap_or(name).trim_end_matches("::");
-    if !(head.starts_with("core::iter::") || head.starts_with("std::iter::")) {
+    let head = path_head(name);
+    if !path_head_is_sysroot_iter_module(name) {
         return None;
     }
     match head.rsplit("::").next()? {
@@ -536,6 +538,61 @@ pub(super) fn unbounded_sysroot_iterator_adt_name(name: &str) -> Option<&'static
         "Cycle" => Some("Cycle"),
         _ => None,
     }
+}
+
+/// The path HEAD — everything before the first `<`, without a trailing `::`. The
+/// same normalization [`unbounded_sysroot_iterator_adt_name`] has always used, and
+/// deliberately NOT [`vc_strip_generics`]: see that function's doc for the
+/// measured `fn() -> u8` mis-parse a balanced-bracket walk suffers.
+fn path_head(name: &str) -> &str {
+    name.split('<').next().unwrap_or(name).trim_end_matches("::")
+}
+
+/// `name` roots in the sysroot ITERATOR module — the crate-anchored spelling of
+/// "this ADT is one of std's own iterator sources or adaptors". Factored out of
+/// [`unbounded_sysroot_iterator_adt_name`] so the deny-LIST and the
+/// unestablished-source refusal below cannot come to disagree about which names
+/// are std's iterator machinery.
+///
+/// A stamped path (`__trust_crate@…::core::iter::…`) does not start with
+/// `core::iter::`, so an impersonator's adaptor is not an adaptor here.
+fn path_head_is_sysroot_iter_module(name: &str) -> bool {
+    let head = path_head(name);
+    head.starts_with("core::iter::") || head.starts_with("std::iter::")
+}
+
+/// `name` is std's own `Option`, by its two rendered spellings (the defining
+/// module `core::option::Option` and the `std` re-export). Anchored the same way
+/// as [`path_head_is_sysroot_iter_module`], so an impersonator's stamped
+/// `Option` is not one.
+fn path_head_is_sysroot_option(name: &str) -> bool {
+    matches!(path_head(name), "core::option::Option" | "std::option::Option")
+}
+
+/// `name` is a sysroot SOURCE TRANSPORT: an ADT that is not itself in an
+/// iterator module but whose payload IS the adapted source, so stopping at it
+/// would read straight past the thing being measured.
+///
+/// `Box<I>` is the one that matters and it is not hypothetical: `impl Iterator
+/// for Box<I>` exists, so `IntoIter = Box<endcrate::Endless>` is a legal
+/// endless source whose root authenticates. MEASURED before this arm existed:
+/// `Box<endcrate::Endless>` and `Map<Box<endcrate::Endless>, F>` both kept the
+/// bounded-collect grant — 0 rows against their controls' 1, and the
+/// `Box`-rooted one compiled exit 0 with zero diagnostic lines.
+///
+/// `Unique`/`NonNull` are here for the same reason one level down: they are how
+/// `Box`'s payload is rendered once the extractor expands it. Note the ELEMENT
+/// type of a bounded iterator also travels through `NonNull` — that is why this
+/// predicate is consulted ONLY from the source-chain walk, which is already
+/// inside a sysroot adaptor's source field, and never from the root scan.
+fn path_head_is_source_transport(name: &str) -> bool {
+    matches!(
+        path_head(name),
+        "alloc::boxed::Box"
+            | "std::boxed::Box"
+            | "core::ptr::unique::Unique"
+            | "core::ptr::non_null::NonNull"
+    )
 }
 
 /// The BOUNDEDNESS half of the value-side identity: `ty` is (or CONTAINS) a
@@ -559,19 +616,39 @@ pub(super) fn unbounded_sysroot_iterator_adt_name(name: &str) -> Option<&'static
 /// rendering of the local's type carries `Map`'s `iter` field, and that field IS
 /// the `RangeFrom`, so the answer is already in the bundle.
 ///
-/// MEASURED FAIL-OPEN, do not read this as a closed refusal: the walk answers
-/// `false` (grant) for any rendering that is not `Ref`/`RawPtr`/`Adt`/`Tuple`.
-/// The extractor compacts a field subtree over 64 nodes into `Ty::Datatype` and
-/// an expanding same-ADT recursion into `Ty::Unsupported`, so a deny-listed
-/// marker nested deeply enough is ERASED before this sees it — measured with
-/// `Fuse<StepBy<Skip<Peekable<Enumerate<Cycle<Range<u64>>>>>>>`, where the
-/// `Cycle` disappears and an infinite `collect` yields zero rows. Closing it
-/// means reading the `Datatype` NAME (which `compact_oversized_field`
-/// preserves) and refusing an unrendered subtree under a `core::iter::` root —
-/// and it must be measured against the 209 of 2587 checked-in bundles that
-/// carry a marker, or it will over-decline.
+/// THE ERASURE, and why the deny-list alone is not the whole refusal (2026-08-18).
+/// The extractor does not always render a field subtree: `compact_oversized_field`
+/// collapses one over 64 nodes to a by-name `Ty::Datatype`, and an expanding
+/// same-ADT recursion becomes `Ty::Unsupported`. Both used to hit a `_ => false`
+/// arm here — a GRANT — so a deny-listed marker nested deeply enough was ERASED
+/// before the name test could see it. MEASURED, `fixtures/compacted-source-
+/// 2026-08-18/`: `Fuse<StepBy<Skip<Peekable<Enumerate<Cycle<Range<u64>>>>>>>` —
+/// all genuine `core`, genuinely infinite — renders as
+/// `Adt Fuse { iter: Datatype{"core::option::Option"} }` with the `Cycle` gone,
+/// and the consumer compiled **exit 0 with zero diagnostic lines** while its
+/// one-crate-name-away control was exit 1 with the row present.
+///
+/// So the refusal is now TWO tests, and neither subsumes the other:
+///
+///  * the DENY-LIST, over `Ty::Adt` names and now `Ty::Datatype` names too
+///    (`compact_oversized_field` PRESERVES an aggregate's name, so a compacted
+///    `Cycle` is still refusable by name);
+///  * [`ty_iterator_source_boundedness_unestablished`], which refuses an
+///    UNRENDERED or unauthenticated source under a sysroot-iterator root. This is
+///    the one that catches the erasure above, where the surviving name
+///    (`core::option::Option`) is not deny-listed and never could be.
+///
+/// The second test is deliberately ROOT-SCOPED rather than a blanket "no
+/// `Ty::Datatype` anywhere". MEASURED over the 2 587 checked-in bundles: 209 of
+/// them carry a `Ty::Datatype` marker somewhere, and refusing on any of them
+/// would be a large, unjustified over-decline — a marker inside
+/// `alloc::vec::into_iter::IntoIter<SomeBigUserEnum>` says nothing about how many
+/// elements the iterator yields. Under a `core::iter::`/`std::iter::` ADT it says
+/// exactly the thing this lane needs and cannot otherwise get: the source it
+/// adapts was not rendered, so its boundedness is not established.
 pub(super) fn ty_is_unbounded_sysroot_iterator(ty: &Ty) -> bool {
     ty_is_unbounded_sysroot_iterator_rec(ty, 0)
+        || ty_iterator_source_boundedness_unestablished(ty, 0)
 }
 
 fn ty_is_unbounded_sysroot_iterator_rec(ty: &Ty, depth: usize) -> bool {
@@ -585,9 +662,136 @@ fn ty_is_unbounded_sysroot_iterator_rec(ty: &Ty, depth: usize) -> bool {
             unbounded_sysroot_iterator_adt_name(name).is_some()
                 || fields.iter().any(|(_, f)| ty_is_unbounded_sysroot_iterator_rec(f, depth + 1))
         }
+        // A compacted / by-name aggregate. `compact_oversized_field` keeps the
+        // aggregate's NAME, so the deny-list still applies to whatever it names;
+        // its `variants` are empty for a by-name reference and carry the fields
+        // for a defining occurrence, so both are walked.
+        Ty::Datatype { name, variants } => {
+            unbounded_sysroot_iterator_adt_name(name).is_some()
+                || variants.iter().any(|(_, fs)| {
+                    fs.iter().any(|(_, f)| ty_is_unbounded_sysroot_iterator_rec(f, depth + 1))
+                })
+        }
         Ty::Tuple(elems) => {
             elems.iter().any(|e| ty_is_unbounded_sysroot_iterator_rec(e, depth + 1))
         }
+        _ => false,
+    }
+}
+
+/// REFUSING, the second half of the boundedness test: `ty` is a sysroot ITERATOR
+/// ADT (`core::iter::`/`std::iter::`-rooted) whose SOURCE is a rendering this walk
+/// cannot decide, so `count <= source.len()` is not established for it.
+///
+/// TWO measured shapes, closed by one rule because they are one defect — the
+/// source of a std adaptor is not something the deny-list can speak about:
+///
+///  * **the compacted source** (`fixtures/compacted-source-2026-08-18/`). The
+///    field is a `Ty::Datatype` or `Ty::Unsupported` marker: the extractor
+///    declined to render the subtree, so nothing downstream knows what it was.
+///    An UNRENDERED source is exactly "boundedness not established".
+///  * **the composed source** (`fixtures/adaptor-over-user-iterator-2026-08-18/`).
+///    The field is an ADT rooted in no authenticated sysroot crate —
+///    `Map<endcrate::Endless, fn(u64) -> u64>`, a `core`-rooted adaptor over a
+///    USER iterator whose `next` never returns `None`. It passes BOTH existing
+///    value-side conjuncts and always did: [`ty_is_authenticated_std_iterator`] is
+///    a ROOT test and reads only `core::iter::adapters::map::Map`, and the
+///    deny-list is a list of SYSROOT names, which `endcrate::Endless` is not.
+///    MEASURED: 0 rows against the control's 1.
+///
+/// WHAT THIS DOES NOT REACH, and the walk must not be credited with it. When the
+/// endless iterator is defined in the IMPERSONATING crate itself the field renders
+/// `std::vec::Endless`, whose root authenticates, and no NAME test can tell it
+/// from a real std iterator. Distinguishing it is the PRODUCER stamp's job
+/// (`trust_mir_extract::convert::impersonates_sysroot_crate`, whose own residual
+/// R2 — a `#[rustc_diagnostic_item]` forgery — is what both fixtures above use to
+/// get their forged receiver past the string side in the first place). This
+/// function closes the composed shape only where the source crate is honestly
+/// named; the sysroot-named-source half belongs to the stamp.
+///
+/// THE DESCENT STOPS AT THE FIRST NON-ITERATOR SYSROOT ADT, and that bound is what
+/// keeps this from being an over-decline. Descending further would read
+/// `alloc::vec::into_iter::IntoIter<mycrate::Foo>`'s `NonNull<mycrate::Foo>` —
+/// the ELEMENT type of a perfectly bounded iterator — as an unauthenticated
+/// source. A `core::iter::`/`std::iter::` ADT is walked into, and so is a
+/// sysroot SOURCE TRANSPORT (`Box`, `Unique`, `NonNull` —
+/// [`path_head_is_source_transport`]); nothing else is. The earlier wording here
+/// said only an iterator-module ADT has "a field the thing being adapted", which
+/// `impl Iterator for Box<I>` refutes.
+fn ty_iterator_source_boundedness_unestablished(ty: &Ty, depth: usize) -> bool {
+    if depth > TY_UNBOUNDED_SCAN_DEPTH {
+        return true;
+    }
+    match ty {
+        // `Iterator::by_ref` hands out `&mut I`; a tuple/aggregate temporary can
+        // carry the adaptor. Same peeling the deny-list walk does.
+        Ty::Ref { inner, .. } => ty_iterator_source_boundedness_unestablished(inner, depth + 1),
+        Ty::RawPtr { pointee, .. } => {
+            ty_iterator_source_boundedness_unestablished(pointee, depth + 1)
+        }
+        Ty::Tuple(elems) => elems
+            .iter()
+            .any(|e| ty_iterator_source_boundedness_unestablished(e, depth + 1)),
+        Ty::Adt { name, fields, .. }
+            if path_head_is_sysroot_iter_module(name) || path_head_is_source_transport(name) =>
+        {
+            fields.iter().any(|(_, f)| adaptor_source_field_unestablished(f, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+/// One FIELD of a sysroot iterator adaptor: `true` when its boundedness is not
+/// established. See [`ty_iterator_source_boundedness_unestablished`].
+fn adaptor_source_field_unestablished(ty: &Ty, depth: usize) -> bool {
+    if depth > TY_UNBOUNDED_SCAN_DEPTH {
+        return true;
+    }
+    match ty {
+        Ty::Ref { inner, .. } => adaptor_source_field_unestablished(inner, depth + 1),
+        Ty::RawPtr { pointee, .. } => adaptor_source_field_unestablished(pointee, depth + 1),
+        // The extractor's two "not rendered" markers, in the one position where
+        // that fact is load-bearing. A `Ty::Datatype` here is a
+        // `compact_oversized_field` collapse or a by-name recursive reference; a
+        // `Ty::Unsupported` is an expanding-generic recursion, a spent lowering
+        // budget, or a bare `TyKind::Param`. None of them says how many elements
+        // the adapted source yields.
+        Ty::Datatype { .. } | Ty::Unsupported { .. } => true,
+        Ty::Adt { name, fields, variants, .. } => {
+            if !trust_types::path_root_is_authenticated_sysroot_crate(name) {
+                // The composed shape: a std adaptor over somebody else's iterator.
+                true
+            } else if path_head_is_sysroot_iter_module(name) {
+                // An adaptor over an adaptor — keep walking the source chain.
+                fields.iter().any(|(_, f)| adaptor_source_field_unestablished(f, depth + 1))
+            } else if path_head_is_source_transport(name) {
+                // `impl Iterator for Box<I>` — the payload IS the source, so
+                // stopping here reads past it. See `path_head_is_source_transport`.
+                fields.iter().any(|(_, f)| adaptor_source_field_unestablished(f, depth + 1))
+            } else if path_head_is_sysroot_option(name) {
+                // `Option` is the ONE non-iterator sysroot ADT core's own adaptors
+                // hold a SOURCE in, so it is transparent here and nothing else is.
+                // MEASURED, `Chain<endcrate::Endless, core::option::IntoIter<u64>>`:
+                // the source renders as `("a", Adt core::option::Option { … })`
+                // with the user iterator one level down, and stopping at `Option`
+                // granted it (0 rows against the control's 1). Both renderings are
+                // walked because the extractor emits an enum as a flattened field
+                // list AND a variant list.
+                fields.iter().any(|(_, f)| adaptor_source_field_unestablished(f, depth + 1))
+                    || variants.iter().any(|v| {
+                        v.fields
+                            .iter()
+                            .any(|(_, f)| adaptor_source_field_unestablished(f, depth + 1))
+                    })
+            } else {
+                // Every other sysroot ADT — `NonNull`, `PhantomData`,
+                // `slice::Iter`, `vec::IntoIter`, `Range`. Its own boundedness is
+                // the deny-list walk's question, not this one's; stopping here is
+                // what bounds the over-decline (see above).
+                false
+            }
+        }
+        // A scalar/pointer/function/closure/slice/array payload carries no source.
         _ => false,
     }
 }

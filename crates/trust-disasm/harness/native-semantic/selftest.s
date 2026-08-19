@@ -23,6 +23,14 @@
 // x18 is avoided as a base or destination throughout: it is the Darwin platform
 // register and words touching it are excluded from comparison (harness bug 3),
 // which would silently shrink this corpus.
+//
+// That claim was HALF TRUE until 2026-08-18. x18 was never an addressing base,
+// but two words WROTE it — `movk x18, #0xbeef, lsl #32` and
+// `csel x18, x19, x20, ne` — so both were excluded and the corpus was quietly
+// two words smaller than it reads. They now target x17 (which the MOVZ above
+// also writes, making the canonical MOVZ/MOVK pair) and x28. A comment
+// asserting an invariant the file violates is worse than no comment: it is the
+// blind spot the inventory in `src/main.rs` exists to forbid.
 
 .text
 .globl _p
@@ -48,7 +56,7 @@ _p:
     and   x13, x14, #0xfffffffffffff000
     eor   x15, x16, #0x8000000000000000
     movz  x17, #0x1234, lsl #16
-    movk  x18, #0xbeef, lsl #32
+    movk  x17, #0xbeef, lsl #32
     movn  x19, #0x00ff
     ldr   x20, [x21]
     ldr   w22, [x23, #16]
@@ -76,7 +84,7 @@ _p:
     cbnz  x15, .+12
     tbz   x16, #5, .+20
     tbnz  x17, #40, .+24
-    csel  x18, x19, x20, ne
+    csel  x28, x19, x20, ne
     csinc x21, x22, x23, lt
     cset  x24, gt
     csneg x25, x26, x27, mi

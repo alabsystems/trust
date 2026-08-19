@@ -538,9 +538,10 @@ impl X86_64Semantics {
         let (dst, dst_width) = extract_dst(insn)?;
         let val = resolve_dst_value_checked(state, &dst, dst_width, insn.opcode, 0)?;
         let count = resolve_operand(state, insn.operand(1), insn.opcode, 1, dst_width)?;
+        let count = mask_shift_count(count, dst_width);
 
         let result = Formula::BvShl(Box::new(val.clone()), Box::new(count), dst_width);
-        let flags = shift_eflags(&result, dst_width);
+        let flags = shift_eflags(&result, dst_width, insn.address);
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
         effects.push(pc_advance(state, insn));
@@ -555,9 +556,10 @@ impl X86_64Semantics {
         let (dst, dst_width) = extract_dst(insn)?;
         let val = resolve_dst_value_checked(state, &dst, dst_width, insn.opcode, 0)?;
         let count = resolve_operand(state, insn.operand(1), insn.opcode, 1, dst_width)?;
+        let count = mask_shift_count(count, dst_width);
 
         let result = Formula::BvLShr(Box::new(val.clone()), Box::new(count), dst_width);
-        let flags = shift_eflags(&result, dst_width);
+        let flags = shift_eflags(&result, dst_width, insn.address);
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
         effects.push(pc_advance(state, insn));
@@ -572,9 +574,10 @@ impl X86_64Semantics {
         let (dst, dst_width) = extract_dst(insn)?;
         let val = resolve_dst_value_checked(state, &dst, dst_width, insn.opcode, 0)?;
         let count = resolve_operand(state, insn.operand(1), insn.opcode, 1, dst_width)?;
+        let count = mask_shift_count(count, dst_width);
 
         let result = Formula::BvAShr(Box::new(val.clone()), Box::new(count), dst_width);
-        let flags = shift_eflags(&result, dst_width);
+        let flags = shift_eflags(&result, dst_width, insn.address);
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
         effects.push(pc_advance(state, insn));
@@ -942,6 +945,24 @@ fn extract_dst_at(
     mem_width_hint: Option<u32>,
 ) -> Result<(DstOperand, u32), SemError> {
     match insn.operand(index) {
+        // Trust: REFUSE the legacy high-byte registers rather than model them
+        // wrongly. `AH/CH/DH/BH` are bits 15:8 of RAX/RCX/RDX/RBX, but
+        // `MachineState::read_gpr(i, 8)` extracts bits 7:0 and a `RegWrite` of
+        // width 8 updates the same low byte — so treating `AH` as GPR 0 width 8
+        // silently reads and writes AL. Until this decoder split landed they
+        // were spelled `Gpr` index 4..7 and matched the `is_sp` test below,
+        // making `mov ah, imm8` a write to the STACK POINTER. Unsupported is a
+        // capability gap; a wrong register is a wrong program.
+        Some(Operand::Reg(r)) if r.kind == RegKind::GprHighByte => {
+            Err(SemError::InvalidOperand {
+                opcode: insn.opcode,
+                index,
+                detail: format!(
+                    "legacy high-byte register {r} (bits 15:8) is not modelled; \
+                     it must not be conflated with the low byte or with SPL/BPL/SIL/DIL"
+                ),
+            })
+        }
         Some(Operand::Reg(r)) => {
             let is_sp = r.kind == RegKind::Sp || (r.kind == RegKind::Gpr && r.index == RSP_INDEX);
             Ok((DstOperand::Reg { index: r.index, is_sp }, u32::from(r.width)))
@@ -951,6 +972,14 @@ fn extract_dst_at(
             // default to 64. Check operand 1 for a register width hint.
             let width = if let Some(width) = mem_width_hint {
                 width
+            } else if let Some(size) = insn.operand_size {
+                // Trust: the decoder recorded the effective operand size. This
+                // is the ONLY source for `mov r/m, imm` (C6/C7), where the
+                // destination is memory and the source is an immediate: the
+                // fallback below found no register and defaulted to 64, so
+                // `movb $1,(%rdi)` was modelled as an EIGHT-byte write,
+                // clobbering seven bytes the program never touches.
+                u32::from(size)
             } else if index == 0 {
                 match insn.operand(1) {
                     Some(Operand::Reg(r)) => u32::from(r.width),
@@ -1258,6 +1287,13 @@ fn resolve_operand(
     })?;
 
     match op {
+        // Trust: see `dst_operand_and_width` — a high-byte register read would
+        // silently return the LOW byte.
+        Operand::Reg(r) if r.kind == RegKind::GprHighByte => Err(SemError::InvalidOperand {
+            opcode,
+            index,
+            detail: format!("legacy high-byte register {r} (bits 15:8) is not modelled"),
+        }),
         Operand::Reg(r) => {
             if r.kind == RegKind::Sp || (r.kind == RegKind::Gpr && r.index == RSP_INDEX) {
                 Ok(state.read_sp(width))
@@ -1327,15 +1363,58 @@ fn resolve_mem_address(state: &MachineState, mem: &MemoryOperand) -> Result<Form
             }
             Ok(Formula::BvAdd(Box::new(base_val), Box::new(idx_val), 64))
         }
-        MemoryOperand::PcRelative { offset } => {
-            // RIP-relative: address = PC + insn_size + offset.
-            // The decoder already resolves this to an absolute address in most
-            // cases, but if not we compute symbolically.
-            Ok(Formula::BvAdd(
-                Box::new(state.pc.clone()),
-                Box::new(Formula::BitVec { value: *offset as i128, width: 64 }),
-                64,
-            ))
+        // Trust: a GROUND address, already resolved by the decoder. This covers
+        // both `[disp32]` (absolute) and `[RIP + disp32]` (resolved against the
+        // next instruction). Both used to arrive as `PcRelative` and be computed
+        // as `state.pc + offset`, which was wrong twice over: `state.pc` is the
+        // CURRENT instruction's address rather than the next one, and an
+        // absolute address has no PC term at all.
+        MemoryOperand::Absolute { address } => {
+            Ok(Formula::BitVec { value: i128::from(*address), width: 64 })
+        }
+        // Trust: base + (index << scale) + displacement, where an absent base
+        // contributes ZERO. Previously the displacement was dropped and a
+        // missing base was fabricated as RBP.
+        MemoryOperand::BaseIndexOffset { base, index, scale_shift, displacement } => {
+            let mut acc = match base {
+                Some(base) => read_base_reg(state, base),
+                None => Formula::BitVec { value: 0, width: 64 },
+            };
+            let mut idx_val = state.read_gpr(index.index, 64);
+            if *scale_shift > 0 {
+                idx_val = Formula::BvShl(
+                    Box::new(idx_val),
+                    Box::new(Formula::BitVec { value: i128::from(*scale_shift), width: 64 }),
+                    64,
+                );
+            }
+            acc = match base {
+                Some(_) => Formula::BvAdd(Box::new(acc), Box::new(idx_val), 64),
+                None => idx_val,
+            };
+            if *displacement != 0 {
+                acc = Formula::BvAdd(
+                    Box::new(acc),
+                    Box::new(Formula::BitVec { value: i128::from(*displacement), width: 64 }),
+                    64,
+                );
+            }
+            Ok(acc)
+        }
+        // Trust: REFUSE, do not compute. `PcRelative` is AArch64's variant — its
+        // base is the instruction's OWN address, a different quantity from
+        // x86-64's next-instruction RIP — and `RipRelative` is decoder-internal,
+        // so observing either here means the decoder's resolution choke point
+        // was bypassed. Computing an address from them is exactly the defect
+        // class this replaced; failing closed is the point of the split.
+        MemoryOperand::PcRelative { .. } | MemoryOperand::RipRelative { .. } => {
+            Err(SemError::InvalidOperand {
+                opcode: Opcode::Mov,
+                index: 1,
+                detail: "x86_64 must not observe a PC-relative memory operand: RIP-relative \
+                         addressing is resolved to an absolute address in the decoder"
+                    .into(),
+            })
         }
         MemoryOperand::PreIndex { base, offset } => {
             let base_val = read_base_reg(state, base);
@@ -1516,6 +1595,23 @@ fn compute_eflags_preserve_cf(
     }
 }
 
+/// Mask an x86-64 shift/rotate count the way the hardware does.
+///
+/// SDM Vol.2, SAL/SAR/SHL/SHR: "the processor masks the count to 5 bits
+/// (or 6 bits if in 64-bit mode and REX.W is used)". A shift by 64 of a 64-bit
+/// operand is therefore a SHIFT BY ZERO, not a shift that clears the register —
+/// and an unmasked `BvShl` with a count >= the bitvector width is not even
+/// well-defined in the same way. Without this, `shl rax, 64` modelled a
+/// different program than the one the CPU runs.
+fn mask_shift_count(count: Formula, dst_width: u32) -> Formula {
+    let mask: i128 = if dst_width == 64 { 0x3F } else { 0x1F };
+    Formula::BvAnd(
+        Box::new(count),
+        Box::new(Formula::BitVec { value: mask, width: dst_width }),
+        dst_width,
+    )
+}
+
 /// Compute EFLAGS for logical operations (AND, OR, XOR, TEST).
 /// CF = 0, OF = 0, SF and ZF from result.
 fn logic_eflags(result: &Formula, width: u32) -> Effect {
@@ -1533,11 +1629,42 @@ fn logic_eflags(result: &Formula, width: u32) -> Effect {
 }
 
 /// Compute EFLAGS for shift operations.
-/// ZF and SF from result, CF and OF simplified to false.
-fn shift_eflags(result: &Formula, width: u32) -> Effect {
-    // Shift flags: CF = last bit shifted out (complex to model precisely),
-    // OF = MSB changed (for count=1). Simplified model: CF=false, OF=false.
-    logic_eflags(result, width)
+///
+/// SF and ZF come from the result. CF and OF are left UNKNOWN — a fresh
+/// symbolic boolean per instruction — rather than asserted `false`.
+///
+/// This previously delegated to `logic_eflags`, which sets `c: Bool(false)` and
+/// `v: Bool(false)`, under a comment calling it a "Simplified model". It is not
+/// a simplification: it is a specific WRONG value. CF after `shl` is the last
+/// bit shifted out, so any shift that shifts a 1 out sets it, and a later
+/// `jc`/`jnc` on that flag took the wrong branch in the model.
+///
+/// Unknown rather than exact, deliberately:
+///   * CF *is* architecturally defined and computable — bit `width - count` of
+///     the operand — but only for `1 <= count <= width`. The SDM leaves it
+///     UNDEFINED when the masked count exceeds the operand size (reachable:
+///     the 8/16/32-bit mask is 0x1F, so an 8-bit shift can be asked for 31).
+///   * OF is defined ONLY for a 1-bit shift; for counts > 1 the SDM says
+///     undefined outright.
+///   * At count == 0 both flags are UNCHANGED, not computed.
+/// Modelling the defined cases while claiming a specific value in the undefined
+/// ones would trade one false claim for another. An unknown flag over-
+/// approximates: a proof that needs CF after a shift now fails instead of
+/// succeeding against a fabricated value.
+///
+/// The symbol is keyed by instruction address so two different shifts get two
+/// different unknowns. Sharing one symbol would force independent unknowns
+/// equal, which excludes real executions — unsound in its own right.
+fn shift_eflags(result: &Formula, width: u32, insn_address: u64) -> Effect {
+    let Effect::FlagUpdate { n: sf, z: zf, .. } = logic_eflags(result, width) else {
+        unreachable!("logic_eflags always returns a FlagUpdate")
+    };
+    Effect::FlagUpdate {
+        n: sf,
+        z: zf,
+        c: Formula::Var(format!("x86_shift_cf@{insn_address:#x}"), Sort::Bool),
+        v: Formula::Var(format!("x86_shift_of@{insn_address:#x}"), Sort::Bool),
+    }
 }
 
 /// Load `num_bytes` from byte-addressed memory in little-endian order,
@@ -1583,6 +1710,189 @@ mod tests {
 
     fn sem() -> X86_64Semantics {
         X86_64Semantics
+    }
+
+    /// A shift must not CLAIM its carry and overflow flags are clear.
+    ///
+    /// `shift_eflags` delegated to `logic_eflags`, which sets
+    /// `c: Bool(false), v: Bool(false)`, calling it a "Simplified model". CF
+    /// after `shl` is the last bit shifted out — so any shift that shifts a 1
+    /// out sets it — and a later `jc`/`jnc` on that flag branched wrongly in the
+    /// model. Unknown over-approximates; `false` is a specific wrong answer.
+    ///
+    /// Also pins the aliasing property: two DIFFERENT shifts must get DIFFERENT
+    /// unknowns. One shared symbol would force independent unknowns equal,
+    /// excluding real executions — unsound in its own right.
+    #[test]
+    fn shift_flags_are_unknown_not_false() {
+        let shl = decode_x86_64(&[0x48, 0xC1, 0xE0, 0x04], 0x1000).expect("shl rax, 4");
+        let effects = sem().effects(&MachineState::symbolic(), &shl).expect("shl");
+        let flags = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FlagUpdate { c, v, .. } => Some((c.clone(), v.clone())),
+                _ => None,
+            })
+            .expect("shl sets flags");
+        assert_ne!(flags.0, Formula::Bool(false), "CF must not be asserted clear");
+        assert_ne!(flags.1, Formula::Bool(false), "OF must not be asserted clear");
+
+        // A shift at a different address gets different unknowns.
+        let other = decode_x86_64(&[0x48, 0xC1, 0xE0, 0x04], 0x2000).expect("shl rax, 4");
+        let other_flags = sem()
+            .effects(&MachineState::symbolic(), &other)
+            .expect("shl")
+            .iter()
+            .find_map(|e| match e {
+                Effect::FlagUpdate { c, .. } => Some(c.clone()),
+                _ => None,
+            })
+            .expect("flags");
+        assert_ne!(
+            flags.0, other_flags,
+            "two distinct shifts must not share one unknown flag symbol"
+        );
+    }
+
+    /// A store's width comes from the INSTRUCTION, not from guessing at the
+    /// source operand.
+    ///
+    /// `mov r/m, imm` (C6/C7) has a memory destination and an immediate source,
+    /// so there is no register to read a width from. The fallback was 64, which
+    /// modelled `movb $1,(%rdi)` as an EIGHT-byte store — six bytes of memory
+    /// declared clobbered that the program never writes. That is a wrong answer
+    /// about memory, and it feeds MemoryAccessFact and the memory-model VCs.
+    #[test]
+    fn an_immediate_store_writes_the_width_the_opcode_says() {
+        // (bytes, mnemonic, expected width_bytes)
+        let cases: &[(&[u8], &str, u32)] = &[
+            (&[0xC6, 0x07, 0x01], "movb $1,(%rdi)", 1),
+            (&[0xC7, 0x00, 0x01, 0x00, 0x00, 0x00], "movl $1,(%rax)", 4),
+            (&[0x48, 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00], "movq $1,(%rax)", 8),
+            (&[0x66, 0xC7, 0x00, 0x01, 0x00], "movw $1,(%rax)", 2),
+        ];
+
+        for (bytes, mnemonic, expected) in cases {
+            let Ok(insn) = decode_x86_64(bytes, 0x1000) else { panic!("{mnemonic} should decode") };
+            let effects = sem().effects(&MachineState::symbolic(), &insn).expect(mnemonic);
+            let widths: Vec<u32> = effects
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::MemWrite { width_bytes, .. } => Some(*width_bytes),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                widths,
+                vec![*expected],
+                "{mnemonic} must store {expected} byte(s); effects: {effects:?}"
+            );
+        }
+    }
+
+    /// `mov ah, imm8` must NEVER be modelled as a write to the stack pointer.
+    ///
+    /// x86-64 8-bit register numbers 4..7 are `AH/CH/DH/BH` with NO REX prefix
+    /// and `SPL/BPL/SIL/DIL` with one. Both were spelled `RegKind::Gpr` index
+    /// 4..7, so `mov ah, 0x12` (`B4 12`) matched machine-sem's
+    /// `is_sp` test — `kind == Gpr && index == RSP_INDEX` — and emitted an
+    /// `Effect::SpWrite`. The stack pointer is exactly the state the frame
+    /// reconstruction in trust-decompile and the stack-discipline VCs rest on.
+    #[test]
+    fn a_high_byte_register_is_never_the_stack_pointer() {
+        // B4 12 = mov ah, 0x12   (no REX -> reg 4 is AH)
+        let insn = decode_x86_64(&[0xB4, 0x12], 0x1000).expect("mov ah, imm8 decodes");
+        let Some(Operand::Reg(r)) = insn.operand(0) else {
+            panic!("expected a register operand, got {:?}", insn.operand(0));
+        };
+        assert_eq!(r.kind, RegKind::GprHighByte, "reg 4 without REX is AH, not SPL");
+        assert_eq!(r.index, 0, "AH is the high byte of RAX");
+
+        // It must be REFUSED rather than modelled as AL or as SP.
+        let effects = sem().effects(&MachineState::symbolic(), &insn);
+        assert!(
+            effects.is_err(),
+            "a high-byte register must be refused, not modelled: {effects:?}"
+        );
+        if let Ok(effects) = &effects {
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::SpWrite { .. })),
+                "mov ah must never write the stack pointer"
+            );
+        }
+    }
+
+    /// The converse: WITH a REX prefix, register 4 really is `SPL` — the low
+    /// byte of RSP — and must stay an ordinary GPR encoding. A fix that turned
+    /// every 8-bit register 4..7 into a high-byte register would break this.
+    #[test]
+    fn with_rex_present_register_four_is_spl_not_ah() {
+        // 40 B4 12 = mov spl, 0x12   (REX present, so reg 4 is SPL)
+        let insn = decode_x86_64(&[0x40, 0xB4, 0x12], 0x1000).expect("mov spl, imm8 decodes");
+        let Some(Operand::Reg(r)) = insn.operand(0) else {
+            panic!("expected a register operand, got {:?}", insn.operand(0));
+        };
+        assert_eq!(r.kind, RegKind::Gpr, "with REX, reg 4 is SPL — an ordinary GPR encoding");
+        assert_eq!(r.index, 4);
+    }
+
+    /// x86-64 MASKS the shift count: `& 0x3F` for 64-bit operands, `& 0x1F`
+    /// otherwise (SDM Vol.2, SAL/SAR/SHL/SHR). So `shl rax, 64` is a shift by
+    /// ZERO — it leaves RAX unchanged — and `shl eax, 32` likewise.
+    ///
+    /// Modelled without the mask, those two instructions denoted a shift by the
+    /// full operand width, which is a DIFFERENT program from the one the CPU
+    /// runs. Pinned structurally: the count operand feeding the shift must be a
+    /// `BvAnd` against the architectural mask.
+    #[test]
+    fn a_shift_count_is_masked_to_the_architectural_width() {
+        // (bytes, mnemonic, dst_width, expected mask)
+        let cases: &[(&[u8], &str, u32, i128)] = &[
+            (&[0x48, 0xC1, 0xE0, 0x40], "shl rax, 64", 64, 0x3F),
+            (&[0xC1, 0xE0, 0x20], "shl eax, 32", 32, 0x1F),
+            (&[0x48, 0xC1, 0xE8, 0x40], "shr rax, 64", 64, 0x3F),
+            (&[0x48, 0xC1, 0xF8, 0x40], "sar rax, 64", 64, 0x3F),
+        ];
+
+        for (bytes, mnemonic, width, mask) in cases {
+            let Ok(insn) = decode_x86_64(bytes, 0x1000) else {
+                panic!("{mnemonic} should decode");
+            };
+            let state = MachineState::symbolic();
+            let effects = sem().effects(&state, &insn).expect(mnemonic);
+
+            // The shift may sit under a wrapper — a 32-bit destination write is
+            // `BvZeroExt(BvShl(..), 32)` because a 32-bit write zero-extends to
+            // 64 — so search rather than match the outermost node.
+            fn find_shift_count(f: &Formula) -> Option<Formula> {
+                match f {
+                    Formula::BvShl(_, count, _)
+                    | Formula::BvLShr(_, count, _)
+                    | Formula::BvAShr(_, count, _) => Some((**count).clone()),
+                    Formula::BvZeroExt(inner, _) | Formula::BvSignExt(inner, _) => {
+                        find_shift_count(inner)
+                    }
+                    Formula::BvExtract { inner, .. } => find_shift_count(inner),
+                    _ => None,
+                }
+            }
+            let shift_count = effects.iter().find_map(|e| match e {
+                Effect::RegWrite { value, .. } => find_shift_count(value),
+                _ => None,
+            });
+
+            let Some(count) = shift_count else {
+                panic!("{mnemonic} produced no shift effect: {effects:?}");
+            };
+            assert!(
+                matches!(
+                    &count,
+                    Formula::BvAnd(_, m, w)
+                        if **m == (Formula::BitVec { value: *mask, width: *width }) && w == width
+                ),
+                "{mnemonic}: shift count must be masked with 0x{mask:X}; got {count:?}"
+            );
+        }
     }
 
     fn state() -> MachineState {

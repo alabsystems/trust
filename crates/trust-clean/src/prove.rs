@@ -8233,6 +8233,42 @@ pub(crate) fn straight_line_ir_body(
             }
             IrRvalue::Bin(to_ir_binop(bop, a, b)?, to_ir_operand(a)?, to_ir_operand(b)?)
         }
+        // Trust: TRANSPARENT-UNWRAP leg (2026-08-18) — the MULTI-HOP by-value
+        // field-chain return on the TRUST-IR lane (`_0 := Copy(_1.0.0)`, the
+        // extractor's transmute spelling): REUSE the mirsem chase whole
+        // (`sem_field_read_operand`'s multi-hop arm — the type chase + the full
+        // entry-time-value gates) and translate the nested selector onto the
+        // RECURSIVE `Index` encoding: `Field` and `Index` both denote the SAME
+        // opaque `idxElem` application, so the nested composition
+        // `Index(Index(Var i, Const f1), Const f2)` IS the multi-hop path's
+        // denotation — model tier (not grounder-connected), no value claim,
+        // exactly the mirsem twin's reading. Fires ONLY for len >= 2 all-Field
+        // paths; the single-hop `Field` leaf is untouched. Keeps the regenerated
+        // NonZero::get rows trust-ir-primary — the teardown criterion holds
+        // through the regen instead of reopening mirsem-first.
+        Rvalue::Use(op @ (Operand::Copy(p) | Operand::Move(p)))
+            if p.projections.len() >= 2
+                && p.projections
+                    .iter()
+                    .all(|pr| matches!(pr, trust_types::Projection::Field(_))) =>
+        {
+            let sem = crate::mirsem::sem_field_read_operand(body, op, &param_index)?;
+            fn nested_to_ir(
+                sem: &crate::mirsem::SemOperand,
+            ) -> Option<crate::trustir_anchor::IrOperand> {
+                use crate::mirsem::SemOperand as S;
+                use crate::trustir_anchor::IrOperand as I;
+                match sem {
+                    S::Var(i) => Some(I::Var(*i)),
+                    S::Field(base, fld) => Some(I::Index(
+                        Box::new(nested_to_ir(base)?),
+                        Box::new(I::Const(i128::try_from(*fld).ok()?)),
+                    )),
+                    _ => None,
+                }
+            }
+            IrRvalue::Use(nested_to_ir(&sem)?)
+        }
         Rvalue::Use(op) => IrRvalue::Use(to_ir_operand(op)?),
         // Trust: COMPARE-AS-VALUE (2026-08-08) — an UNCHECKED `BinaryOp` may be a
         // COMPARISON returning `bool` (`_0 := p < 0; Return` — `is_negative` and its
@@ -11725,6 +11761,14 @@ fn signum_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
         return false;
     }
     true
+}
+
+/// Trust: TRANSPARENT-UNWRAP twin pin hook — test-visible re-export of the
+/// straight-line lane (the mirsem tests pin that the synthetic post-fix get
+/// certifies trust-ir-primary).
+#[cfg(test)]
+pub(crate) fn straight_line_fully_faithful_via_trustir_pub(func: &VerifiableFunction) -> bool {
+    straight_line_fully_faithful_via_trustir(func)
 }
 
 fn straight_line_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {

@@ -152,11 +152,16 @@ pub(crate) struct DoctorVerifierSuiteStatus {
     pub(crate) adapter_compiled: bool,
     /// Truthful capability signal: the compiled in-process adapter declares it can
     /// handle ≥1 obligation kind (its manifest has a Supported capability). This is
-    /// distinct from `in_process_available` (which reflects only the contentless
-    /// doctor SMOKE probe, and is honestly `false` because a bare obligation carries
-    /// no typed CHC input to prove). A consumer asking "is this batteries-on engine
-    /// actually wired/capable?" should read THIS, not the smoke result; real
-    /// proof-grade behavior is exercised by compilation (see the falsification gate).
+    /// distinct from `in_process_available`, which reflects the doctor SMOKE probe:
+    /// a canonical request (the bundle carries the one obligation it asks about;
+    /// for trust-mc under `trust-mc-in-process` it is a real typed-CHC bundle the
+    /// native solver genuinely solves) dispatched through the public validated
+    /// `verify_with_context`. That public boundary deliberately never mints
+    /// `Proved` for native CHC/PDR candidates without a deliverable live receipt,
+    /// so the smoke stays honestly non-available today — its `detail` says why. A
+    /// consumer asking "is this batteries-on engine actually wired/capable?"
+    /// should read THIS, not the smoke result; real proof-grade behavior is
+    /// exercised by compilation (see the falsification gate).
     pub(crate) capability_available: bool,
     pub(crate) in_process_available: bool,
     pub(crate) in_process_status: &'static str,
@@ -704,16 +709,30 @@ struct VerifierEngineSmokeProbe {
     detail: Option<String>,
 }
 
-fn verifier_engine_smoke_probe(
+/// Build the smoke-probe request for one verifier suite.
+///
+/// The request must be CANONICAL: the hardened `verify_with_context` wrapper
+/// fail-closes when a requested obligation is missing from the bundle's own
+/// obligation inventory — as it must — so the bundle carries the one
+/// obligation it asks about. (Empty publication metadata is fine: nothing on
+/// the probe path requires publication hashes.)
+///
+/// For trust-mc, when the in-process native adapter is compiled
+/// (`trust-mc-in-process`), the probe uses trust-bmc's canonical
+/// one-obligation typed-CHC doctor bundle so the smoke exercises the real
+/// native typed-CHC lane end-to-end instead of a payload-less synthetic
+/// obligation. The constructor only BUILDS the request; verification still
+/// goes through the public validated `verify_with_context` below.
+fn doctor_smoke_probe_request(
     suite_name: &str,
+    run_id: &str,
     obligation_kind: ObligationKind,
-    engine: &dyn VerificationEngine,
-) -> VerifierEngineSmokeProbe {
-    let run_id = format!("targo-trust-doctor-{suite_name}-smoke");
-    let bundle = TrustContractBundle::empty(
-        format!("{run_id}-bundle"),
-        BundleSubject::Artifact { name: suite_name.to_string(), kind: "doctor-smoke".to_string() },
-    );
+) -> (TrustContractBundle, TrustObligation) {
+    #[cfg(feature = "trust-mc-in-process")]
+    if suite_name == "trust-mc" {
+        return trust_bmc::doctor_smoke_bundle();
+    }
+
     let obligation = TrustObligation {
         obligation_id: format!("{run_id}-obligation"),
         kind: obligation_kind,
@@ -725,6 +744,21 @@ fn verifier_engine_smoke_probe(
         summary_facts: Vec::new(),
         metadata: Vec::new(),
     };
+    let mut bundle = TrustContractBundle::empty(
+        format!("{run_id}-bundle"),
+        BundleSubject::Artifact { name: suite_name.to_string(), kind: "doctor-smoke".to_string() },
+    );
+    bundle.obligations = vec![obligation.clone()];
+    (bundle, obligation)
+}
+
+fn verifier_engine_smoke_probe(
+    suite_name: &str,
+    obligation_kind: ObligationKind,
+    engine: &dyn VerificationEngine,
+) -> VerifierEngineSmokeProbe {
+    let run_id = format!("targo-trust-doctor-{suite_name}-smoke");
+    let (bundle, obligation) = doctor_smoke_probe_request(suite_name, &run_id, obligation_kind);
 
     let support = engine.supports(&obligation);
     if !support.is_supported() {
@@ -747,9 +781,9 @@ fn verifier_engine_smoke_probe(
         && result.status != VerificationRunStatus::Empty
         && result.summary.requested_obligations == 1
         && result.summary.evidence_count == 1
-        && result.requested_obligations == [obligation]
+        && result.requested_obligations.as_slice() == std::slice::from_ref(&obligation)
         && result.evidence.len() == 1
-        && result.evidence[0].obligation_id == format!("{run_id}-obligation")
+        && result.evidence[0].obligation_id == obligation.obligation_id
         && result.evidence[0].engine.name == manifest.name;
 
     if !structurally_valid {
@@ -776,13 +810,22 @@ fn verifier_engine_smoke_probe(
         };
     }
     if evidence.status != EvidenceStatus::Proved {
+        // v7/D3: a refusal must carry the fix — surface the engine's own
+        // summary (its LAST diagnostic) so e.g. a solved-but-non-definitive
+        // native candidate explains itself instead of hiding behind a bare
+        // status word.
+        let mut detail = format!(
+            "in-process verifier returned {:?} evidence for smoke obligation",
+            evidence.status
+        );
+        if let Some(reason) = evidence.diagnostics.last() {
+            detail.push_str(": ");
+            detail.push_str(reason);
+        }
         return VerifierEngineSmokeProbe {
             available: false,
             status: "unavailable",
-            detail: Some(format!(
-                "in-process verifier returned {:?} evidence for smoke obligation",
-                evidence.status
-            )),
+            detail: Some(detail),
         };
     }
     if !doctor_suite_evidence_has_native_artifacts(suite_name, evidence) {
@@ -1289,6 +1332,62 @@ mod tests {
             !doctor_suite_has_native_source_route(&suite),
             "native adapters without declared capabilities must not count as routed"
         );
+    }
+
+    /// The smoke request must be CANONICAL: the bundle carries the one
+    /// obligation it asks about, so the hardened `verify_with_context`
+    /// wrapper's inventory validation passes and the engine actually runs.
+    #[test]
+    fn test_doctor_smoke_probe_request_is_canonical() {
+        let (bundle, obligation) = doctor_smoke_probe_request(
+            "trust-wp",
+            "targo-trust-doctor-trust-wp-smoke",
+            ObligationKind::Precondition,
+        );
+        assert_eq!(bundle.obligations.as_slice(), std::slice::from_ref(&obligation));
+        bundle
+            .validate_requested_obligations(std::slice::from_ref(&obligation))
+            .expect("doctor smoke request must be an exact subset of its own bundle");
+    }
+
+    /// The trust-mc smoke must reach the engine and report the engine's own
+    /// honest verdict — never the pre-fix "invalid one-obligation run
+    /// envelope" message, which meant the hardened wrapper had (correctly)
+    /// fail-closed on a non-canonical request and the engine never ran.
+    #[test]
+    fn test_trust_mc_smoke_probe_reports_engine_verdict_not_envelope_failure() {
+        let engine = trust_bmc::TrustMcVerifierApiAdapter::default();
+        let probe = verifier_engine_smoke_probe("trust-mc", ObligationKind::Assertion, &engine);
+
+        assert!(!probe.available, "{probe:?}");
+        let detail = probe.detail.as_deref().unwrap_or_default();
+        assert!(
+            !detail.contains("one-obligation run envelope"),
+            "smoke must not report the misleading envelope message: {probe:?}"
+        );
+        #[cfg(not(feature = "trust-mc-in-process"))]
+        {
+            // Default build: the fail-closed metadata-only stub adapter runs
+            // and declines with its actionable feature-gate diagnostic.
+            assert_eq!(probe.status, "unsupported", "{probe:?}");
+            assert!(
+                detail.contains("disabled in the default trust-bmc build"),
+                "stub decline must carry its actionable reason: {probe:?}"
+            );
+        }
+        #[cfg(feature = "trust-mc-in-process")]
+        {
+            // Shipped feature set: the native solver genuinely solves the
+            // canonical typed-CHC smoke bundle, and public dispatch keeps the
+            // candidate NON-definitive (Proved requires a deliverable live
+            // receipt), so the probe honestly reports the engine's Unknown
+            // verdict with the engine's own explanation.
+            assert_eq!(probe.status, "unavailable", "{probe:?}");
+            assert!(
+                detail.contains("returned Unknown evidence"),
+                "native candidate outcome must be surfaced: {probe:?}"
+            );
+        }
     }
 
     #[test]

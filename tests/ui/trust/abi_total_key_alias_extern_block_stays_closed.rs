@@ -39,9 +39,12 @@
 //! MEASURED, both states, on two real compilers built from this tree. The
 //! observable is the OBLIGATION COUNT, not the exit code: every raw FFI call also
 //! mints `hardened_ffi_boundary` / `hardened_unsafe_operation` rows that never
-//! prove, so this file is red either way and its `//~? RAW Trust` alone cannot
-//! witness the gate (the same caveat
-//! `static_str_write_fmt_placeholder_site_stays_closed.rs` carries).
+//! prove, so this file is red either way and its raw error-pattern annotation
+//! alone cannot witness the gate (the same caveat
+//! `static_str_write_fmt_placeholder_site_stays_closed.rs` carries). Do not
+//! spell that annotation literally in prose: compiletest scans for the marker
+//! ANYWHERE in the file, comments included, and would register this sentence as
+//! a second expected diagnostic.
 //!
 //! ```text
 //! dropped {{extern}} segment (pristine, and the shipped stage2 trustc):

@@ -1403,6 +1403,9 @@ fn byte_store_formula(
     current
 }
 
+/// Width of one addressable memory cell: `memory` is `Array(BitVec 64, BitVec 8)`.
+const BYTE_BITS: u32 = 8;
+
 fn byte_load_formula(
     memory: &Formula,
     address: &Formula,
@@ -1421,7 +1424,23 @@ fn byte_load_formula(
             )
         };
         let byte_value = Formula::Select(Box::new(memory.clone()), Box::new(byte_address));
-        let extended = Formula::BvZeroExt(Box::new(byte_value), result_width);
+        // `BvZeroExt`'s second field is the extension AMOUNT, not the target
+        // width: `check_formula_sort` returns `BitVec(inner + extra)`
+        // (trust-types/src/smt_logic.rs) and the printer emits SMT-LIB
+        // `((_ zero_extend n) ..)`, where `n` is likewise an amount. `memory` is
+        // `Array(BitVec 64, BitVec 8)`, so a `Select` from it is 8 bits wide and
+        // the amount needed to reach `result_width` is `result_width - 8`.
+        //
+        // This passed `result_width` until 2026-08-18, so every AArch64 lifted
+        // load denoted `BitVec(8 + result_width)` — `BitVec(72)` at the default
+        // width — and was then fed to `BvShl`/`BvOr` declared at
+        // `result_width`. `bv_operand` rejects that with
+        // `FormulaSortError::BitWidth { declared: 64, actual: 72 }`. It shipped
+        // silently because nothing on the lift path sort-checks the formulas it
+        // builds; x86_64 was unaffected because it composes loads through
+        // trust-machine-sem's `zero_extend_to`, which already subtracts.
+        let extended =
+            Formula::BvZeroExt(Box::new(byte_value), result_width.saturating_sub(BYTE_BITS));
         if byte_index == 0 {
             result = extended;
         } else {
@@ -2909,6 +2928,65 @@ fn apply_effect_to_state(state: &mut MachineState, effect: &Effect) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lifted load must be WELL-SORTED. Nothing else on the lift path checks
+    /// this, which is exactly why the bug it pins shipped: `byte_load_formula`
+    /// passed `result_width` as `BvZeroExt`'s second field, but that field is
+    /// the extension AMOUNT (`check_formula_sort` returns `BitVec(inner +
+    /// extra)`), so each byte lane denoted `BitVec(8 + result_width)` and was
+    /// then fed to `BvShl`/`BvOr` declared at `result_width`.
+    ///
+    /// Measured before the fix: an AArch64 `ldr x0, [x1]` lifted to
+    /// `BvZeroExt(Select(MEM, ..), 64)` — `BitVec(72)` — and
+    /// `check_formula_sort` rejects it with
+    /// `BitWidth { declared: 64, actual: 72 }`. x86_64 was unaffected because it
+    /// composes loads via trust-machine-sem's `zero_extend_to`.
+    #[test]
+    fn a_lifted_load_formula_is_well_sorted_at_every_width() {
+        let memory = Formula::Var(
+            "MEM".to_string(),
+            trust_types::Sort::Array(
+                Box::new(trust_types::Sort::BitVec(64)),
+                Box::new(trust_types::Sort::BitVec(8)),
+            ),
+        );
+        let address = Formula::Var("X1".to_string(), trust_types::Sort::BitVec(64));
+
+        for width_bytes in [1u32, 2, 4, 8] {
+            let result_width = width_bytes * 8;
+            let loaded = byte_load_formula(&memory, &address, width_bytes, result_width);
+            assert_eq!(
+                trust_types::check_formula_sort(&loaded),
+                Ok(trust_types::Sort::BitVec(result_width)),
+                "a {width_bytes}-byte load must denote BitVec({result_width}); got {loaded:?}"
+            );
+        }
+    }
+
+    /// The companion direction: a byte STORE keeps the memory array's sort.
+    /// `byte_store_formula` uses `BvExtract`, whose `high`/`low` are a RANGE
+    /// rather than an amount, so it never had the defect above — pinned so a
+    /// future edit cannot introduce it there either.
+    #[test]
+    fn a_lifted_store_formula_preserves_the_memory_sort() {
+        let array_sort = trust_types::Sort::Array(
+            Box::new(trust_types::Sort::BitVec(64)),
+            Box::new(trust_types::Sort::BitVec(8)),
+        );
+        let memory = Formula::Var("MEM".to_string(), array_sort.clone());
+        let address = Formula::Var("X1".to_string(), trust_types::Sort::BitVec(64));
+
+        for width_bytes in [1u32, 2, 4, 8] {
+            let value =
+                Formula::Var("V".to_string(), trust_types::Sort::BitVec(width_bytes * 8));
+            let stored = byte_store_formula(memory.clone(), &address, &value, width_bytes);
+            assert_eq!(
+                trust_types::check_formula_sort(&stored),
+                Ok(array_sort.clone()),
+                "a {width_bytes}-byte store must stay an Array sort; got {stored:?}"
+            );
+        }
+    }
 
     fn assert_aarch64_exclusive_blocker_detail(
         text: &str,

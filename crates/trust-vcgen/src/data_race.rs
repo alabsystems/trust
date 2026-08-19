@@ -336,6 +336,22 @@ pub fn generate_race_vcs(
             // establishes a happens-before edge. If we already determined
             // there is no HB edge (that's why it's in the race list), this
             // is simply `false` -- meaning NOT(ordered) is true.
+            // SOUNDNESS (#59, 2026-08-19): this conjunct is a PLACEHOLDER, not a
+            // model. The happens-before question is decided in Rust above and
+            // hardcoded here, so the emitted obligation is VACUOUS — it says
+            // `reach_a AND reach_b`, never anything about ordering.
+            //
+            // That is inert ONLY because nothing routes it: `trust.vc/data_race`
+            // is an `ObligationKind::Custom` that falls to the catch-all in
+            // `trust-router`'s `obligation_route`, and `fallback_route` returns
+            // None. Pinned by
+            // `full_verification::tests::concurrency_obligations_are_unroutable_until_their_formula_is_real`.
+            //
+            // DO NOT route this kind while this line reads `Bool(true)`. Routing a
+            // vacuous obligation manufactures a verdict about a claim nobody
+            // stated. v6/D2 gives `ty` ownership of concurrency, which makes
+            // "add a route" the obvious next edit — the gate is THIS FORMULA
+            // becoming real, not the routing table.
             let not_ordered = Formula::Bool(true);
 
             // VC formula: both accesses reachable AND not ordered.

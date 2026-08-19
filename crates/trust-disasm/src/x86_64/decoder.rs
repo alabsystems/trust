@@ -10,9 +10,9 @@
 use crate::error::DisasmError;
 use crate::instruction::{ControlFlow, Instruction};
 use crate::opcode::Opcode;
-use crate::operand::{Condition, Operand};
+use crate::operand::{Condition, MemoryOperand, Operand};
 
-use super::modrm::{ModRM, decode_rm_operand, gpr};
+use super::modrm::{ModRM, decode_rm_operand, gpr, gpr8, gpr_sized};
 use super::prefix::Prefixes;
 
 /// Decode one x86-64 instruction from `bytes` at the given virtual address.
@@ -46,6 +46,29 @@ pub(crate) fn decode_instruction(bytes: &[u8], addr: u64) -> Result<Instruction,
         return Err(DisasmError::InsufficientBytes { needed: total_len, available: bytes.len() });
     }
     instruction.bytes = bytes[..total_len].to_vec();
+
+    // Trust: THE RIP-RESOLUTION CHOKE POINT. x86-64 RIP-relative addressing is
+    // measured from the first byte of the NEXT instruction, so the effective
+    // address is only computable once `size` is final — which is HERE, and
+    // nowhere earlier: a trailing immediate can extend the instruction past the
+    // displacement (`48 C7 05 <disp32> <imm32>` is 11 bytes, and objdump
+    // resolves it to insn.address + 11 + disp).
+    //
+    // `MemoryOperand::RipRelative` must not escape this function; anything that
+    // observes one downstream is a bug, which is why it is a distinct variant
+    // rather than a reuse of AArch64's `PcRelative` (whose base is the
+    // instruction's OWN address). Branch targets a few hundred lines below have
+    // always resolved correctly as `addr + total + rel`; this makes the memory
+    // path agree.
+    let next_insn = addr.wrapping_add(total_len as u64);
+    for operand in instruction.operands_mut() {
+        if let Operand::Mem(MemoryOperand::RipRelative { displacement }) = operand {
+            *operand = Operand::Mem(MemoryOperand::Absolute {
+                address: next_insn.wrapping_add(*displacement as u64),
+            });
+        }
+    }
+
     Ok(instruction)
 }
 
@@ -79,7 +102,7 @@ fn decode_one_byte_opcode(
             let reg_idx = (opcode - 0x50) | if prefixes.rex.b { 8 } else { 0 };
             let mut insn =
                 make_insn(addr, offset, opcode as u32, Opcode::Push, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(reg_idx, 64)));
+            insn.push_operand(Operand::Reg(gpr(reg_idx, push_pop_width(prefixes))));
             Ok(insn)
         }
 
@@ -88,7 +111,7 @@ fn decode_one_byte_opcode(
             let reg_idx = (opcode - 0x58) | if prefixes.rex.b { 8 } else { 0 };
             let mut insn =
                 make_insn(addr, offset, opcode as u32, Opcode::Pop, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(reg_idx, 64)));
+            insn.push_operand(Operand::Reg(gpr(reg_idx, push_pop_width(prefixes))));
             Ok(insn)
         }
 
@@ -123,6 +146,9 @@ fn decode_one_byte_opcode(
             let imm = read_imm_signed(&rest[imm_start..], imm_size);
             let total = offset + 1 + rm_result.extra_bytes + imm_size;
             let mut insn = make_insn(addr, total, 0xC7, Opcode::Mov, ControlFlow::Fallthrough);
+            // Trust: a MEMORY destination carries no width; with an immediate
+            // source there is no register to infer it from, so record it here.
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             insn.push_operand(Operand::SignedImm(imm));
             Ok(insn)
@@ -152,7 +178,7 @@ fn decode_one_byte_opcode(
             let total = offset + imm_size;
             let mut insn =
                 make_insn(addr, total, opcode as u32, Opcode::Mov, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(reg_idx, width)));
+            insn.push_operand(Operand::Reg(gpr_sized(reg_idx, width, prefixes.rex.present)));
             if prefixes.rex.w {
                 insn.push_operand(Operand::Imm(imm as u64));
             } else {
@@ -171,13 +197,26 @@ fn decode_one_byte_opcode(
             let total = offset + 1;
             let mut insn =
                 make_insn(addr, total, opcode as u32, Opcode::Mov, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(reg_idx, 8)));
+            insn.push_operand(Operand::Reg(gpr8(reg_idx, prefixes.rex.present)));
             insn.push_operand(Operand::SignedImm(imm));
             Ok(insn)
         }
 
         // --- LEA r, m (0x8D) ---
-        0x8D => decode_modrm_reg_rm(rest, addr, prefixes, offset, Opcode::Lea),
+        //
+        // LEA computes an EFFECTIVE ADDRESS, so its source must be a memory
+        // operand: `mod == 11` (register-direct) has no address to compute and
+        // is an invalid encoding — LLVM decodes `8d d9` as `<unknown>`. We
+        // accepted it and produced two register operands, which is the
+        // accepts-what-the-CPU-rejects class that `native-invariant` exists to
+        // catch on AArch64. Found by the x86-64 decode differential.
+        0x8D => {
+            let modrm_byte = *rest.first().ok_or_else(|| insufficient(offset + 1, 0))?;
+            if (modrm_byte >> 6) == 0b11 {
+                return Err(unknown_enc(addr, opcode));
+            }
+            decode_modrm_reg_rm(rest, addr, prefixes, offset, Opcode::Lea)
+        }
 
         // --- ADD r/m, r (0x01) ---
         0x01 => decode_modrm_rm_reg(rest, addr, prefixes, offset, Opcode::Add, false),
@@ -319,7 +358,12 @@ fn decode_one_byte_opcode(
             let target = addr.wrapping_add(total as u64).wrapping_add(rel as i64 as u64);
             let mut insn =
                 make_insn(addr, total, opcode as u32, Opcode::Jcc, ControlFlow::ConditionalBranch);
-            insn.push_operand(Operand::Cond(x86_cc_to_condition(cc)));
+            let Some(cond) = x86_cc_to_condition(cc) else {
+                // Parity condition: refuse rather than model a branch the
+                // machine model cannot express. See `x86_cc_to_condition`.
+                return Err(unknown_enc(addr, opcode));
+            };
+            insn.push_operand(Operand::Cond(cond));
             insn.push_operand(Operand::PcRelAddr(target));
             Ok(insn)
         }
@@ -356,6 +400,8 @@ fn decode_one_byte_opcode(
             let imm = rest[imm_off] as i8 as i64;
             let total = offset + imm_off + 1;
             let mut insn = make_insn(addr, total, 0xC6, Opcode::Mov, ControlFlow::Fallthrough);
+            // Trust: see 0xC7 — `movb $imm,(mem)` is an EIGHT-bit store.
+            insn.operand_size = Some(8);
             insn.push_operand(rm_result.operand);
             insn.push_operand(Operand::SignedImm(imm));
             Ok(insn)
@@ -368,7 +414,7 @@ fn decode_one_byte_opcode(
             let mut insn =
                 make_insn(addr, offset, opcode as u32, Opcode::Xchg, ControlFlow::Fallthrough);
             insn.push_operand(Operand::Reg(gpr(0, width)));
-            insn.push_operand(Operand::Reg(gpr(reg_idx, width)));
+            insn.push_operand(Operand::Reg(gpr_sized(reg_idx, width, prefixes.rex.present)));
             Ok(insn)
         }
 
@@ -399,7 +445,7 @@ fn decode_one_byte_opcode(
                 let total = offset + 1 + rm_result.extra_bytes;
                 let mut insn =
                     make_insn(addr, total, 0x63, Opcode::Movsxd, ControlFlow::Fallthrough);
-                insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+                insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
                 insn.push_operand(rm_result.operand);
                 Ok(insn)
             }
@@ -444,7 +490,12 @@ fn decode_two_byte_opcode(
                 Opcode::Jcc,
                 ControlFlow::ConditionalBranch,
             );
-            insn.push_operand(Operand::Cond(x86_cc_to_condition(cc)));
+            let Some(cond) = x86_cc_to_condition(cc) else {
+                // Parity condition: refuse rather than model a branch the
+                // machine model cannot express. See `x86_cc_to_condition`.
+                return Err(unknown_enc(addr, opcode2));
+            };
+            insn.push_operand(Operand::Cond(cond));
             insn.push_operand(Operand::PcRelAddr(target));
             Ok(insn)
         }
@@ -459,7 +510,7 @@ fn decode_two_byte_opcode(
             let dst_width = prefixes.operand_size();
             let total = offset2 + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0x0FB6, Opcode::Movzx, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(modrm.reg, dst_width)));
+            insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, dst_width, prefixes.rex.present)));
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -474,7 +525,7 @@ fn decode_two_byte_opcode(
             let dst_width = prefixes.operand_size();
             let total = offset2 + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0x0FB7, Opcode::Movzx, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(modrm.reg, dst_width)));
+            insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, dst_width, prefixes.rex.present)));
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -489,7 +540,7 @@ fn decode_two_byte_opcode(
             let dst_width = prefixes.operand_size();
             let total = offset2 + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0x0FBE, Opcode::Movsx, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(modrm.reg, dst_width)));
+            insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, dst_width, prefixes.rex.present)));
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -504,7 +555,7 @@ fn decode_two_byte_opcode(
             let dst_width = prefixes.operand_size();
             let total = offset2 + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0x0FBF, Opcode::Movsx, ControlFlow::Fallthrough);
-            insn.push_operand(Operand::Reg(gpr(modrm.reg, dst_width)));
+            insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, dst_width, prefixes.rex.present)));
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -560,8 +611,13 @@ fn decode_two_byte_opcode(
                 Opcode::Cmovcc,
                 ControlFlow::Fallthrough,
             );
-            insn.push_operand(Operand::Cond(x86_cc_to_condition(cc)));
-            insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+            let Some(cond) = x86_cc_to_condition(cc) else {
+                // Parity condition: refuse rather than model a branch the
+                // machine model cannot express. See `x86_cc_to_condition`.
+                return Err(unknown_enc(addr, opcode2));
+            };
+            insn.push_operand(Operand::Cond(cond));
+            insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -582,7 +638,12 @@ fn decode_two_byte_opcode(
                 Opcode::Setcc,
                 ControlFlow::Fallthrough,
             );
-            insn.push_operand(Operand::Cond(x86_cc_to_condition(cc)));
+            let Some(cond) = x86_cc_to_condition(cc) else {
+                // Parity condition: refuse rather than model a branch the
+                // machine model cannot express. See `x86_cc_to_condition`.
+                return Err(unknown_enc(addr, opcode2));
+            };
+            insn.push_operand(Operand::Cond(cond));
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -599,7 +660,7 @@ fn decode_two_byte_opcode(
             let mut insn =
                 make_insn(addr, total, 0x0FB1, Opcode::Cmpxchg, ControlFlow::Fallthrough);
             insn.push_operand(rm_result.operand);
-            insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+            insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
             Ok(insn)
         }
 
@@ -634,7 +695,7 @@ fn decode_modrm_rm_reg(
     let enc = opcode_to_enc(opcode);
     let mut insn = make_insn(addr, total, enc, opcode, opcode_flow(opcode));
     insn.push_operand(rm_result.operand);
-    insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+    insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
     Ok(insn)
 }
 
@@ -655,7 +716,7 @@ fn decode_modrm_reg_rm(
     let total = offset + 1 + rm_result.extra_bytes;
     let enc = opcode_to_enc(opcode);
     let mut insn = make_insn(addr, total, enc, opcode, opcode_flow(opcode));
-    insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+    insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
     insn.push_operand(rm_result.operand);
     Ok(insn)
 }
@@ -676,7 +737,7 @@ fn decode_modrm_reg_rm_8bit(
     let total = offset + 1 + rm_result.extra_bytes;
     let enc = opcode_to_enc(opcode);
     let mut insn = make_insn(addr, total, enc, opcode, opcode_flow(opcode));
-    insn.push_operand(Operand::Reg(gpr(modrm.reg, 8)));
+    insn.push_operand(Operand::Reg(gpr8(modrm.reg, prefixes.rex.present)));
     insn.push_operand(rm_result.operand);
     Ok(insn)
 }
@@ -698,7 +759,7 @@ fn decode_modrm_reg_rm_2byte(
     let total = offset + 1 + rm_result.extra_bytes;
     let enc = opcode_to_enc(opcode);
     let mut insn = make_insn(addr, total, enc, opcode, opcode_flow(opcode));
-    insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+    insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
     insn.push_operand(rm_result.operand);
     Ok(insn)
 }
@@ -883,10 +944,21 @@ fn decode_group5(
         return Err(insufficient(offset + 1, 0));
     }
     let modrm = ModRM::decode(rest[0], prefixes);
-    let op_width = prefixes.operand_size();
+    let reg_field = modrm.reg & 0x07;
+    // The width is PER FORM, so it must be chosen before the r/m operand is
+    // decoded. Near CALL (/2) and JMP (/4) default to 64 bits in long mode and
+    // have no 32-bit form at all — the operand-size prefix is ignored for near
+    // branches — yet the width used to be `prefixes.operand_size()`, so
+    // `callq *%rbx` (`ff d3`) decoded its target as EBX. PUSH (/6) likewise
+    // defaults to 64, with `0x66` selecting 16. INC/DEC follow the ordinary
+    // operand size. Found by the x86-64 decode differential.
+    let op_width = match reg_field {
+        2 | 4 => 64,
+        6 => push_pop_width(prefixes),
+        _ => prefixes.operand_size(),
+    };
     let rm_result = decode_rm_operand(&modrm, &rest[1..], prefixes, op_width, addr)?;
     let total = offset + 1 + rm_result.extra_bytes;
-    let reg_field = modrm.reg & 0x07;
 
     let (opcode, flow) = match reg_field {
         0 => (Opcode::Inc, ControlFlow::Fallthrough),
@@ -922,7 +994,7 @@ fn decode_shift_imm(
     let shift_amount = rest[imm_off];
     let total = offset + imm_off + 1;
 
-    let opcode = shift_opcode(modrm.reg & 0x07)?;
+    let opcode = shift_opcode(modrm.reg & 0x07, addr)?;
 
     let mut insn = make_insn(addr, total, 0xC1, opcode, ControlFlow::Fallthrough);
     insn.push_operand(rm_result.operand);
@@ -945,7 +1017,7 @@ fn decode_shift_one(
     let rm_result = decode_rm_operand(&modrm, &rest[1..], prefixes, op_width, addr)?;
     let total = offset + 1 + rm_result.extra_bytes;
 
-    let opcode = shift_opcode(modrm.reg & 0x07)?;
+    let opcode = shift_opcode(modrm.reg & 0x07, addr)?;
 
     let mut insn = make_insn(addr, total, 0xD1, opcode, ControlFlow::Fallthrough);
     insn.push_operand(rm_result.operand);
@@ -968,7 +1040,7 @@ fn decode_shift_cl(
     let rm_result = decode_rm_operand(&modrm, &rest[1..], prefixes, op_width, addr)?;
     let total = offset + 1 + rm_result.extra_bytes;
 
-    let opcode = shift_opcode(modrm.reg & 0x07)?;
+    let opcode = shift_opcode(modrm.reg & 0x07, addr)?;
 
     let mut insn = make_insn(addr, total, 0xD3, opcode, ControlFlow::Fallthrough);
     insn.push_operand(rm_result.operand);
@@ -997,7 +1069,7 @@ fn decode_imul_imm8(
     let imm = rest[imm_off] as i8 as i64;
     let total = offset + imm_off + 1;
     let mut insn = make_insn(addr, total, 0x6B, Opcode::Imul, ControlFlow::Fallthrough);
-    insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+    insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
     insn.push_operand(rm_result.operand);
     insn.push_operand(Operand::SignedImm(imm));
     Ok(insn)
@@ -1024,7 +1096,7 @@ fn decode_imul_imm32(
     let imm = read_imm_signed(&rest[imm_off..], imm_size);
     let total = offset + imm_off + imm_size;
     let mut insn = make_insn(addr, total, 0x69, Opcode::Imul, ControlFlow::Fallthrough);
-    insn.push_operand(Operand::Reg(gpr(modrm.reg, op_width)));
+    insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
     insn.push_operand(rm_result.operand);
     insn.push_operand(Operand::SignedImm(imm));
     Ok(insn)
@@ -1059,12 +1131,21 @@ fn group1_opcode(reg: u8) -> Opcode {
 }
 
 /// Map shift /reg field to opcode.
-fn shift_opcode(reg: u8) -> Result<Opcode, DisasmError> {
+fn shift_opcode(reg: u8, addr: u64) -> Result<Opcode, DisasmError> {
     match reg {
         4 => Ok(Opcode::Shl),
         5 => Ok(Opcode::Shr),
         7 => Ok(Opcode::Sar),
-        _ => Ok(Opcode::Unknown), // ROL, ROR, RCL, RCR not yet supported
+        // /6 is an UNDEFINED encoding: the SDM assigns SAL to /4 and leaves /6
+        // unlisted, and LLVM decodes it `<unknown>`. This arm used to fall into
+        // the catch-all and ACCEPT it as `Opcode::Unknown` — consuming its
+        // bytes and materialising its operands — which is the
+        // accepts-what-the-oracle-rejects class. Found by the x86-64 decode
+        // differential (`d1 76 8f`, `d3 f4`, `c1 77 5f 89`).
+        6 => Err(DisasmError::UnknownEncoding { encoding: u32::from(reg), address: addr }),
+        // ROL/ROR/RCL/RCR (/0../3) are VALID instructions this decoder does not
+        // model yet — a capability gap, deliberately distinct from /6.
+        _ => Ok(Opcode::Unknown),
     }
 }
 
@@ -1072,8 +1153,20 @@ fn shift_opcode(reg: u8) -> Result<Opcode, DisasmError> {
 /// x86 CCs: 0=O, 1=NO, 2=B/C, 3=NB/NC, 4=Z/E, 5=NZ/NE,
 /// 6=BE/NA, 7=A/NBE, 8=S, 9=NS, A=P, B=NP, C=L/NGE,
 /// D=NL/GE, E=LE/NG, F=NLE/G
-fn x86_cc_to_condition(cc: u8) -> Condition {
-    match cc & 0x0F {
+/// Map an x86-64 condition code to the shared (ARM-shaped) `Condition`.
+///
+/// Returns `None` for the PARITY conditions (`cc` 0xA = JP/PE, 0xB = JNP/PO),
+/// which have NO AArch64 equivalent: `Condition` is a faithful 4-bit ARM
+/// encoding (`Al = 0b1110`, `Nv = 0b1111`) with no parity member, and
+/// `MachineState`'s flags are NZCV with no parity flag either.
+///
+/// They used to map to `Condition::Al` — "always" — with the comment "no direct
+/// AArch64 equivalent, use Al as placeholder". That made `jp` AND `jnp` both
+/// unconditional branches: two mutually exclusive conditions, each modelled as
+/// always taken. A caller must REFUSE the instruction rather than substitute a
+/// condition the machine does not have.
+fn x86_cc_to_condition(cc: u8) -> Option<Condition> {
+    Some(match cc & 0x0F {
         0x0 => Condition::Vs, // O (overflow) -> Vs
         0x1 => Condition::Vc, // NO -> Vc
         0x2 => Condition::Cs, // B/C (carry set) -> Cs (= below)
@@ -1084,16 +1177,16 @@ fn x86_cc_to_condition(cc: u8) -> Condition {
         0x7 => Condition::Hi, // A (above) -> Hi
         0x8 => Condition::Mi, // S (sign) -> Mi
         0x9 => Condition::Pl, // NS -> Pl
-        // 0xA => Parity (no direct AArch64 equivalent, use Al as placeholder)
-        0xA => Condition::Al,
-        // 0xB => No parity
-        0xB => Condition::Al,
+        // JP/JPE and JNP/JPO: no AArch64 condition, no parity flag in the model.
+        0xA | 0xB => return None,
         0xC => Condition::Lt, // L (less) -> Lt
         0xD => Condition::Ge, // GE (greater or equal) -> Ge
         0xE => Condition::Le, // LE -> Le
         0xF => Condition::Gt, // G (greater) -> Gt
-        _ => Condition::Al,
-    }
+        // `cc & 0x0F` is exhaustive over 0x0..=0xF; this arm is unreachable and
+        // must NOT default to a condition — that is how the parity bug began.
+        _ => return None,
+    })
 }
 
 /// Read a signed immediate of 1, 2, 4, or 8 bytes.
@@ -1124,6 +1217,21 @@ fn read_imm_unsigned(bytes: &[u8], size: usize) -> u64 {
 
 fn insufficient(needed: usize, available: usize) -> DisasmError {
     DisasmError::InsufficientBytes { needed, available }
+}
+
+/// Operand width of the `PUSH`/`POP` register forms (`0x50+rd` / `0x58+rd`).
+///
+/// In 64-bit mode these DEFAULT to 64 bits and cannot be encoded 32-bit at all;
+/// the only other size is 16, selected by the `0x66` operand-size prefix
+/// (`pushw %ax`). The width was hardcoded to 64, so `66 50` — `pushw %ax` —
+/// decoded as a 64-bit push of RAX. Found by the x86-64 decode differential.
+/// REX.W is irrelevant here: 64 is already the default.
+fn push_pop_width(prefixes: &Prefixes) -> u16 {
+    if prefixes.legacy.operand_size {
+        16
+    } else {
+        64
+    }
 }
 
 fn unknown_enc(addr: u64, opcode: u8) -> DisasmError {

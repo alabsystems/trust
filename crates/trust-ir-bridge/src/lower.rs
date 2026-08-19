@@ -1553,6 +1553,126 @@ impl<'a> LoweringCtx<'a> {
         Ok(result)
     }
 
+    /// Trust (vtable slice 1): the TRAIT-OBJECT sibling of [`Self::emit_slice_fat_pointer`]
+    /// — assemble a first-class `FatPtr(TraitObject)` from a REAL data lane and an
+    /// unconstrained vtable metadata lane.
+    ///
+    /// The slice assembler above takes a LENGTH and refuses a `TraitObject` fat type
+    /// outright, because no length lane can supply a vtable. That refusal is why this
+    /// exists rather than a widened parameter: the two metadata lanes are different
+    /// SORTS (`U64` vs `Ptr` — `PointerMetadataShape::{SliceLen, VTable}`), and the
+    /// validator's `check_pointer_metadata_ty` enforces exactly that, so one assembler
+    /// taking "a metadata value" would only move the mismatch to its callers.
+    ///
+    /// What is claimed, and what is not:
+    ///   * DATA lane — the caller's `data_ptr`, the coercion source. The trait-object
+    ///     unsize `&T -> &dyn Trait` attaches a vtable and leaves the address alone,
+    ///     so asserting `PtrData(result) == data_ptr` is TRUE of every real execution.
+    ///     This is the precision this slice buys: the previous model
+    ///     (`ConstValue::OpaqueConst` -> a fully fact-free `Inst::Undef` at the fat
+    ///     sort) discarded a lane the oracle knows exactly.
+    ///   * METADATA lane — Trust (vtable slice 3): when the caller derived the shared
+    ///     `(principal, source)` identity, a `GlobalAddr`+`Load` of the NAMED,
+    ///     initializer-less external global that `trust_ir::stable_vtable_global_name`
+    ///     mints — the SAME name the THIR producer emits for the same coercion, so the
+    ///     differential's two modules reference one symbol for one vtable. The claim
+    ///     this adds over a fresh havoc is exactly "two coercions of one `T as dyn Tr`
+    ///     yield the SAME metadata" — TRUE of every real execution (a vtable is
+    ///     per-(type, trait)); the value itself stays underived (`initializer: None`),
+    ///     so every vtable-VALUE-dependent obligation is as unprovable as ever.
+    ///     Without an identity (`None` — no principal, or a source outside the shared
+    ///     renderer's closed grammar) the slice-1 FRESH unconstrained `Ptr` havoc is
+    ///     kept byte-identically: fail-closed, never a guessed identity — a wrong name
+    ///     would assert equality of DIFFERENT vtables, which is why the mint embeds
+    ///     the key verbatim and both sides derive it with one renderer.
+    ///
+    /// The `data_ptr` must be a thin `Ty::Ptr` value — `check_ptr_from_parts_operands`
+    /// hardcodes `Ty::Ptr` for the data operand — which the caller establishes from the
+    /// SOURCE type before choosing this path.
+    fn emit_trait_object_fat_pointer(
+        &mut self,
+        fat_ty: TrustIrTy,
+        data_ptr: ValueId,
+        vtable_global_name: Option<String>,
+        body: &mut Vec<InstrNode>,
+    ) -> Result<ValueId, BridgeError> {
+        if !matches!(&fat_ty, TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject { .. })) {
+            return Err(BridgeError::UnsupportedOp(
+                "trait-object fat pointer assembler requires a TraitObject fat type".to_string(),
+            ));
+        }
+        if self.value_is_symbolic(data_ptr) {
+            return self.emit_symbolic_aggregate(
+                "trait_object_fat_pointer",
+                fat_ty,
+                &[data_ptr],
+                body,
+            );
+        }
+        let metadata = match vtable_global_name {
+            Some(name) => {
+                // Get-or-create BY NAME in the module being built: the mint embeds the
+                // key pair verbatim and injectively, so name equality IS key equality —
+                // two same-key coercions (any function of this module) share one global
+                // and their loads are structurally read-read equal, never coincidental.
+                let global = match self
+                    .module
+                    .globals
+                    .iter()
+                    .position(|g| g.name == name)
+                {
+                    Some(i) => trust_ir::value::GlobalId::new(i as u32),
+                    None => {
+                        let idx = self.module.globals.len();
+                        self.module.globals.push(trust_ir::Global {
+                            name,
+                            ty: TrustIrTy::Ptr,
+                            mutable: false,
+                            initializer: None,
+                            linkage: trust_ir::Linkage::External,
+                            tls: None,
+                            align: None,
+                        });
+                        trust_ir::value::GlobalId::new(idx as u32)
+                    }
+                };
+                let ptr = self.fresh_value();
+                body.push(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
+                let loaded = self.fresh_value();
+                body.push(
+                    InstrNode::new(Inst::Load {
+                        ty: TrustIrTy::Ptr,
+                        ptr,
+                        volatile: false,
+                        align: None,
+                    })
+                    .with_result(loaded),
+                );
+                loaded
+            }
+            None => {
+                let metadata = self.fresh_value();
+                body.push(
+                    InstrNode::new(Inst::Undef { ty: TrustIrTy::Ptr })
+                        .with_result(metadata)
+                        .with_proof(ProofAnnotation::FreshSymbolicHavoc),
+                );
+                metadata
+            }
+        };
+        let result = self.fresh_value();
+        body.push(
+            InstrNode::new(Inst::PtrFromParts {
+                ptr_ty: fat_ty,
+                metadata_ty: TrustIrTy::Ptr,
+                data: data_ptr,
+                metadata,
+            })
+            .with_result(result),
+        );
+        Ok(result)
+    }
+
     /// Trust (faithful `Str` constants): lower a `ConstValue::Str { bytes }`
     /// literal to a DEFINED byte-slice fat value instead of a bare havoc seed.
     ///
@@ -13339,8 +13459,49 @@ fn strip_generics(callee: &str) -> String {
     without_generics.split("::").filter(|seg| !seg.is_empty()).collect::<Vec<_>>().join("::")
 }
 
+/// Whether `path` may be GRANTED std semantics on the strength of its spelling.
+///
+/// Trust (#58, 2026-08-19) — this delegates to
+/// `trust_types::path_root_is_authenticated_sysroot_crate`, which that module
+/// documents as "the one predicate a matcher must use before it GRANTS anything on
+/// the strength of a `core`/`alloc`/`std` spelling". It is two conjuncts and its
+/// doc says BOTH are load-bearing, "either alone was measured insufficient":
+///
+///   !path_has_unauthenticated_crate_stamp(path)          // unstamped ANYWHERE
+///     && (starts_with "core::" | "alloc::" | "std::")    // anchored at the ROOT
+///
+/// This function used to be the SECOND CONJUNCT ALONE — precisely the form the doc
+/// says is insufficient. The extractor already stamps an impersonating crate
+/// (`sysroot_identity_stamp_required`: `wears_sysroot_spelling && !is_real_sysroot`
+/// ⇒ `__trust_crate@<id>::` on the front), so the common case was caught by the
+/// prefix test failing. What a front-anchored test CANNOT catch is a genuinely
+/// std-rooted spelling carrying an unauthenticated component further in — inside a
+/// generic argument, or in a qualified `<Self as Trait>` header. The root alone
+/// then says nothing about the part the recognizer is really about.
+///
+/// This is not a hypothetical bug class; it is a REPEAT of one. trust-types' own
+/// doc records that `trust_vcgen::generate::alloc_vcs::is_std_collection_iter_producer`
+/// "kept granting std-collection treatment to a crate built `--crate-name alloc`
+/// after the extractor had already stamped it". That consumer was fixed and this
+/// one was not, so trust-ir-bridge carried the same hole with zero uses of the
+/// scanner anywhere in the crate.
+///
+/// WHAT IT GATES, and why it is worth being exact about: every caller below decides
+/// whether a call may be MODELED instead of RESOLVED — `get_unchecked` as
+/// safe-iff-`i < len`, the closure-consumer / HOF lane, `Range::contains` as TOTAL.
+/// Granting those to a forged spelling models a body that may panic as one that
+/// cannot. The caller at the HOF site already says as much in its own comment: "the
+/// receiver leaf alone is forgeable ... must resolve to its real body or fail
+/// closed."
+///
+/// RESIDUAL, disclosed rather than closed: an unstamped sysroot root means "rustc
+/// resolved this to a crate carrying the sysroot's own lang/diagnostic-item
+/// anchors" — no more. The anchors are attributes, so a `#![no_core]` crate that
+/// declares one can still register as real. That is recorded upstream as residual
+/// R2 at `trust_mir_extract::convert::impersonates_sysroot_crate`; this change does
+/// not close it and does not claim to.
 fn has_trusted_std_root(path: &str) -> bool {
-    path.starts_with("core::") || path.starts_with("alloc::") || path.starts_with("std::")
+    trust_types::path_root_is_authenticated_sysroot_crate(path)
 }
 
 /// Whether a modeled `len()` call has the `isize::MAX` result bound.
@@ -22624,6 +22785,81 @@ fn lower_rvalue(
             }
 
             let dst_trust_ir = ctx.map_type_ctx(target_ty)?;
+
+            // Trust (vtable slice 1): the TRAIT-OBJECT unsize `&T -> &dyn Trait` /
+            // `*const T -> *const dyn Trait`. The extractor now spells this coercion as
+            // an ordinary `Rvalue::Cast` to the target type (it used to discard the
+            // operand into `Use(OpaqueConst)`), so THIS is where the data lane is
+            // recovered.
+            //
+            // The lane is identified by the exact THIN -> POINTER-TO-`dyn` transition:
+            // Rust admits no `as` cast from a thin pointer to a trait-object pointer, so
+            // this shape IS the unsize and nothing else. A pre-existing fat-to-fat cast
+            // (`*const dyn A as *mut dyn A`) has a FAT source, fails the `src == Ptr`
+            // test, and keeps the generic same-width `Bitcast` below, byte for byte.
+            if ctx.map_type_ctx(&src_trust_ty).is_ok_and(|t| t == TrustIrTy::Ptr)
+                && target_ty.pointee_ty().is_some_and(|p| matches!(p, Ty::Dynamic { .. }))
+            {
+                let result = match &dst_trust_ir {
+                    // FAT destination — a SHARED `&dyn Trait` or a raw `*dyn Trait` with a
+                    // real principal. The data lane becomes the coercion's real source
+                    // address; the vtable lane carries the shared `(principal, source)`
+                    // identity when it is mintable (vtable slice 3), else stays the
+                    // slice-1 fresh havoc.
+                    TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject { .. }) => {
+                        // Trust (vtable slice 3): derive the identity key from what the
+                        // extractor recorded — the principal spelling it stamped into
+                        // `Ty::Dynamic { trait_name }` (refusing the principal-less
+                        // "dyn" sentinel outright), and the ONE shared renderer over the
+                        // recorded source pointee (`vtable_source_type_key`, the same
+                        // function the THIR producer applies to the same converter's
+                        // output — equal rustc types render equal strings by
+                        // construction). An unmintable key keeps the fresh havoc.
+                        let vtable_name = target_ty
+                            .pointee_ty()
+                            .and_then(|p| match p {
+                                Ty::Dynamic { trait_name } if trait_name != "dyn" => {
+                                    Some(trait_name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .zip(
+                                src_trust_ty
+                                    .pointee_ty()
+                                    .and_then(Ty::vtable_source_type_key),
+                            )
+                            .and_then(|(principal, source_key)| {
+                                trust_ir::stable_vtable_global_name(principal, &source_key)
+                            });
+                        ctx.emit_trait_object_fat_pointer(
+                            dst_trust_ir.clone(),
+                            src,
+                            vtable_name,
+                            body,
+                        )?
+                    }
+                    // THIN destination — `&mut dyn Trait` and the principal-less `dyn`
+                    // sentinel (`&dyn Send`), which `map_type` spells `Ptr` on BOTH sides.
+                    // Held at the STATUS-QUO fact-free havoc, deliberately, and this is the
+                    // scope line of the slice rather than an oversight: a thin destination
+                    // has no vtable lane, so a precise lowering here would leave the whole
+                    // oracle value defined — retiring the differential's live-havoc skip for
+                    // these bodies and manufacturing a fresh verdict against a producer that
+                    // still models the coercion as a value-less symbolic global. That is a
+                    // divergence risk with no offsetting precision claim about a vtable.
+                    // Retiring it is the thin-posture slice, which must move BOTH sides.
+                    _ => {
+                        let result = ctx.fresh_value();
+                        body.push(
+                            InstrNode::new(Inst::Undef { ty: dst_trust_ir.clone() })
+                                .with_result(result),
+                        );
+                        result
+                    }
+                };
+                assign_value_to_place(dest, result, ctx, body)?;
+                return Ok(());
+            }
 
             // Determine source type. Use the CONTEXT-AWARE mapper (not the stateless
             // `operand_trust_ir_type`/`map_type`, which errors "ADT requires module
@@ -34155,5 +34391,88 @@ mod place_walk_agreement_tests {
             .expect("a trailing retype must not stop a field read from lowering");
         lower_to_trust_ir(&body_storing(trailing, Ty::u32(), pair_struct()))
             .expect("a trailing retype must not stop a field store from lowering");
+    }
+}
+
+/// Trust (#58, 2026-08-19) — `has_trusted_std_root` must refuse a spelling that
+/// carries an unauthenticated-crate stamp ANYWHERE, not just at the front.
+#[cfg(test)]
+mod trusted_std_root_stamp_tests {
+    use super::*;
+
+    /// POSITIVE — a genuine, unstamped sysroot root is still granted. Without this
+    /// the fix could "pass" by refusing everything.
+    #[test]
+    fn genuine_sysroot_roots_are_still_granted() {
+        for p in [
+            "core::slice::<impl [T]>::get_unchecked",
+            "alloc::vec::Vec::<u8>::len",
+            "std::ops::Range::<usize>::contains",
+        ] {
+            assert!(has_trusted_std_root(p), "{p} is a genuine sysroot root and must be granted");
+        }
+    }
+
+    /// FRONT STAMP — an impersonating crate is stamped by the extractor
+    /// (`sysroot_identity_stamp_required`), and the stamp displaces the root. The
+    /// OLD implementation already refused this, because `starts_with("core::")`
+    /// fails once the stamp is on the front. Pinned so the delegation cannot
+    /// regress the case that used to work.
+    #[test]
+    fn front_stamped_impersonator_is_refused() {
+        for p in [
+            "__trust_crate@1973d11b2baa21fa::core::slice::<impl [T]>::get_unchecked",
+            "__trust_crate@deadbeefdeadbeef::alloc::vec::Vec::<u8>::len",
+            "__trust_crate@0123456789abcdef::std::ops::Range::<usize>::contains",
+        ] {
+            assert!(!has_trusted_std_root(p), "a front-stamped impersonator must be refused: {p}");
+        }
+    }
+
+    /// THE ACTUAL FIX. A genuinely std-ROOTED spelling whose unauthenticated
+    /// component sits further in — inside a generic argument, or in a qualified
+    /// `<Self as Trait>` header. The root is real, so the old front-anchored test
+    /// GRANTED these; the whole-path scan refuses them.
+    ///
+    /// This is the same bug class trust-types records against
+    /// `alloc_vcs::is_std_collection_iter_producer`, which kept granting
+    /// std-collection treatment to a crate built `--crate-name alloc` after the
+    /// extractor had already stamped it. That consumer was fixed; this one was not.
+    #[test]
+    fn interior_stamp_under_a_genuine_root_is_refused() {
+        for p in [
+            // stamped type inside a generic argument
+            "core::iter::Map::<__trust_crate@1973d11b2baa21fa::evil::Iter>::next",
+            // stamped component in a qualified header's trait path
+            "core::option::Option::<__trust_crate@deadbeefdeadbeef::evil::T>::map",
+            // stamped tail component
+            "std::vec::Vec::<u8>::__trust_crate@0123456789abcdef::evil",
+        ] {
+            assert!(
+                !has_trusted_std_root(p),
+                "an interior stamp under a genuine root must be refused (the old \
+                 front-anchored check granted this): {p}"
+            );
+        }
+    }
+
+    /// The delegation is exactly the shared predicate — not a re-transcription of
+    /// it. Two copies of an authentication rule that must agree is the pair that
+    /// drifts, and a drift here grants std semantics to a forged spelling.
+    #[test]
+    fn delegates_to_the_shared_predicate() {
+        for p in [
+            "core::slice::get_unchecked",
+            "__trust_crate@1973d11b2baa21fa::core::slice::get_unchecked",
+            "core::iter::Map::<__trust_crate@deadbeefdeadbeef::evil::I>::next",
+            "mycrate::Iterator::fold",
+            "",
+        ] {
+            assert_eq!(
+                has_trusted_std_root(p),
+                trust_types::path_root_is_authenticated_sysroot_crate(p),
+                "must agree with the shared predicate for {p:?}"
+            );
+        }
     }
 }

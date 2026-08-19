@@ -338,6 +338,47 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
                 })
             }
         }
+        // The five FP conversion nodes (2026-08-18). Added EXPLICITLY rather
+        // than left to the wildcard below: the wildcard answers
+        // `UnsupportedVariant`, which is fail-closed but would silently turn
+        // every conversion-bearing effect ill-sorted — the exact
+        // wildcard-absorbs-a-new-variant hazard this file's history warns
+        // about.
+        Formula::FpToSbv { rm, value, width, eb, sb }
+        | Formula::FpToUbv { rm, value, width, eb, sb } => {
+            expect_sort("floating to integer", check_formula_sort(rm)?, Sort::RoundingMode)?;
+            expect_sort(
+                "floating to integer",
+                check_formula_sort(value)?,
+                Sort::Float { eb: *eb, sb: *sb },
+            )?;
+            Ok(Sort::BitVec(*width))
+        }
+        Formula::FpFromSbv { rm, value, eb, sb }
+        | Formula::FpFromUbv { rm, value, eb, sb } => {
+            expect_sort("integer to floating", check_formula_sort(rm)?, Sort::RoundingMode)?;
+            let sort = check_formula_sort(value)?;
+            if !matches!(sort, Sort::BitVec(_)) {
+                return Err(FormulaSortError::Expected {
+                    operator: "integer to floating",
+                    expected: Sort::BitVec(64),
+                    actual: sort,
+                });
+            }
+            Ok(Sort::Float { eb: *eb, sb: *sb })
+        }
+        Formula::FpConvert { rm, value, eb, sb } => {
+            expect_sort("floating format conversion", check_formula_sort(rm)?, Sort::RoundingMode)?;
+            let sort = check_formula_sort(value)?;
+            if !matches!(sort, Sort::Float { .. }) {
+                return Err(FormulaSortError::Expected {
+                    operator: "floating format conversion",
+                    expected: Sort::Float { eb: 8, sb: 24 },
+                    actual: sort,
+                });
+            }
+            Ok(Sort::Float { eb: *eb, sb: *sb })
+        }
         Formula::FpRem(left, right)
         | Formula::FpMin(left, right)
         | Formula::FpMax(left, right) => {

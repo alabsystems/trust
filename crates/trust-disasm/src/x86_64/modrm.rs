@@ -97,7 +97,13 @@ pub(crate) fn decode_rm_operand(
 ) -> Result<ModRMOperand, DisasmError> {
     // Mode 3: register direct
     if modrm.mode == 3 {
-        return Ok(ModRMOperand { operand: Operand::Reg(gpr(modrm.rm, op_width)), extra_bytes: 0 });
+        // Trust: an 8-bit r/m needs the AH-vs-SPL resolution; see `gpr8`.
+        let reg = if op_width == 8 {
+            gpr8(modrm.rm, prefixes.rex.present)
+        } else {
+            gpr(modrm.rm, op_width)
+        };
+        return Ok(ModRMOperand { operand: Operand::Reg(reg), extra_bytes: 0 });
     }
 
     // rm=4 (without REX.B) means SIB byte follows (unless mode=3).
@@ -116,7 +122,9 @@ fn decode_simple_rm(
     modrm: &ModRM,
     bytes: &[u8],
     _prefixes: &Prefixes,
-    address: u64,
+    // Trust: unused since RIP-relative resolution moved to the decoder's choke
+    // point, which is the only place the final instruction length is known.
+    _address: u64,
 ) -> Result<ModRMOperand, DisasmError> {
     let rm_base = modrm.rm & 0x07;
 
@@ -131,12 +139,17 @@ fn decode_simple_rm(
                     });
                 }
                 let disp = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
-                // The RIP-relative address is computed from the END of the instruction,
-                // but we don't know the full size yet. Store as PcRelative offset.
-                // The caller can adjust when the full instruction length is known.
-                let _ = address; // Address used by caller for adjustment
+                // Trust: RIP-relative is measured from the FIRST BYTE OF THE NEXT
+                // instruction, which is not knowable here — a trailing immediate
+                // can still extend this one (`48 C7 05 <disp32> <imm32>` is 11
+                // bytes, so resolving at the end of the displacement is off by
+                // 4). Emit the unresolved marker; `decode_instruction` rewrites
+                // it once `size` is final. Previously this stored the raw
+                // displacement as `PcRelative` and left a comment saying the
+                // caller would adjust — no caller ever did, so every x86-64
+                // RIP-relative address was short by `insn.size`.
                 Ok(ModRMOperand {
-                    operand: Operand::Mem(MemoryOperand::PcRelative { offset: disp }),
+                    operand: Operand::Mem(MemoryOperand::RipRelative { displacement: disp }),
                     extra_bytes: 4,
                 })
             } else {
@@ -190,7 +203,6 @@ fn decode_sib_operand(
     let sib = Sib::decode(bytes[0], prefixes);
     let after_sib = &bytes[1..];
     let sib_base_low = sib.base & 0x07;
-    let sib_index_low = sib.index & 0x07;
 
     // Determine displacement size
     let (disp, disp_len) = match modrm.mode {
@@ -231,14 +243,28 @@ fn decode_sib_operand(
     };
 
     let has_base = !(modrm.mode == 0 && sib_base_low == 5);
-    let has_index = sib_index_low != 4; // index=4 (RSP) means no index
+    // Trust: "no index" is index == 0b100 AND REX.X == 0. `Sib::decode` has
+    // already folded REX.X in, so R12 (index 12) is a REAL index register.
+    // Testing the low three bits made `12 & 7 == 4` and silently dropped R12
+    // from the address: `movq (%rbx,%r12),%rax` decoded as `[rbx]`.
+    let has_index = sib.index != 4;
 
+    // Trust: every x86-64 SIB form now has ONE faithful spelling. Until
+    // 2026-08-18 this block produced a wrong address for THREE of its four
+    // arms — the shared `MemoryOperand` enum is AArch64-shaped and had no
+    // variant for an absolute address or for base+index+displacement, so the
+    // decoder spelled them as `PcRelative` or discarded information outright.
     let mem = match (has_base, has_index) {
-        (true, true) => MemoryOperand::BaseRegister {
-            base: gpr(sib.base, 64),
+        // base + index*scale + disp. The displacement used to be DROPPED here
+        // and mislabelled "an over-approximation downstream consumers must
+        // handle": an over-approximation is a WIDER address set, whereas a
+        // dropped displacement is a DIFFERENT, SPECIFIC, WRONG address.
+        // `movq 0x20(%rbx,%rcx,2),%rdx` yielded `rbx + rcx*2`.
+        (true, true) => MemoryOperand::BaseIndexOffset {
+            base: Some(gpr(sib.base, 64)),
             index: gpr(sib.index, 64),
-            extend: None,
-            shift: scale_to_shift(sib.scale),
+            scale_shift: scale_to_shift(sib.scale),
+            displacement: disp,
         },
         (true, false) => {
             if disp == 0 {
@@ -247,38 +273,21 @@ fn decode_sib_operand(
                 MemoryOperand::BaseOffset { base: gpr(sib.base, 64), offset: disp }
             }
         }
-        (false, true) => {
-            // [index*scale + disp32]
-            // We represent this as BaseOffset with a synthetic zero-base +
-            // the index encoded in the base. Not ideal but works with our
-            // existing MemoryOperand variants. Use BaseRegister with a known
-            // pattern: base is a placeholder, but better to use BaseOffset
-            // with the displacement and note the index separately.
-            // For now, use BaseRegister where base is RBP (index 5) as
-            // that's the conventional encoding.
-            MemoryOperand::BaseRegister {
-                base: gpr(sib.base, 64), // Won't be used — mod=00, base=5
-                index: gpr(sib.index, 64),
-                extend: None,
-                shift: scale_to_shift(sib.scale),
-            }
-        }
-        (false, false) => {
-            // [disp32] absolute
-            MemoryOperand::PcRelative { offset: disp }
-        }
-    };
-
-    // Adjust for displacement if we have base+offset but used BaseRegister
-    let mem = if has_base && has_index && disp != 0 {
-        // Limitation: MemoryOperand lacks a base+index+disp variant.
-        // We use BaseRegister (base+index) and the displacement is dropped.
-        // Downstream consumers must handle this over-approximation.
-        mem
-    } else if has_base && !has_index && disp != 0 {
-        MemoryOperand::BaseOffset { base: gpr(sib.base, 64), offset: disp }
-    } else {
-        mem
+        // index*scale + disp32, with NO base register. This used to emit
+        // `BaseRegister { base: gpr(sib.base) }` — where `sib.base` is the 101
+        // "no base" encoding — under a comment claiming "Won't be used". It WAS
+        // used, so `movq 0x10(,%rax,4),%rcx` read RBP and dropped the 0x10,
+        // yielding `rbp + rax*4`. `base: None` contributes zero, as the
+        // encoding requires.
+        (false, true) => MemoryOperand::BaseIndexOffset {
+            base: None,
+            index: gpr(sib.index, 64),
+            scale_shift: scale_to_shift(sib.scale),
+            displacement: disp,
+        },
+        // [disp32] — an ABSOLUTE address. Spelling it `PcRelative` made it
+        // resolve to `PC + disp`.
+        (false, false) => MemoryOperand::Absolute { address: disp as u64 },
     };
 
     Ok(ModRMOperand {
@@ -302,6 +311,35 @@ fn scale_to_shift(scale: u8) -> u8 {
 /// index: 0-15 (RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15).
 /// width: 8, 16, 32, or 64 bits.
 #[must_use]
+/// An 8-bit register operand, resolving the AH/CH/DH/BH vs SPL/BPL/SIL/DIL
+/// ambiguity.
+///
+/// x86-64: 8-bit register numbers 4..7 denote the legacy HIGH-BYTE registers
+/// `AH/CH/DH/BH` when NO REX prefix is present, and the low bytes
+/// `SPL/BPL/SIL/DIL` when one is. Encoding both as `RegKind::Gpr` index 4..7
+/// made `mov ah, imm8` indistinguishable from a write to `SPL`, and machine-sem
+/// then modelled it as a STACK POINTER write.
+pub(crate) fn gpr8(index: u8, rex_present: bool) -> Register {
+    use crate::operand::RegKind;
+    if !rex_present && (4..=7).contains(&index) {
+        // AH/CH/DH/BH are bits 15:8 of RAX/RCX/RDX/RBX respectively.
+        return Register { kind: RegKind::GprHighByte, index: index - 4, width: 8 };
+    }
+    Register { kind: RegKind::Gpr, index, width: 8 }
+}
+
+/// A general-purpose register operand of any width, resolving the 8-bit
+/// AH/CH/DH/BH vs SPL/BPL/SIL/DIL ambiguity when the width is 8.
+///
+/// Use this wherever the width is a VARIABLE. Calling `gpr` with a width that
+/// can be 8 reintroduces the defect: `decode_modrm_rm_reg` did exactly that and
+/// rendered `mov r/m8, r8` reg 5 as `bpl` instead of `ch` — found by the
+/// x86-64 decode differential on its first random run, after three other sites
+/// had been fixed by hand.
+pub(crate) fn gpr_sized(index: u8, width: u16, rex_present: bool) -> Register {
+    if width == 8 { gpr8(index, rex_present) } else { gpr(index, width) }
+}
+
 pub(crate) fn gpr(index: u8, width: u16) -> Register {
     use crate::operand::RegKind;
     // RSP (index 4) is also the stack pointer, but in x86-64 context
@@ -373,10 +411,36 @@ mod tests {
         let disp_bytes = 0x100i32.to_le_bytes();
         let result = decode_rm_operand(&m, &disp_bytes, &prefixes, 64, 0x1000).unwrap();
         assert_eq!(result.extra_bytes, 4);
+        // The ModRM layer emits the UNRESOLVED marker and nothing more: the
+        // effective address is relative to the next instruction, whose start is
+        // not knowable here because a trailing immediate can still extend this
+        // one. `decode_instruction` resolves it once `size` is final.
+        //
+        // This asserted `PcRelative { offset: 0x100 }` until 2026-08-18 — it
+        // pinned the shape that let the address stay unadjusted all the way
+        // into the lifted memory facts.
         assert!(matches!(
             result.operand,
-            Operand::Mem(MemoryOperand::PcRelative { offset: 0x100 })
+            Operand::Mem(MemoryOperand::RipRelative { displacement: 0x100 })
         ));
+    }
+
+    /// The unresolved marker must NEVER survive a full decode — that is the
+    /// invariant which makes a missed resolution fail closed rather than
+    /// silently produce an AArch64-correct/x86-wrong address.
+    #[test]
+    fn the_unresolved_rip_marker_never_escapes_a_full_decode() {
+        use crate::arch::{Arch, Decoder};
+        let decoder = crate::x86_64::X86_64Decoder::new();
+        // mov rax,[rip+0x10] at 0x1000 -> 0x1000 + 7 + 0x10
+        let insn = decoder
+            .decode(&[0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00], 0x1000)
+            .expect("decode should succeed");
+        assert_eq!(
+            insn.operand(1),
+            Some(&Operand::Mem(MemoryOperand::Absolute { address: 0x1017 })),
+            "0x1000 + 7 + 0x10 = 0x1017"
+        );
     }
 
     #[test]
