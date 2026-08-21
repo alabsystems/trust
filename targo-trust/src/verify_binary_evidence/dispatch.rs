@@ -31,7 +31,7 @@ use super::{
     EXACT_REPLAY_WITNESS_EXECUTED_RANGE_DIAGNOSTIC,
     EXACT_REPLAY_WITNESS_INSTRUCTION_BYTES_DIAGNOSTIC,
     EXACT_REPLAY_WITNESS_MEMORY_EFFECT_DIAGNOSTIC, EXACT_REPLAY_WITNESS_SELECTED_IMAGE_DIAGNOSTIC,
-    canonical_vc_bytes, is_canonical_sha256_hex, stable_json_sha256,
+    canonical_vc_bytes, is_canonical_sha256_hex, stable_json_sha256, stable_model_json_sha256,
 };
 use crate::vc_kind_key;
 #[cfg(test)]
@@ -643,7 +643,10 @@ fn derive_exact_replay_transcript_artifact_digest(record: &SolverDispatchRecord)
         },
         solver_dispatch_artifact_sha256,
     };
-    stable_json_sha256(&artifact)
+    // Canonical, not raw: the artifact embeds trust-types model structs
+    // (BinaryArtifactDigestIdentity, BinarySelectedImageIdentity), so an
+    // additive model field must not move this digest.
+    stable_model_json_sha256(&artifact)
 }
 
 fn exact_replay_transcript_fact_set(
@@ -697,7 +700,10 @@ fn solver_dispatch_artifact_sha256(record: &SolverDispatchRecord) -> Option<Stri
     });
     artifact.diagnostics.sort();
     artifact.diagnostics.dedup();
-    stable_json_sha256(&artifact)
+    // Canonical, not raw: the record embeds the VC itself
+    // (`SolverDispatchRecord::vc: Option<SerializableVc>`), whose additive
+    // `obligation` field already moved one raw-serde digest domain this way.
+    stable_model_json_sha256(&artifact)
 }
 
 fn dispatch_binary_artifact_digest_identity_mismatch_blockers(

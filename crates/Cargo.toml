@@ -186,6 +186,21 @@ members = [
     "trust-temporal",
     "trust-proof-cert",
     "trust-clean",
+    # I4 (docs/design/2026-08-04-two-language-compiler-architecture.md): Clean
+    # type -> Rust carrier. The ONLY sound producer of `CarrierEvidence::Total`,
+    # and therefore the gate that stands between a Clean `Nat` and a wrapping
+    # `u64` in the emitted binary. Lands before any `DefId` is minted.
+    "trust-clean-carrier",
+    # I6, runtime half: the Trust-owned arbitrary-precision natural with Lean
+    # Nat semantics EXACTLY (truncated sub, n/0 = 0, n%0 = n) — the bignum
+    # carrier §5b names as the default for unbounded Clean types. Zero
+    # dependencies, no_std; deliberately independent of clean-kernel's BigNat
+    # so the agreement tests are evidence, not a shared bug.
+    "trust-bignum",
+    # I5: the Clean-origin CALL lane — the gated DefId-mint decision and the
+    # carrier-typed faithfulness gate. Not yet wired into the compiler; see the
+    # crate docs for the four measured blockers.
+    "trust-clean-origin",
     "trust-certify",
     "trust-semantics",
     "trust-decompile",
@@ -279,6 +294,8 @@ trust-report = { path = "trust-report" }
 trust-ts-embed = { path = "trust-ts-embed" }
 trust-release = { path = "trust-release" }
 trust-clean = { path = "trust-clean" }
+trust-clean-origin = { path = "trust-clean-origin" }
+trust-bignum = { path = "trust-bignum" }
 trust-convergence = { path = "trust-convergence" }
 trust-temporal = { path = "trust-temporal" }
 trust-proof-cert = { path = "trust-proof-cert" }

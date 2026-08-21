@@ -1,0 +1,151 @@
+{
+ "name": "bswap_u8_identity",
+ "def_path": "fx::bswap_u8_identity",
+ "span": {
+  "file": "<dump-root>/fx.rs",
+  "line_start": 29,
+  "col_start": 0,
+  "line_end": 29,
+  "col_end": 73
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": false
+     }
+    },
+    "name": "x"
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "@trust-rustc-intrinsic::core::intrinsics::bswap::<u8>",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "<dump-root>/fx.rs",
+       "line_start": 29,
+       "col_start": 60,
+       "line_end": 29,
+       "col_end": 71
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Int": {
+    "width": 8,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [
+  {
+   "kind": "Ensures",
+   "span": {
+    "file": "<dump-root>/fx.rs",
+    "line_start": 29,
+    "col_start": 46,
+    "line_end": 29,
+    "col_end": 57
+   },
+   "body": "__trust_lowered_compiler_contract__:(result) == (x)"
+  }
+ ],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 255
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [
+  {
+   "Eq": [
+    {
+     "Var": [
+      "_0",
+      "Int"
+     ]
+    },
+    {
+     "Var": [
+      "x",
+      "Int"
+     ]
+    }
+   ]
+  }
+ ],
+ "spec": {
+  "requires": [],
+  "ensures": [
+   "(result) == (x)"
+  ],
+  "invariants": []
+ }
+}

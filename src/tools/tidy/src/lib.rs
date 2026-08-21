@@ -130,6 +130,7 @@ pub mod target_specific_tests;
 pub mod tests_placement;
 pub mod tests_revision_unpaired_stdout_stderr;
 pub mod triagebot;
+pub mod trust_prose_annotations;
 pub mod ui_tests;
 pub mod unit_tests;
 pub mod unknown_revision;

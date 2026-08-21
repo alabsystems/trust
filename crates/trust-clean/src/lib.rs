@@ -465,12 +465,14 @@ pub use reflect::{
 // (RPIT/TAIT existential), #3 multi-bound trait objects (conjoined-vtable existential),
 // #4 HRTBs (`Π(r : Trust.Region)` over the fn arrow), #5 GATs (parameterized
 // type-level-function family), #6 coroutines (state record env + resume : S → Y).
+// Trust (vtable slice 19): `IMPL_TRAIT_PREFIX`, `impl_trait_const_name`,
+// `reflect_impl_trait`, `reflect_multi_dyn`, `split_multi_bound` and `is_marker_trait` are
+// GONE — the `trait_name`-tag dispatch that selected them was unreachable in production and
+// would be wrong on the faithful key. See the note in `reflect.rs` where they used to live.
 pub use reflect::{
     ARRAYN_CONS, ARRAYN_NIL, CARRIER_ARRAYN, CARRIER_REGION, COROUTINE_PREFIX, GAT_PREFIX,
-    IMPL_TRAIT_PREFIX, REGION_INDUCTIVE, coroutine_inductive_name, gat_family_name,
-    impl_trait_const_name, is_marker_trait, reflect_array_indexed, reflect_coroutine,
-    reflect_gat_family, reflect_hrtb_fn, reflect_impl_trait, reflect_multi_dyn, reflect_region,
-    split_multi_bound,
+    REGION_INDUCTIVE, coroutine_inductive_name, gat_family_name, reflect_array_indexed,
+    reflect_coroutine, reflect_gat_family, reflect_hrtb_fn, reflect_region,
 };
 // Trust: trait objects (`dyn Trait`) as REAL existential dependent types
 // (`Trust.Dyn.<trait> := Sigma (T:Type), Vtable_<trait> T`), rooted in the 3 axioms.

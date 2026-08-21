@@ -237,8 +237,60 @@ provide! { tcx, def_id, other, cdata,
     const_param_default => { table }
     object_lifetime_default => { table }
     thir_abstract_const => { table }
-    optimized_mir => { table }
-    mir_for_ctfe => { table }
+    // Trust: (I7) — THE CROSS-CRATE CHOKEPOINT. These two arms are the sole point where
+    // foreign MIR bytes become a local `Body` (the CTFE machine loads `InstanceKind::Item`
+    // via `mir_for_ctfe` directly, NOT via `instance_mir`; the inliner and the collector
+    // reach extern bodies via `instance_mir` -> extern `optimized_mir` — all funnel here,
+    // except the two decode-only `trust_clean_extern_unreadmitted_*` accessors below,
+    // whose sole legitimate caller is the readmission provider itself). For a def the
+    // exporting crate lists in `trust_clean_origin_exports`, the decoded body is served
+    // ONLY after `trust_clean_extern_readmission` has run to completion: the provider
+    // fatals with a v7/D3 note on any certificate problem (missing/undecodable digest,
+    // island sources that no longer elaborate under the local kernel, any `readmit` field
+    // mismatch — kernel-version skew above all — or a local re-gate refusal), so control
+    // returning here IS the verdict. Never serve silently; never skip the def silently
+    // (an absent body would surface as ICEs downstream, not as a refusal).
+    //
+    // Ordinary defs — every dependency without Clean-origin exports — pay one arena-cached
+    // root-array read per crate and never invoke the readmission query, which also keeps
+    // this file compilable and RUNNABLE independently of the rustc_mir_transform provider
+    // wiring (the same registry-emptiness discipline as the encode half). In a build where
+    // the import provider is not wired, a LISTED def dies at the query system's
+    // missing-provider ICE rather than being served ungated: fail-closed without the note.
+    //
+    // ANTI-TAMPER SCOPE, honestly: these in-tree arms are compiler-owned TCB in every
+    // mode. The `changed_trust_critical_query_provider` reject list does NOT yet carry
+    // rows for them (it lives in rustc_interface, another wave's file), and even once it
+    // does, it runs only in trust-semantics-active modes — an embedder's
+    // `override_queries` in `-Ztrust-verify=off` modes is outside that boundary. Do not
+    // cite the ratchet as protection for this lane.
+    optimized_mir => {
+        if tcx.trust_clean_origin_exports(def_id.krate).contains(&def_id.index) {
+            tcx.ensure_done().trust_clean_extern_readmission(def_id);
+        }
+        cdata
+            .root
+            .tables
+            .optimized_mir
+            .get(cdata, def_id.index)
+            .map(|lazy| lazy.decode((cdata, tcx)))
+            .process_decoded(tcx, || panic!("{def_id:?} does not have optimized_mir"))
+    }
+    // Trust: (I7) — the chokepoint's second arm; see `optimized_mir` above. Guarded for
+    // the same reasons (this is the lane CTFE actually loads through), so a `constness`
+    // drift that flips the table choice cannot route around the gate (I7 risk R8).
+    mir_for_ctfe => {
+        if tcx.trust_clean_origin_exports(def_id.krate).contains(&def_id.index) {
+            tcx.ensure_done().trust_clean_extern_readmission(def_id);
+        }
+        cdata
+            .root
+            .tables
+            .mir_for_ctfe
+            .get(cdata, def_id.index)
+            .map(|lazy| lazy.decode((cdata, tcx)))
+            .process_decoded(tcx, || panic!("{def_id:?} does not have mir_for_ctfe"))
+    }
     trivial_const => { table }
     closure_saved_names_of_captured_variables => { table }
     mir_coroutine_witnesses => { table }
@@ -276,6 +328,40 @@ provide! { tcx, def_id, other, cdata,
             .get(cdata, def_id.index)
             .map(|lazy| lazy.decode((cdata, tcx)))
             .unwrap_or_else(|| TrustContractBundle::empty(def_id))
+    }
+    // Trust: (I7) — the extern halves of the Clean-origin ENCODE-side queries. Plain
+    // decodes, deliberately authority-free: a decoded digest is a CLAIM anyone could have
+    // written (trust-clean-origin admission docs), and the sources are transport the
+    // importer re-elaborates under its OWN kernel. The authority is per-def readmission
+    // at the extern `optimized_mir`/`mir_for_ctfe` decode arms above, plus the local
+    // re-gate inside the readmission provider — these three feed it and decide nothing.
+    trust_clean_verdict_digest => { table }
+    trust_clean_island_sources => {
+        cdata.root.trust_clean_island_sources.decode((cdata, tcx)).collect()
+    }
+    trust_clean_origin_exports => {
+        cdata.root.trust_clean_origin_exports.decode((cdata, tcx)).collect()
+    }
+    // Trust: (I7) — decode-only unreadmitted MIR accessors, for the readmission provider
+    // ONLY: it must re-gate the same bodies the guarded arms would serve, without
+    // re-entering the ensure (the ensure-inside-decode cycle, I7 risk R3). Plain decodes
+    // of the SAME two tables the chokepoint arms serve, minus the guard; `None` when the
+    // row is not encoded. Any other caller is bypassing the chokepoint (I7 risk R2).
+    trust_clean_extern_unreadmitted_optimized_mir => {
+        cdata
+            .root
+            .tables
+            .optimized_mir
+            .get(cdata, def_id.index)
+            .map(|lazy| &*tcx.arena.alloc(lazy.decode((cdata, tcx))))
+    }
+    trust_clean_extern_unreadmitted_mir_for_ctfe => {
+        cdata
+            .root
+            .tables
+            .mir_for_ctfe
+            .get(cdata, def_id.index)
+            .map(|lazy| &*tcx.arena.alloc(lazy.decode((cdata, tcx))))
     }
     asyncness => { table_direct }
     fn_arg_idents => { table }

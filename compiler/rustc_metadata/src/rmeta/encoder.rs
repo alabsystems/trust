@@ -695,6 +695,23 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let stable_order_of_exportable_impls =
             stat!("exportable-items", || self.encode_stable_order_of_exportable_impls());
 
+        // Trust: (I7) — Clean-origin cross-crate transport, root halves. Consulted only
+        // when this crate actually minted Clean-origin defs: every ordinary crate writes
+        // two empty arrays WITHOUT invoking the trust queries (whose local providers live
+        // in rustc_mir_transform and re-run the Clean kernel). A crate whose islands are
+        // proof-only (registry empty) also transports nothing — cross-crate Clean CITATION
+        // is a named boundary of I7 decision (e), not silently half-shipped here.
+        let (trust_clean_island_sources, trust_clean_origin_exports) =
+            stat!("trust-clean-origin", || {
+                if tcx.resolutions(()).clean_origin_defs.is_empty() {
+                    (LazyArray::default(), LazyArray::default())
+                } else {
+                    let sources = tcx.trust_clean_island_sources(LOCAL_CRATE);
+                    let exports = tcx.trust_clean_origin_exports(LOCAL_CRATE);
+                    (self.lazy_array(sources.iter()), self.lazy_array(exports.iter()))
+                }
+            });
+
         // Encode exported symbols info. This is prefetched in `encode_metadata`.
         let (exported_non_generic_symbols, exported_generic_symbols) =
             stat!("exported-symbols", || {
@@ -769,6 +786,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 incoherent_impls,
                 exportable_items,
                 stable_order_of_exportable_impls,
+                // Trust: (I7)
+                trust_clean_island_sources,
+                trust_clean_origin_exports,
                 exported_non_generic_symbols,
                 exported_generic_symbols,
                 interpret_alloc_index,
@@ -1105,6 +1125,47 @@ fn should_encode_mir(
     reachable_set: &LocalDefIdSet,
     def_id: LocalDefId,
 ) -> (bool, bool) {
+    // Trust: (I7) — a Clean-origin def's gated body ALWAYS travels, on both rows.
+    //
+    // WHY (measured 2026-08-19; this corrects the I7 plan's original claim): it is NOT
+    // that `reachable_set` cannot contain a Clean-origin def. In the target configuration
+    // it DOES: the mint plants the def into its enclosing module's resolutions with
+    // `Visibility::Public` (rustc_resolve/src/build_reduced_graph.rs), the resolver's
+    // effective-visibilities pass iterates module RESOLUTIONS, not AST/HIR items
+    // (rustc_resolve/src/effective_visibilities.rs:125-148), privacy clones and only
+    // extends that table (rustc_privacy/src/lib.rs:1787), and `reachable_set` seeds its
+    // worklist from it — for library crate types `propagate_node` then inserts every
+    // worklist item unconditionally, and `Node::Synthetic` (what `feed_hir` produces) is a
+    // handled no-recurse arm, not a `bug!` (rustc_passes/src/reachable.rs:481-486,
+    // :196-202, :299-306). So for a def in a `pub mod` of an rlib the stock
+    // `reachable_set.contains` conjunct is TRUE.
+    //
+    // The conjuncts that actually decide the stock `opt` answer are the OTHER two, and
+    // they vary with build mode:
+    //   * `should_codegen()` is false for check-mode rmeta (pipelined `cargo check`), so
+    //     downstream consumers of that rmeta would find no opt row at all;
+    //   * at `OptLevel::No` a monomorphic def neither requires monomorphization nor is
+    //     `cross_crate_inlinable` (cross_crate_inline.rs returns false at O0), while at
+    //     O1+ the one-statement projection body can already be inlinable — i.e. whether
+    //     the body travels would flip with the optimization level; and in a PRIVATE
+    //     module the def genuinely is absent from `reachable_set`.
+    //
+    // None of those knobs may decide whether a Clean-origin body crosses the crate
+    // boundary. The gated body is the ONLY body such a def has (there is no HIR to
+    // re-derive one from), the importer re-gates whatever it decodes under its own
+    // kernel, and a row whose presence varies with -O level, crate type, or module
+    // visibility is a lane where a downstream crate sometimes links an upstream symbol
+    // its own readmission never saw. Both rows therefore encode unconditionally: the
+    // ctfe row because the def is fed `Constness::Const { always: false }` (callable in
+    // const position), the opt row for every other consumer — and both extern decode
+    // surfaces are gated by the import wave for the same reason (I7 risk R8).
+    //
+    // Registry lookup, never a HIR-derived filter: a Clean-origin def is exactly the
+    // thing HIR inventories cannot see.
+    if tcx.resolutions(()).clean_origin_defs.iter().any(|&(clean_def, _, _)| clean_def == def_id)
+    {
+        return (true, true);
+    }
     match tcx.def_kind(def_id) {
         // instance_mir uses mir_for_ctfe rather than optimized_mir for constructors
         DefKind::Ctor(_, _) => (true, false),
@@ -1667,6 +1728,38 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         for (def_id, traits) in &tcx.resolutions(()).doc_link_traits_in_scope {
             record_array!(self.tables.doc_link_traits_in_scope[def_id.to_def_id()] <- traits);
         }
+
+        // Trust: (I7) — one verdict-digest row per Clean-origin def. The registry (fed by
+        // rustc_resolve's mint, the ONE site that can create a Clean-origin `DefId`) is
+        // iterated directly rather than filtered from a HIR-derived inventory — a
+        // Clean-origin def is exactly the thing HIR walks cannot see, so a predicate over
+        // `iter_local_def_id` filtered on HIR would be vacuously false while looking like a
+        // working filter.
+        //
+        // The digest provider FATALS on any refusal instead of returning `None` for a
+        // registry def: row-absence is how importers recognise ordinary Rust, so encoding
+        // nothing here would fail OPEN (I7 risk R1). The `bug!` below is the belt on that
+        // contract, and the root `trust_clean_origin_exports` list is the second,
+        // independent encoding the importer cross-checks rows against.
+        let clean_origin_defs = &tcx.resolutions(()).clean_origin_defs;
+        let mut trust_digest_rows = 0usize;
+        for &(clean_def, name, _) in clean_origin_defs.iter() {
+            let def_id = clean_def.to_def_id();
+            let Some(digest) = tcx.trust_clean_verdict_digest(def_id) else {
+                bug!(
+                    "Clean-origin def `{name}` ({def_id:?}) is in the mint registry but its \
+                     verdict-digest provider returned None; the provider's contract is to \
+                     fatal on refusal, so this is a compiler defect"
+                );
+            };
+            record!(self.tables.trust_clean_verdict_digest[def_id] <- digest);
+            trust_digest_rows += 1;
+        }
+        assert_eq!(
+            trust_digest_rows,
+            clean_origin_defs.len(),
+            "every Clean-origin def must have exactly one verdict-digest row (I7 risk R1)"
+        );
     }
 
     fn encode_externally_implementable_items(&mut self) -> LazyArray<EiiMapEncodedKeyValue> {

@@ -1,0 +1,24 @@
+# WAIVERS against scripts/frozen-files.txt. One row per (file, new blob).
+#
+# Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
+#
+# Columns: path | new-blob-sha1 | YYYY-MM-DD | commits | reason
+#
+# THREE PROPERTIES, EACH LOAD-BEARING
+#
+#  * A waiver names the EXACT NEW BLOB, never just the path. A path-scoped waiver
+#    would excuse every future edit to that file — which is how a freeze becomes
+#    a comment. Edit the file again and the waiver stops applying.
+#  * A waiver that is NO LONGER NEEDED (its blob equals the pin) FAILS the gate
+#    and asks to be deleted. Mirrors scripts/hooks-pin/pin-waivers.txt: a waiver
+#    must not outlive the problem it documents.
+#  * A waiver for a path that is not in the manifest FAILS. A waiver is only
+#    meaningful against something actually frozen.
+#
+# The date is the date the waiver was WRITTEN, and it does not expire on its own.
+# These waivers record a movement that has ALREADY LANDED on main and is awaiting
+# the owner's ratify-or-revert decision; an expiry would convert that decision
+# into a deadline nobody agreed to.
+
+crates/trust-thir-lower/src/crate_module.rs|8c7b7123347dac247684a277a487dc7352496ef8|2026-08-20|e73d7d0553,5b38ded9d9|ADJUDICATED, AWAITING OWNER RATIFICATION. e73d7d0553 routes pending-const bodies to the crate-finalize seam (a population that previously had NO verdict at all) and adds a NEW fail-close on r.unsupported; 5b38ded9d9 is 23 lines of doc comment and nothing else (proven: strip line comments and the two blobs are byte-identical at 5,458 lines). Neither can move a codegen flip: mir_differential::compare_derived refuses every pending-const body at its own (0.25) guard, in an UNMOVED frozen file, before it reads the snapshot. Evidence: reports/freeze-adjudication-2026-08-20.md
+crates/trust-thir-lower/src/differential.rs|df08f902295ea2a03d9f628cf9fe6acf2518b3e5|2026-08-20|e73d7d0553,65f2577dca|ADJUDICATED, AWAITING OWNER RATIFICATION. Both edits are SAMPLE-MORE, which this file's rule permits. e73d7d0553 widens deferred_to_seam so pending-const bodies reach the seam and moves the pending-const guard below the extraction (same mode, same note, snapshot now carried); 65f2577dca adds the PtrTo lane, which claims only READ pointer params that were previously a NotRun skip. Neither reroutes any body that already had a verdict. Evidence: reports/freeze-adjudication-2026-08-20.md

@@ -12495,6 +12495,33 @@ fn full_verification_flags_failed_unknown_runtime_and_unaccounted_artifacts() {
 }
 
 #[test]
+fn advisory_policy_help_is_only_for_structurally_sound_pure_gaps() {
+    let gap = |unknown, runtime_checked, skipped| FullVerificationFailure {
+        failed: 0,
+        unknown,
+        runtime_checked,
+        skipped,
+    };
+
+    let pure_gaps =
+        [(gap(1, 0, 0), false), (gap(0, 1, 0), false), (gap(0, 0, 1), false), (gap(0, 0, 0), true)];
+    for (failure, has_unproved_assumption_panic) in pure_gaps {
+        assert!(
+            advisory_policy_help_applies(failure, has_unproved_assumption_panic, true),
+            "a structurally sound pure coverage gap should receive actionable advisory guidance"
+        );
+    }
+
+    let refutation =
+        FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 };
+    let mixed = FullVerificationFailure { failed: 1, unknown: 1, runtime_checked: 0, skipped: 0 };
+    assert!(!advisory_policy_help_applies(refutation, false, true));
+    assert!(!advisory_policy_help_applies(mixed, false, true));
+    assert!(!advisory_policy_help_applies(gap(1, 0, 0), false, false));
+    assert!(!advisory_policy_help_applies(gap(0, 0, 0), false, true));
+}
+
+#[test]
 fn strict_scope_bucket_fatality_follows_the_discharge_policy() {
     // Trust (program-3 C.7): `strict_failure_is_fatal` gained
     // `require_full_discharge`, and the two policies differ on EXACTLY ONE
@@ -17962,54 +17989,59 @@ fn coroutine_contract_upgrade_row_gates_fail_closed() {
         row
     };
     let two_proved = [sentinel_row(Outcome::Proved, &[0]), sentinel_row(Outcome::Proved, &[0])];
-    assert!(rows_exhibit_coroutine_sentinel_proof(&two_proved, &evidence, "crate::f::{closure#0}"));
+    assert!(rows_exhibit_coroutine_sentinel_proof(&two_proved, &evidence));
     // Count mismatch (one of the two sentinels vanished): decline.
-    assert!(!rows_exhibit_coroutine_sentinel_proof(
-        &two_proved[..1],
-        &evidence,
-        "crate::f::{closure#0}"
-    ));
+    assert!(!rows_exhibit_coroutine_sentinel_proof(&two_proved[..1], &evidence));
     // Unproved sentinel: decline.
     let one_unknown = [sentinel_row(Outcome::Proved, &[0]), sentinel_row(Outcome::Unknown, &[0])];
-    assert!(!rows_exhibit_coroutine_sentinel_proof(
-        &one_unknown,
-        &evidence,
-        "crate::f::{closure#0}"
-    ));
+    assert!(!rows_exhibit_coroutine_sentinel_proof(&one_unknown, &evidence));
     // State-set drift between the marker rows and the evidence: decline.
     let drifted = [sentinel_row(Outcome::Proved, &[0, 3]), sentinel_row(Outcome::Proved, &[0, 3])];
-    assert!(!rows_exhibit_coroutine_sentinel_proof(&drifted, &evidence, "crate::f::{closure#0}"));
+    assert!(!rows_exhibit_coroutine_sentinel_proof(&drifted, &evidence));
 
-    // (c) the aggregate fallback: the whole-function panic-freedom row counts
-    // only via its EXACT compiler-minted obligation id, and only when PROVED.
-    let mut aggregate = plain_transport_row(Outcome::Proved, false);
-    aggregate.obligation_id = Some(format!(
-        "vc:{}:assertion:panic-freedom:0",
-        trust_types::canonical_artifact_id_component("crate::f::{closure#0}")
-    ));
-    assert!(rows_exhibit_coroutine_sentinel_proof(
-        std::slice::from_ref(&aggregate),
-        &evidence,
-        "crate::f::{closure#0}"
-    ));
-    let mut unproved_aggregate = aggregate.clone();
-    unproved_aggregate.outcome = Outcome::Unknown;
-    assert!(!rows_exhibit_coroutine_sentinel_proof(
-        std::slice::from_ref(&unproved_aggregate),
-        &evidence,
-        "crate::f::{closure#0}"
-    ));
-    // A proved row with a DIFFERENT function's aggregate id must not count.
-    let mut foreign_aggregate = aggregate.clone();
-    foreign_aggregate.obligation_id = Some(format!(
-        "vc:{}:assertion:panic-freedom:0",
-        trust_types::canonical_artifact_id_component("crate::other")
-    ));
-    assert!(!rows_exhibit_coroutine_sentinel_proof(
-        std::slice::from_ref(&foreign_aggregate),
-        &evidence,
-        "crate::f::{closure#0}"
-    ));
+    // The marker travels inside `VcKind::Assertion`'s RENDERED description, so
+    // the belt must see through exactly the one `"assertion: "` renderer prefix
+    // — without this the real transport shape is unmatchable and the belt could
+    // only ever have passed via the deleted aggregate fallback.
+    let rendered = |states: &[u128]| {
+        let mut row = plain_transport_row(Outcome::Proved, false);
+        row.description = trust_types::VcKind::Assertion {
+            message: trust_types::assumption::coroutine_resume_contract_obligation_description(
+                states,
+                "resumed after return",
+            ),
+        }
+        .description();
+        row
+    };
+    assert!(rows_exhibit_coroutine_sentinel_proof(&[rendered(&[0]), rendered(&[0])], &evidence));
+
+    // (c) THE DELETED AGGREGATE FALLBACK. A proved whole-function panic-freedom
+    // row — under either the id the fallback looked for or the `assert:0` id a
+    // coroutine body actually carries — is NOT sentinel-proof evidence:
+    // measured, that row's `Proved` came from the interprocedural rule, which
+    // cannot see a sentinel `Terminator::Assert` and is vacuous for a call-free
+    // resume body. Accepting it would make the contract vacuous.
+    let canon = trust_types::canonical_artifact_id_component("crate::f::{closure#0}");
+    for id in [format!("vc:{canon}:assertion:panic-freedom:0"), format!("vc:{canon}:assert:0")] {
+        let mut aggregate = plain_transport_row(Outcome::Proved, false);
+        aggregate.obligation_id = Some(id);
+        aggregate.description =
+            "assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable"
+                .to_string();
+        assert!(!rows_exhibit_coroutine_sentinel_proof(
+            std::slice::from_ref(&aggregate),
+            &evidence
+        ));
+    }
+
+    // Zero-sentinel evidence can never be witnessed by an empty marker count.
+    let empty_evidence = trust_ir_bridge::CoroutineResumeContractModuleEvidence {
+        function_def_path: "crate::f::{closure#0}".to_string(),
+        live_states: vec![0],
+        sentinel_obligation_count: 0,
+    };
+    assert!(!rows_exhibit_coroutine_sentinel_proof(&[], &empty_evidence));
 }
 
 // Trust (coroutine resume-state contract, D1 publish coupling): the pure
@@ -18027,41 +18059,169 @@ fn coroutine_publish_decision_pairs_every_assume_with_a_row() {
         sentinel_obligation_count: count,
     };
 
+    // Advisory lane + no unmarked conditional proof, so these cases isolate the
+    // ORIGINAL (pre-D2) axes; the D2 axes get their own test below.
+    let ev2 = evidence(2);
+    let decide = |sentinels, ev, proved, visible| {
+        coroutine_protocol_publish_decision(sentinels, ev, proved, visible, true, true)
+    };
+
     // Not a coroutine resume body: no sentinels, no evidence — publish nothing.
     assert!(matches!(
-        coroutine_protocol_publish_decision(0, None, true, false),
+        decide(0, None, true, false),
         CoroutineProtocolPublishDecision::NotACoroutineResumeBody
     ));
     // Sentinels without evidence: the pre-lane fail-closed assumption row.
     assert!(matches!(
-        coroutine_protocol_publish_decision(2, None, true, false),
+        decide(2, None, true, false),
         CoroutineProtocolPublishDecision::PublishAssumptionRow
     ));
     // THE D1 PIN: evidence (the module carries the entry Assume) with zero
     // MIR sentinels must still publish — assumption row + strict abort.
     assert!(matches!(
-        coroutine_protocol_publish_decision(0, Some(&evidence(2)), true, true),
+        decide(0, Some(&ev2), true, true),
         CoroutineProtocolPublishDecision::PublishAssumptionRow
     ));
     // Sentinel-count mismatch (a pruned/dropped sentinel): assumption row.
     assert!(matches!(
-        coroutine_protocol_publish_decision(1, Some(&evidence(2)), true, true),
+        decide(1, Some(&ev2), true, true),
         CoroutineProtocolPublishDecision::PublishAssumptionRow
     ));
     // Unproved rows / invisible sentinel proof: assumption row.
     assert!(matches!(
-        coroutine_protocol_publish_decision(2, Some(&evidence(2)), false, true),
+        decide(2, Some(&ev2), false, true),
         CoroutineProtocolPublishDecision::PublishAssumptionRow
     ));
     assert!(matches!(
-        coroutine_protocol_publish_decision(2, Some(&evidence(2)), true, false),
+        decide(2, Some(&ev2), true, false),
         CoroutineProtocolPublishDecision::PublishAssumptionRow
     ));
     // The full upgrade: exact count + all rows proved + sentinel proof visible.
     assert!(matches!(
-        coroutine_protocol_publish_decision(2, Some(&evidence(2)), true, true),
+        decide(2, Some(&ev2), true, true),
         CoroutineProtocolPublishDecision::PublishContractRow
     ));
+}
+
+// Trust (D2): THE FALSE-PROVE PINS. `pub async fn tick(x: u32) -> u32 { x }`
+// under default strict policy reported "2 proved, 0 failed, 0 unknown … of
+// which 2 kernel-certified by the clean CIC kernel" and exit 0, while a driver
+// polling it twice panicked "`async fn` resumed after completion" at the exact
+// span of the row certified panic-free. Two independent gates now close it.
+#[test]
+fn coroutine_publish_decision_refuses_contract_in_fail_closed_and_over_unmarked_proof() {
+    let evidence = trust_ir_bridge::CoroutineResumeContractModuleEvidence {
+        function_def_path: "crate::f::{closure#0}".to_string(),
+        live_states: vec![0],
+        sentinel_obligation_count: 2,
+    };
+    // Everything the ORIGINAL upgrade required is satisfied in all three calls;
+    // only the two D2 axes vary. That is what makes these gates load-bearing
+    // rather than incidentally masked by another failing precondition.
+
+    // PART A — a fail-closed lane may not publish the contract row. No
+    // caller-side discharge lane exists (the bridge says so in the obligation
+    // text it mints), so publishing here converts an undischarged premise into
+    // silence. This is the arm that restores the strict abort.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, Some(&evidence), true, true, false, true),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    // PART B — an UNMARKED row claiming proof over the entry `Assume` blocks
+    // the upgrade even in the advisory lane. The whole-function panic-freedom
+    // aggregate was exactly such a row: a proof that consumed the premise
+    // without saying so on the row.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, Some(&evidence), true, true, true, false),
+        CoroutineProtocolPublishDecision::PublishAssumptionRow
+    ));
+    // Both D2 axes clear + advisory: the feature is GATED, not deleted.
+    assert!(matches!(
+        coroutine_protocol_publish_decision(2, Some(&evidence), true, true, true, true),
+        CoroutineProtocolPublishDecision::PublishContractRow
+    ));
+}
+
+// Trust (D2 part B): the marker must land ON THE ROW THAT CONSUMED THE ASSUME.
+// The entry `Assume(resume_state ∈ live_states)` dominates every block, so every
+// discharge in the body is conditional; only the bridge-MARKED sentinel rows may
+// be conditional without saying so on the row, because describing them is what
+// the contract row is for. Before D2 the whole-function panic-freedom aggregate
+// shipped as `kind: "assert"`, `outcome: "proved"`, `assurance: Certified`,
+// `axiom_closure: Empty`, with a CIC term BYTE-IDENTICAL to the sentinel row's
+// ex-falso derivation — and nothing linked it to the sibling contract row.
+#[test]
+fn coroutine_conditional_stamp_marks_the_row_that_consumed_the_assume() {
+    let evidence = trust_ir_bridge::CoroutineResumeContractModuleEvidence {
+        function_def_path: "crate::f::{closure#0}".to_string(),
+        live_states: vec![0],
+        sentinel_obligation_count: 1,
+    };
+    let marked_sentinel = {
+        let mut row = plain_transport_row(Outcome::Proved, false);
+        row.description = trust_types::VcKind::Assertion {
+            message: trust_types::assumption::coroutine_resume_contract_obligation_description(
+                &[0],
+                "resumed after return",
+            ),
+        }
+        .description();
+        row
+    };
+    let aggregate = {
+        let mut row = plain_transport_row(Outcome::Proved, false);
+        row.kind = "assert".to_string();
+        row.description =
+            "assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable"
+                .to_string();
+        row
+    };
+
+    // The marked sentinel alone is fine: it is conditional BY DESIGN and says so.
+    assert!(coroutine_rows_free_of_unmarked_conditional_proof(
+        std::slice::from_ref(&marked_sentinel),
+        &evidence
+    ));
+    // The aggregate next to it is NOT: an unmarked proof over the entry Assume.
+    assert!(!coroutine_rows_free_of_unmarked_conditional_proof(
+        &[marked_sentinel.clone(), aggregate.clone()],
+        &evidence
+    ));
+    // A design-mandate row is inventory, never a discharge target.
+    assert!(coroutine_rows_free_of_unmarked_conditional_proof(
+        &[marked_sentinel.clone(), plain_transport_row(Outcome::Proved, true)],
+        &evidence
+    ));
+    // A row that never claimed proof needs no marker.
+    assert!(coroutine_rows_free_of_unmarked_conditional_proof(
+        &[marked_sentinel.clone(), plain_transport_row(Outcome::Unknown, false)],
+        &evidence
+    ));
+
+    // The stamp: the aggregate loses its bare proof claim and its Certified
+    // grade, keeps its identity after the prefix, and the marked sentinel is
+    // left exactly as it was.
+    let stamped =
+        stamp_coroutine_conditional_rows(&[marked_sentinel.clone(), aggregate], &evidence);
+    assert_eq!(stamped.len(), 2);
+    assert_eq!(stamped[0], marked_sentinel, "a marked sentinel row must pass through untouched");
+    assert_eq!(stamped[1].outcome, Outcome::Skipped);
+    assert!(stamped[1].proof_evidence.is_none(), "a conditional row keeps no Certified grade");
+    assert!(trust_types::assumption::is_coroutine_resume_conditional_row_kind(&stamped[1].kind));
+    assert_eq!(
+        stamped[1].kind.strip_prefix(
+            trust_types::assumption::COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX
+        ),
+        Some("assert"),
+        "the original kind must survive after the prefix"
+    );
+    assert_eq!(
+        stamped[1].reason.as_deref(),
+        Some(trust_types::assumption::COROUTINE_RESUME_CONDITIONAL_ROW_REASON)
+    );
+    // Idempotent: a stamped row no longer claims Proved, so it is not restamped.
+    let twice = stamp_coroutine_conditional_rows(&stamped, &evidence);
+    assert_eq!(twice, stamped);
 }
 
 // The published contract row is Skipped/conditional on the wire: the

@@ -2167,6 +2167,23 @@ fn cast_to_formula_checked(
         return Ok(Formula::Var(format!("__trust_slice_cast_{dest_name}"), sort));
     }
 
+    // `&T -> &dyn Trait` (trait-object pointer unsize): an infallible vtable
+    // attach carrying no obligation. The vtable lane is not modeled here, so the
+    // result is a fresh unconstrained value — the same over-approximation this
+    // cast had when `convert.rs` spelled it `Use(OpaqueConst)` before d806992cd4.
+    // NOT the source operand: the target is fat, the source thin, and equating
+    // them would assert a fact that is false of every real execution.
+    if crate::cast_target_is_trait_object_pointer(to_ty) {
+        let Some((dest_name, sort, _, _)) = dest else {
+            return Err(unsupported_chc_lowering(
+                "Rvalue::Cast",
+                "trait-object unsize requires an assignment destination for a stable fresh value"
+                    .to_string(),
+            ));
+        };
+        return Ok(Formula::Var(format!("__trust_dyn_cast_{dest_name}"), sort));
+    }
+
     Err(unsupported_chc_lowering(
         "Rvalue::Cast",
         format!(

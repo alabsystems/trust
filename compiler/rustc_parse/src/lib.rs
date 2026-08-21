@@ -86,6 +86,30 @@ pub fn unwrap_or_emit_fatal<T>(expr: Result<T, Vec<Diag<'_>>>) -> T {
     }
 }
 
+/// Trust (I8): REALLY PARSE the contents of an out-of-line `.clean` unit
+/// (`clean mod name;`) with the SAME Clean parse the inline `clean { … }`
+/// island gets in `Parser::parse_clean_island` — one shared function produces
+/// both payloads, so the two island forms cannot drift.
+///
+/// Called by `rustc_expand`'s unit loader at the out-of-line-module seam;
+/// exporting the parse from `rustc_parse` keeps `clean-parser` off
+/// `rustc_expand`'s own dependency list.
+///
+/// `content_span` must be the unit file's own `SourceFile` range and `text`
+/// that file's normalized source: a Clean syntax error is emitted here,
+/// remapped onto `content_span`, i.e. spanned inside the `.clean` file at the
+/// right line. A parse SUCCESS means only that; it never implies kernel
+/// authority — elaboration and CIC kernel checking stay exactly where they
+/// are for inline islands.
+pub fn trust_parse_clean_unit_decls(
+    psess: &ParseSess,
+    content_span: Span,
+    text: &str,
+    unit: rustc_span::Ident,
+) -> thin_vec::ThinVec<ast::CleanIslandDecl> {
+    parser::trust_clean_decls_from_text(psess, content_span, text, Some(unit))
+}
+
 /// Creates a new parser from a source string.
 ///
 /// On failure, the errors must be consumed via `unwrap_or_emit_fatal`, `emit`, `cancel`,

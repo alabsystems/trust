@@ -3330,6 +3330,105 @@ pub(crate) fn formula_uses_unmodeled_machine_arithmetic(formula: &Formula) -> bo
     ) || formula.children().into_iter().any(formula_uses_unmodeled_machine_arithmetic)
 }
 
+/// Trust (I5 cross-authority call modeling — `WrappingBinOp`): is `formula`
+/// EXACTLY a single-`Ite` modular-reduction definition of a result — the ONE
+/// arithmetic-bearing shape whose mathematical-Int reading coincides with
+/// fixed-width machine evaluation, and therefore the one exemption the
+/// machine-arithmetic injection filter grants?
+///
+/// Accepted shapes (structurally, nothing more general):
+///
+/// ```text
+/// d == ite(x + y >= M, x + y - M, x + y)      // wrapping_add, unsigned
+/// d == ite(x - y <  0, x - y + M, x - y)      // wrapping_sub, unsigned
+/// ```
+///
+/// where `d` is an Int-sorted variable, `M` is a power-of-two literal
+/// (`2 <= M`, i.e. width >= 1), the combination term is STRUCTURALLY IDENTICAL
+/// in all three of its positions, and each operand is an Int-sorted variable
+/// or a literal in `[0, M)`. This is byte-for-byte the encoding
+/// `generate::assert_refutation::wrapping_call_assert_model` produces for an
+/// authenticated `wrapping_{add,sub}` call inside an extracted body, and the
+/// encoding `modular::clean_origin_wrapping_binop_postconditions` mints for a
+/// Clean-origin `WrappingBinOp` summary — the pin tests hold the three
+/// together.
+///
+/// # Why this exemption is sound where general arithmetic is not
+///
+/// [`formula_uses_unmodeled_machine_arithmetic`]'s purpose is to reject
+/// clauses whose mathematical-Int encoding DIVERGES from fixed-width
+/// evaluation — the unbounded `_0 == a + b` for a wrapping body is the
+/// canonical false-PROVE. The modular-`Ite` shape does not diverge: for
+/// operands in `[0, M)` it IS the machine result (the same faithfulness
+/// statement `wrapping_call_assert_model` documents), and the operand range
+/// facts that ride alongside pin the operands into that band. Whether `M`
+/// matches the callee's actual width is NOT decidable here and is not
+/// claimed here — that rests on the producer's definitional authority
+/// (`with_definitional_postcondition`'s contract), exactly as every other
+/// definitional clause's truth does. What this recognizer guarantees is
+/// narrower and structural: no clause of any OTHER arithmetic shape can
+/// launder through the exemption.
+pub(crate) fn formula_is_exact_modular_wrapping_definition(formula: &Formula) -> bool {
+    let Formula::Eq(dest, rhs) = formula else {
+        return false;
+    };
+    if !matches!(dest.as_ref(), Formula::Var(_, Sort::Int)) {
+        return false;
+    }
+    let Formula::Ite(cond, then_branch, else_branch) = rhs.as_ref() else {
+        return false;
+    };
+    // The else branch is the unwrapped combination `x op y`, and its operator
+    // decides which reduction form must surround it.
+    let s = else_branch.as_ref();
+    let (x, y, modulus) = match s {
+        // add form: cond `s >= M`, then `s - M`.
+        Formula::Add(x, y) => {
+            let Formula::Ge(cond_s, m) = cond.as_ref() else {
+                return false;
+            };
+            let Formula::Sub(then_s, then_m) = then_branch.as_ref() else {
+                return false;
+            };
+            if cond_s.as_ref() != s || then_s.as_ref() != s || then_m.as_ref() != m.as_ref() {
+                return false;
+            }
+            (x.as_ref(), y.as_ref(), m.as_ref())
+        }
+        // sub form: cond `s < 0`, then `s + M`.
+        Formula::Sub(x, y) => {
+            let Formula::Lt(cond_s, zero) = cond.as_ref() else {
+                return false;
+            };
+            if !matches!(zero.as_ref(), Formula::Int(0)) {
+                return false;
+            }
+            let Formula::Add(then_s, m) = then_branch.as_ref() else {
+                return false;
+            };
+            if cond_s.as_ref() != s || then_s.as_ref() != s {
+                return false;
+            }
+            (x.as_ref(), y.as_ref(), m.as_ref())
+        }
+        _ => return false,
+    };
+    let Formula::Int(m) = modulus else {
+        return false;
+    };
+    // A power of two >= 2 (width >= 1). `2^64` — the widest modulus the
+    // producers mint — fits i128 comfortably.
+    if *m < 2 || !(*m as u128).is_power_of_two() {
+        return false;
+    }
+    let operand_ok = |operand: &Formula| match operand {
+        Formula::Var(_, Sort::Int) => true,
+        Formula::Int(v) => *v >= 0 && *v < *m,
+        _ => false,
+    };
+    operand_ok(x) && operand_ok(y)
+}
+
 /// Function-aware version of [`formula_uses_unmodeled_machine_arithmetic`].
 ///
 /// A small source arithmetic fragment is exact when the function contract

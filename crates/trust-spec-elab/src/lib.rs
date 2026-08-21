@@ -35,6 +35,9 @@ use clean_auto::AutomationEngine;
 use clean_kernel::expr::BinderInfo;
 use clean_kernel::{Declaration, Environment, Expr, Level, Name};
 use syn::{BinOp, Expr as SynExpr, Lit};
+// I2: the one vocabulary that says whether a kernel constant is a reflected
+// Rust carrier or a kernel-re-checked Clean declaration.
+use trust_symbols::KernelStatus;
 
 fn nat() -> Expr {
     Expr::const_(Name::from_string("Nat"), vec![])
@@ -1004,6 +1007,18 @@ fn elab_term(e: &SynExpr, vars: &[String], offset: u32, dom: &Domain) -> Result<
             // the ambient admission table gates on certified facets + a minted
             // constant, so this fires only for genuinely admitted functions.
             if let Some(admission) = ambient_admission(&callee) {
+                // I3 (decision doc §7): THIS is where a name acquires a kernel
+                // denotation on the call lane, so this is where the PROOF/CALL
+                // firewall is enforced. It runs BEFORE the arity check on
+                // purpose: whether a use site may name the symbol at all is a
+                // prior question to whether it applied the right number of
+                // arguments, and answering them in the other order tells an
+                // author to fix an arity in a call they were never allowed to
+                // write. A PROOF use site — every caller in this tree today —
+                // never fails here.
+                if let Err(refusal) = admission.require_at(ambient_use_site(), &callee) {
+                    return Err(refusal.to_string());
+                }
                 if admission.arity != c.args.len() {
                     return Err(format!(
                         "admitted `{callee}` has arity {} but is applied to {} argument(s)",
@@ -1733,6 +1748,40 @@ impl FnFacets {
 /// [`FacetTable::admitted`], which additionally requires the facet record to be
 /// [`FnFacets::admissible`]). Until the import brick lands, no `Admission` is
 /// ever produced in the compiler, so every spec call still fails closed.
+///
+/// # I2 — the record says WHOSE authority
+///
+/// Before I2 a reflected Rust carrier and a kernel-re-checked Clean island
+/// declaration were **indistinguishable** here: both were a `(kernel_const,
+/// arity)` pair, and the only signal telling them apart was whether
+/// `kernel_const` happened to start with `trust_import_`. A string prefix is an
+/// audit procedure, not an invariant. The [`KernelStatus`] field is the
+/// invariant.
+///
+/// The status is **private**, so an `Admission` cannot be assembled by struct
+/// literal outside this crate: it is minted by whoever actually holds the
+/// evidence, through [`Admission::reflected`] or [`Admission::kernel_checked`].
+/// Neither constructor can *invent* a kernel verdict —
+/// `KernelStatus::KernelChecked` is only constructible through
+/// `trust_symbols`' sealed `KernelAuthority` seam, so
+/// [`Admission::kernel_checked`] takes a status its caller already holds rather
+/// than producing one.
+///
+/// # I3 — the record also says WHO MAY NAME IT
+///
+/// [`Admission::capability`] is the visibility half of the same idea. A
+/// `KernelStatus` says how much the *kernel* vouches for the constant; a
+/// [`trust_symbols::EffectiveCapability`] says whether naming it may produce a
+/// value. The two are independent and both are needed: a `KernelChecked` Clean
+/// `def` is maximally trusted and still may not emit a call, because §5(b) of
+/// the decision doc withholds CALL by not minting a `DefId` for it, and
+/// `CarrierEvidence::Total` — the other half of `SymbolHeader::grant_call` — is
+/// unconstructed anywhere in this tree.
+///
+/// Like `status`, the field is **private**: an `Admission` cannot be assembled
+/// by struct literal outside this crate, so a capability arrives from a
+/// constructor that had a reason, and [`Admission::restrict`] can only ever
+/// lower it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
     /// The Clean kernel constant name the function was admitted as.
@@ -1740,6 +1789,172 @@ pub struct Admission {
     /// The function's arity (number of value parameters) — the elaborator
     /// applies the constant to exactly this many arguments.
     pub arity: usize,
+    /// How this constant got into the kernel environment, and on whose
+    /// authority. Private: see the type docs.
+    status: KernelStatus,
+    /// I3: what a use site may do with it, after the transitive firewall.
+    /// Private: see the type docs.
+    capability: trust_symbols::EffectiveCapability,
+    /// The proof-only symbol that bound the capability down, when
+    /// [`Admission::restrict`] carried one. Diagnostics only.
+    proof_only_via: Option<String>,
+}
+
+impl Admission {
+    /// Mint the admission of a **reflected Rust carrier** (I2).
+    ///
+    /// This is what `admit_function_into` produces: the compiler projected a
+    /// Rust `fn` into the Clean environment as `kernel_const`. The kernel
+    /// checked that the carrier's body inhabits its declared type — `add_decl`
+    /// is a full kernel check and a mistaken term is rejected, never admitted —
+    /// but it did **not** re-check that `kernel_const` denotes that Rust `fn`.
+    /// The compiler asserts that correspondence; it is TCB, and
+    /// [`KernelStatus::Reflected`] is how the record says so.
+    ///
+    /// **I3 capability: CALL.** A reflected carrier denotes a Rust `fn` that
+    /// already exists as compiled code, so naming it from a call position emits
+    /// a call to something real. Rust's own resolver polices *whose* code may
+    /// name it — that is CALL obeying the declaring language's ordinary
+    /// visibility, symmetrically, and it is not this crate's to re-decide. What
+    /// this crate must not do is hand CALL to a declaration that has no
+    /// executable form at all, which is the Clean side.
+    #[must_use]
+    pub fn reflected(kernel_const: impl Into<String>, arity: usize) -> Self {
+        Self {
+            kernel_const: kernel_const.into(),
+            arity,
+            status: KernelStatus::Reflected,
+            capability: trust_symbols::EffectiveCapability::Determined(
+                trust_symbols::Capability::Call,
+            ),
+            proof_only_via: None,
+        }
+    }
+
+    /// Mint the admission of a declaration the Clean CIC kernel re-checked.
+    ///
+    /// `status` must be a `KernelStatus::KernelChecked` the caller obtained
+    /// from `trust_symbols`' sealed seam after a full certification audit. This
+    /// constructor deliberately cannot build one: it only carries it. Passing a
+    /// weaker status is *allowed* and is simply weaker — the enforcement in
+    /// [`Admission::require_kernel_check`] fails closed on it.
+    ///
+    /// **I3 capability: PROOF.** This is a *Clean declaration*, and a Clean
+    /// declaration has no executable form in this tree: CALL needs a total Rust
+    /// carrier (`CarrierEvidence::Total`, which nothing constructs — I4) and a
+    /// `DefId` (which `def_collector` does not mint — I5). Note the asymmetry
+    /// with [`Admission::reflected`] and that it runs *opposite* to the kernel
+    /// status: the more trusted declaration is the less executable one. That is
+    /// correct and it is the whole point of two axes — trust and executability
+    /// are different questions, and a design with one axis gets this backwards.
+    #[must_use]
+    pub fn kernel_checked(
+        kernel_const: impl Into<String>,
+        arity: usize,
+        status: KernelStatus,
+    ) -> Self {
+        Self {
+            kernel_const: kernel_const.into(),
+            arity,
+            status,
+            capability: trust_symbols::EffectiveCapability::Determined(
+                trust_symbols::Capability::Proof,
+            ),
+            proof_only_via: None,
+        }
+    }
+
+    /// How this constant entered the environment, and on whose authority.
+    #[must_use]
+    pub fn status(&self) -> &KernelStatus {
+        &self.status
+    }
+
+    /// I3: what a use site may do with this constant, after the firewall.
+    #[must_use]
+    pub fn capability(&self) -> trust_symbols::EffectiveCapability {
+        self.capability
+    }
+
+    /// I3: lower this admission's capability to the meet with `effective`,
+    /// optionally naming the proof-only symbol that bound it.
+    ///
+    /// **Meet, never join.** There is deliberately no way to raise an
+    /// admission's capability: this is the seam a
+    /// [`trust_symbols::CapabilityClosure`] result is applied through, and a
+    /// closure that could *promote* would let a producer's incomplete edge set
+    /// manufacture executability. Applying the same closure twice, or applying
+    /// two closures in either order, gives the same answer — which is what
+    /// makes it safe to call from wherever the graph happens to be available.
+    #[must_use]
+    pub fn restrict(
+        mut self,
+        effective: trust_symbols::EffectiveCapability,
+        via: Option<&str>,
+    ) -> Self {
+        let lowered = self.capability.meet(effective);
+        if lowered != self.capability {
+            self.proof_only_via = via.map(ToString::to_string);
+        }
+        self.capability = lowered;
+        self
+    }
+
+    /// I3 enforcement: refuse this admission at a use site that needs more
+    /// authority than it grants.
+    ///
+    /// `use_site` is the capability the *position* holds: PROOF for a spec
+    /// clause or a `clean { … }` island, CALL for anything that will emit a
+    /// call, a load, a const evaluation, a layout or dispatch decision, or
+    /// discharge an unsafe obligation. `spelled` is how the source named it, so
+    /// the refusal quotes the user's own text rather than a mangled constant.
+    ///
+    /// # Errors
+    ///
+    /// [`trust_symbols::ProofOnlyRefusal`] — "visible but not executable", with
+    /// options. A PROOF use site never errors: §4.1.1 gives it total observer
+    /// capability over every item-level declaration including private
+    /// internals, same-crate and cross-crate, with zero annotations.
+    pub fn require_at(
+        &self,
+        use_site: trust_symbols::Capability,
+        spelled: &str,
+    ) -> Result<(), trust_symbols::ProofOnlyRefusal> {
+        use trust_symbols::{EffectiveCapability, ProofOnlyRefusal};
+        if use_site.observes_at_least(self.capability.claimable()) {
+            return Ok(());
+        }
+        Err(match (self.capability, self.proof_only_via.as_deref()) {
+            (EffectiveCapability::Determined(_), Some(via)) => ProofOnlyRefusal::Transitive {
+                symbol: spelled.to_string(),
+                via: via.to_string(),
+            },
+            (EffectiveCapability::Determined(_), None) => {
+                ProofOnlyRefusal::Declared { symbol: spelled.to_string() }
+            }
+            // `EffectiveCapability::Unrecorded`, and — because the enum is
+            // `#[non_exhaustive]` — any variant a later increment adds. A new
+            // capability state this crate has never heard of is exactly the
+            // "cannot determine" case, so it takes the same answer: refuse, and
+            // say the closure is incomplete rather than assert a finding about
+            // the symbol.
+            _ => ProofOnlyRefusal::ClosureUnrecorded { symbol: spelled.to_string() },
+        })
+    }
+
+    /// I2's enforcement: refuse this admission where a kernel re-check is
+    /// required.
+    ///
+    /// # Errors
+    ///
+    /// [`trust_symbols::KernelCheckRequired`] when the admission is a reflected
+    /// carrier (or anything else short of a kernel re-check). The error carries
+    /// the fix with options.
+    pub fn require_kernel_check(
+        &self,
+    ) -> Result<&trust_symbols::KernelVerdict, trust_symbols::KernelCheckRequired> {
+        self.status.require_kernel_check(&self.kernel_const)
+    }
 }
 
 /// Facet records keyed by the callee path exactly as spelled in the spec
@@ -1850,9 +2065,44 @@ impl FacetTable {
     /// never-certified function, confers nothing (fail-closed). This is the
     /// query the elaborator's call arm consults to decide whether a spec call
     /// elaborates to the kernel constant or stays fail-closed.
+    ///
+    /// **I2, stated so the asymmetry is deliberate and not an oversight:** this
+    /// query does NOT require [`Admission::require_kernel_check`]. A spec call
+    /// site is precisely the position a reflected Rust carrier is *for* — the
+    /// whole point of E6 kernel-import is that `f(x)` in an `ensures` clause
+    /// denotes the imported defining equation of the Rust `fn f`. Requiring a
+    /// kernel re-check here would refuse every program function and delete the
+    /// lane. The positions that DO require one — where the compiler is about to
+    /// report a Clean declaration the kernel authenticated — call
+    /// `require_kernel_check` explicitly; see
+    /// `trust_certify::clean_island::admit_certified_island_definition`.
     pub fn admitted(&self, callee_path: &str) -> Option<&Admission> {
         let certified = self.map.get(callee_path).is_some_and(FnFacets::admissible);
         if certified { self.admissions.get(callee_path) } else { None }
+    }
+
+    /// I2: the status a **kernel constant** was minted under, looked up by the
+    /// constant's own name rather than by the callee path.
+    ///
+    /// This is the reverse of [`Self::admitted`], and it exists because the
+    /// consumer that must refuse a reflected carrier — the island-definition
+    /// admitter — is handed a *kernel constant name*, not a Rust callee path.
+    ///
+    /// Deliberately **not** gated on [`FnFacets::admissible`]: this query is
+    /// used to REFUSE, so a stale or facet-regressed admission must still be
+    /// visible. Gating it would make a regressed record invisible and therefore
+    /// silently acceptable, which is the wrong direction for a fail-closed
+    /// check.
+    ///
+    /// A duplicate `kernel_const` under two callee paths is normal — the
+    /// compiler records each admission under both the full def-path and the
+    /// bare name — so the first match is answered; they are the same mint.
+    #[must_use]
+    pub fn kernel_const_status(&self, kernel_const: &str) -> Option<&KernelStatus> {
+        self.admissions
+            .values()
+            .find(|admission| admission.kernel_const == kernel_const)
+            .map(Admission::status)
     }
 }
 
@@ -1894,7 +2144,11 @@ pub fn admit_constant_function(
         is_reducible: true,
     })
     .map_err(|e| format!("kernel rejected the constant defining equation: {e:?}"))?;
-    Ok(Admission { kernel_const: kernel_const.to_string(), arity: 0 })
+    // I2: a Rust body imported into the kernel is a REFLECTED carrier.
+    // `add_decl` above kernel-checked that the value inhabits the type; nothing
+    // kernel-checked that this constant DENOTES the Rust function, which is the
+    // compiler's own assertion and is TCB.
+    Ok(Admission::reflected(kernel_const, 0))
 }
 
 /// Mint an E6 [`Admission`] for a PROJECTION function — an n-ary function whose
@@ -1941,7 +2195,8 @@ pub fn admit_projection_function(
         is_reducible: true,
     })
     .map_err(|e| format!("kernel rejected the projection defining equation: {e:?}"))?;
-    Ok(Admission { kernel_const: kernel_const.to_string(), arity: n })
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
 }
 
 /// Mint an E6 [`Admission`] for a single-domain ARITHMETIC function whose body is
@@ -1988,7 +2243,8 @@ pub fn admit_expr_function(
         is_reducible: true,
     })
     .map_err(|e| format!("kernel rejected the arithmetic defining equation: {e:?}"))?;
-    Ok(Admission { kernel_const: kernel_const.to_string(), arity: n })
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
 }
 
 /// The comparison a [`admit_select_function`] branch tests.
@@ -2106,7 +2362,8 @@ pub fn admit_select_function(
         is_reducible: true,
     })
     .map_err(|e| format!("kernel rejected the select defining equation: {e:?}"))?;
-    Ok(Admission { kernel_const: kernel_const.to_string(), arity: n })
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
 }
 
 thread_local! {
@@ -2121,6 +2378,19 @@ thread_local! {
     /// no expressiveness.
     static ADMISSION_FACETS: std::cell::RefCell<Option<FacetTable>> =
         const { std::cell::RefCell::new(None) };
+
+    /// I3: the capability the *use site* holds for the current elaboration.
+    ///
+    /// The default is [`trust_symbols::Capability::Proof`], and that is a
+    /// statement rather than a convenience: everything this crate builds is a
+    /// kernel proposition, so every position it elaborates into is by
+    /// construction a PROOF position. A CALL position must therefore *ask* for
+    /// CALL — see [`elaborate_goal_typed_in`] — which is the fail-closed
+    /// polarity: a future consumer that forgets to declare its position gets
+    /// the weaker authority, not the stronger one, and a forgotten declaration
+    /// costs a refusal instead of a wrong binary.
+    static USE_SITE_CAPABILITY: std::cell::Cell<trust_symbols::Capability> =
+        const { std::cell::Cell::new(trust_symbols::Capability::Proof) };
 }
 
 /// RAII guard that installs an ambient [`FacetTable`] for admission-aware
@@ -2129,18 +2399,26 @@ thread_local! {
 /// elaboration cannot leave a stale table behind.
 struct AdmissionScope {
     previous: Option<FacetTable>,
+    previous_use_site: trust_symbols::Capability,
 }
 
 impl AdmissionScope {
-    fn enter(facets: FacetTable) -> Self {
+    /// Enter an elaboration whose use site holds `use_site`.
+    ///
+    /// There is deliberately no `enter(facets)` convenience that picks PROOF
+    /// for you: the use site is a decision, and a default-carrying wrapper is
+    /// how the decision stops being made.
+    fn enter_at(facets: FacetTable, use_site: trust_symbols::Capability) -> Self {
         let previous = ADMISSION_FACETS.with(|slot| slot.replace(Some(facets)));
-        AdmissionScope { previous }
+        let previous_use_site = USE_SITE_CAPABILITY.with(|slot| slot.replace(use_site));
+        AdmissionScope { previous, previous_use_site }
     }
 }
 
 impl Drop for AdmissionScope {
     fn drop(&mut self) {
         ADMISSION_FACETS.with(|slot| *slot.borrow_mut() = self.previous.take());
+        USE_SITE_CAPABILITY.with(|slot| slot.set(self.previous_use_site));
     }
 }
 
@@ -2148,6 +2426,12 @@ impl Drop for AdmissionScope {
 fn ambient_admission(callee: &str) -> Option<Admission> {
     ADMISSION_FACETS
         .with(|slot| slot.borrow().as_ref().and_then(|table| table.admitted(callee).cloned()))
+}
+
+/// I3: the capability the current elaboration's use site holds. PROOF unless a
+/// caller entered a scope that said otherwise.
+fn ambient_use_site() -> trust_symbols::Capability {
+    USE_SITE_CAPABILITY.with(std::cell::Cell::get)
 }
 
 /// Like [`elaborate_goal_typed`], with a facet table consulted for program-
@@ -2162,6 +2446,32 @@ pub fn elaborate_goal_typed_with_facets(
     var_types: &[(&str, &str)],
     facets: &FacetTable,
 ) -> Result<Expr, String> {
+    elaborate_goal_typed_in(trust_symbols::Capability::Proof, spec, var_types, facets)
+}
+
+/// I3: [`elaborate_goal_typed_with_facets`] with the use site's capability
+/// stated.
+///
+/// This is the seam the decision doc's I3 control pair runs on. Pass
+/// [`trust_symbols::Capability::Proof`] for a spec clause, a citation, or a
+/// `clean { … }` island — every position this crate is called from today —
+/// and every path in the clause resolves with no visibility ceremony, which is
+/// §4.1.1's total observer capability. Pass
+/// [`trust_symbols::Capability::Call`] from a position that will emit a call,
+/// a load, a const evaluation, a layout or dispatch decision, or discharge an
+/// unsafe obligation; a path naming a PROOF-only symbol is then refused with
+/// "visible but not executable" rather than resolving to a kernel constant
+/// that has no executable form.
+///
+/// `elaborate_goal_typed_with_facets` is exactly this function at `Proof`, so
+/// the pre-I3 behaviour of every existing caller is unchanged by construction
+/// rather than by inspection.
+pub fn elaborate_goal_typed_in(
+    use_site: trust_symbols::Capability,
+    spec: &str,
+    var_types: &[(&str, &str)],
+    facets: &FacetTable,
+) -> Result<Expr, String> {
     // E3: a quantified clause is not syn-parseable as a whole, so the facet
     // diagnostic walk runs over the pre-parsed leaves instead; the admission
     // scope then covers the same quantified elaboration path.
@@ -2170,14 +2480,14 @@ pub fn elaborate_goal_typed_with_facets(
         if let Some(err) = qclause_first_call_facet_error(&clause, facets) {
             return Err(err);
         }
-        let _scope = AdmissionScope::enter(facets.clone());
+        let _scope = AdmissionScope::enter_at(facets.clone(), use_site);
         return elaborate_goal_typed(spec, var_types);
     }
     let ast: SynExpr = syn::parse_str(spec).map_err(|e| format!("parse error: {e}"))?;
     if let Some(err) = first_call_facet_error(&ast, facets) {
         return Err(err);
     }
-    let _scope = AdmissionScope::enter(facets.clone());
+    let _scope = AdmissionScope::enter_at(facets.clone(), use_site);
     elaborate_goal_typed(spec, var_types)
 }
 
@@ -2202,6 +2512,18 @@ pub fn elaborate_goal_typed_with_facets(
 /// the other typed elaborators. This constructs the goal only; it grants NO VC
 /// authority — the grading wire + its faithfulness shadow-check are the separate,
 /// soundness-critical piece (design note §4.2, §5).
+///
+/// **I3: this is a PROOF position, by construction and not by default.** An
+/// `ensures` clause and the theorem cited against it are *observations* — the
+/// goal this returns is a kernel proposition and nothing here emits a call, a
+/// load, or a const evaluation. So §4.1.1's total observer capability applies
+/// and no path in the clause can be refused on visibility grounds. There is
+/// deliberately no `elaborate_ensures_in`: a second door onto the same seam
+/// would be a place for a CALL position to be declared inconsistently, and
+/// there is no CALL position here to declare. If one is ever added — a clause
+/// lowered to a runtime check, say — it belongs on
+/// [`elaborate_goal_typed_in`], which is the one seam that consults the
+/// firewall.
 pub fn elaborate_ensures(
     clause: &str,
     param_types: &[(&str, &str)],
@@ -5478,16 +5800,53 @@ mod machine_domain_tests {
         // admitted; the non-admissible `g` stays closed even if an Admission is
         // (wrongly) minted for it — both gates are required.
         let mut table = table;
-        table.admit("crate::f", Admission { kernel_const: "f_def".into(), arity: 1 });
-        table.admit("crate::g", Admission { kernel_const: "g_def".into(), arity: 1 });
+        table.admit("crate::f", Admission::reflected("f_def", 1));
+        table.admit("crate::g", Admission::reflected("g_def", 1));
         assert_eq!(
             table.admitted("crate::f"),
-            Some(&Admission { kernel_const: "f_def".into(), arity: 1 })
+            Some(&Admission::reflected("f_def", 1))
         );
         assert_eq!(
             table.admitted("crate::g"),
             None,
             "a non-admissible facet record cannot be admitted"
+        );
+    }
+
+    /// I2: a Rust program function enters the Clean environment as a REFLECTED
+    /// carrier, and the table can answer that question about a kernel constant
+    /// by name — the query the island admitter needs in order to refuse one.
+    #[test]
+    fn a_minted_carrier_is_reflected_and_findable_by_kernel_constant() {
+        let mut env = Environment::with_prelude();
+        let adm = admit_constant_function(&mut env, "trust_import_crate__answer", 42, MachineUIntWidth::U64)
+            .expect("a constant u64 function must admit");
+        assert!(adm.status().is_reflected());
+        assert!(
+            adm.require_kernel_check().is_err(),
+            "a reflected carrier never satisfies a kernel-check requirement"
+        );
+
+        let mut table = FacetTable::from_structural_facets([("crate::answer", true, true, true, true)]);
+        table.admit("crate::answer", adm);
+        // Found by the KERNEL CONSTANT, not the callee path — that is the
+        // lookup the refusal site has available.
+        assert!(
+            table
+                .kernel_const_status("trust_import_crate__answer")
+                .is_some_and(KernelStatus::is_reflected),
+            "the table must be able to say what a kernel constant was minted as"
+        );
+        assert_eq!(table.kernel_const_status("crate::answer"), None);
+        assert_eq!(table.kernel_const_status("some_island_def"), None);
+
+        // The reverse query must survive a facet regression: it is used to
+        // REFUSE, so an invisible stale record would be silently acceptable.
+        table.insert("crate::answer", FnFacets::unknown());
+        assert_eq!(table.admitted("crate::answer"), None, "the forward query fails closed");
+        assert!(
+            table.kernel_const_status("trust_import_crate__answer").is_some(),
+            "the refusal query stays visible"
         );
     }
 
@@ -5498,7 +5857,7 @@ mod machine_domain_tests {
         let mut env = Environment::with_prelude();
         let adm = admit_constant_function(&mut env, "answer_def", 42, MachineUIntWidth::U64)
             .expect("a constant u64 function must admit");
-        assert_eq!(adm, Admission { kernel_const: "answer_def".to_string(), arity: 0 });
+        assert_eq!(adm, Admission::reflected("answer_def", 0));
 
         // Fail closed BEFORE the kernel on an out-of-range literal.
         assert!(
@@ -5565,7 +5924,7 @@ mod machine_domain_tests {
         // fn winc(x: u64) -> u64 { x.wrapping_add(1) }  (machine `+` is wrapping)
         let adm = admit_expr_function(&mut env, "winc_def", "x + 1", &["x"], &u)
             .expect("wrapping-add function must admit");
-        assert_eq!(adm, Admission { kernel_const: "winc_def".to_string(), arity: 1 });
+        assert_eq!(adm, Admission::reflected("winc_def", 1));
 
         // fn add2(x, y) -> u64 { x + y } — a two-parameter arithmetic body.
         admit_expr_function(&mut env, "add2_def", "x + y", &["x", "y"], &u)
@@ -5588,7 +5947,7 @@ mod machine_domain_tests {
         // fn fst(x: u64, y: u64) -> u64 { x }  ⇒  fun x y => x  :  u64 → u64 → u64
         let adm = admit_projection_function(&mut env, "fst_def", &[u64d(), u64d()], 0)
             .expect("first-projection must admit");
-        assert_eq!(adm, Admission { kernel_const: "fst_def".to_string(), arity: 2 });
+        assert_eq!(adm, Admission::reflected("fst_def", 2));
 
         // Returning the SECOND parameter is equally sound (de Bruijn index 0).
         admit_projection_function(&mut env, "snd_def", &[u64d(), u64d()], 1)
@@ -5626,7 +5985,7 @@ mod machine_domain_tests {
             FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
         let mut facets = FacetTable::new();
         facets.insert("f", admissible);
-        facets.admit("f", Admission { kernel_const: "f_def".to_string(), arity: 1 });
+        facets.admit("f", Admission::reflected("f_def", 1));
 
         let params: &[(&str, &str)] = &[("x", "u64")];
         let tc = clean_kernel::TypeChecker::new(&env);
@@ -5749,7 +6108,7 @@ mod machine_domain_tests {
         partial.deterministic = cert();
         // no_panic stays Unknown -> not admissible
 
-        let adm = || Admission { kernel_const: "min2".into(), arity: 2 };
+        let adm = || Admission::reflected("min2", 2);
 
         // (1) certified facets + minted admission -> admitted.
         let mut t = FacetTable::new();
@@ -5796,7 +6155,7 @@ mod machine_domain_tests {
 
         let mut t = FacetTable::new();
         t.insert("min2", admissible);
-        t.admit("min2", Admission { kernel_const: "min2".into(), arity: 2 });
+        t.admit("min2", Admission::reflected("min2", 2));
 
         // Admitted: elaborates (no error), and the elaborated goal mentions the
         // kernel constant `min2`.
@@ -5823,6 +6182,235 @@ mod machine_domain_tests {
         // plain path still fails closed on the same call.
         let err = elaborate_goal("min2(x, y) <= x").unwrap_err();
         assert!(err.contains("facet"), "{err}");
+    }
+
+    // -- I3 controls ------------------------------------------------------
+    //
+    // Decision of record §7, increment I3: "a CALL-context path naming a
+    // proof-only symbol must error; a PROOF-context path naming it must not."
+    // Both halves are required — (b) is what stops the fix being "refuse
+    // everything", which would delete PROOF's whole point (§4.1.1: PROOF may
+    // name every declaration, including private internals, with ZERO
+    // annotations).
+
+    /// A PROOF-only admission and the certified facet record that makes it
+    /// live, for both controls. The admission is a **Clean declaration**
+    /// (`Admission::kernel_checked`): §5(b) withholds CALL from a Clean `def`
+    /// by not minting a `DefId` for it, and `CarrierEvidence::Total` is
+    /// unconstructed at I3, so no Clean declaration is executable in this tree.
+    fn proof_only_clean_def_table() -> FacetTable {
+        let cert = || FacetStatus::Certified { evidence: "clean-island-kernel-definition".into() };
+        let mut t = FacetTable::new();
+        t.insert(
+            "clean_min2",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit(
+            "clean_min2",
+            Admission::kernel_checked("clean_min2", 2, trust_symbols::KernelStatus::Elaborated),
+        );
+        t
+    }
+
+    /// I3 control (a): naming a PROOF-only symbol from a CALL context must be
+    /// an ERROR, and the error must say "visible but not executable" — never
+    /// "not found", because the symbol *is* found and *is* observable.
+    #[test]
+    fn i3_control_a_call_context_refuses_a_proof_only_symbol() {
+        let vt: &[(&str, &str)] = &[("x", "u64"), ("y", "u64")];
+        let t = proof_only_clean_def_table();
+        let err = elaborate_goal_typed_in(
+            trust_symbols::Capability::Call,
+            "clean_min2(x, y) <= x",
+            vt,
+            &t,
+        )
+        .expect_err("a CALL-context path naming a proof-only symbol must be refused");
+        assert!(err.contains("visible but not executable"), "{err}");
+        assert!(!err.contains("not found"), "a proof-visible symbol is never 'not found': {err}");
+        assert!(err.contains("clean_min2"), "the refusal must name the symbol: {err}");
+        assert!(err.contains("options:"), "v7/D3: a refusal carries the fix with options: {err}");
+    }
+
+    /// I3 control (b): the SAME symbol named from a PROOF context must NOT
+    /// error. This is the half that keeps the firewall a firewall rather than
+    /// a wall.
+    #[test]
+    fn i3_control_b_proof_context_admits_the_same_proof_only_symbol() {
+        let vt: &[(&str, &str)] = &[("x", "u64"), ("y", "u64")];
+        let t = proof_only_clean_def_table();
+        let goal = elaborate_goal_typed_with_facets("clean_min2(x, y) <= x", vt, &t)
+            .expect("a PROOF-context path naming a proof-only symbol must elaborate");
+        assert!(
+            format!("{goal:?}").contains("clean_min2"),
+            "the proof goal must apply the kernel constant: {goal:?}"
+        );
+    }
+
+    /// The other half of "not refuse everything", one layer below the control
+    /// pair: a REFLECTED Rust carrier is executable, so a CALL context names it
+    /// happily. If this ever fails alongside control (a) passing, the fix has
+    /// degenerated into refusing the whole call lane.
+    #[test]
+    fn i3_a_call_context_still_names_an_executable_symbol() {
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let vt: &[(&str, &str)] = &[("x", "u64"), ("y", "u64")];
+        let mut t = FacetTable::new();
+        t.insert(
+            "min2",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit("min2", Admission::reflected("min2", 2));
+
+        for use_site in [trust_symbols::Capability::Proof, trust_symbols::Capability::Call] {
+            let goal = elaborate_goal_typed_in(use_site, "min2(x, y) <= x", vt, &t)
+                .unwrap_or_else(|e| panic!("a reflected Rust carrier is executable ({use_site:?}): {e}"));
+            assert!(format!("{goal:?}").contains("min2"), "{goal:?}");
+        }
+    }
+
+    /// The capability check runs BEFORE the arity check: a use site that may
+    /// not name the symbol must not be told to fix its argument count.
+    #[test]
+    fn i3_capability_is_decided_before_arity() {
+        let t = proof_only_clean_def_table();
+        let err = elaborate_goal_typed_in(
+            trust_symbols::Capability::Call,
+            "clean_min2(x) <= x",
+            &[("x", "u64")],
+            &t,
+        )
+        .expect_err("refused");
+        assert!(err.contains("visible but not executable"), "{err}");
+        assert!(!err.contains("arity"), "a capability refusal must not mention arity: {err}");
+    }
+
+    /// The transitive tag reaches the seam: an admission restricted by a
+    /// proof-only edge is refused in a CALL context, and the refusal names the
+    /// BINDING EDGE rather than the symbol the author wrote.
+    #[test]
+    fn i3_a_transitively_restricted_admission_names_the_binding_edge() {
+        use trust_symbols::{Capability, EffectiveCapability};
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let vt: &[(&str, &str)] = &[("x", "u64"), ("y", "u64")];
+        let mut t = FacetTable::new();
+        t.insert(
+            "wrapper",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit(
+            "wrapper",
+            Admission::reflected("wrapper", 2).restrict(
+                EffectiveCapability::Determined(Capability::Proof),
+                Some("crate::secret"),
+            ),
+        );
+
+        // PROOF still names it — the firewall did not delete the symbol.
+        let observed = elaborate_goal_typed_in(Capability::Proof, "wrapper(x, y) <= x", vt, &t)
+            .expect("PROOF observes the whole closure");
+        assert!(format!("{observed:?}").contains("wrapper"), "{observed:?}");
+
+        let err = elaborate_goal_typed_in(Capability::Call, "wrapper(x, y) <= x", vt, &t)
+            .expect_err("CALL through a proof-only edge is refused");
+        assert!(err.contains("visible but not executable"), "{err}");
+        assert!(err.contains("transitively"), "{err}");
+        assert!(err.contains("crate::secret"), "the binding edge must be named: {err}");
+        assert!(!err.contains("not found"), "{err}");
+    }
+
+    /// An admission whose closure is `Unrecorded` is refused in a CALL context
+    /// with the "refusal to guess" diagnostic — not with a claim that the
+    /// symbol is proof-only, which would be a finding nobody made.
+    #[test]
+    fn i3_an_unrecorded_closure_refuses_without_asserting_a_finding() {
+        use trust_symbols::{Capability, EffectiveCapability};
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let vt: &[(&str, &str)] = &[("x", "u64"), ("y", "u64")];
+        let mut t = FacetTable::new();
+        t.insert(
+            "opaque",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit(
+            "opaque",
+            Admission::reflected("opaque", 2).restrict(EffectiveCapability::Unrecorded, None),
+        );
+
+        let observed = elaborate_goal_typed_in(Capability::Proof, "opaque(x, y) <= x", vt, &t)
+            .expect("observation needs no closure at all");
+        assert!(format!("{observed:?}").contains("opaque"), "{observed:?}");
+        let err = elaborate_goal_typed_in(Capability::Call, "opaque(x, y) <= x", vt, &t)
+            .expect_err("refused");
+        assert!(err.contains("visible but not executable"), "{err}");
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert!(err.contains("refusal to guess"), "{err}");
+    }
+
+    /// `restrict` is a MEET: it lowers, is idempotent, and can never raise a
+    /// PROOF-only admission to CALL however it is called.
+    #[test]
+    fn i3_restrict_can_only_lower_a_capability() {
+        use trust_symbols::{Capability, EffectiveCapability};
+        let call = EffectiveCapability::Determined(Capability::Call);
+        let proof = EffectiveCapability::Determined(Capability::Proof);
+
+        let reflected = Admission::reflected("f", 1);
+        assert_eq!(reflected.capability(), call);
+        assert_eq!(reflected.clone().restrict(call, None).capability(), call, "no-op");
+        assert_eq!(reflected.clone().restrict(proof, None).capability(), proof, "lowers");
+
+        let clean = Admission::kernel_checked("g", 1, KernelStatus::Elaborated);
+        assert_eq!(clean.capability(), proof);
+        assert_eq!(
+            clean.clone().restrict(call, None).capability(),
+            proof,
+            "a CALL closure may not promote a PROOF-only declaration"
+        );
+        // Idempotent, and order-independent.
+        let once = reflected.clone().restrict(proof, None);
+        assert_eq!(once.clone().restrict(proof, None).capability(), proof);
+        assert_eq!(once.restrict(call, None).capability(), proof);
+        // Unrecorded is absorbing here too.
+        assert_eq!(
+            Admission::reflected("h", 1).restrict(EffectiveCapability::Unrecorded, None).capability(),
+            EffectiveCapability::Unrecorded
+        );
+    }
+
+    /// The ambient use-site capability is scoped and restored: a CALL
+    /// elaboration must not leak CALL into a later PROOF one, and a refusal
+    /// mid-elaboration must not strand it.
+    #[test]
+    fn i3_the_use_site_capability_does_not_leak() {
+        use trust_symbols::Capability;
+        let t = proof_only_clean_def_table();
+        let vt: &[(&str, &str)] = &[("x", "u64"), ("y", "u64")];
+        assert_eq!(ambient_use_site(), Capability::Proof, "default is PROOF");
+        let _ = elaborate_goal_typed_in(Capability::Call, "clean_min2(x, y) <= x", vt, &t)
+            .expect_err("refused");
+        assert_eq!(ambient_use_site(), Capability::Proof, "restored after a refusal");
+        let later = elaborate_goal_typed_with_facets("clean_min2(x, y) <= x", vt, &t)
+            .expect("a later PROOF elaboration is unaffected");
+        assert!(format!("{later:?}").contains("clean_min2"), "{later:?}");
+        assert_eq!(ambient_use_site(), Capability::Proof);
+    }
+
+    /// `elaborate_ensures` — the citation seam — is a PROOF position. A
+    /// citation is an observation, so a proof-only symbol in the clause must
+    /// reach the kernel goal rather than be refused.
+    #[test]
+    fn i3_the_ensures_citation_seam_is_a_proof_position() {
+        let mut t = proof_only_clean_def_table();
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        t.insert(
+            "f",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit("f", Admission::reflected("f_def", 2));
+        let goal = elaborate_ensures("result <= clean_min2(x, y)", &[("x", "u64"), ("y", "u64")], "f", &t)
+            .expect("a citation observes a proof-only symbol without ceremony");
+        assert!(format!("{goal:?}").contains("clean_min2"), "{goal:?}");
     }
 
     #[test]
@@ -6419,7 +7007,7 @@ mod quantifier_tests {
             FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
         let mut t = FacetTable::new();
         t.insert("wid", admissible);
-        t.admit("wid", Admission { kernel_const: "wid".into(), arity: 1 });
+        t.admit("wid", Admission::reflected("wid", 1));
         let goal = elaborate_goal_typed_with_facets("forall x: u64, wid(x) <= x", &[], &t)
             .expect("an admitted call under a quantifier must elaborate");
         assert!(format!("{goal:?}").contains("wid"), "{goal:?}");

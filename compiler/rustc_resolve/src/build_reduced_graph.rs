@@ -488,6 +488,181 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         }
     }
 
+    /// Trust (I5): mint and plant a `DefId` for every declaration of this
+    /// `clean { … }` island that earned one at the root-fragment seam.
+    ///
+    /// Called from `def_collector`'s `ItemKind::CleanIsland` arm, **before**
+    /// `with_owner` — see the comment there for why both the `node_id` table
+    /// and the def PARENT depend on that.
+    ///
+    /// # This function makes no decision
+    ///
+    /// Every precondition was settled in `crate::trust_clean_mint::decide`,
+    /// against the crate's kernel-checked Clean environment. A `NodeId` with no
+    /// grant simply mints nothing, which is the pre-I5 behaviour: the name never
+    /// enters the value namespace and a call site gets `E0425`. There is no
+    /// path here that mints without a grant.
+    ///
+    /// # What is fed, and why each one
+    ///
+    /// A Clean-origin def has no HIR item, so every query whose provider reads
+    /// HIR must be answered here or it is an ICE. The set is closed and
+    /// derived, never invented:
+    ///
+    /// * `feed_hir()` — `hir_owner` (a synthetic `OwnerNodes`, the same one
+    ///   RPITIT synthesis uses) and `hir_attr_map` (`AttributeMap::EMPTY`).
+    ///   These are exactly the two `trust_mir_extract::extract_function`
+    ///   reaches for on the MIR side (`local_def_id_to_hir_id` then
+    ///   `hir_attrs`, twice and unconditionally). The extractor is NOT narrowed
+    ///   to avoid them: it is side B's producer for the faithfulness gate, and
+    ///   an extractor this lane authored would make the gate a round trip.
+    /// * `fn_sig` and `type_of` — from the DISCHARGED TOTAL CARRIERS of the
+    ///   declaration's Clean type. Not guessed: `CarrierSignature` cannot exist
+    ///   with a partial position anywhere in the signature.
+    /// * `generics_of` / `explicit_predicates_of` / `inferred_outlives_of` /
+    ///   `param_env` — a Clean `def` in the emittable fragment is monomorphic
+    ///   and unconstrained, so these are empty by construction rather than by
+    ///   omission.
+    /// * `constness` — `Const`. A Clean definition is pure, total and
+    ///   deterministic by the kernel language's semantics, which is exactly
+    ///   what const-eval requires, and the const fixture
+    ///   (`tests/ui/trust/clean_origin_const_ctfe.rs`) is an acceptance
+    ///   criterion: `const X: u64 = f(6, 7);` must traverse the gate.
+    /// * `codegen_fn_attrs` / `def_span` / `def_ident_span` — defaults and the
+    ///   island-relative span, so a diagnostic about this def lands where the
+    ///   user can see the declaration.
+    pub(crate) fn trust_mint_clean_island_decls(&mut self, island: &ast::CleanIsland) {
+        if island.decls.is_empty() {
+            return;
+        }
+        let parent = self.parent_scope.module.expect_local();
+        let expansion = self.parent_scope.expansion;
+        // PUBLIC, and this is the parity criterion rather than a convenience.
+        //
+        // The `clean { … }` island has no visibility syntax, so the choice is
+        // between two inventions and the question is which one keeps the two
+        // spellings denoting the same thing. Clean names are resolved from a
+        // WHOLE-CRATE, header-first symbol table (see
+        // `tests/ui/trust/clean_symbol_graph_forward_reference.rs`): any island
+        // anywhere in the crate may write `Crate.m.f`. Making the Rust spelling
+        // `Restricted(m)` would mean `crate::m::f` is nameable only inside `m`
+        // while `Crate.m.f` is nameable everywhere — the two spellings would
+        // disagree about where the SAME entity exists, which is exactly what
+        // the parity fixture rules out. `Public` is the reach Clean already
+        // gives it. (Measured: `Restricted` produced `E0603: function `f` is
+        // private` on `clean_origin_call_parity.rs`.)
+        let vis = Visibility::Public;
+
+        for decl in &island.decls {
+            let Some(grant) = self.r.clean_origin_mints.grant(decl.node_id).cloned() else {
+                continue;
+            };
+            let ident = Ident::new(grant.name, grant.span);
+            let feed = self.create_def(decl.node_id, Some(grant.name), DefKind::Fn, grant.span);
+            let def_id = feed.def_id();
+
+            self.trust_feed_clean_origin_def(&feed, &grant);
+            self.r.feed_visibility(feed, vis);
+
+            // The plant. `define_local` routes through
+            // `plant_decl_into_local_module`, where duplicate detection lives —
+            // so `E0428` against a same-module Rust `fn` of the same name comes
+            // free, and only because the plant goes into the ENCLOSING module.
+            let res = self.res(def_id);
+            self.r.define_local(parent, ident, ValueNS, res, vis, grant.span, expansion);
+
+            self.r.clean_origin_defs.push((def_id, grant.name, grant.span));
+        }
+    }
+
+    /// Answer, for a HIR-less Clean-origin def, every query whose provider
+    /// would read HIR. See [`Self::trust_mint_clean_island_decls`] for the
+    /// argument that this set is closed.
+    fn trust_feed_clean_origin_def(
+        &mut self,
+        feed: &TyCtxtFeed<'tcx, LocalDefId>,
+        grant: &crate::trust_clean_mint::CleanOriginMint,
+    ) {
+        use rustc_middle::ty::{self, Ty};
+
+        let tcx = self.r.tcx;
+        let def_id = feed.def_id();
+
+        // `hir_owner` + `hir_attr_map`.
+        feed.feed_hir();
+        feed.def_span(grant.span);
+        feed.def_ident_span(Some(grant.span));
+
+        // Monomorphic and unconstrained.
+        feed.generics_of(ty::Generics {
+            parent: None,
+            parent_count: 0,
+            own_params: Vec::new(),
+            param_def_id_to_index: Default::default(),
+            has_self: false,
+            has_late_bound_regions: None,
+        });
+        feed.explicit_predicates_of(ty::GenericPredicates { parent: None, predicates: &[] });
+        feed.inferred_outlives_of(&[]);
+        feed.param_env(ty::ParamEnv::empty());
+
+        // The signature, from I4's discharged total carriers.
+        //
+        // Trust (I6): a `Nat`-carrying signature is NOT fed here — building
+        // the `Nat` type demands `adt_def(trust_bignum::Nat)`, whose extern
+        // decode walks `lang_items` -> `resolver_for_lowering`, a query cycle
+        // from inside resolution (measured: E0391). The carriers travel to
+        // the `fn_sig` PROVIDER arm instead, which runs post-resolution where
+        // the decode is legal. Every other feed below stays: none of them
+        // names an ADT.
+        let has_nat = grant.result == crate::trust_clean_mint::CleanCarrierTy::Nat
+            || grant.params.contains(&crate::trust_clean_mint::CleanCarrierTy::Nat);
+        if has_nat {
+            self.r.clean_origin_deferred_sigs.push((
+                def_id,
+                grant.params.iter().map(|c| c.to_middle()).collect(),
+                grant.result.to_middle(),
+            ));
+        } else {
+            let inputs = grant
+                .params
+                .iter()
+                .map(|carrier| crate::trust_clean_mint::rustc_ty(tcx, *carrier))
+                .collect::<Vec<_>>();
+            let output = crate::trust_clean_mint::rustc_ty(tcx, grant.result);
+            let fn_sig = tcx.mk_fn_sig_rust_abi(inputs, output, rustc_hir::Safety::Safe);
+            feed.fn_sig(ty::EarlyBinder::bind(tcx, ty::Binder::dummy(fn_sig)));
+        }
+        // One `None` per parameter. A Clean declaration's parameters have Clean
+        // names, not Rust identifiers, and `None` is exactly what this table
+        // means by that. The metadata encoder calls this for every local
+        // `DefKind::Fn` and its provider `span_bug!`s on a synthetic HIR owner.
+        feed.fn_arg_idents(
+            tcx.arena.alloc_from_iter(grant.params.iter().map(|_| None::<rustc_span::Ident>)),
+        );
+        feed.type_of(ty::EarlyBinder::bind(
+            tcx,
+            Ty::new_fn_def(tcx, def_id.to_def_id(), [] as [ty::GenericArg<'tcx>; 0]),
+        ));
+
+        // Pure, total, deterministic — so const-callable, which is what the
+        // CTFE acceptance criterion needs.
+        //
+        // `always: false`, i.e. an ordinary `const fn`, NOT `comptime`.
+        // Measured: `always: true` makes `rustc_hir_typeck`'s callee check emit
+        // *"comptime fns can only be called at compile time"* for
+        // `let g = crate::m::f(6u64);` — it would have made every Clean
+        // declaration const-context-ONLY, which is a capability loss, not a
+        // safety property. `always: false` also makes
+        // `is_conditionally_const` true, which is why `const_conditions` is fed
+        // below.
+        feed.constness(rustc_hir::Constness::Const { always: false });
+        feed.const_conditions(ty::ConstConditions { parent: None, predicates: &[] });
+        feed.codegen_fn_attrs(
+            rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs::new(),
+        );
+    }
+
     fn insert_field_idents(&mut self, def_id: LocalDefId, fields: &[ast::FieldDef]) {
         if fields.iter().any(|field| field.is_placeholder) {
             // The fields are not expanded yet.

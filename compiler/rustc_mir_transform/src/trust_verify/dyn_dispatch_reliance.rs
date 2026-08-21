@@ -20,10 +20,22 @@
 //! the reachable `Self` types are a finite enumerated set and the obligation is a
 //! decidable CASE SPLIT over them. Quantifies over the VALUE FLOW into one
 //! receiver, not over the impl set, so it needs no seal and no whole-program bit
-//! — which is what makes it usable from an rlib. `fmt::Write` can only ever be
-//! served this way: Φ is FALSE for `fmt::Write::write_str` (std's private
-//! `Adapter` impl forwards to an arbitrary user `io::Write`), so declaring it
-//! would be a false promise of exactly the kind `EXACT_TOTAL` membership is.
+//! — which is what makes it usable from an rlib. Φ is FALSE for
+//! `fmt::Write::write_str` (std's private `Adapter` impl forwards to an arbitrary
+//! user `io::Write`), so declaring it would be a false promise of exactly the kind
+//! `EXACT_TOTAL` membership is — C-UNIVERSAL can never serve that trait.
+//!
+//! MEASURED 2026-08-19, and this header used to say C-FLOW therefore serves it:
+//! it no longer does, in the one shape anybody writes. `core::fmt::write` dispatches
+//! each argument through a FUNCTION POINTER taking `&mut Formatter<'_>`, and
+//! `Formatter` holds `buf: &'a mut dyn Write` in a FIELD such a callee could
+//! overwrite — so `fmt::Write` is POISONED in every bundle containing a
+//! `write!`/`format!`. That channel was invisible only because
+//! `dyn_principals_in_ty` decomposed an ADT through its generic arguments alone,
+//! which is the fail-open closed on that function. The shape stays verifiable
+//! through the SIBLING `write_fmt` reduction;
+//! `dyn_dispatch_reliance_cflow_concrete_sink.rs` records which lane carries it
+//! and what going red there would mean.
 //!
 //! ## Why bundle-local coercion enumeration is complete
 //!
@@ -150,6 +162,21 @@ const MAX_ENUMERATED_SELF_TYPES: usize = 16;
 
 /// Pointer layers peeled when matching an `Unsize` source against its target.
 const MAX_POINTER_PEEL: usize = 4;
+
+/// Type nodes [`dyn_principals_in_ty`] may visit before it reports the REST of
+/// the type as unexamined (`opaque`), which refuses C-FLOW for the whole bundle.
+///
+/// Raised from 256 when that walk started descending into ADT FIELDS: a field
+/// walk reaches a great deal more of a real type than its generic arguments do,
+/// and exhausting this budget is not one site's decline but a bundle-wide
+/// refusal. The visited set keeps the common cases far below it — what remains
+/// is genuinely distinct types.
+///
+/// Not interchangeable with that visited set, which is why both exist. A
+/// polymorphically recursive `struct P<T> { next: Box<P<(T, T)>> }` reaches
+/// infinitely many DISTINCT types; no set of seen types bounds it, and only a
+/// budget terminates the walk.
+const MAX_CARRIER_WALK_FUEL: u32 = 4096;
 
 /// One `InstanceKind::Virtual` call site, keyed by the EXACT identity the bridge
 /// will see. Reconstructing it from a `DefId` is not good enough: extraction puts
@@ -321,11 +348,39 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
     }
 
     /// Poison every trait object principal a value of `ty` could carry.
-    fn poison_dyn_in_ty(&mut self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) {
-        self.poison_carriers(tcx, &dyn_principals_in_ty(ty));
+    fn poison_dyn_in_ty(&mut self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, source: PoisonSource<'_>) {
+        self.poison_carriers(tcx, &dyn_principals_in_ty(tcx, ty), source);
     }
 
-    fn poison_carriers(&mut self, tcx: TyCtxt<'tcx>, carriers: &DynCarriers) {
+    /// Apply a carrier set, naming WHERE it came from for the probe.
+    ///
+    /// `source` is probe-only and never influences a decision. It exists because
+    /// the field walk made poison the ROUTINE decline reason where vacuity used
+    /// to be: `site_discharges` can now say "trait `core::fmt::Write` poisoned"
+    /// for a bundle in which nothing is obviously unknown, and the reader's next
+    /// question — which entry point admitted the unknown vtable — had no answer
+    /// anywhere in the output. This module already holds that a guard whose
+    /// firing is indistinguishable from an ordinary decline cannot be watched
+    /// (see `target_decline_reason`); the same standard applies to the poison
+    /// that fires before any target is examined.
+    fn poison_carriers(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        carriers: &DynCarriers,
+        source: PoisonSource<'_>,
+    ) {
+        if !carriers.is_empty() && probe_enabled() {
+            let named: Vec<String> = carriers
+                .principals
+                .iter()
+                .map(|&did| with_no_trimmed_paths!(tcx.def_path_str(did)))
+                .collect();
+            eprintln!(
+                "TRUST_DYN_RELIANCE_PROBE:   poison from {source}: {}{}",
+                if named.is_empty() { "(none)".to_string() } else { named.join(", ") },
+                if carriers.opaque { " [+ UNDECOMPOSABLE carrier]" } else { "" },
+            );
+        }
         if carriers.opaque {
             self.opaque_carrier_seen = true;
         }
@@ -359,9 +414,13 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
             // poisoned here and the site stays fail-closed — the honest verdict,
             // since such a body really can panic through a panicking sink.
             for local in body.args_iter() {
-                self.poison_dyn_in_ty(tcx, body.local_decls[local].ty);
+                self.poison_dyn_in_ty(tcx, body.local_decls[local].ty, PoisonSource::RootParam);
             }
-            self.poison_dyn_in_ty(tcx, body.local_decls[RETURN_PLACE].ty);
+            self.poison_dyn_in_ty(
+                tcx,
+                body.local_decls[RETURN_PLACE].ty,
+                PoisonSource::RootReturn,
+            );
         }
 
         for (block_id, block) in body.basic_blocks.iter_enumerated() {
@@ -386,7 +445,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
                     Rvalue::Cast(_, operand, target_ty) => {
                         let source_ty = operand.ty(&body.local_decls, tcx);
                         if !is_array_element_projection(source_ty, *target_ty) {
-                            self.poison_dyn_in_ty(tcx, *target_ty);
+                            self.poison_dyn_in_ty(tcx, *target_ty, PoisonSource::CastTarget);
                         }
                     }
                     // A thread-local handle names storage no body in this bundle
@@ -394,7 +453,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
                     // origin.
                     Rvalue::ThreadLocalRef(_) => {
                         let place_ty = place.ty(&body.local_decls, tcx).ty;
-                        self.poison_dyn_in_ty(tcx, place_ty);
+                        self.poison_dyn_in_ty(tcx, place_ty, PoisonSource::ThreadLocal);
                     }
                     _ => {}
                 }
@@ -404,8 +463,10 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
             // &dyn T` is read — carry vtables minted outside any body. Their TYPE
             // is enough to refuse.
             let mut constant_carriers = DynCarriers::default();
-            for_each_constant_ty(block, |ty| constant_carriers.merge(dyn_principals_in_ty(ty)));
-            self.poison_carriers(tcx, &constant_carriers);
+            for_each_constant_ty(block, |ty| {
+                constant_carriers.merge(dyn_principals_in_ty(tcx, ty))
+            });
+            self.poison_carriers(tcx, &constant_carriers, PoisonSource::Constant);
 
             // A `TailCall` has no destination place — it returns into the
             // caller's — so only its `&mut` arguments can hand a vtable back.
@@ -439,7 +500,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
                 // An INDIRECT call (fn pointer / erased callable): no body to
                 // witness, ever.
                 self.call_keys.record_uncertified(trust_mir_extract::func_operand_name(tcx, func));
-                self.poison_carriers(tcx, &output_traits);
+                self.poison_carriers(tcx, &output_traits, PoisonSource::IndirectCall);
                 continue;
             };
             match ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args) {
@@ -478,7 +539,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
                 _ => {
                     self.call_keys
                         .record_uncertified(trust_mir_extract::func_operand_name(tcx, func));
-                    self.poison_carriers(tcx, &output_traits);
+                    self.poison_carriers(tcx, &output_traits, PoisonSource::UnresolvedCall);
                 }
             }
         }
@@ -495,7 +556,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
     ) -> DynCarriers {
         let mut out = DynCarriers::default();
         if let Some(destination) = destination {
-            out.merge(dyn_principals_in_ty(destination.ty(&body.local_decls, tcx).ty));
+            out.merge(dyn_principals_in_ty(tcx, destination.ty(&body.local_decls, tcx).ty));
         }
         for arg in args {
             let arg_ty = arg.node.ty(&body.local_decls, tcx);
@@ -509,7 +570,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
             if matches!(pointee.kind(), ty::Dynamic(..)) {
                 continue;
             }
-            out.merge(dyn_principals_in_ty(pointee));
+            out.merge(dyn_principals_in_ty(tcx, pointee));
         }
         out
     }
@@ -523,18 +584,34 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
             if self.observed_bodies.contains(&callee) {
                 continue;
             }
-            self.poison_carriers(tcx, &principals);
+            // Naming the callee costs a `def_path_str` per deferred entry, so it
+            // is built only when someone is reading. `with_no_trimmed_paths!`
+            // is not optional here: bare `def_path_str` arms `trimmed_def_paths`
+            // and ICEs when the compilation goes on to emit no diagnostic, which
+            // is exactly the all-discharged run this instrument exists to watch.
+            let name = if probe_enabled() {
+                with_no_trimmed_paths!(tcx.def_path_str(callee))
+            } else {
+                String::new()
+            };
+            self.poison_carriers(tcx, &principals, PoisonSource::UnbundledCallee(&name));
         }
     }
 
     /// One `Unsize` coercion. Either it names a concrete source type — the whole
     /// point of the analysis — or it refuses the traits it produces.
     fn observe_unsize(&mut self, tcx: TyCtxt<'tcx>, source_ty: Ty<'tcx>, target_ty: Ty<'tcx>) {
-        let carriers = dyn_principals_in_ty(target_ty);
+        let carriers = dyn_principals_in_ty(tcx, target_ty);
         if carriers.opaque {
             // A coercion built SOMETHING this analysis cannot decompose. It may
             // be a vtable for a trait we cannot even name, so nothing may rely on
             // an enumeration in this bundle.
+            if probe_enabled() {
+                eprintln!(
+                    "TRUST_DYN_RELIANCE_PROBE:   poison from an `Unsize` coercion whose TARGET \
+                     is undecomposable: [UNDECOMPOSABLE carrier]"
+                );
+            }
             self.opaque_carrier_seen = true;
             return;
         }
@@ -569,11 +646,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
             UnsizeShape::Vtable { source, principal } if !source.has_non_region_param() => {
                 self.record(tcx, principal, source);
             }
-            _ => {
-                for principal in carriers.principals {
-                    self.poison(tcx, principal);
-                }
-            }
+            _ => self.poison_carriers(tcx, &carriers, PoisonSource::UnclassifiableUnsize),
         }
     }
 
@@ -1251,6 +1324,65 @@ impl DynCarriers {
     }
 }
 
+/// Is the reliance probe on?
+///
+/// Cached: the poison probe fires from inside per-call and per-block walks, and
+/// an `env::var_os` on each of those is a syscall-shaped cost paid by every
+/// compilation to answer a question whose answer cannot change during one.
+fn probe_enabled() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| std::env::var_os("TRUST_DYN_RELIANCE_PROBE").is_some())
+}
+
+/// WHICH entry point admitted a vtable of unknown origin.
+///
+/// PROBE-ONLY. No decision reads it, and it is constructed at every
+/// `poison_carriers` call whether or not the probe is on — a `&'static str` and
+/// a discriminant, so the cost of always building it is nil and there is no
+/// second code path to keep in step with the first.
+#[derive(Clone, Copy)]
+enum PoisonSource<'a> {
+    /// The bundle root's own parameter — the caller chose this vtable. The
+    /// canonical instance is `Display::fmt`'s `f: &mut Formatter<'_>`.
+    RootParam,
+    /// The bundle root's return place.
+    RootReturn,
+    /// A cast that is not an `Unsize` and not an array-element projection.
+    CastTarget,
+    /// A thread-local handle: storage no bundled body initialized.
+    ThreadLocal,
+    /// A constant or static operand, whose vtable was minted outside any body.
+    Constant,
+    /// An indirect call (fn pointer / erased callable) — no body to witness.
+    IndirectCall,
+    /// A call whose target `Instance::try_resolve` could not name.
+    UnresolvedCall,
+    /// A resolved callee whose BODY this bundle never walked, reached through
+    /// its destination place or an out-parameter.
+    UnbundledCallee(&'a str),
+    /// An `Unsize` coercion `classify_unsize` could not put in a shape —
+    /// notably a `dyn`-to-`dyn` upcast, whose source is already erased.
+    UnclassifiableUnsize,
+}
+
+impl std::fmt::Display for PoisonSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RootParam => f.write_str("a ROOT PARAMETER (the caller chose this vtable)"),
+            Self::RootReturn => f.write_str("the ROOT RETURN PLACE"),
+            Self::CastTarget => f.write_str("a non-`Unsize` CAST target"),
+            Self::ThreadLocal => f.write_str("a THREAD-LOCAL handle"),
+            Self::Constant => f.write_str("a CONSTANT/STATIC operand"),
+            Self::IndirectCall => f.write_str("an INDIRECT call's outputs"),
+            Self::UnresolvedCall => f.write_str("an UNRESOLVED call's outputs"),
+            Self::UnbundledCallee(callee) => {
+                write!(f, "the outputs of UNBUNDLED callee `{callee}`")
+            }
+            Self::UnclassifiableUnsize => f.write_str("an UNCLASSIFIABLE `Unsize` coercion"),
+        }
+    }
+}
+
 /// Every trait-object principal a VALUE of `ty` can carry.
 ///
 /// Deliberately NOT `ty.walk()`. A callable's TYPE mentions its whole signature,
@@ -1269,8 +1401,70 @@ impl DynCarriers {
 /// polymorphic body, or a type kind a future rustc adds would all read as "no
 /// vtable here" and quietly widen the case split. Marking them opaque instead
 /// makes C-FLOW decline for every trait in the bundle.
-fn dyn_principals_in_ty<'tcx>(ty: Ty<'tcx>) -> DynCarriers {
-    fn walk<'tcx>(ty: Ty<'tcx>, fuel: &mut u32, out: &mut DynCarriers) {
+///
+/// ## An ADT is decomposed through its FIELDS, not only its generic arguments
+///
+/// MEASURED LIVE FALSE PROVE, closed here 2026-08-19. This arm used to be
+/// `ty::Adt(_, args) => for arg in args.types()`, so a `dyn` reachable through a
+/// field whose type is written CONCRETELY — rather than through a type
+/// parameter — was invisible to the whole analysis:
+///
+/// ```ignore
+/// pub struct Bundle<'a> { pub sink: &'a mut dyn Emit }   // no type parameter
+/// pub fn drive(b: &mut Bundle<'_>) -> u32 {
+///     let mut g = Good;
+///     let local: &mut dyn Emit = &mut g;
+///     let a = local.emit(1);      // WITNESSED  -> coerced[dyn Emit] = {Good}
+///     let c = b.sink.emit(2);     // the CALLER's vtable, never witnessed
+///     a.wrapping_add(c)
+/// }
+/// ```
+///
+/// `Bundle<'a>`'s arguments are one LIFETIME, so this function reported no
+/// principal, `observe_bundle_body`'s root-parameter poison never fired, and
+/// C-FLOW discharged `Emit::emit` against the enumeration `{Good}` — which does
+/// not contain the receiver the call actually dispatches on. Compiled as an rlib
+/// on the DEFAULT lane the crate verified with exit 0; linked to a driver
+/// supplying a panicking `Emit` it panicked at runtime. `core::fmt::Formatter`
+/// (`buf: &'a mut dyn Write`) is the same shape, which is why
+/// `dyn_dispatch_reliance_open_sink_stays_closed.rs` was declining by VACUITY
+/// rather than by the poison its own header claimed.
+///
+/// The pure case failed closed BY ACCIDENT — with no coercion anywhere,
+/// `coerced.get(trait)` is `None` and `site_discharges` declines on vacuity. The
+/// unsound shape is MIXED: add one unrelated witnessed coercion for the same
+/// trait and the set looks complete and non-empty, its members prove, and the
+/// case split runs over an enumeration missing the caller's vtable.
+///
+/// That is precisely the shape `17b2aaf890` named and closed for UNHANDLED type
+/// kinds. It did not close this one, because `ty::Adt` is a HANDLED arm: a
+/// handled arm that returns nothing is indistinguishable from a type that really
+/// carries nothing, and only the arms are auditable. Every path out of this walk
+/// is now written against that distinction.
+///
+/// ## Termination: a VISITED SET, with fuel still failing CLOSED
+///
+/// A field walk recurses through `struct List { next: Option<Box<List>> }`
+/// forever, so the walk carries a visited set keyed by the FULL INTERNED TYPE.
+/// A repeat is SKIPPED rather than reported opaque, and that is sound for a
+/// reason the fail-open above did not have: the identical `Ty` is already being
+/// walked into the SAME `out`, so every principal it carries is collected by
+/// that walk. Keying on `AdtDef` instead would NOT be sound — `Wrapper<u8>`
+/// would suppress `Wrapper<&dyn Emit>` — which is why the key is the type.
+///
+/// Reporting opaque on a revisit was considered and rejected: it would make
+/// every recursive, indeed every merely REPEATED, type refuse C-FLOW for the
+/// entire bundle. Fuel keeps the fail-closed role for the case a visited set
+/// cannot bound at all (see [`MAX_CARRIER_WALK_FUEL`]) — unexamined is not
+/// absent.
+fn dyn_principals_in_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> DynCarriers {
+    fn walk<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        fuel: &mut u32,
+        visited: &mut FxHashSet<Ty<'tcx>>,
+        out: &mut DynCarriers,
+    ) {
         if *fuel == 0 {
             // Ran out of budget mid-type: the rest is unexamined, not absent.
             out.opaque = true;
@@ -1289,20 +1483,51 @@ fn dyn_principals_in_ty<'tcx>(ty: Ty<'tcx>) -> DynCarriers {
                 // is impossible, so refuse rather than ignore.
                 None => out.opaque = true,
             },
-            ty::Ref(_, inner, _) | ty::RawPtr(inner, _) => walk(*inner, fuel, out),
-            ty::Slice(inner) | ty::Array(inner, _) | ty::Pat(inner, _) => walk(*inner, fuel, out),
+            ty::Ref(_, inner, _) | ty::RawPtr(inner, _) => walk(tcx, *inner, fuel, visited, out),
+            ty::Slice(inner) | ty::Array(inner, _) | ty::Pat(inner, _) => {
+                walk(tcx, *inner, fuel, visited, out)
+            }
             ty::Tuple(elements) => {
                 for element in elements.iter() {
-                    walk(element, fuel, out);
+                    walk(tcx, element, fuel, visited, out);
                 }
             }
-            ty::Adt(_, args)
-            | ty::Closure(_, args)
+            // A HELD value of this type holds every one of its fields, at THIS
+            // instantiation. `all_fields` iterates every variant, so an enum
+            // payload and a union field are covered by the same walk as a struct
+            // field — see
+            // `dyn_dispatch_reliance_field_held_dyn_variant_carrier_stays_closed.rs`.
+            //
+            // The generic arguments are STILL walked. They are not redundant: a
+            // `PhantomData<&mut dyn Emit>` carries its argument in no field at
+            // all, and an argument that appears only in an uninhabited variant is
+            // still nameable. Overlap is free — `DynCarriers::merge` and the
+            // push below both dedup.
+            ty::Adt(adt_def, args) => {
+                if !visited.insert(ty) {
+                    return;
+                }
+                for arg in args.types() {
+                    walk(tcx, arg, fuel, visited, out);
+                }
+                for field in adt_def.all_fields() {
+                    walk(tcx, instantiated_field_ty(tcx, field, args), fuel, visited, out);
+                }
+            }
+            // NOT collapsed into the ADT arm. These have no `all_fields`; their
+            // held values — the captured upvars, and a coroutine's live locals —
+            // ARE their generic arguments, which is what the doc comment above
+            // means by descending into them. The visited guard is the same one,
+            // for the same reason: a boxed recursive coroutine reaches itself.
+            ty::Closure(_, args)
             | ty::Coroutine(_, args)
             | ty::CoroutineClosure(_, args)
             | ty::CoroutineWitness(_, args) => {
+                if !visited.insert(ty) {
+                    return;
+                }
                 for arg in args.types() {
-                    walk(arg, fuel, out);
+                    walk(tcx, arg, fuel, visited, out);
                 }
             }
             // Scalars and `!`: no interior at all.
@@ -1323,9 +1548,48 @@ fn dyn_principals_in_ty<'tcx>(ty: Ty<'tcx>) -> DynCarriers {
         }
     }
     let mut out = DynCarriers::default();
-    let mut fuel = 256u32;
-    walk(ty, &mut fuel, &mut out);
+    let mut fuel = MAX_CARRIER_WALK_FUEL;
+    let mut visited = FxHashSet::default();
+    walk(tcx, ty, &mut fuel, &mut visited, &mut out);
     out
+}
+
+/// One field's type, instantiated for the ADT it was reached through and
+/// NORMALIZED where that is possible.
+///
+/// Normalization is a PRECISION measure, not a soundness one, and the direction
+/// matters: an unresolved `Alias` falls into the walk's catch-all and reports
+/// `opaque`, which refuses C-FLOW for the WHOLE bundle. Associated-type fields
+/// are ordinary — `Peekable<I> { peeked: Option<Option<I::Item>> }` is in core —
+/// so leaving them unresolved would trade the fail-open this walk just closed
+/// for a broad capability loss that buys nothing.
+///
+/// The two guards are what keep the query honest, and each fails CLOSED:
+///
+/// * `fully_monomorphized` carries an EMPTY param env, so a type still
+///   mentioning a parameter or an inference variable must not be handed to it.
+///   Such a type is returned untouched, meets the catch-all, and refuses — the
+///   same answer the walk already gives a bare `ty::Param`, which is correct: a
+///   polymorphic body names no impl and can serve no case split.
+/// * A normalization that FAILS likewise returns the alias untouched and is
+///   refused there. `try_normalize_erasing_regions` is the fallible spelling for
+///   exactly this reason; the infallible one would ICE on a type that does not
+///   resolve, turning a conservative decline into a compiler crash.
+fn instantiated_field_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    field: &ty::FieldDef,
+    args: ty::GenericArgsRef<'tcx>,
+) -> Ty<'tcx> {
+    let unnormalized = field.ty(tcx, args);
+    let raw = unnormalized.skip_normalization();
+    if !raw.has_aliases() {
+        return raw;
+    }
+    if raw.has_non_region_param() || raw.has_infer() || raw.has_escaping_bound_vars() {
+        return raw;
+    }
+    tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), unnormalized)
+        .unwrap_or(raw)
 }
 
 /// Is this cast a pointer to an ARRAY or SLICE re-typed as a pointer to its

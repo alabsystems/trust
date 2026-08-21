@@ -201,7 +201,7 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com> | Copyright 2026 | License: Apache-2.0
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use rustc_middle::mir;
@@ -484,9 +484,40 @@ pub fn compare_derived<'tcx>(
         }
     };
 
+    // (2.75) A6 REFS-BOOTSTRAP GUARD. The derived side's shared-param exemption (step 3)
+    // can fire only through `env.refs`, whose SOLE bootstrap is a projection-free
+    // `Rvalue::Ref`. `to_mir` emits no such borrow today — every one of its `Rvalue::Ref`
+    // sites borrows a PROJECTED place — but that invariant lives in an UNFROZEN file, so
+    // the oracle refuses the shape itself instead of trusting another file to keep it
+    // absent: fail-closed, and refuse-only by construction. See
+    // `derived_bare_local_borrow` for the full argument.
+    if let Some(found) = derived_bare_local_borrow(&vf_derived.body) {
+        return report(
+            tcx,
+            DerivedVerdict::DerivedUnsupported,
+            format!("derived-refs guard: {found}"),
+            NO_NORMS,
+        );
+    }
+
     // (3) Canonicalize. A derived-side failure is a shim bug surfaced honestly; a built-side
     //     failure means the built MIR uses constructs outside the comparator fragment.
-    let (canon_derived, derived_norms) = canonicalize(&vf_derived.body);
+    // BOTH SIDES ARE ANNOTATED FROM THEIR OWN BODY. An earlier revision handed the derived
+    // side an empty map on the belief that it had no rustc `mir::Body` to read callee
+    // signatures from. It does: `lower_ir_to_mir` returns a `MirLowering` whose `.body` is
+    // exactly that, and `vf_derived` is extracted from it at step (2) above.
+    //
+    // Reading each side from its OWN body is what makes the fact honest rather than
+    // borrowed. Copying the built side's kinds across would assert that derived calls the
+    // same callee with the same signature at the same block — which is a large part of what
+    // this comparator EXISTS to check, so assuming it here would let a shim that called
+    // something else inherit an exemption it never earned.
+    //
+    // Block keying is valid on this side for the same reason it is on the other: the
+    // faithful extraction runs no block-rewriting pass, so `vf_derived.body`'s block ids are
+    // `derived.body`'s block indices (see `CallArgKinds`).
+    let (canon_derived, derived_norms) =
+        canonicalize(&vf_derived.body, arg_borrow_kinds_by_block(tcx, &derived.body));
     let canon_derived = match canon_derived {
         Ok(c) => c,
         Err(e) => {
@@ -498,7 +529,11 @@ pub fn compare_derived<'tcx>(
             );
         }
     };
-    let (canon_built, built_norms) = canonicalize(&vf_built.body);
+    // The BUILT side reads its own body likewise. Both sets are block-keyed and
+    // `Freeze`-guarded at the mint, and the exemption they feed is live (see
+    // `operand_expr_call_arg` and `EscapeNames`).
+    let (canon_built, built_norms) =
+        canonicalize(&vf_built.body, arg_borrow_kinds_by_block(tcx, built));
     let comparison_norms = add_norm_counts(derived_norms, built_norms);
     let canon_built = match canon_built {
         Ok(c) => c,
@@ -752,6 +787,113 @@ pub(crate) enum ArgBorrowKind {
 /// signature whose inputs cannot be read. Consumers must treat `None` as
 /// conservative-everything. Never returns a partial vec for a call.
 ///
+/// Per-CALL argument borrow kinds keyed by ORIGINAL BLOCK ID — the form `canonicalize`
+/// consumes (see [`Graph::arg_kinds`]).
+///
+/// WHY A SECOND KEYING EXISTS BESIDE [`arg_borrow_kinds_in_dfs_order`]. That one is keyed by
+/// DFS ordinal and derives from `raw_calls_in_dfs_order`, which makes its alignment hold by
+/// construction FOR THE CALL CHANNEL — the caller collects `b_calls`/`d_calls` in the same
+/// order and proves them equal callee-for-callee, so ordinal `i` denotes the same callee on
+/// both sides. That argument does NOT carry to the classifier, which walks a
+/// `VerifiableBody`, a different IR: matching a DFS ordinal produced by walking
+/// `mir::Body` against a position in a walk of `VerifiableBody` reintroduces exactly the
+/// keeping-two-traversals-in-sync problem, and a mis-key here hands a no-write exemption to
+/// a parameter that IS written — the manufactured-agreement failure this comparator exists
+/// to prevent.
+///
+/// A block id is a TOTAL key instead, and it survives end to end: a MIR block has exactly
+/// one terminator (hence at most one call), `convert.rs` stamps
+/// `BasicBlock { id: BlockId(bb.as_usize()) }`, the faithful extraction runs no
+/// block-rewriting pass, and `Graph::blocks` is 1:1 with `body.blocks` because it filters
+/// STATEMENTS, not blocks. So the `b` the classifier holds IS the rustc block index and the
+/// lookup is local, with no cross-IR correspondence to maintain.
+///
+/// AN ABSENT ENTRY MEANS NOT RECORDED and must DENY the exemption — never grant it. Same
+/// discipline as the `None` entry in the DFS-ordered form.
+pub(crate) type CallArgKinds = HashMap<usize, Vec<ArgBorrowKind>>;
+
+/// [`CallArgKinds`] for `body`: for every block whose terminator is a `Call` with an interned
+/// `FnDef` callee, the callee's per-parameter borrow kinds read from its instantiated
+/// signature.
+///
+/// Blocks with a non-`FnDef` callee (fn pointer / indirect call) get NO entry, which the
+/// consumer must read as conservative-everything. A call is never given a partial vec.
+///
+/// The classification is [`arg_borrow_kinds_in_dfs_order`]'s, extracted so both keyings mint
+/// `Shared` under exactly one rule — including the `Freeze` requirement, whose absence would
+/// hand the exemption to `&Cell<U>`.
+///
+/// INERT: nothing consumes the exemption yet. See [`operand_expr_call_arg`] for the one
+/// question that must be answered before it can be enabled.
+#[allow(dead_code)] // Trust: INERT — see above.
+fn arg_borrow_kinds_by_block<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+) -> CallArgKinds {
+    let mut out = CallArgKinds::new();
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        let Some(term) = &data.terminator else { continue };
+        let mir::TerminatorKind::Call { func, .. } = &term.kind else { continue };
+        let Some(fn_ty) = func.constant().map(|c| c.const_.ty()) else { continue };
+        let rustc_middle::ty::TyKind::FnDef(def_id, args) = fn_ty.kind() else { continue };
+        let sig = tcx.fn_sig(*def_id).instantiate(tcx, args).skip_binder();
+        out.insert(bb.as_usize(), sig.inputs().iter().map(|t| arg_borrow_kind_of(tcx, *t)).collect());
+    }
+    out
+}
+
+/// The ONE rule that mints an [`ArgBorrowKind`] from a parameter type.
+///
+/// Extracted so the DFS-ordered and block-keyed collectors cannot drift: a `Shared` minted
+/// under a weaker rule in one of them would be a silent hole, and this classification is the
+/// entire basis of the no-write exemption.
+fn arg_borrow_kind_of<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    t: rustc_middle::ty::Ty<'tcx>,
+) -> ArgBorrowKind {
+    use rustc_middle::ty::TypeVisitableExt as _;
+    match t.kind() {
+        // `&T` grants the no-write exemption ONLY when `T: Freeze`. A `&Cell<U>` /
+        // `&UnsafeCell<U>` is `Ref(.., Not)` too and the callee CAN write through it, so it is
+        // minted `Mut` — which is exactly true of it. `NotARef` would be wrong: that variant is
+        // a POSITIVE claim that the parameter is not a reference.
+        rustc_middle::ty::TyKind::Ref(_, pointee, rustc_hir::Mutability::Not) => {
+            // REENTRANCY/VALIDITY GUARD (ICE fix, 2026-08-20). Callers reach this through
+            // `tcx.fn_sig(..).instantiate(..).skip_binder()`, and `skip_binder` LEAVES the
+            // signature's late-bound regions in place as escaping `ReBound` vars. A parameter
+            // whose POINTEE mentions one — canonically `&'a (dyn Trait + 'a)`, i.e. any
+            // `&dyn Trait` argument — therefore arrives here carrying escaping bound vars.
+            // `Ty::is_freeze` feeds the type to the `is_freeze_raw` query, which builds a
+            // `Freeze<..>` `TraitRef` and wraps it in `ty::Binder::dummy`, and `dummy` asserts
+            // `!has_escaping_bound_vars` (compiler/rustc_type_ir/src/binder.rs:86) — so the
+            // query is not merely imprecise on this shape, it ABORTS THE COMPILER. Measured:
+            // `tests/ui/trust/trust_ir_unsize_dyn_data_lane.rs` ICEd at
+            // `rustc_middle/src/ty/predicate.rs:492` via `is_freeze_raw` on `dyn Speak`, from
+            // `mir_built` for `call_through` (whose callee `through` takes `&dyn Speak`).
+            //
+            // This is the FOURTH instance of one family: a `tcx` query issued from inside
+            // `mir_built` can close a fatal cycle or trip an invariant (previously RPIT, a
+            // self-referential static, and TAIT normalization). The standing rule: a widening
+            // change is also a reentrancy audit.
+            //
+            // FAIL CLOSED, never assume freeze-ness: an unqueryable pointee is minted `Mut`
+            // ("the callee may write through it"), which DENIES the no-write exemption. That is
+            // the refuses-more direction — it can cost a flip, never manufacture agreement.
+            // Erasing the regions to recover precision would be a semantic change to the
+            // comparator's admitted scope and is deliberately NOT done here.
+            if pointee.has_escaping_bound_vars() {
+                ArgBorrowKind::Mut
+            } else if pointee.is_freeze(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized()) {
+                ArgBorrowKind::Shared
+            } else {
+                ArgBorrowKind::Mut
+            }
+        }
+        rustc_middle::ty::TyKind::Ref(_, _, rustc_hir::Mutability::Mut) => ArgBorrowKind::Mut,
+        _ => ArgBorrowKind::NotARef,
+    }
+}
+
 /// INERT AS OF THIS COMMIT: nothing reads the result yet. It is landed and proved
 /// behaviour-neutral first so the classifier change that consumes it is a small diff with a
 /// clean before/after — the same two-step used for the topological intern (#174).
@@ -768,38 +910,14 @@ fn arg_borrow_kinds_in_dfs_order<'tcx>(
             };
             let sig = tcx.fn_sig(*def_id).instantiate(tcx, args).skip_binder();
             Some(
-                sig.inputs()
-                    .iter()
-                    .map(|t| match t.kind() {
-                        // Trust (A6 audit): `&T` grants the no-write exemption ONLY when `T` is
-                        // `Freeze`. A `&Cell<U>` / `&UnsafeCell<U>` is `Ref(.., Not)` too, and the
-                        // callee CAN write through it — classifying it `Shared` would hand the
-                        // exemption to a parameter that IS written, which is the
-                        // manufactured-agreement failure mode this comparator exists to prevent.
-                        // Interior-mutable pointees are therefore reported as `Mut` ("the callee
-                        // may write through it"), which is exactly true of them; `NotARef` would
-                        // be wrong here because that variant is a POSITIVE claim that the
-                        // parameter is not a reference. Same discipline as the `StaticRef`
-                        // interior-mutability check in `lib.rs`.
-                        //
-                        // This guard is BEHAVIOUR-NEUTRAL today — nothing consumes these kinds yet
-                        // (see the INERT note above) — and it is landed FIRST, deliberately, so
-                        // that the B4 pre-tranche consumer cannot inherit an unguarded `Shared`.
-                        rustc_middle::ty::TyKind::Ref(_, pointee, rustc_hir::Mutability::Not) => {
-                            if pointee
-                                .is_freeze(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
-                            {
-                                ArgBorrowKind::Shared
-                            } else {
-                                ArgBorrowKind::Mut
-                            }
-                        }
-                        rustc_middle::ty::TyKind::Ref(_, _, rustc_hir::Mutability::Mut) => {
-                            ArgBorrowKind::Mut
-                        }
-                        _ => ArgBorrowKind::NotARef,
-                    })
-                    .collect(),
+                // Trust (2026-08-20): this used to inline a SECOND copy of the classification,
+                // which is precisely the drift `arg_borrow_kind_of`'s doc comment says the
+                // extraction exists to prevent — and the copy did not carry the escaping
+                // bound-var guard, so a future consumer of this INERT keying would have
+                // inherited the `&dyn Trait` ICE verbatim. Both keyings now mint through the
+                // one rule; the A6 interior-mutability reasoning that stood here lives on that
+                // function, next to the guard, rather than being duplicated and re-drifting.
+                sig.inputs().iter().map(|t| arg_borrow_kind_of(tcx, *t)).collect(),
             )
         })
         .collect()
@@ -1146,6 +1264,64 @@ impl NormCounter {
     }
 }
 
+/// Trust (A6): side-stable names for body-locals whose ADDRESS escapes to a `&T` parameter.
+///
+/// THE PROBLEM THIS SOLVES. Admitting a `refs`-bound by-value read (see
+/// [`operand_expr_call_arg`]) means rendering the address of a body-local, and a body-local
+/// has no name in the value channel — `vals` names PARAMS `a{i}` and gives a body-local only
+/// its symbolic VALUE. Rendering the address as a function of that value manufactures
+/// agreement, because two distinct slots holding equal values render identically:
+///
+/// ```text
+/// source     f(&a, &b)        distinct slots, EQUAL values
+/// built      f(&_x, &_y)  ->  ref(v), ref(v)
+/// derived    f(&_x, &_x)  ->  ref(v), ref(v)     <- shim wrongly aliased them, hidden
+/// ```
+///
+/// THE FIX IS L13'S OWN ARGUMENT, APPLIED TO ADDRESSES. Number each escaping local by FIRST
+/// APPEARANCE in the canonical walk. That is a BIJECTION slot <-> name, so it preserves
+/// exactly the property a callee can observe about addresses — which pointers are EQUAL to
+/// which — while discarding the absolute values, which no correct program can depend on
+/// (they are not stable across runs in the first place). It is the same reasoning LEDGER L13
+/// makes for storage-marker locals: "a bijective renaming of storage slots is observationally
+/// identical".
+///
+/// Under it the collapse above no longer hides:
+///
+/// ```text
+/// built      f(&_x, &_y)  ->  ref(e0), ref(e1)
+/// derived    f(&_x, &_x)  ->  ref(e0), ref(e0)   <- DIFFERS -> mismatch -> no flip
+/// ```
+///
+/// WHY IT IS SIDE-STABLE. First appearance is taken in the canonical block order the
+/// comparator already imposes, so two bodies agree on the numbering exactly when they agree
+/// on the structure the comparator is checking anyway. If their structures differ the
+/// numbering differs too — which fails in the SAFE direction (a spurious mismatch, never a
+/// spurious agreement).
+///
+/// WHY IT IS BODY-GLOBAL AND NOT PER-CALL. A callee may retain a pointer and compare it
+/// against one received later. Numbering per call site would let two different slots take the
+/// name `e0` at two sites, so a cross-call aliasing difference could render identically. One
+/// counter for the whole body closes that.
+///
+/// WHY INTERIOR MUTABILITY. Numbering must NOT live in `Env`: `Env` is cloned per path and
+/// merged at joins, so a per-path map would let two paths disagree on a name. This is one
+/// counter for the whole canonicalization, advanced in the deterministic `g.topo` walk —
+/// same shape as [`NormCounter`], and for the same reason.
+#[derive(Default)]
+struct EscapeNames {
+    names: RefCell<HashMap<usize, usize>>,
+}
+
+impl EscapeNames {
+    /// The stable name for `local`'s address: its existing number, or the next one.
+    fn name_of(&self, local: usize) -> usize {
+        let mut names = self.names.borrow_mut();
+        let next = names.len();
+        *names.entry(local).or_insert(next)
+    }
+}
+
 /// Symbolic machine state at a program point: every VALUE-carrying local's symbolic
 /// expression (`vals`), plus the reference-alias bindings created by in-fragment bare-local
 /// borrows (`refs`: ref local -> target local). INVARIANT: a local is never in both maps —
@@ -1212,6 +1388,22 @@ struct Edge {
 struct Graph<'a> {
     /// Filtered blocks by ORIGINAL id: kept pure assigns + terminator (ALL original blocks).
     blocks: Vec<(Vec<&'a Statement>, &'a Terminator)>,
+    /// Trust (A6): per-CALL argument borrow kinds, keyed by ORIGINAL BLOCK ID.
+    ///
+    /// WHY BLOCK ID AND NOT A DFS ORDINAL. A side vec keyed by DFS position would have to be
+    /// matched against a traversal of a DIFFERENT IR (`raw_calls_in_dfs_order` walks the rustc
+    /// `mir::Body`; this walks a `VerifiableBody`), and keeping two dissimilar traversals in sync
+    /// is exactly the mis-keying that hands a no-write exemption to a parameter that IS written.
+    /// A block id is a TOTAL key instead — a MIR block has exactly one terminator, hence at most
+    /// one call — and it is preserved end-to-end: `convert.rs` stamps
+    /// `BasicBlock { id: BlockId(bb.as_usize()) }`, the faithful extraction runs no
+    /// block-rewriting pass, and `blocks` above is 1:1 with `body.blocks` (it filters
+    /// STATEMENTS, not blocks). So `b` here IS the rustc block index, and the lookup is local.
+    ///
+    /// Each SIDE is annotated from its OWN body with its own `tcx` (built from the rustc body,
+    /// derived from the shim's lowering), so nothing is ever matched ACROSS the two walks.
+    /// An ABSENT entry means NOT RECORDED (non-`FnDef` callee) and denies the exemption.
+    arg_kinds: CallArgKinds,
     /// Reachable canonical blocks in DFS preorder (canonical id -> original id). (The
     /// internal orig->preorder-id map is a LOCAL of `canonicalize` — output ids live in
     /// `final_of`/`ret_of`.)
@@ -1255,13 +1447,69 @@ impl<'a> Graph<'a> {
     }
 }
 
-fn canonicalize(body: &VerifiableBody) -> (CanonResult<Vec<String>>, NormCounts) {
+/// A6 FAIL-CLOSED GUARD (2026-08-20): the first projection-free `Rvalue::Ref`
+/// (`_d = &_s` / `_d = &mut _s` — no projections on the BORROWED place) in a DERIVED body,
+/// or `None`.
+///
+/// WHY THE ORACLE CHECKS THIS ITSELF. The shared-param exemption
+/// ([`operand_expr_call_arg`]) can fire only through `env.refs`, and `env.refs` BOOTSTRAPS
+/// at exactly one statement shape: `apply_stmt`'s bare-local-borrow arm. Every other write
+/// to `refs` (the reborrow arm, the loop-header seeds) only PROPAGATES entries that already
+/// exist. On the derived side that shape is absent today — every `Rvalue::Ref` emission
+/// site in `to_mir::lower_ir_to_mir` borrows a PROJECTED place (`mk_place_field` /
+/// `mk_place_deref`) — but that invariant lives in an UNFROZEN file, so inside the oracle
+/// it was "empty by construction, provable only by reading another file".
+/// `compare_derived` calls this at the derived-side canonicalize seam and REFUSES
+/// (`DerivedUnsupported`) any derived body carrying the shape, which converts the
+/// invariant into "empty by CHECK, enforced here".
+///
+/// Mutability is deliberately NOT consulted: `apply_stmt`'s borrow arm ignores it too, so
+/// a bare-local `&mut` would seed `refs` exactly like a shared borrow — and the only thing
+/// denying a `&mut` exemption after that is `arg_borrow_kind_of`'s `Freeze` check, again
+/// outside this file. Refusing both mutabilities keeps the guard total over the bootstrap
+/// shape. The destination's projections are likewise ignored (broader than the bootstrap,
+/// which also requires a bare destination): refusing more is free, and it keeps the guard
+/// a statement about the RVALUE alone.
+///
+/// This can only ever REFUSE more (cost a comparison, land `DerivedUnsupported`, ship
+/// rustc's own built MIR), never widen what is accepted — the one direction the oracle
+/// freeze permits.
+fn derived_bare_local_borrow(body: &VerifiableBody) -> Option<String> {
+    for block in &body.blocks {
+        for s in &block.stmts {
+            let Statement::Assign { place, rvalue: Rvalue::Ref { mutable, place: rp }, .. } = s
+            else {
+                continue;
+            };
+            if rp.projections.is_empty() {
+                let amp = if *mutable { "&mut " } else { "&" };
+                return Some(format!(
+                    "bare-local borrow in derived body (bb{}: _{} = {amp}_{}) — the one \
+                     env.refs bootstrap shape; to_mir emits only projected borrows, so this \
+                     is refused before it can arm the shared-param exemption",
+                    block.id.0, place.local, rp.local
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn canonicalize(body: &VerifiableBody, arg_kinds: CallArgKinds) -> (CanonResult<Vec<String>>, NormCounts) {
     let norms = NormCounter::default();
-    let result = canonicalize_with_norms(body, &norms);
+    // ONE counter for the whole body — see `EscapeNames` on why it is not per-call and not
+    // in `Env`.
+    let escapes = EscapeNames::default();
+    let result = canonicalize_with_norms(body, arg_kinds, &norms, &escapes);
     (result, norms.snapshot())
 }
 
-fn canonicalize_with_norms(body: &VerifiableBody, norms: &NormCounter) -> CanonResult<Vec<String>> {
+fn canonicalize_with_norms(
+    body: &VerifiableBody,
+    arg_kinds: CallArgKinds,
+    norms: &NormCounter,
+    escapes: &EscapeNames,
+) -> CanonResult<Vec<String>> {
     // --- signature lines ---
     let mut out: Vec<String> = Vec::new();
     out.push(format!("args:{}", body.arg_count));
@@ -1636,6 +1884,7 @@ fn canonicalize_with_norms(body: &VerifiableBody, norms: &NormCounter) -> CanonR
 
     let g = Graph {
         blocks,
+        arg_kinds,
         order,
         succ_of,
         edges_in,
@@ -1651,11 +1900,11 @@ fn canonicalize_with_norms(body: &VerifiableBody, norms: &NormCounter) -> CanonR
     // --- symbolic evaluation ---
     let (term_lines, loop_lines) = match g.headers.as_slice() {
         [] => {
-            let (lines, _) = eval_all(body, &g, None, None, norms)?;
+            let (lines, _) = eval_all(body, &g, None, None, norms, escapes)?;
             (lines, Vec::new())
         }
-        [h] => eval_loop(body, &g, *h, norms)?,
-        hs => eval_sequential_loops(body, &g, hs, norms)?,
+        [h] => eval_loop(body, &g, *h, norms, escapes)?,
+        hs => eval_sequential_loops(body, &g, hs, norms, escapes)?,
     };
 
     for (i, line) in term_lines.into_iter().enumerate() {
@@ -1777,12 +2026,13 @@ fn eval_all(
     hdr_env: Option<&Env>,
     stop_before: Option<usize>,
     norms: &NormCounter,
+    escapes: &EscapeNames,
 ) -> CanonResult<(Vec<String>, HashMap<usize, Env>)> {
     let mut header_envs = HashMap::new();
     if let (Some(h), Some(env)) = (g.header, hdr_env) {
         header_envs.insert(h, env.clone());
     }
-    eval_with_header_envs(body, g, &header_envs, stop_before, norms)
+    eval_with_header_envs(body, g, &header_envs, stop_before, norms, escapes)
 }
 
 /// Generalized backedge-free walk used by the sequential-loop solver. Every
@@ -1794,6 +2044,7 @@ fn eval_with_header_envs(
     header_envs: &HashMap<usize, Env>,
     stop_before: Option<usize>,
     norms: &NormCounter,
+    escapes: &EscapeNames,
 ) -> CanonResult<(Vec<String>, HashMap<usize, Env>)> {
     let mut exits: HashMap<usize, Env> = HashMap::new();
     let mut lines: Vec<Option<String>> = vec![None; g.nodes_total];
@@ -1885,9 +2136,14 @@ fn eval_with_header_envs(
                 if !probe.is_empty() {
                     return Err(format!("callee name carries a class-shaped token: {func}"));
                 }
+                // Trust (A6): the callee's per-arg borrow kinds for THIS block's call. Absent =>
+                // not recorded => no exemption for any argument (see `Graph::arg_kinds`).
+                let kinds = g.arg_kinds.get(&b);
                 let mut rendered: Vec<String> = Vec::with_capacity(args.len());
-                for a in args {
-                    rendered.push(operand_expr(a, &env, norms)?);
+                for (i, a) in args.iter().enumerate() {
+                    let shared_exempt =
+                        kinds.and_then(|k| k.get(i)).copied() == Some(ArgBorrowKind::Shared);
+                    rendered.push(operand_expr_call_arg(a, &env, norms, escapes, shared_exempt)?);
                 }
                 if !dest.projections.is_empty() {
                     return Err("projected call destination outside fragment".to_string());
@@ -1989,11 +2245,12 @@ fn eval_loop(
     g: &Graph<'_>,
     h: usize,
     norms: &NormCounter,
+    escapes: &EscapeNames,
 ) -> CanonResult<(Vec<String>, Vec<String>)> {
     // LEDGER L9: the loop-congruence machinery is engaged for this body.
     norms.fire(NORM_LOOP_CONGRUENCE);
     // Seed state: the merge of the header's OUTSIDE edges, evaluated on the loop-free prefix.
-    let (_, prefix_exits) = eval_all(body, g, None, Some(h), norms)?;
+    let (_, prefix_exits) = eval_all(body, g, None, Some(h), norms, escapes)?;
     let outside: Vec<&Edge> = g.edges_in[&h]
         .iter()
         .filter(|e| e.pred.map_or(true, |p| !g.back_edges.contains(&(p, e.slot))))
@@ -2068,7 +2325,7 @@ fn eval_loop(
                 // position silently vanished.
                 memseq: Vec::new(),
             };
-            let (lines, exits) = eval_all(body, g, Some(&hdr_env), None, norms)?;
+            let (lines, exits) = eval_all(body, g, Some(&hdr_env), None, norms, escapes)?;
             let mut back_envs: Vec<Env> = Vec::new();
             for e in &back {
                 back_envs.push(edge_env(body, g, e, &exits, norms)?);
@@ -2263,13 +2520,14 @@ fn eval_sequential_loops(
     g: &Graph<'_>,
     headers: &[usize],
     norms: &NormCounter,
+    escapes: &EscapeNames,
 ) -> CanonResult<(Vec<String>, Vec<String>)> {
     norms.fire(NORM_LOOP_CONGRUENCE);
     let mut solved_headers = HashMap::<usize, Env>::new();
     let mut solutions = Vec::<SequentialLoopSolution>::with_capacity(headers.len());
 
     for (loop_index, &h) in headers.iter().enumerate() {
-        let (_, prefix_exits) = eval_with_header_envs(body, g, &solved_headers, Some(h), norms)?;
+        let (_, prefix_exits) = eval_with_header_envs(body, g, &solved_headers, Some(h), norms, escapes)?;
         let outside: Vec<&Edge> = g.edges_in[&h]
             .iter()
             .filter(|e| e.pred.map_or(true, |p| !g.back_edges.contains(&(p, e.slot))))
@@ -2326,7 +2584,7 @@ fn eval_sequential_loops(
                 let mut trial_headers = solved_headers.clone();
                 trial_headers.insert(h, hdr_env.clone());
                 let (_, exits) =
-                    eval_with_header_envs(body, g, &trial_headers, stop_before, norms)?;
+                    eval_with_header_envs(body, g, &trial_headers, stop_before, norms, escapes)?;
                 let mut back_envs = Vec::<Env>::with_capacity(back.len());
                 for e in &back {
                     back_envs.push(
@@ -2403,7 +2661,7 @@ fn eval_sequential_loops(
         solutions.push(SequentialLoopSolution { header: h, token_prefix, class_seed, class_back });
     }
 
-    let (mut term_lines, _) = eval_with_header_envs(body, g, &solved_headers, None, norms)?;
+    let (mut term_lines, _) = eval_with_header_envs(body, g, &solved_headers, None, norms, escapes)?;
 
     // Global liveness closure over all fixed-point definitions. Starting from
     // terminator observables (including every loop condition), follow only
@@ -3210,6 +3468,65 @@ fn place_expr(place: &Place, env: &Env) -> CanonResult<String> {
 /// belongs: the shim re-spells one-shot struct call-result temps as `Move` (built's as_operand
 /// discipline), and `flip.rs::gate_derived_body` fail-closes any residual memory-ABI whole-struct
 /// `Copy` call arg. Immediate/Pair operands remain genuinely spelling-blind in codegen.
+/// [`operand_expr`] for an operand in ARGUMENT position, told whether the callee's matching
+/// parameter is `&T` with `T: Freeze` ([`ArgBorrowKind::Shared`]).
+///
+/// TODAY THIS IS EXACTLY `operand_expr`. `shared_exempt` is plumbed and honestly derived —
+/// block-keyed ([`CallArgKinds`]), `Freeze`-guarded at the mint — but it grants NOTHING yet,
+/// so this lane is behaviour-neutral by construction. That is deliberate, and it is the same
+/// two-step [`arg_borrow_kinds_in_dfs_order`] used: land the fact, prove it changes nothing,
+/// then change behaviour in a diff small enough to argue about.
+///
+/// WHAT THE EXEMPTION WOULD PERMIT. `place_expr` fails closed on a by-value read of a
+/// `refs`-bound local — "ref local _N used by value (escape) outside fragment" — because the
+/// referent is a body-local snapshot. `Shared` answers one objection to admitting it: the
+/// callee provably cannot WRITE through the parameter, so the alias cannot be invalidated by
+/// the call.
+///
+/// WHAT IT PERMITS, AND WHY THAT IS SOUND. `place_expr` fails closed on a by-value read of a
+/// `refs`-bound local — "ref local _N used by value (escape) outside fragment" — because the
+/// referent is a body-local snapshot and nothing invalidates `vals` if the callee writes
+/// through the pointer. (The `Call` arm rebinds only `dest`; there is no havoc.) `Shared`
+/// removes exactly that objection: `&T` with `T: Freeze` cannot be written through, so the
+/// symbolic value of the referent survives the call unchanged.
+///
+/// The remaining objection is that "cannot write" is not "cannot observe" — a `&T` callee may
+/// still `ptr::eq` the pointer. That is answered by HOW the address is rendered, not by
+/// `Shared`: [`EscapeNames`] numbers each escaping local by first appearance, a BIJECTION that
+/// preserves precisely which pointers are equal to which while discarding absolute addresses
+/// no correct program can depend on. See its doc for the argument and for why the numbering is
+/// body-global rather than per-call.
+///
+/// So the two halves are separate and both are needed: `Shared` licenses the VALUE surviving
+/// the call, the bijection licenses the ADDRESS being rendered at all. Neither alone is enough,
+/// which is why this stayed inert until the second one existed.
+///
+/// STILL FAILS CLOSED for everything else: a projected use of a `refs`-bound local, a
+/// `ref_places` binding (those are answered earlier by `place_expr`'s own arms), a `Mut` or
+/// `NotARef` parameter, and any call whose kinds were not recorded — an absent entry denies.
+fn operand_expr_call_arg(
+    op: &Operand,
+    env: &Env,
+    norms: &NormCounter,
+    escapes: &EscapeNames,
+    shared_exempt: bool,
+) -> CanonResult<String> {
+    if shared_exempt {
+        // A BARE by-value read only. A projection on top of the reference is a different
+        // idiom and keeps failing closed in `place_expr`, where it already does.
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            if p.projections.is_empty() {
+                if let Some(&target) = env.refs.get(&p.local) {
+                    // `ref(..)` so an ADDRESS can never collide with the VALUE at that
+                    // address — the same wrapper the T2d arm uses for an interior borrow.
+                    return Ok(format!("ref(e{})", escapes.name_of(target)));
+                }
+            }
+        }
+    }
+    operand_expr(op, env, norms)
+}
+
 fn operand_expr(op: &Operand, env: &Env, norms: &NormCounter) -> CanonResult<String> {
     match op {
         Operand::Copy(p) => place_expr(p, env),
@@ -3681,7 +3998,7 @@ mod session_state_tests {
 
     #[test]
     fn sequential_loop_fixed_points_compose_into_later_seed_and_return() {
-        let (canonical, _) = canonicalize(&sequential_loop_body(1));
+        let (canonical, _) = canonicalize(&sequential_loop_body(1), CallArgKinds::new());
         let canonical = canonical.expect("two dominance-ordered natural loops are supported");
         let rendered = canonical.join("\n");
 
@@ -3701,8 +4018,8 @@ mod session_state_tests {
 
     #[test]
     fn mutating_only_the_first_transition_changes_the_composed_canonical_body() {
-        let (correct, _) = canonicalize(&sequential_loop_body(1));
-        let (mutated, _) = canonicalize(&sequential_loop_body(2));
+        let (correct, _) = canonicalize(&sequential_loop_body(1), CallArgKinds::new());
+        let (mutated, _) = canonicalize(&sequential_loop_body(2), CallArgKinds::new());
         let correct = correct.expect("reference two-loop body is supported");
         let mutated = mutated.expect("mutation stays in-fragment so it must be compared");
 
@@ -3718,7 +4035,7 @@ mod session_state_tests {
 
     #[test]
     fn later_header_does_not_truncate_an_earlier_canonical_latch() {
-        let (canonical, _) = canonicalize(&sequential_loop_body_with_canonical_latches());
+        let (canonical, _) = canonicalize(&sequential_loop_body_with_canonical_latches(), CallArgKinds::new());
         let canonical = canonical.expect(
             "topological tie-breaking may place loop 2 before loop 1's independent latch",
         );
@@ -3740,7 +4057,7 @@ mod session_state_tests {
             span: SourceSpan::default(),
         };
 
-        let (canonical, _) = canonicalize(&body);
+        let (canonical, _) = canonicalize(&body, CallArgKinds::new());
         let canonical = canonical.expect(
             "a later optional SCC is still dominance-ordered when every entered path follows loop 1",
         );
@@ -3766,11 +4083,280 @@ mod session_state_tests {
             span: SourceSpan::default(),
         };
 
-        let (canonical, _) = canonicalize(&body);
+        let (canonical, _) = canonicalize(&body, CallArgKinds::new());
         assert_eq!(
             canonical.unwrap_err(),
             "non-sequential multiple loops outside fragment",
             "the first header no longer dominates the second, so the multi-loop gate must close",
+        );
+    }
+
+    /// A6: the exemption ADMITS the case it exists for, and only that case.
+    ///
+    /// Without `shared_exempt` a by-value read of a `refs`-bound local is an escape and
+    /// fails closed — that is the behaviour every other call keeps. With it, the read
+    /// renders as an address. Both directions are asserted here because a test that only
+    /// checked the admit would pass just as well if the flag were ignored and the escape
+    /// admitted unconditionally, which is the dangerous shape.
+    #[test]
+    fn the_shared_param_exemption_admits_only_when_the_kind_says_shared() {
+        let mut env = Env::default();
+        env.refs.insert(7, 3); // `_7 = &_3`
+        env.vals.insert(3, "a1".to_string());
+        let arg = Operand::Copy(Place::local(7));
+        let norms = NormCounter::default();
+
+        let denied = operand_expr_call_arg(&arg, &env, &norms, &EscapeNames::default(), false);
+        assert_eq!(
+            denied.unwrap_err(),
+            "ref local _7 used by value (escape) outside fragment",
+            "without a Shared kind the escape must still fail closed",
+        );
+
+        let admitted = operand_expr_call_arg(&arg, &env, &norms, &EscapeNames::default(), true);
+        assert_eq!(
+            admitted.unwrap(),
+            "ref(e0)",
+            "a Shared parameter admits the escape, rendered as an ADDRESS",
+        );
+    }
+
+    /// A6: the exemption changes the ADDRESS case and nothing else.
+    ///
+    /// `*_r` where `_r |-> _x` is the ordinary ref-alias READ (LEDGER L7) and has always
+    /// been admitted, rendering the referent's VALUE. The escape the exemption unlocks is
+    /// the BARE use of `_r`, which denotes its ADDRESS. Those are different observables,
+    /// and the exemption must not blur them.
+    ///
+    /// (This test first asserted the deref was REFUSED — mistaking "projection on a
+    /// reference" for "escape". It is not one, and running the test is what said so.)
+    #[test]
+    fn the_exemption_leaves_ordinary_alias_reads_untouched() {
+        let mut env = Env::default();
+        env.refs.insert(7, 3); // `_7 = &_3`
+        env.vals.insert(3, "a1".to_string());
+        let deref = Operand::Copy(Place { local: 7, projections: vec![Projection::Deref] });
+        let norms = NormCounter::default();
+
+        let without =
+            operand_expr_call_arg(&deref, &env, &norms, &EscapeNames::default(), false).unwrap();
+        let with =
+            operand_expr_call_arg(&deref, &env, &norms, &EscapeNames::default(), true).unwrap();
+        assert_eq!(without, "a1", "a read THROUGH the alias renders the referent's value");
+        assert_eq!(
+            with, without,
+            "the exemption must not alter an ordinary read — it exists only for the bare \
+             ADDRESS case, and a value rendered as an address would be a different observable",
+        );
+    }
+
+    /// A6, THE PROPERTY THE WHOLE RENDERING EXISTS FOR: an address escape cannot
+    /// canonicalize two DISTINCT slots to the same string.
+    ///
+    /// This is the manufactured-agreement case. If the address were rendered from the
+    /// slot's VALUE, then `f(&a, &b)` with `a` and `b` holding equal values would render
+    /// identically to a shim that wrongly aliased them into `f(&a, &a)` — the comparator
+    /// would agree, the flip would be admitted, and a callee doing `ptr::eq` would observe
+    /// the difference at runtime. The first-appearance bijection is what closes it.
+    #[test]
+    fn distinct_slots_never_render_the_same_address_even_with_equal_values() {
+        let mut env = Env::default();
+        env.refs.insert(7, 3); // `_7 = &_3`
+        env.refs.insert(8, 4); // `_8 = &_4`
+        // EQUAL values in the two referents — the case a value-derived rendering collapses.
+        env.vals.insert(3, "a1".to_string());
+        env.vals.insert(4, "a1".to_string());
+        let norms = NormCounter::default();
+        let render = |a: usize, b: usize| {
+            let escapes = EscapeNames::default();
+            let one = operand_expr_call_arg(
+                &Operand::Copy(Place::local(a)), &env, &norms, &escapes, true,
+            )
+            .unwrap();
+            let two = operand_expr_call_arg(
+                &Operand::Copy(Place::local(b)), &env, &norms, &escapes, true,
+            )
+            .unwrap();
+            format!("{one},{two}")
+        };
+
+        let honest = render(7, 8); // f(&_3, &_4)
+        let aliased = render(7, 7); // a shim that collapsed them: f(&_3, &_3)
+        assert_eq!(honest, "ref(e0),ref(e1)", "distinct slots take distinct names");
+        assert_eq!(aliased, "ref(e0),ref(e0)", "the same slot takes the same name twice");
+        assert_ne!(
+            honest, aliased,
+            "a wrongly-aliased call MUST canonicalize differently, or the comparator \
+             would admit a flip that changes what `ptr::eq` observes",
+        );
+    }
+
+    /// A6: the escape numbering is a BIJECTION and is body-global.
+    ///
+    /// Same slot -> same name however often it appears (so genuine aliasing still reads as
+    /// aliasing), distinct slots -> distinct names (so a collapse cannot hide), and the
+    /// counter does not restart per call — a callee may retain a pointer and compare it
+    /// against one received at a LATER call, which per-site numbering would let two
+    /// different slots both answer to `e0`.
+    #[test]
+    fn escape_names_are_a_body_global_bijection() {
+        let escapes = EscapeNames::default();
+        assert_eq!(escapes.name_of(3), 0);
+        assert_eq!(escapes.name_of(4), 1);
+        assert_eq!(escapes.name_of(3), 0, "the same slot keeps its name");
+        assert_eq!(escapes.name_of(9), 2, "a later first appearance continues the count");
+        assert_eq!(escapes.name_of(4), 1, "and earlier names are stable");
+    }
+
+    /// A6 guard helper: a body whose bb0 carries `_2 = &proj(_1)` (or `&mut`) and returns a
+    /// constant — the minimal carrier for one `Rvalue::Ref` statement shape.
+    fn body_with_one_borrow(projections: Vec<Projection>, mutable: bool) -> VerifiableBody {
+        let uint = Ty::Int { width: 32, signed: false };
+        VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: uint.clone(), name: None },
+                LocalDecl { index: 1, ty: uint.clone(), name: Some("x".into()) },
+                LocalDecl { index: 2, ty: uint.clone(), name: None },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Ref { mutable, place: Place { local: 1, projections } },
+                        span: SourceSpan::default(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
+                        span: SourceSpan::default(),
+                    },
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: uint,
+            datatype_defs: Default::default(),
+        }
+    }
+
+    /// `_2 = &_1; observe(move _2) -> bb1; _0 = _3; return` — the exact derived-side shape
+    /// that would arm the shared-param exemption if it ever reached `canonicalize`.
+    fn bare_borrow_then_call_body() -> VerifiableBody {
+        let uint = Ty::Int { width: 32, signed: false };
+        VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: uint.clone(), name: None },
+                LocalDecl { index: 1, ty: uint.clone(), name: Some("x".into()) },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(uint.clone()) },
+                    name: None,
+                },
+                LocalDecl { index: 3, ty: uint.clone(), name: None },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Call {
+                        func: "observe".into(),
+                        args: vec![Operand::Move(Place::local(2))],
+                        dest: Place::local(3),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(3))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: uint,
+            datatype_defs: Default::default(),
+        }
+    }
+
+    /// A6 GUARD: the ONE `env.refs` bootstrap shape — a borrow of a bare local — is
+    /// refused, in BOTH mutabilities. `apply_stmt`'s borrow arm ignores `mutable`, so a
+    /// bare `&mut _1` would seed `refs` exactly like `&_1`; a guard that only caught the
+    /// shared spelling would leave open exactly the `&mut` latency it exists to close.
+    #[test]
+    fn the_refs_bootstrap_shape_is_refused_in_both_mutabilities() {
+        for mutable in [false, true] {
+            let found = derived_bare_local_borrow(&body_with_one_borrow(vec![], mutable))
+                .expect("a projection-free Rvalue::Ref must be refused");
+            assert!(
+                found.contains("bare-local borrow in derived body (bb0: _2 = &"),
+                "the refusal names the site: {found}"
+            );
+        }
+    }
+
+    /// A6 GUARD: every `Rvalue::Ref` shape `to_mir::lower_ir_to_mir` actually emits
+    /// PASSES. Measured at to_mir.rs blob cb034e4b (six sites, all projected): three via
+    /// `mk_place_deref` (`&(*p)`), one via `mk_place_field` on a deref (`&((*p).k)`), and
+    /// two via `mk_place_field` on a downcast of a deref (`&(((*p) as V).k)`). The guard
+    /// must refuse NONE of them — it pins the absent shape, never narrows the present ones.
+    #[test]
+    fn every_projected_borrow_shape_to_mir_emits_passes_the_guard() {
+        let shapes: [Vec<Projection>; 3] = [
+            vec![Projection::Deref],
+            vec![Projection::Deref, Projection::Field(0)],
+            vec![Projection::Deref, Projection::Downcast(1), Projection::Field(0)],
+        ];
+        for projections in shapes {
+            for mutable in [false, true] {
+                assert!(
+                    derived_bare_local_borrow(&body_with_one_borrow(projections.clone(), mutable))
+                        .is_none(),
+                    "a projected borrow {projections:?} must pass the guard"
+                );
+            }
+        }
+    }
+
+    /// A6 GUARD, THE MUTATION PROOF: the refused shape is not hypothetical. Fed to
+    /// `canonicalize` with a `Shared` kind, the SAME body renders the exemption's address
+    /// token; with no recorded kinds it fails closed as an escape. So the guard sits in
+    /// front of a genuinely armable path (it is not vacuous), and the kinds map is
+    /// genuinely consulted (the M2 direction at unit scale). `compare_derived` refuses
+    /// this body at the guard BEFORE canonicalize ever sees it.
+    #[test]
+    fn the_guarded_shape_genuinely_arms_the_exemption_when_it_reaches_canonicalize() {
+        let body = bare_borrow_then_call_body();
+        let refusal =
+            derived_bare_local_borrow(&body).expect("the guard must catch the body this test arms");
+        assert!(refusal.contains("bare-local borrow in derived body"));
+
+        let mut shared = CallArgKinds::new();
+        shared.insert(0, vec![ArgBorrowKind::Shared]);
+        let (armed, _) = canonicalize(&body, shared);
+        let armed = armed.expect("with a Shared kind the exemption admits the escape");
+        assert!(
+            armed.iter().any(|line| line.contains("ref(e0)")),
+            "the exemption rendered the borrow as an address: {armed:?}"
+        );
+
+        let (denied, _) = canonicalize(&body, CallArgKinds::new());
+        assert_eq!(
+            denied.unwrap_err(),
+            "ref local _2 used by value (escape) outside fragment",
+            "with no recorded kinds the same body must fail closed",
         );
     }
 }

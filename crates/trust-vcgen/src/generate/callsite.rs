@@ -766,12 +766,15 @@ pub(super) fn capture_avoiding_rebind(
 /// All conditions are required for SOUNDNESS / well-formedness:
 /// - `has_reusable_postcondition_evidence()` — the canonical reuse bar: a private
 ///   authority bound to this exact summary contract. Public proof labels and
-///   evidence-id strings are deliberately ignored. Production currently has no
-///   minter, so this remains false until trust-vcgen can verify a non-forgeable
-///   compiler carrier; the crate-private test mint exercises the consumer seal.
-///   This is STRICTLY STRONGER than `proved`: a sealed-but-unverified or
-///   open-world `dyn` summary is `proved` for precondition CHECKS yet must not
-///   have its postcondition ASSUMED;
+///   evidence-id strings are deliberately ignored. The ONE production minter is
+///   `FunctionSummary::with_definitional_postcondition` (I5 cross-authority call
+///   modeling): a clause that RESTATES a callee body its producer itself emitted
+///   from a kernel-gated plan, definitionally true of every execution — see the
+///   builder's authority contract. Contract-claim clauses (`with_postcondition`,
+///   any label/evidence string) still never pass this bar. This is a DIFFERENT
+///   axis than `proved`: a sealed-but-unverified or open-world `dyn` summary is
+///   `proved` for precondition CHECKS yet must not have its postcondition
+///   ASSUMED;
 /// - non-empty `postconditions` — otherwise there is nothing to inject;
 /// - projection-free, single-static-assignment `dest` — the same gate the stdlib
 ///   min/max facts use, so a `&mut`-reassigned dest cannot leave a stale bound;
@@ -788,11 +791,18 @@ pub(crate) fn callee_postcondition_is_injectable(
         && is_single_static_assignment(func, dest.local)
         // At least one postcondition must be fully rebindable, else nothing is
         // injected (and `assumptions_injected` would over-count).
+        //
+        // The machine-arithmetic filter has ONE structural exemption: the exact
+        // single-`Ite` modular-reduction shape, whose mathematical-Int reading
+        // IS fixed-width evaluation (the Clean-origin `WrappingBinOp` summary;
+        // see `formula_is_exact_modular_wrapping_definition` for the soundness
+        // argument and what the recognizer does and does not guarantee).
         && summary
             .postconditions
             .iter()
             .any(|p| {
-                !contracts::formula_uses_unmodeled_machine_arithmetic(p)
+                (!contracts::formula_uses_unmodeled_machine_arithmetic(p)
+                    || contracts::formula_is_exact_modular_wrapping_definition(p))
                     && postcondition_rebindable(p, &summary.param_names)
             })
 }
@@ -839,8 +849,15 @@ pub(crate) fn rebind_callee_postconditions(
         .postconditions
         .iter()
         // A proof produced for mathematical-Int arithmetic is not authority for
-        // a fixed-width Rust postcondition at the call site.
-        .filter(|post| !contracts::formula_uses_unmodeled_machine_arithmetic(post))
+        // a fixed-width Rust postcondition at the call site. Exemption: the
+        // exact modular-reduction shape, whose Int reading IS the fixed-width
+        // evaluation — kept in lockstep with the gate in
+        // `callee_postcondition_is_injectable` (see
+        // `formula_is_exact_modular_wrapping_definition`).
+        .filter(|post| {
+            !contracts::formula_uses_unmodeled_machine_arithmetic(post)
+                || contracts::formula_is_exact_modular_wrapping_definition(post)
+        })
         // Drop any clause with a non-rebindable free var BEFORE substitution — see
         // `postcondition_rebindable`. Without this filter a stray callee symbol
         // captures a same-named caller local and can false-PROVE.

@@ -4,12 +4,17 @@
 // summary model. Each function summary captures pre/postconditions and
 // proof status. At call sites:
 // - Proved summary: verify preconditions
-// - All return values/postconditions remain unmodeled until precise call-site
-//   substitution and dominance are implemented.
+// - CONTRACT postconditions remain unmodeled (retained as evidence only): a
+//   public label cannot authorize assuming a claim nobody replayed.
+// - DEFINITIONAL postconditions (`with_definitional_postcondition` — the I5
+//   cross-authority Clean-origin lane) ARE assumed at call sites, via the
+//   establish-point rebinding lane in `generate::semantic_guard`; see
+//   `has_reusable_postcondition_evidence` for the authority boundary.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_types::admissible_body::{ArithBinOp, ArithOperand};
 use trust_types::fx::FxHashMap;
 use trust_types::*;
 
@@ -76,6 +81,17 @@ pub struct FunctionSummary {
     pub proof_evidence_id: Option<String>,
     /// Proof strength attached to `proof_evidence_id`.
     pub proof_strength: Option<ProofStrength>,
+    /// PRIVATE (I5 cross-authority call modeling): true iff `postconditions` is
+    /// non-empty and EVERY entry was added through
+    /// [`Self::with_definitional_postcondition`] — i.e. every clause is a
+    /// DEFINITIONAL restatement of a callee body the producing compiler itself
+    /// constructed, not a contract claim awaiting proof. This is the one bit
+    /// [`Self::has_reusable_postcondition_evidence`] reads; it is deliberately
+    /// not `pub`, so a deserialized or field-forged summary cannot carry it —
+    /// the only way to set it is the builder whose doc states the authority
+    /// contract, and ANY plain `with_postcondition` on the same summary clears
+    /// it permanently (mixed provenance fails closed).
+    postconditions_are_definitional: bool,
 }
 
 impl FunctionSummary {
@@ -93,6 +109,7 @@ impl FunctionSummary {
             proved: false,
             proof_evidence_id: None,
             proof_strength: None,
+            postconditions_are_definitional: false,
         }
     }
 
@@ -139,8 +156,50 @@ impl FunctionSummary {
     }
 
     /// Add a postcondition.
+    ///
+    /// A postcondition added here is a CONTRACT CLAIM: evidence to report,
+    /// never a fact to assume (`has_reusable_postcondition_evidence` stays
+    /// false). Adding one also permanently strips any definitional authority
+    /// the summary previously carried — a summary of mixed provenance must
+    /// fail closed, because the injection lane conjoins EVERY rebindable
+    /// clause and cannot tell them apart afterwards.
     pub fn with_postcondition(mut self, formula: Formula) -> Self {
         self.postconditions.push(formula);
+        self.postconditions_are_definitional = false;
+        self
+    }
+
+    /// Trust (I5 cross-authority call modeling): add a DEFINITIONAL
+    /// postcondition — one that restates, over the callee's formals and the
+    /// result symbol `_0`, the exact semantics of a callee body the CALLER OF
+    /// THIS BUILDER itself constructed or verified by construction.
+    ///
+    /// # The authority contract, which the caller asserts by calling this
+    ///
+    /// Unlike `with_postcondition`, a clause added here is ASSUMED at call
+    /// sites (rebound formals→actuals / `_0`→dest, version-pinned to the
+    /// dest's post-call SSA token, conjoined — the
+    /// `build_semantic_guard_map_with_summaries` lane). That is sound exactly
+    /// when the clause is TRUE OF EVERY EXECUTION of the callee body, not
+    /// merely claimed of it. The intended (and currently only) producer is
+    /// the Trust compiler's Clean-origin lane: there the callee body is
+    /// EMITTED by the compiler from a kernel-checked plan
+    /// (`trust_clean_origin::plan_clean_origin_body`), the faithfulness gate
+    /// fatally refuses compilation if the emitted body disagrees with that
+    /// plan, and the clause passed here is derived from the SAME plan — so
+    /// the clause is definitionally true of the body that will run.
+    ///
+    /// Do NOT call this with a parsed user contract, a deserialized artifact,
+    /// or anything whose truth rests on a proof that has not happened inside
+    /// the calling authority. That is what `with_postcondition` is for.
+    ///
+    /// Mixing is fail-closed in both orders: a summary holding any plain
+    /// postcondition never regains definitional authority.
+    #[must_use]
+    pub fn with_definitional_postcondition(mut self, formula: Formula) -> Self {
+        let pure = self.postconditions.is_empty() || self.postconditions_are_definitional;
+        self.postconditions.push(formula);
+        self.postconditions_are_definitional = pure;
         self
     }
 
@@ -199,14 +258,155 @@ impl FunctionSummary {
 
     /// Whether this summary may authorize postcondition reuse.
     ///
-    /// Hard-blocked: every field on `FunctionSummary` is publicly constructible,
-    /// and `proof_evidence_id` is only an unbound string. Accepting it would let a
-    /// caller stamp `Sound`/`Certified` and conjoin an arbitrary postcondition into
-    /// a caller VC. Re-enable only with an opaque, replayed proof capability bound
-    /// to the exact callee identity, contract digest, and instantiated obligation.
+    /// For CONTRACT-CLAIM postconditions this stays hard-blocked, for the
+    /// original reason: every public field on `FunctionSummary` is publicly
+    /// constructible, and `proof_evidence_id` is only an unbound string —
+    /// accepting those would let a caller stamp `Sound`/`Certified` and
+    /// conjoin an arbitrary postcondition into a caller VC. That half is
+    /// unchanged: `proved`, `proof_evidence_id`, and `proof_strength` still
+    /// authorize NOTHING here, and re-enabling them still requires an opaque,
+    /// replayed proof capability bound to the exact callee identity, contract
+    /// digest, and instantiated obligation.
+    ///
+    /// The ONE open lane is the crate-private DEFINITIONAL bit
+    /// (`postconditions_are_definitional`), settable only through
+    /// [`Self::with_definitional_postcondition`] — see its doc for the
+    /// authority contract the caller asserts. It is not reachable from any
+    /// public field write, any evidence string, or any mix that includes a
+    /// plain `with_postcondition` clause.
     pub(crate) fn has_reusable_postcondition_evidence(&self) -> bool {
-        false
+        self.postconditions_are_definitional && !self.postconditions.is_empty()
     }
+}
+
+/// Trust (I5 cross-authority call modeling — `WrappingBinOp`): the DEFINITIONAL
+/// postcondition set for a Clean-origin callee whose emitted body is a single
+/// wrapping binary op — `bb0: _0 = Call(u{w}::wrapping_{op}, [l, r]) -> bb1:
+/// Return` — over operands that are each a source parameter or an in-range
+/// numeral, at ONE unsigned machine width `width` shared by every signature
+/// position (the shape `trust_clean_origin::CleanOriginShape::WrappingBinOp`
+/// plans, with `width` from the plan's result carrier).
+///
+/// # The encoding, and why it is not this function's to choose
+///
+/// The clauses restate the EXTRACTOR'S OWN wrapping encoding — the single-`Ite`
+/// modular reduction `generate::assert_refutation::wrapping_call_assert_model`
+/// produces when it models a call to the SAME `u{w}::wrapping_{op}` primitive
+/// inside an ordinary extracted Rust body, kept in Int/LIA so ay decides it
+/// directly:
+///
+/// ```text
+/// wrapping_add:  _0 == ite(x + y >= 2^w, x + y - 2^w, x + y)
+/// wrapping_sub:  _0 == ite(x - y <  0,   x - y + 2^w, x - y)
+/// ```
+///
+/// plus the extractor's operand range facts (`0 <= operand <= 2^w - 1`, one per
+/// operand — true of every execution, because both operands are typed `u{w}`).
+/// A summary that encoded wrapping DIFFERENTLY from the extractor's own
+/// encoding would be a soundness bug: the same call modeled two ways in one
+/// solver query can manufacture or destroy models. The unit tests in
+/// `generate::clean_origin_wrapping_summary_tests` pin this equality against
+/// `wrapping_call_assert_model` itself (same operands, same dest — the rebound
+/// clauses must be BYTE-IDENTICAL formulas), so the two encodings cannot drift
+/// silently. The unbounded `_0 == x + y` would be the classic false-PROVE
+/// (`assert!(a.wrapping_add(1) > a)` at `a == MAX`) and is exactly what the
+/// injection gate's machine-arithmetic filter still rejects
+/// (`contracts::formula_is_exact_modular_wrapping_definition` admits ONLY the
+/// self-consistent modular shape above).
+///
+/// # Authority contract
+///
+/// Every returned clause is intended for
+/// [`FunctionSummary::with_definitional_postcondition`] and is definitionally
+/// true of every execution of the emitted callee body — the producer (the
+/// Trust compiler's Clean-origin lane) derives `op`/`left`/`right`/`width`
+/// from the SAME kernel-gated plan the emitter acted on, and the faithfulness
+/// gate fatally refuses compilation if the emitted body disagrees with that
+/// plan. Do NOT call this with values from any other source.
+///
+/// # Refusals — `None` means "inject nothing", never a fallback
+///
+/// * **`ArithBinOp::Mul` — the recorded boundary.** The extractor's own Int/LIA
+///   lane has NO encoding for `wrapping_mul` (its `WrappingMul(_) => None`:
+///   the full nonlinear modular reduction is not decidable in the lane that
+///   consumes these clauses, and a single-`Ite` reduction is wrong for `mul`,
+///   which can wrap more than once). Encoding it here — e.g. via
+///   `Formula::Rem` — would diverge from the extractor's own encoding, which
+///   is the soundness bar stated above. The call's panic-freedom is modeled
+///   separately by the compiler (wrapping ops are total); only its VALUE stays
+///   havocked, fail-closed.
+/// * **`width` outside `1..=64`** — the modulus `1i128 << width` (= `2^width`)
+///   must stay within `i128` (the extractor's own cap, same reason); the
+///   Clean-origin planner only mints 8/16/32/64, so this is refuse-not-trust.
+/// * **`Param(i)` with `i >= param_names.len()`**, or **`Const(v)` with
+///   `v >= 2^width`** — the planner guarantees neither can happen
+///   (`recognise_arith_operand` re-checks numerals against the carrier width);
+///   any violation refuses the summary rather than trusting it.
+#[must_use]
+pub fn clean_origin_wrapping_binop_postconditions(
+    op: ArithBinOp,
+    left: ArithOperand,
+    right: ArithOperand,
+    width: u32,
+    param_names: &[String],
+) -> Option<Vec<Formula>> {
+    // The recorded Mul boundary — see the doc above. An explicit match with no
+    // `_` arm, so a future `ArithBinOp` variant fails compilation here rather
+    // than falling through to either polarity.
+    match op {
+        ArithBinOp::Add | ArithBinOp::Sub => {}
+        ArithBinOp::Mul => return None,
+    }
+    if !(1..=64).contains(&width) {
+        return None;
+    }
+    let operand_formula = |operand: ArithOperand| -> Option<Formula> {
+        match operand {
+            ArithOperand::Param(i) => {
+                Some(Formula::var(param_names.get(i)?.as_str(), Sort::Int))
+            }
+            // width <= 64 (checked above), so the shift cannot overflow and the
+            // in-range value cannot exceed i128::MAX.
+            ArithOperand::Const(v) => {
+                (v < (1u128 << width)).then(|| Formula::Int(v as i128))
+            }
+        }
+    };
+    let x = operand_formula(left)?;
+    let y = operand_formula(right)?;
+    let modulus = Formula::Int(1i128 << width);
+    // The combination term and the single-Ite modular reduction, mirroring
+    // `wrapping_call_assert_model`'s unsigned arms CONSTRUCTOR-FOR-CONSTRUCTOR
+    // (the pin tests compare the two outputs structurally).
+    let s = match op {
+        ArithBinOp::Add => Formula::Add(Box::new(x.clone()), Box::new(y.clone())),
+        ArithBinOp::Sub => Formula::Sub(Box::new(x.clone()), Box::new(y.clone())),
+        ArithBinOp::Mul => return None, // unreachable; kept fail-closed
+    };
+    let ite = match op {
+        ArithBinOp::Add => Formula::Ite(
+            Box::new(Formula::Ge(Box::new(s.clone()), Box::new(modulus.clone()))),
+            Box::new(Formula::Sub(Box::new(s.clone()), Box::new(modulus))),
+            Box::new(s),
+        ),
+        // wrapping_sub unsigned: borrow when the difference goes negative.
+        _ => Formula::Ite(
+            Box::new(Formula::Lt(Box::new(s.clone()), Box::new(Formula::Int(0)))),
+            Box::new(Formula::Add(Box::new(s.clone()), Box::new(modulus))),
+            Box::new(s),
+        ),
+    };
+    let def = Formula::Eq(Box::new(Formula::var("_0", Sort::Int)), Box::new(ite));
+    // The extractor emits a range fact per OPERAND FORMULA, unconditionally for
+    // both operands (a constant's range fact is ground and trivially true).
+    // Mirror it exactly — the parity pin covers these clauses too. Each fact is
+    // definitional: a `u{width}`-typed value is in `[0, 2^width - 1]` in every
+    // execution, and a rebindable free var (the formal) or no free var at all.
+    let ranges = [
+        crate::range::input_range_constraint(&x, width, false),
+        crate::range::input_range_constraint(&y, width, false),
+    ];
+    Some(std::iter::once(def).chain(ranges).collect())
 }
 
 /// Trust: Database of function summaries for modular verification.
@@ -252,6 +452,36 @@ impl SummaryDatabase {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.summaries.is_empty()
+    }
+
+    /// Trust (I5 cross-authority call modeling): the subset of summaries that
+    /// may ride a caller's L0-safety VC generation — exactly those that carry
+    /// DEFINITIONAL postcondition authority
+    /// (`has_reusable_postcondition_evidence`, settable only via
+    /// `with_definitional_postcondition`) AND declare NO preconditions.
+    ///
+    /// # Why this subset exists (audit R3 #1)
+    ///
+    /// A contract postcondition is CONDITIONAL on its precondition, and the
+    /// two travel as different VC levels: the assumed postcondition rides L0
+    /// body VCs while the precondition check is an L1 `VcKind::Precondition`.
+    /// An L0-only run filters the precondition VC out, so applying the general
+    /// summary DB at L0 would assume the postcondition WITHOUT ever checking
+    /// its precondition — a false-PROVE. A definitional, precondition-free
+    /// summary has no conditional half: there is no precondition to leave
+    /// unchecked, and the clause is true of every execution of the emitted
+    /// callee body by construction. Both properties are enforced HERE, in the
+    /// crate that owns the authority bit, so no consumer can widen the L0
+    /// lane by passing a different filter.
+    #[must_use]
+    pub fn definitional_precondition_free_subset(&self) -> SummaryDatabase {
+        let mut subset = SummaryDatabase::new();
+        for summary in self.summaries.values() {
+            if summary.preconditions.is_empty() && summary.has_reusable_postcondition_evidence() {
+                subset.insert(summary.clone());
+            }
+        }
+        subset
     }
 
     /// Preserve the former summary-to-fact synchronization API.
@@ -1686,5 +1916,406 @@ mod tests {
         let vcs = generate_modular_vcs(&func, &db);
         assert_eq!(vcs.len(), 1, "declared callee preconditions are caller obligations");
         assert!(matches!(&vcs[0].kind, VcKind::Precondition { callee } if callee == "parse"));
+    }
+
+    // ---- I5 cross-authority call modeling: the DEFINITIONAL postcondition lane ----
+
+    /// The Clean-origin producer's shape: `parse`'s summary carrying
+    /// `result <= 100` as a DEFINITIONAL clause (as if the producer had itself
+    /// emitted `parse`'s body and derived the clause from the emission plan).
+    fn definitional_parse_summary() -> FunctionSummary {
+        FunctionSummary::new("parse")
+            .with_param_names(vec!["input".to_string()])
+            .with_definitional_postcondition(parse_post_le_100())
+    }
+
+    #[test]
+    fn definitional_postcondition_carries_reusable_evidence() {
+        assert!(definitional_parse_summary().has_reusable_postcondition_evidence());
+        // The plain builder still never does (unchanged authority boundary).
+        let plain = FunctionSummary::new("parse")
+            .with_param_names(vec!["input".to_string()])
+            .with_postcondition(parse_post_le_100());
+        assert!(!plain.has_reusable_postcondition_evidence());
+        // Empty postconditions never carry evidence, whatever the flag history.
+        assert!(!FunctionSummary::new("parse").has_reusable_postcondition_evidence());
+    }
+
+    #[test]
+    fn mixed_provenance_kills_definitional_authority_in_both_orders() {
+        let definitional_then_plain = FunctionSummary::new("parse")
+            .with_definitional_postcondition(parse_post_le_100())
+            .with_postcondition(post_eq_stray());
+        assert!(
+            !definitional_then_plain.has_reusable_postcondition_evidence(),
+            "a plain clause after a definitional one must strip the authority"
+        );
+        let plain_then_definitional = FunctionSummary::new("parse")
+            .with_postcondition(post_eq_stray())
+            .with_definitional_postcondition(parse_post_le_100());
+        assert!(
+            !plain_then_definitional.has_reusable_postcondition_evidence(),
+            "a definitional clause must not launder an earlier plain claim"
+        );
+    }
+
+    #[test]
+    fn definitional_postcondition_injects_at_post_call_block() {
+        use crate::generate::build_semantic_guard_map_with_summaries;
+        let caller = caller_with_arithmetic();
+        let mut db = SummaryDatabase::new();
+        db.insert(definitional_parse_summary());
+
+        let r = modular_vcgen(&caller, &db);
+        assert_eq!(r.assumptions_injected, 1, "the definitional clause must be assumed");
+        assert_eq!(r.havoced_calls, 0);
+
+        let map = build_semantic_guard_map_with_summaries(&caller, &db);
+        let bb1 = map.get(&BlockId(1)).cloned().unwrap_or_default();
+        assert!(
+            bb1.iter().any(|f| has_versioned_var_and_int(f, 100)),
+            "the rebound, version-pinned fact must reach the post-call block: {bb1:?}"
+        );
+    }
+
+    /// Two-arg caller mirroring the Clean-origin fixture: `v = pick(41, 7)`.
+    fn caller_of_pick_consts() -> VerifiableFunction {
+        VerifiableFunction {
+            name: "caller".to_string(),
+            def_path: "test::caller".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::usize(), name: Some("v".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            is_foreign: false,
+                            func: "pick".to_string(),
+                            args: vec![
+                                Operand::Constant(ConstValue::Uint(41, 64)),
+                                Operand::Constant(ConstValue::Uint(7, 64)),
+                            ],
+                            dest: Place::local(1),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn definitional_projection_pins_dest_to_projected_argument() {
+        // The exact Clean-origin Projection summary shape: `_0 == a0` for
+        // `pick(a0, a1)`, called as `pick(41, 7)`. The injected fact must PIN
+        // the dest to 41 (an Eq — refutable by a wrong caller claim), and must
+        // not mention the non-projected argument.
+        use crate::generate::build_semantic_guard_map_with_summaries;
+        let caller = caller_of_pick_consts();
+        let post = Formula::Eq(
+            Box::new(Formula::var("_0", Sort::Int)),
+            Box::new(Formula::var("a0", Sort::Int)),
+        );
+        let mut db = SummaryDatabase::new();
+        db.insert(
+            FunctionSummary::new("pick")
+                .with_param_names(vec!["a0".to_string(), "a1".to_string()])
+                .with_definitional_postcondition(post),
+        );
+
+        let r = modular_vcgen(&caller, &db);
+        assert_eq!(r.assumptions_injected, 1);
+
+        let map = build_semantic_guard_map_with_summaries(&caller, &db);
+        let bb1 = map.get(&BlockId(1)).cloned().unwrap_or_default();
+        let pinned = bb1
+            .iter()
+            .find(|f| has_versioned_var_and_int(f, 41))
+            .unwrap_or_else(|| panic!("expected a version-pinned `dest == 41` fact: {bb1:?}"));
+        assert!(
+            matches!(pinned, Formula::Eq(..)),
+            "the projection fact must be an EQUALITY (it must refute a wrong \
+             caller claim, not merely bless a right one): {pinned:?}"
+        );
+        fn mentions_int(f: &Formula, n: i128) -> bool {
+            let mut found = false;
+            fn walk(f: &Formula, n: i128, found: &mut bool) {
+                if matches!(f, Formula::Int(v) if *v == n) {
+                    *found = true;
+                }
+                for c in f.children() {
+                    walk(c, n, found);
+                }
+            }
+            walk(f, n, &mut found);
+            found
+        }
+        assert!(
+            !bb1.iter().any(|f| mentions_int(f, 7)),
+            "the non-projected argument must not leak into any fact: {bb1:?}"
+        );
+        // The synthetic formal names must be substituted away entirely.
+        assert!(
+            !bb1.iter().any(|f| mentions_var(f, "a0") || mentions_var(f, "a1")),
+            "callee formals must not survive rebinding: {bb1:?}"
+        );
+    }
+
+    #[test]
+    fn definitional_authority_still_respects_arity_and_rebindability_gates() {
+        // Definitional authority opens ONLY the evidence gate; every other
+        // soundness gate of `callee_postcondition_is_injectable` must still
+        // hold. Wrong arity: inject nothing.
+        let caller = caller_with_arithmetic(); // single-argument `parse(input)` call
+        let mut arity_db = SummaryDatabase::new();
+        arity_db.insert(
+            FunctionSummary::new("parse")
+                .with_param_names(vec!["a".to_string(), "b".to_string()])
+                .with_definitional_postcondition(parse_post_le_100()),
+        );
+        let r = modular_vcgen(&caller, &arity_db);
+        assert_eq!(r.assumptions_injected, 0, "arity mismatch must fail closed");
+        assert_eq!(r.havoced_calls, 1);
+
+        // A definitional clause whose free var is neither `_0` nor a formal:
+        // unrebindable, inject nothing.
+        let mut stray_db = SummaryDatabase::new();
+        stray_db.insert(
+            FunctionSummary::new("parse")
+                .with_param_names(vec!["input".to_string()])
+                .with_definitional_postcondition(post_eq_stray()),
+        );
+        let r = modular_vcgen(&caller, &stray_db);
+        assert_eq!(r.assumptions_injected, 0, "unrebindable clause must fail closed");
+        assert_eq!(r.havoced_calls, 1);
+    }
+
+    #[test]
+    fn l0_subset_keeps_only_definitional_precondition_free_summaries() {
+        let pre = Formula::Ge(
+            Box::new(Formula::var("p", Sort::Int)),
+            Box::new(Formula::Int(0)),
+        );
+        let mut db = SummaryDatabase::new();
+        // Kept: definitional, no preconditions.
+        db.insert(definitional_parse_summary());
+        // Dropped: plain contract postcondition (no definitional authority).
+        db.insert(
+            FunctionSummary::new("contracted")
+                .with_param_names(vec!["p".to_string()])
+                .with_postcondition(parse_post_le_100()),
+        );
+        // Dropped: definitional clause BUT carries a precondition — at L0 the
+        // precondition VC would be filtered out, so the summary must not ride
+        // (audit R3 #1).
+        db.insert(
+            FunctionSummary::new("conditional")
+                .with_param_names(vec!["p".to_string()])
+                .with_precondition(pre)
+                .with_definitional_postcondition(parse_post_le_100()),
+        );
+        let subset = db.definitional_precondition_free_subset();
+        assert_eq!(subset.len(), 1);
+        assert!(subset.get("parse").is_some());
+        assert!(subset.get("contracted").is_none());
+        assert!(subset.get("conditional").is_none());
+    }
+
+    // ---- I5 cross-authority call modeling: the WrappingBinOp summary lane ----
+
+    fn wrapping_formals() -> Vec<String> {
+        vec!["a0".to_string(), "a1".to_string()]
+    }
+
+    #[test]
+    fn wrapping_postconditions_constructor_boundaries() {
+        use trust_types::admissible_body::{ArithBinOp, ArithOperand};
+        let names = wrapping_formals();
+        let pp = (ArithOperand::Param(0), ArithOperand::Param(1));
+
+        // The recorded Mul boundary: the extractor's Int/LIA lane has no
+        // nonlinear-mod encoding, so the summary lane must inject NOTHING.
+        assert!(
+            clean_origin_wrapping_binop_postconditions(ArithBinOp::Mul, pp.0, pp.1, 64, &names)
+                .is_none(),
+            "wrapping_mul has no faithful encoding in this lane — inject nothing"
+        );
+        // Width outside 1..=64 (the extractor's own modulus cap).
+        for width in [0u32, 65, 128] {
+            assert!(
+                clean_origin_wrapping_binop_postconditions(
+                    ArithBinOp::Add,
+                    pp.0,
+                    pp.1,
+                    width,
+                    &names,
+                )
+                .is_none(),
+                "width {width} must be refused"
+            );
+        }
+        // Operand validation: parameter index out of arity; numeral out of the
+        // carrier range (the planner guarantees neither; refuse, don't trust).
+        assert!(
+            clean_origin_wrapping_binop_postconditions(
+                ArithBinOp::Add,
+                ArithOperand::Param(2),
+                pp.1,
+                64,
+                &names,
+            )
+            .is_none()
+        );
+        assert!(
+            clean_origin_wrapping_binop_postconditions(
+                ArithBinOp::Add,
+                pp.0,
+                ArithOperand::Const(256),
+                8,
+                &names,
+            )
+            .is_none()
+        );
+        // In-range instances produce the def + one range fact per operand.
+        for (op, right) in [
+            (ArithBinOp::Add, ArithOperand::Param(1)),
+            (ArithBinOp::Sub, ArithOperand::Param(1)),
+            (ArithBinOp::Add, ArithOperand::Const(255)),
+        ] {
+            let posts = clean_origin_wrapping_binop_postconditions(op, pp.0, right, 8, &names)
+                .expect("valid add/sub instances must be expressible");
+            assert_eq!(posts.len(), 3, "def + two operand range facts");
+            assert!(matches!(&posts[0], Formula::Eq(lhs, _)
+                if matches!(lhs.as_ref(), Formula::Var(n, Sort::Int) if n == "_0")));
+        }
+    }
+
+    /// Two-arg caller mirroring the Clean-origin wrapping fixture:
+    /// `s = wsum(u64::MAX, 1)` at `u64`.
+    fn caller_of_wsum_consts() -> VerifiableFunction {
+        VerifiableFunction {
+            name: "caller".to_string(),
+            def_path: "test::caller".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::u64(), name: Some("s".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            is_foreign: false,
+                            func: "wsum".to_string(),
+                            args: vec![
+                                Operand::Constant(ConstValue::Uint(u64::MAX as u128, 64)),
+                                Operand::Constant(ConstValue::Uint(1, 64)),
+                            ],
+                            dest: Place::local(1),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn definitional_wrapping_summary_pins_dest_to_the_modular_ite() {
+        // The exact Clean-origin WrappingBinOp summary shape for
+        // `wsum(a0, a1) := a0 + a1` at UInt64, called as `wsum(u64::MAX, 1)`.
+        // The injected fact must pin the dest to the MODULAR-Ite value (which
+        // grounds to 0 — the wrapped result), never to the unbounded `a0 + a1`
+        // (which would ground to 2^64 and REFUTE a correct `assert!(s == 0)`).
+        use crate::generate::build_semantic_guard_map_with_summaries;
+        use trust_types::admissible_body::{ArithBinOp, ArithOperand};
+        let caller = caller_of_wsum_consts();
+        let posts = clean_origin_wrapping_binop_postconditions(
+            ArithBinOp::Add,
+            ArithOperand::Param(0),
+            ArithOperand::Param(1),
+            64,
+            &wrapping_formals(),
+        )
+        .expect("u64 wrapping add over two params must be expressible");
+        let mut summary =
+            FunctionSummary::new("wsum").with_param_names(wrapping_formals());
+        for post in posts {
+            summary = summary.with_definitional_postcondition(post);
+        }
+        let mut db = SummaryDatabase::new();
+        db.insert(summary);
+
+        // The summary must ride the L0 lane: definitional, precondition-free.
+        assert!(
+            db.definitional_precondition_free_subset().get("wsum").is_some(),
+            "the wrapping summary must survive the L0 definitional subset"
+        );
+
+        let r = modular_vcgen(&caller, &db);
+        assert_eq!(r.assumptions_injected, 1, "the definitional clauses must be assumed");
+        assert_eq!(r.havoced_calls, 0);
+
+        // The version-pinned fact at the post-call block must be the EXACT
+        // modular reduction over the substituted actuals.
+        let max = u64::MAX as i128;
+        let s = || Box::new(Formula::Add(Box::new(Formula::Int(max)), Box::new(Formula::Int(1))));
+        let m = || Box::new(Formula::Int(1i128 << 64));
+        let expected_rhs = Formula::Ite(
+            Box::new(Formula::Ge(s(), m())),
+            Box::new(Formula::Sub(s(), m())),
+            s(),
+        );
+        let map = build_semantic_guard_map_with_summaries(&caller, &db);
+        let bb1 = map.get(&BlockId(1)).cloned().unwrap_or_default();
+        assert!(
+            bb1.iter().any(|f| matches!(f, Formula::Eq(lhs, rhs)
+                if matches!(lhs.as_ref(), Formula::Var(n, _) if n.contains('#'))
+                    && rhs.as_ref() == &expected_rhs)),
+            "expected a version-pinned `dest == ite((MAX+1) >= 2^64, ..)` fact: {bb1:?}"
+        );
+        // The anti-blessing control: no fact may pin the dest to the UNBOUNDED
+        // sum — that encoding would refute the correct wrapped-value claim.
+        assert!(
+            !bb1.iter().any(|f| matches!(f, Formula::Eq(_, rhs)
+                if matches!(rhs.as_ref(), Formula::Add(..)))),
+            "the unbounded `a0 + a1` encoding must never be injected: {bb1:?}"
+        );
+        // The synthetic formals must be substituted away entirely.
+        assert!(
+            !bb1.iter().any(|f| mentions_var(f, "a0") || mentions_var(f, "a1")),
+            "callee formals must not survive rebinding: {bb1:?}"
+        );
     }
 }

@@ -44,6 +44,35 @@ use crate::{
     debug, trace,
 };
 
+/// Opt-out for `-Zalways-encode-mir` on the standard library.
+pub(crate) const TRUST_STD_ENCODE_MIR_ENV: &str = "TRUST_STD_ENCODE_MIR";
+
+/// Should std be built with `-Zalways-encode-mir`? Unset means yes.
+///
+/// This switch decides whether std is LOWERABLE AT ALL for the trust-ir
+/// frontend, which is load-bearing for the verified-library lane — so an
+/// unrecognized value must not be read as "leave it on" while the person who
+/// set it believes they turned it off. It used to disable on the exact string
+/// `0` and silently ignore everything else, so `TRUST_STD_ENCODE_MIR=false`,
+/// `=no` and `=off` all left the flag ON with no diagnostic.
+///
+/// Deliberately NOT a permissive boolean: this is an internal build switch, and
+/// the accepted set is named in the error so a wrong value is a one-line fix.
+fn trust_std_encode_mir_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(true),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(other) => Err(format!(
+            "{TRUST_STD_ENCODE_MIR_ENV}={other:?} is not a recognized value: use `1` (the \
+             default — encode MIR for every std function, which is what makes std lowerable \
+             for the trust-ir frontend) or `0` (opt out). Unset means `1`. Refusing rather \
+             than ignoring it, because ignoring would leave -Zalways-encode-mir ON while \
+             looking like it had been turned off."
+        )),
+    }
+}
+
 /// Build a standard library for the given `target` using the given `build_compiler`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Std {
@@ -308,7 +337,9 @@ impl Step for Std {
             // `Formatter::write_str` (1 call) stayed an absent callee, so no impl of
             // `Debug` or `Display` could verify. An inlining heuristic must not decide
             // what a VERIFYING compiler is able to prove.
-            if std::env::var_os("TRUST_STD_ENCODE_MIR").is_none_or(|v| v != "0") {
+            if trust_std_encode_mir_enabled(std::env::var_os(TRUST_STD_ENCODE_MIR_ENV).as_deref())
+                .unwrap_or_else(|message| panic!("{message}"))
+            {
                 cargo.rustflag("-Zalways-encode-mir");
             }
             cargo
@@ -2693,7 +2724,20 @@ impl Step for Assemble {
             // (`add_rustc_to_sysroot`, with its duplicate-rustc-crate guard) that
             // the rustc-private sysroot path uses; copies exactly what
             // restore-rustc-dev.sh copied (whole stamp -> target libdir).
-            if builder.kind == Kind::Build {
+            //
+            // SELF-HOST ONLY. The convenience above is defined for a compiler
+            // being built to run on the machine building it; the librustc stamp
+            // of a CROSS-HOST build carries both, and they are not
+            // interchangeable. Its rustc_private proc-macro crates are built for
+            // and loaded by the BUILD machine, while the rest of the stamp is
+            // built for the host the assembled compiler will run on — so the
+            // same crate name appears twice, once per architecture. Copying both
+            // into one target libdir puts a build-machine dylib in a sysroot that
+            // cannot load it, and trips `add_rustc_to_sysroot`'s
+            // duplicate-rustc-crate guard besides. A cross-host build keeps the
+            // clean pruned sysroot, exactly as dist images do; `trustc-dev`
+            // remains the supported way to get rustc_private for such a target.
+            if builder.kind == Kind::Build && build_compiler.host == host {
                 add_rustc_to_sysroot(builder, &host_libdir, &host_libdir, &stamp);
             }
             crate::core::build_steps::tool::ensure_user_facing_tools(

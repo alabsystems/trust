@@ -1,0 +1,11 @@
+error: `clean mod oops` takes no braced body: a Clean unit's declarations live in `oops.clean`
+  --> $DIR/clean_unit_braces.rs:11:16
+   |
+LL | clean mod oops { def x (a : UInt64) : UInt64 := a }
+   |                ^
+   |
+   = note: `clean { … }` is the inline island form and `clean mod name;` is the out-of-line form; there is no form that names a unit AND carries a body
+   = help: options: write `clean mod oops;` and move the body to `oops.clean`; drop `mod oops` to make this an inline `clean { … }` island in this module (declarations land in the enclosing module either way); or, if you meant a Rust module containing Clean, write `mod oops { clean { … } }`
+
+error: aborting due to 1 previous error
+

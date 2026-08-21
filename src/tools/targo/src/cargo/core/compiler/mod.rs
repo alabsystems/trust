@@ -1035,7 +1035,11 @@ fn reject_in_process_proc_macro_tcb(
 
 struct AuditedTrustSpecSource {
     package: &'static str,
-    version: &'static str,
+    /// The resolved version this audit applies to, or `None` when the version
+    /// is not audit evidence for this provider — see
+    /// [`AUDITED_TRUST_SPEC_SOURCES`]. `None` never widens what BYTES are
+    /// admitted: both digests still have to match exactly.
+    version: Option<&'static str>,
     manifest_sha256: &'static str,
     lib_sha256: &'static str,
 }
@@ -1069,16 +1073,54 @@ impl AuditedTrustSpecCapture {
 // name is not authority.  These are the exact, dependency-free passthrough
 // sources reviewed with this toolchain.  Adding or changing a provider requires
 // an explicit source audit and an allowlist update.
+//
+// WHAT THE TWO DIGESTS ATTEST, AND WHY `version` IS NOT A THIRD DIGEST.
+// `manifest_sha256` and `lib_sha256` fully determine the bytes admitted into
+// the verified compiler's address space: the manifest fixes the dependency set,
+// the absence of a build script, and the `[lib] proc-macro` shape, and the
+// library source fixes the code. A resolved VERSION is not covered by either
+// digest whenever the manifest inherits it (`version.workspace = true`), because
+// it then comes from a workspace root that is not hashed. For such a provider
+// the version is metadata its own workspace chooses — it constrains nothing an
+// adversary controls, while guaranteeing that an unrelated `pub bump` silently
+// expires the carve-out and `targo trust check -p ny-cert` stops starting with
+// a no-proc-macro TCB refusal that names a crate which never changed.
+//
+// So `version` is `None` for inheriting providers and the digests carry the
+// identity. This does not widen the admitted bytes: a provider that pins its
+// own literal version has DIFFERENT manifest bytes, hence a different digest,
+// and can never match a `None` row. `trust-spec` is exactly that case — its
+// manifest carries `version = "0.1.1"` literally, so its version IS digest-
+// covered and stays pinned.
 const AUDITED_TRUST_SPEC_SOURCES: &[AuditedTrustSpecSource] = &[
     AuditedTrustSpecSource {
         package: "trust-spec",
-        version: "0.1.1",
-        manifest_sha256: "faa5a55395b863b137019d442d815be85cd8c5d279077b4089e1cf8fa0fcecbd",
+        // Digest-covered: this manifest pins its version literally.
+        version: Some("0.1.1"),
+        // Re-audited 2026-08-20. The previous pin (faa5a553...) was the state at
+        // `fix(targo): authenticate renamed NY contract source`; exactly one
+        // commit moved it, `wave 3: Trust compiles pure Lean, and the TCB says
+        // what it actually is`, and the entire diff is three lines adding
+        // `[lints] workspace = true`. That inherits `[workspace.lints.rust]
+        // warnings = "warn"` — a lint LEVEL, which cannot introduce code,
+        // dependencies, or output. No dependency section, no build script, no
+        // change to `[lib] name = "trust"` / `proc-macro = true`, and no version
+        // change. `src/lib.rs` is byte-identical to the initial commit (its
+        // digest below has never moved): `#![forbid(unsafe_code)]`, no
+        // dependencies, three attribute macros that all return the annotated
+        // item unchanged through one `passthrough` helper. It emits nothing, so
+        // it cannot forge or influence proof transport.
+        manifest_sha256: "4ae3ab8609a321764b5fb20035ce712281cef902dcf3135c780ee597af740e91",
         lib_sha256: "892427b12ab2f4533cce4ae9de0f27432ec3f7e722cdec7d3ebcf933d9afe229",
     },
     AuditedTrustSpecSource {
         package: "ny-contracts",
-        version: "0.1.0",
+        // NOT digest-covered: this manifest declares `version.workspace = true`,
+        // so the resolved version comes from NY's workspace root. Audited at
+        // 0.1.0; NY's submodule pin resolves 0.2.0 and the sibling checkout
+        // 0.3.0, all with these identical digests (verified 2026-08-20 against
+        // both checkouts and against the pinned submodule commit).
+        version: None,
         manifest_sha256: "83569caf993ba8a93f6cd7af9d3ba23440f69baa23e6fe1cf053679eb82f42aa",
         lib_sha256: "af8f868e0706b3084e4ee0911aa9256b8c46ba8c0d0db50f44703d4013380a29",
     },
@@ -1088,9 +1130,18 @@ fn audited_trust_spec_source(
     package: &str,
     version: &str,
 ) -> Option<&'static AuditedTrustSpecSource> {
-    AUDITED_TRUST_SPEC_SOURCES
-        .iter()
-        .find(|entry| entry.package == package && entry.version == version)
+    AUDITED_TRUST_SPEC_SOURCES.iter().find(|entry| {
+        entry.package == package
+            && match entry.version {
+                Some(audited) => audited == version,
+                // Not "any provider is fine": the caller still has to match
+                // BOTH digests, and those digests cover a manifest whose bytes
+                // say `version.workspace = true`. A provider that pins its own
+                // literal version has different manifest bytes and therefore a
+                // different digest, so it can never reach a `None` row.
+                None => true,
+            }
+    })
 }
 
 fn regular_file_sha256(path: &Path) -> Result<String, String> {
@@ -3796,14 +3847,44 @@ mod trust_verification_role_tests {
 
     #[test]
     fn verified_targo_trust_proc_macro_exemption_requires_audited_package_identity() {
+        // A provider whose manifest pins its version literally keeps that
+        // version as digest-covered evidence, and a different version of it is
+        // still refused.
         assert!(audited_trust_spec_source("trust-spec", "0.1.1").is_some());
-        assert!(audited_trust_spec_source("ny-contracts", "0.1.0").is_some());
+        assert!(
+            audited_trust_spec_source("trust-spec", "0.1.2").is_none(),
+            "a literally-versioned provider must not accept an unaudited version"
+        );
 
+        // `ny-contracts` inherits its version from a workspace root that NEITHER
+        // digest covers, so the version is not audit evidence for it and an
+        // unrelated `pub bump` must not expire the carve-out. THIS IS THE CASE
+        // THE OLD RULE GOT WRONG: it enumerated resolved versions, so every bump
+        // silently dropped the provider back to a no-proc-macro TCB refusal
+        // naming a crate whose bytes had not changed. Any resolved version must
+        // now match, and must still attest the exact audited bytes.
+        for version in ["0.1.0", "0.2.0", "0.3.0", "1.4.7", "99.0.0-rc.1"] {
+            let audited = audited_trust_spec_source("ny-contracts", version)
+                .unwrap_or_else(|| panic!("ny-contracts@{version} must stay audited"));
+            assert_eq!(
+                audited.manifest_sha256,
+                "83569caf993ba8a93f6cd7af9d3ba23440f69baa23e6fe1cf053679eb82f42aa",
+                "ny-contracts@{version} must attest the audited manifest bytes"
+            );
+            assert_eq!(
+                audited.lib_sha256,
+                "af8f868e0706b3084e4ee0911aa9256b8c46ba8c0d0db50f44703d4013380a29",
+                "ny-contracts@{version} must attest the audited library bytes"
+            );
+        }
+
+        // Dropping the version as a matching key must not let a NAME through:
+        // the package name is still exact, and the digests still decide.
         for (package, version) in [
             ("hostile-shadow", "0.1.1"),
             ("trust", "0.1.1"),
             ("trust-spec", "0.1.0"),
-            ("ny-contracts", "0.1.1"),
+            ("ny-contracts-shim", "0.1.0"),
             ("ny-trust-spec", "0.1.0"),
         ] {
             assert!(

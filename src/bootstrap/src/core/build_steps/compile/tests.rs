@@ -276,3 +276,24 @@ fn compiler_runtime_restore_prunes_every_stale_driver_generation() {
     assert!(!older.exists());
     assert!(backend.exists(), "codegen backends are not driver generations");
 }
+
+/// SILENT-WRONG-BEHAVIOUR REGRESSION. `TRUST_STD_ENCODE_MIR` used to disable on
+/// the exact string `0` and silently ignore every other value, so
+/// `TRUST_STD_ENCODE_MIR=false` left `-Zalways-encode-mir` ON while reading like
+/// an opt-out. That switch decides whether std is lowerable at all.
+#[test]
+fn trust_std_encode_mir_refuses_unrecognized_values() {
+    // Default and the two accepted values are unchanged.
+    assert_eq!(trust_std_encode_mir_enabled(None), Ok(true));
+    assert_eq!(trust_std_encode_mir_enabled(Some(OsStr::new("1"))), Ok(true));
+    assert_eq!(trust_std_encode_mir_enabled(Some(OsStr::new("0"))), Ok(false));
+
+    // Everything a person might reach for meaning "off" is now a hard error
+    // naming the accepted set, rather than a silent ON.
+    for value in ["false", "no", "off", "n", "", "00", "1 ", "true", "yes"] {
+        let error = trust_std_encode_mir_enabled(Some(OsStr::new(value)))
+            .expect_err(&format!("{value:?} was silently accepted"));
+        assert!(error.contains(TRUST_STD_ENCODE_MIR_ENV), "{error}");
+        assert!(error.contains('`') && error.contains("`1`") && error.contains("`0`"), "{error}");
+    }
+}

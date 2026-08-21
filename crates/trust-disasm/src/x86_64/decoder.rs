@@ -69,7 +69,77 @@ pub(crate) fn decode_instruction(bytes: &[u8], addr: u64) -> Result<Instruction,
         }
     }
 
+    // Trust: LOCK LEGALITY. `F0` is #UD on any instruction that is not a
+    // read-modify-write of a MEMORY destination from the lockable set. The
+    // model does not see prefixes, so an illegal LOCK it cannot observe would
+    // be modeled as the un-prefixed instruction — and a verifying compiler
+    // would then reason about a program the CPU actually TRAPS on. Refuse it at
+    // decode, fail-closed. Measured against Rosetta by the x86 semantic
+    // differential: `f0 90` (lock nop), `f0 2d ..` (lock sub eax,imm) and
+    // kin were accepted here and #UD'd on hardware.
+    if prefixes.legacy.group1 == Some(0xF0) && !lock_is_legal(&instruction) {
+        return Err(DisasmError::UnknownEncoding { encoding: 0xF0, address: addr });
+    }
+
+    // Trust: prefixes the MODEL cannot honor are refused, not silently ignored.
+    // A SEGMENT OVERRIDE (2E/36/3E/26/64/65) changes the effective address by
+    // the segment base — FS/GS carry the TLS base in real code — and the
+    // machine model has no segment base register, so honoring it is impossible
+    // and ignoring it computes the WRONG address. An ADDRESS-SIZE override (67)
+    // switches to 32-bit addressing, which the model likewise does not
+    // implement. Both are refused at decode so a verifying compiler fails
+    // closed rather than reasoning about a different memory access. Found by
+    // the x86 semantic differential (`65 d1 ..`, `67 85 ..` were accepted here
+    // and faulted or diverged on hardware).
+    if prefixes.legacy.group2.is_some() || prefixes.legacy.address_size {
+        return Err(DisasmError::UnknownEncoding { encoding: 0x2E, address: addr });
+    }
+
+    // Trust: F2/F3 (REPNE/REP) are legal only on the STRING ops (which this
+    // decoder does not model, so they are outside the antecedent anyway) and,
+    // as scalar forms, on PAUSE (`F3 90`, decoded as Nop) and ENDBR64
+    // (`F3 0F 1E FA`). On anything else the CPU #UDs, while the model — which
+    // never sees the prefix — would silently execute the un-prefixed
+    // instruction. Refuse fail-closed. Measured against Rosetta: `f3 5a`
+    // (rep pop), `f2 5c` (repne pop) and kin were accepted and #UD'd.
+    if let Some(p1) = prefixes.legacy.group1 {
+        let is_rep = p1 == 0xF2 || p1 == 0xF3;
+        let legal_scalar_rep = p1 == 0xF3
+            && matches!(instruction.opcode, Opcode::Nop | Opcode::Endbr64);
+        if is_rep && !legal_scalar_rep {
+            return Err(DisasmError::UnknownEncoding { encoding: u32::from(p1), address: addr });
+        }
+    }
+
     Ok(instruction)
+}
+
+/// Is a `LOCK` prefix legal on this instruction? Only when the destination is a
+/// MEMORY operand and the opcode is one of the lockable read-modify-writes
+/// (SDM Vol.2, LOCK): ADD ADC AND BTC BTR BTS CMPXCHG DEC INC NEG NOT OR SBB
+/// SUB XOR XADD XCHG. XCHG locks implicitly and is legal with or without a
+/// memory form only when a memory operand is present.
+fn lock_is_legal(insn: &Instruction) -> bool {
+    let lockable = matches!(
+        insn.opcode,
+        Opcode::Add
+            | Opcode::Adc
+            | Opcode::And
+            | Opcode::Dec
+            | Opcode::Inc
+            | Opcode::Neg
+            | Opcode::Not
+            | Opcode::Or
+            | Opcode::Sub
+            | Opcode::Xor
+            | Opcode::Xchg
+            | Opcode::Cmpxchg
+    );
+    if !lockable {
+        return false;
+    }
+    // The destination (operand 0) must be memory.
+    matches!(insn.operand(0), Some(Operand::Mem(_)))
 }
 
 /// Decode a single-byte opcode instruction.
@@ -434,20 +504,16 @@ fn decode_one_byte_opcode(
                 insn.push_operand(rm_result.operand);
                 Ok(insn)
             } else {
-                // Without REX.W, 0x63 is ARPL in 32-bit mode (not valid in 64-bit long mode
-                // for normal use). Decode as MOVSXD with 32-bit operands for compatibility.
-                if rest.is_empty() {
-                    return Err(insufficient(offset + 1, 0));
-                }
-                let modrm = ModRM::decode(rest[0], prefixes);
-                let op_width = prefixes.operand_size();
-                let rm_result = decode_rm_operand(&modrm, &rest[1..], prefixes, op_width, addr)?;
-                let total = offset + 1 + rm_result.extra_bytes;
-                let mut insn =
-                    make_insn(addr, total, 0x63, Opcode::Movsxd, ControlFlow::Fallthrough);
-                insn.push_operand(Operand::Reg(gpr_sized(modrm.reg, op_width, prefixes.rex.present)));
-                insn.push_operand(rm_result.operand);
-                Ok(insn)
+                // Trust: `63 /r` WITHOUT REX.W has IMPLEMENTATION-DEFINED
+                // semantics — Intel discourages the encoding, and it diverges
+                // in practice (bare-metal sign-extends to 32, a 32-bit move;
+                // Rosetta sign-extends to 64 — measured `63 c3` -> model
+                // 0x0000_0000_ffff_ffff, Rosetta 0xffff_ffff_ffff_ffff). A
+                // verifying compiler must not model an instruction whose result
+                // the hardware does not agree on, so refuse it fail-closed.
+                // `48 63` (REX.W MOVSXD) is the only form real code emits and
+                // is decoded above, unaffected.
+                Err(unknown_enc(addr, 0x63))
             }
         }
 
@@ -818,6 +884,12 @@ fn decode_group1_imm(
     let total = offset + imm_off + imm_size;
 
     let mut insn = make_insn(addr, total, opcode_byte as u32, opcode, ControlFlow::Fallthrough);
+    // Trust: a MEMORY r/m with an IMMEDIATE source carries the width nowhere
+    // else — the same gap the C6/C7 mov fix (e5f6a9a07a) closed, here for the
+    // arithmetic groups. Without it `andl $imm,(mem)` defaulted to width 64 and
+    // computed 64-bit flags for a 32-bit op (SF from bit 63, not 31). Found by
+    // the x86 SEMANTIC differential against Rosetta.
+    insn.operand_size = Some(op_width as u8);
     insn.push_operand(rm_result.operand);
     insn.push_operand(Operand::SignedImm(imm));
     Ok(insn)
@@ -843,6 +915,7 @@ fn decode_group1_imm8(
     let imm = rest[imm_off] as i8 as i64;
     let total = offset + imm_off + 1;
     let mut insn = make_insn(addr, total, 0x80, opcode, ControlFlow::Fallthrough);
+    insn.operand_size = Some(8);
     insn.push_operand(rm_result.operand);
     insn.push_operand(Operand::SignedImm(imm));
     Ok(insn)
@@ -883,6 +956,7 @@ fn decode_group3(
             let total = offset + imm_off + imm_size;
             let enc = if is_8bit { 0xF6u32 } else { 0xF7 };
             let mut insn = make_insn(addr, total, enc, Opcode::Test, ControlFlow::Fallthrough);
+        insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             insn.push_operand(Operand::SignedImm(imm));
             Ok(insn)
@@ -891,6 +965,7 @@ fn decode_group3(
             // NOT r/m
             let total = offset + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0xF7, Opcode::Not, ControlFlow::Fallthrough);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -898,6 +973,7 @@ fn decode_group3(
             // NEG r/m
             let total = offset + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0xF7, Opcode::Neg, ControlFlow::Fallthrough);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -905,6 +981,7 @@ fn decode_group3(
             // MUL r/m
             let total = offset + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0xF7, Opcode::Mul, ControlFlow::Fallthrough);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -912,6 +989,7 @@ fn decode_group3(
             // IMUL r/m (single operand)
             let total = offset + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0xF7, Opcode::Imul, ControlFlow::Fallthrough);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -919,6 +997,7 @@ fn decode_group3(
             // DIV r/m
             let total = offset + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0xF7, Opcode::Div, ControlFlow::Fallthrough);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -926,6 +1005,7 @@ fn decode_group3(
             // IDIV r/m
             let total = offset + 1 + rm_result.extra_bytes;
             let mut insn = make_insn(addr, total, 0xF7, Opcode::Idiv, ControlFlow::Fallthrough);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             Ok(insn)
         }
@@ -997,6 +1077,7 @@ fn decode_shift_imm(
     let opcode = shift_opcode(modrm.reg & 0x07, addr)?;
 
     let mut insn = make_insn(addr, total, 0xC1, opcode, ControlFlow::Fallthrough);
+    insn.operand_size = Some(op_width as u8);
     insn.push_operand(rm_result.operand);
     insn.push_operand(Operand::Imm(shift_amount as u64));
     Ok(insn)
@@ -1020,6 +1101,7 @@ fn decode_shift_one(
     let opcode = shift_opcode(modrm.reg & 0x07, addr)?;
 
     let mut insn = make_insn(addr, total, 0xD1, opcode, ControlFlow::Fallthrough);
+    insn.operand_size = Some(op_width as u8);
     insn.push_operand(rm_result.operand);
     insn.push_operand(Operand::Imm(1));
     Ok(insn)
@@ -1043,6 +1125,7 @@ fn decode_shift_cl(
     let opcode = shift_opcode(modrm.reg & 0x07, addr)?;
 
     let mut insn = make_insn(addr, total, 0xD3, opcode, ControlFlow::Fallthrough);
+    insn.operand_size = Some(op_width as u8);
     insn.push_operand(rm_result.operand);
     // CL is register index 1, 8-bit
     insn.push_operand(Operand::Reg(gpr(1, 8)));

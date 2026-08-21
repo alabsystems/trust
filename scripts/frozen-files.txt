@@ -1,0 +1,137 @@
+# THE ORACLE FREEZE MANIFEST — one row per frozen file, pinned by BLOB.
+#
+# Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The differential is the ORACLE: rustc's own freshly-built MIR is what the
+# AI-generated compiler components are checked against. Weakening it manufactures
+# agreement instead of earning it, so the files that implement it are FROZEN.
+#
+# Until 2026-08-20 that freeze was enforced by lanes REMEMBERING it. Measured on
+# that day, three commits had moved two of the four frozen files and nobody
+# noticed until an audit went looking:
+#
+#   e73d7d0553  crate_module.rs (+280/-13)  and  differential.rs
+#   5b38ded9d9  crate_module.rs (+23/-0, doc comment only)
+#   65f2577dca  differential.rs (+949/-12)
+#
+# All three were adjudicated LEGITIMATE on their merits
+# (reports/freeze-adjudication-2026-08-20.md) — which is exactly why a memory-
+# enforced freeze is the wrong instrument. A rule that only fires when someone
+# remembers it cannot distinguish the three good commits from the bad one it
+# exists to catch, because it does not fire at all.
+#
+# COLUMNS
+# -------
+#   path | pinned-blob-sha1 | rule | one-line reason the file is frozen
+#
+# `rule` is NOT machine-checkable and the gate does not try. It records what a
+# waiver for this file must ARGUE:
+#
+#   BYTE-IDENTICAL          no change of any kind, comments included
+#   SAMPLE-MORE-OR-REFUSE-MORE
+#                           a change may widen what is compared or add a
+#                           refusal; it may NEVER widen what is ACCEPTED
+#
+# The gate checks BLOB IDENTITY only, for both HEAD and the working tree. That
+# is deliberate: blob identity is the one property a script can decide without
+# judgement, and every judgement call is therefore pushed into a WRITTEN waiver
+# with a name on it (scripts/frozen-waivers.txt) instead of into a heuristic
+# nobody audits.
+#
+# TO CHANGE A FROZEN FILE
+# -----------------------
+#   1. Make the change and state, in the commit message, which half of the rule
+#      it satisfies and how that was MEASURED (not argued).
+#   2. Add a waiver row to scripts/frozen-waivers.txt naming the file and the
+#      exact NEW blob.
+#   3. The owner ratifies by moving the pin here and DELETING the waiver. The
+#      gate fails on a waiver that is no longer needed, so a waiver cannot
+#      outlive the change it documents.
+#
+# Most pins below are the 2026-08-17 freeze baseline (trust 289ba550db), NOT the
+# current tree. crate_module.rs and differential.rs have moved since and still
+# carry waivers; ratifying those commits means moving their pins forward and
+# deleting their waivers, and that remains a decision for the owner, not for the
+# lane that found them.
+#
+# RATIFIED 2026-08-20 — mir_differential.rs re-pinned (461ab7af -> 83f63d04),
+# and its waiver deleted per step 3 above. This is a BASELINE UPDATE, not an
+# exception: the row still reads BYTE-IDENTICAL and the next edit still needs a
+# waiver. Three deltas are folded into the new baseline, and the reason each is
+# not comparator drift is recorded rather than asserted:
+#
+#   e6c2fbb6d3 + d67b975fa1 (A6)  the shared-param escape exemption and the
+#       block-keyed callee borrow kinds. Adjudicated REFUSES-MORE on the merits
+#       when the waiver was written; evidence in
+#       reports/freeze-adjudication-2026-08-20.md, which is retained.
+#   d624e950a9                    DOC-ONLY, and this is checkable in seconds
+#       rather than taken on trust: diff the two blobs and EVERY differing line
+#       begins with `///` — it wraps two ASCII address diagrams in ```text
+#       fences so rustdoc stops reading them as doctests.
+#         git cat-file blob 2a185f56 > /tmp/a; git cat-file blob 9ed1aa55 > /tmp/b
+#         diff /tmp/a /tmp/b | grep -E '^[<>]' | grep -vE '^[<>] *///'   # empty
+#   ICE FIX 2026-08-20            arg_borrow_kind_of now refuses to query
+#       `is_freeze` on a pointee carrying escaping bound vars and mints `Mut`
+#       instead. REFUSES-MORE by construction: the guard only ever DENIES the
+#       no-write exemption, so it can cost a flip and can never manufacture
+#       agreement. Without it a `&dyn Trait` callee argument ABORTS the compiler
+#       (tests/ui/trust/trust_ir_unsize_dyn_data_lane.rs).
+
+#
+# RATIFIED 2026-08-20 (second re-pin) — mir_differential.rs re-pinned
+# (83f63d04 -> 709a7794), and its waiver deleted per step 3 above. The row
+# still reads BYTE-IDENTICAL and the next edit still needs a waiver. Three
+# deltas fold into the new baseline, each recorded with how it was MEASURED:
+#
+#   81d107f042d (A6)   the derived side's CallArgKinds read from its OWN body
+#       instead of the empty map. ACCEPT-MORE IN FORM — exactly the class this
+#       freeze exists to adjudicate — and measured a behavioural NO-OP in fact,
+#       twice over. STRUCTURALLY, at the blobs main carried (mir_differential
+#       ea47847197 + to_mir cb034e4b): the exemption fires only via env.refs
+#       (operand_expr_call_arg); env.refs bootstraps ONLY on a borrow of a
+#       projection-free place (apply_stmt's bare-local arm; all other writes
+#       propagate existing entries); and all six Rvalue::Ref sites in to_mir
+#       emit PROJECTED places (7298/8927/9030 via mk_place_field,
+#       10160/11642/11678 via mk_place_deref) — so derived env.refs is always
+#       empty and the exemption cannot fire on that side. The pre-change
+#       asymmetry was equally unreachable, and a denied exemption is an
+#       Err -> DerivedUnsupported (a refusal), so the old code could only ever
+#       cost flips, never mint a verdict. EMPIRICALLY, by the laneRAT
+#       whole-crate A/B on clean-kernel (ctl driver at 21cf0dbc93 = the merge
+#       before the change; sub driver at 111f5f48fc, whose mir_differential.rs
+#       is blob ea478471), at BOTH -O3 and -O0: 13,778 bodies per arm,
+#       key-symmetric; verdict counts identical (1,559 agreed / 12,219
+#       unsupported); ZERO verdict transitions; zero markers_exact movement
+#       among both-agreed; flips identical (O3: 182 codegen + 41 CTFE;
+#       O0: 606 codegen + 42 CTFE; 0 gained, 0 lost); fallback sets identical
+#       (19/19 at O3, 55/55 at O0). The structural proof predicted every
+#       transition count 0 and the measurement agrees.
+#   a26e98eece1        TEST-ONLY: one +117/-0 hunk entirely inside
+#       `mod session_state_tests`; no production path touched.
+#   f429bb245c (guard) REFUSE-MORE plus a comment correction: the (2.75)
+#       derived-refs guard refuses (DerivedUnsupported) any derived body
+#       carrying a projection-free Rvalue::Ref — the one env.refs bootstrap
+#       shape — converting the invariant 81d107f042d leans on from "empty by
+#       construction, provable only from the UNFROZEN to_mir.rs" into "empty
+#       by CHECK, enforced in the oracle"; and fixes the false "two lines
+#       above" comment (the extraction is at step (2), 47 lines up).
+#       Mutation-proved in session_state_tests (645 passed, 0 failed, clean
+#       tree at f429bb245c): the bootstrap shape is refused in both
+#       mutabilities (apply_stmt ignores `mutable`); all six emitted projected
+#       shapes pass; and the same guarded body handed directly to canonicalize
+#       with a Shared kind renders the exemption's address token — the guard
+#       fronts a genuinely armable path, not a vacuous one.
+#
+#   M2 (mutant, never landed): a driver at 81d107f042d + a forced grant of
+#       `Shared` to EVERY derived-side call argument moves fwd_param /
+#       fwd_param_twice / fwd_two_params / fwd_field agreed -> MISMATCH
+#       (probes/esc2, -O3) and takes_cell agreed -> MISMATCH with its -O0
+#       codegen flip LOST — the exemption path can fail and does, so the kinds
+#       map is genuinely consulted and the wrong-grant direction fails closed.
+
+crates/trust-thir-lower/src/mir_differential.rs|709a7794d01a7b3cecd5122e85f003143de8df5e|BYTE-IDENTICAL|differential B: producer trust-ir -> to_mir derived MIR vs rustc-built MIR; the SOLE writer path to record_green -> try_flip
+crates/trust-thir-lower/src/flip_registry.rs|771cd9ec0b53cb98c342f16beb5fd35cdb015cc9|BYTE-IDENTICAL|the flip gate itself (markers_exact + DerivedAgreed); a relaxation here ships wrong code
+crates/trust-thir-lower/src/crate_module.rs|266c373cbbfcc09a1235d9e4870da9511a4965b0|BYTE-IDENTICAL|hosts run_seam_differentials, the crate-finalize comparison site, and splice_ok
+crates/trust-thir-lower/src/differential.rs|2149e954076c01d6657d84efc9496cbe7eb0543b|SAMPLE-MORE-OR-REFUSE-MORE|the interpretation differential: sampled THIR-trust-ir vs MIR-trust-ir equivalence

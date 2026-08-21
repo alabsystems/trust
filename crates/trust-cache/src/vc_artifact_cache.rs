@@ -283,7 +283,14 @@ impl VcArtifactCache {
 /// v3: stored values are raw pre-discharge body vectors captured during fresh
 /// generation, not post-discharge solver vectors. The read surface remains
 /// observation-only and exposes only a count.
-pub const VC_ARTIFACT_TIER_VERSION: u32 = 3;
+/// v4: the MAC payload is CANONICAL model JSON
+/// (`trust_types::stable_model_json_bytes`), not raw serde. The raw payload
+/// re-serialized deserialized VCs at lookup, so the additive
+/// `VerificationCondition::obligation` field silently invalidated every
+/// pre-existing record as a spurious HMAC mismatch instead of a version
+/// rejection; canonical bytes make additive `#[serde(default)]` model fields
+/// digest-invisible, and this bump retires the raw-payload records by version.
+pub const VC_ARTIFACT_TIER_VERSION: u32 = 4;
 
 /// Hard cap for one experimental disk record. Observation is best-effort, so
 /// oversized records safely degrade to a miss before JSON allocation/parsing.
@@ -304,7 +311,13 @@ struct VcArtifactRecord {
 }
 
 /// Bytes covered by the HMAC: `(version, key, vcs)`, NOT the tag itself.
-/// Serialized as a fixed tuple for a deterministic, field-order-stable payload.
+/// Serialized as a fixed tuple for a deterministic, field-order-stable payload,
+/// through the ONE model canonicalizer (`trust_types::stable_model_json_bytes`)
+/// rather than raw serde: the payload embeds `VerificationCondition`s and is
+/// RECOMPUTED from the deserialized record at lookup, so a raw payload moves
+/// whenever an additive `#[serde(default)]` model field starts serializing —
+/// which the `obligation` field did, turning every pre-existing record into a
+/// spurious HMAC mismatch (see the v4 entry on [`VC_ARTIFACT_TIER_VERSION`]).
 /// The error is PROPAGATED (never defaulted to empty) so `store` refuses to sign
 /// and `lookup` misses on the same unserializable data — no un-authenticated
 /// record can be minted or accepted.
@@ -313,7 +326,7 @@ fn record_mac_payload(
     key: &VcArtifactKey,
     vcs: &[VerificationCondition],
 ) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&(version, key, vcs))
+    trust_types::stable_model_json_bytes(&(version, key, vcs))
 }
 
 /// Cross-invocation experimental disk tier, rooted at a directory of

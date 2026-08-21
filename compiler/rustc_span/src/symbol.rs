@@ -2488,6 +2488,11 @@ symbols! {
         // and the `core::fmt::Write` trait, both looked up as diagnostic items.
         FmtArgumentsFromStr,
         FmtWrite,
+        // I6, the Nat carrier: `trust_bignum` is the sysroot carrier-runtime
+        // crate the creader injects when a Clean-origin mint carries `Nat`;
+        // `Nat` is the struct the loader's sanity check requires it to export.
+        Nat,
+        trust_bignum,
     }
 }
 

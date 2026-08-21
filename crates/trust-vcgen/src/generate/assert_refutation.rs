@@ -1029,14 +1029,49 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             cs.push(formula);
             formula = Formula::And(cs);
         }
-        out.push(VerificationCondition {
-            kind: VcKind::Assertion { message: v2_panic_call_vc_message(func, callee, args) },
-            function: func.name.clone().into(),
-            location: span.clone(),
-            formula,
-            contract_metadata: None,
-            obligation: None,
-        });
+        // ── PER-PATH SPLIT OF THE PANIC-PATH FEASIBILITY FORMULA ─────────────
+        // Emit ONE obligation PER CONTROL-FLOW PATH instead of one for the whole
+        // `Or`. `split_path_feasibility_disjuncts` performs the exact
+        // distributivity rewriting `And(C, Or(d…)) ≡ Or_i And(C, d_i)` (see its
+        // doc comment for the two-verdict soundness argument: a part's model is
+        // verbatim a model of the whole, and the whole is UNSAT iff every part
+        // is). It DECLINES — returning the single input formula — whenever there
+        // is no top-level `Or` to split, so every other shape keeps today's
+        // exact behaviour.
+        //
+        // The consumer already requires a definite verdict on EVERY emitted VC
+        // (`refute_full_assert_obligations`: `refuted == 0 && left_unknown == 0`),
+        // which is exactly the "all parts proved" side condition the rewriting
+        // needs; one unknown part leaves the assert undischarged, as it must.
+        //
+        // MEASURED (real MIR, `proved/cursor_clamp_assert.rs`, in-process ay):
+        //
+        //   combined `And(C, Or(d0,d1,d2))`  -> Unknown
+        //                                       ("(incomplete self-check-rejected)":
+        //                                        ay computes UNSAT and then REJECTS
+        //                                        ITS OWN PROOF)
+        //   split into 3 obligations         -> Proved, Proved, Proved
+        //                                       (SmtBacked, each kernel-certified)
+        //
+        // The rejection is not about formula SIZE: handing ay the same predicate
+        // pre-distributed as ONE obligation, `Or(And(C,d0), And(C,d1), And(C,d2))`,
+        // was measured to be Unknown for the same reason. It is the separate
+        // QUERIES that ay can certify, so a genuine per-VC split is what the lane
+        // needs.
+        //
+        // The mutant still refutes: its 2 parts split 1 Failed / 1 Proved, so
+        // `refuted > 0` keeps the whole-function catch-all open exactly as before.
+        for part in crate::guards::split_path_feasibility_disjuncts(&formula) {
+            out.push(VerificationCondition {
+                kind: VcKind::Assertion { message: v2_panic_call_vc_message(func, callee, args) },
+                function: func.name.clone().into(),
+                location: span.clone(),
+                formula: part,
+                contract_metadata: None,
+                obligation: None,
+            });
+        }
+        // ── END PER-PATH SPLIT ───────────────────────────────────────────────
     }
     // verifier-perf (mid-generation work-bound): a function whose VC-gen tripped the work
     // budget gets NO refutation claims — emit an empty set so it can never produce a

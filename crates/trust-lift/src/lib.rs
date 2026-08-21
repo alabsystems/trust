@@ -34,5 +34,8 @@ pub use boundary::FunctionBoundary;
 pub use calling_convention::{CallingConvention, FunctionSignature};
 pub use cfg::LiftedFunction;
 pub use error::{LiftError, LiftProofMode};
-pub use lifter::{LiftArch, Lifter, summarize_function_signature};
+pub use lifter::{
+    EntryRegisterBindingCandidate, LiftArch, Lifter, entry_register_binding_candidates,
+    entry_register_binding_prefix, summarize_function_signature,
+};
 pub use semantic_lift::LocalLayout;

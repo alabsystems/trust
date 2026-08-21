@@ -228,7 +228,12 @@ fn payload_rejects_missing_unexpected_and_malformed_manifest_entries() {
     make_writable_if_present(&manifest);
     fs::write(&manifest, format!("{}  ../escape\n", "1".repeat(64))).unwrap();
     set_mode(&manifest, 0o400);
-    assert!(malformed.validate().unwrap_err().contains("exactly 6 entries"));
+    assert!(
+        malformed
+            .validate()
+            .unwrap_err()
+            .contains(&format!("exactly {} entries", CERTIFIED_MONITOR_PAYLOAD_FILES.len()))
+    );
 }
 
 #[test]

@@ -188,6 +188,35 @@ impl<'ra, 'tcx> ResolverExpand for Resolver<'ra, 'tcx> {
         expansion: LocalExpnId,
         fragment: &AstFragment,
     ) {
+        // Trust (I5): decide the Clean-origin mints BEFORE def collection.
+        //
+        // This is `MacroExpander::collect_invocations`'s call into the resolver
+        // — i.e. after `fragment.mut_visit_with(&mut InvocationCollector)` has
+        // renumbered every `CleanIslandDecl::node_id` off `DUMMY_NODE_ID`, and
+        // immediately before `collect_definitions` runs. `def_collector` cannot
+        // evaluate the three mint preconditions itself: they are facts about
+        // the crate's Clean environment, which has to be checked as ONE
+        // header-first batch.
+        //
+        // ROOT `AstFragment::Crate` ONLY. `trust_clean_mint::decide` returns the
+        // empty decision for every other fragment, so an island introduced by a
+        // later macro expansion mints nothing and its declarations never enter
+        // the value namespace — the ordinary `E0425`, which is the fail-closed
+        // answer. See that module's docs for why widening this is a design
+        // question rather than an implementation gap.
+        //
+        // The root check is spelled at the call site as well as inside
+        // `decide`, so a reader of either one sees it.
+        if matches!(fragment, AstFragment::Crate(_)) {
+            self.clean_origin_mints = crate::trust_clean_mint::decide(fragment);
+            // Trust (I6): a grant whose signature carries `Nat` depends on the
+            // `trust_bignum` carrier crate. Load it NOW — before
+            // `collect_definitions` feeds any signature — and demote those
+            // grants to v7/D3 refusals if it cannot be loaded. Exact trigger:
+            // no `Nat`-carrying grant, no load. See the method's docs.
+            self.trust_resolve_carrier_crates();
+        }
+
         // Integrate the new AST fragment into all the definition and module structures.
         // We are inside the `expansion` now, but other parent scope components are still the same.
         let parent_scope = ParentScope { expansion, ..self.invocation_parent_scopes[&expansion] };

@@ -1,0 +1,18 @@
+[package]
+name = "x86-semantic-differential"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace on purpose, like every harness beside it: this one
+# spawns an x86_64 executor under Rosetta and must be buildable without
+# dragging the compiler workspace along.
+[workspace]
+
+[dependencies]
+trust-disasm = { path = "../.." }
+trust-machine-sem = { path = "../../../trust-machine-sem" }
+trust-types = { path = "../../../trust-types" }
+
+[profile.release]
+debug-assertions = false

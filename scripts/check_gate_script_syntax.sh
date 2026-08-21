@@ -20,9 +20,20 @@ trap 'rm -f "$ERR_LOG"' EXIT
 TOTAL=0
 BAD=()
 
-for script in scripts/*.sh scripts/js262/*.sh scripts/tests/*.sh scripts/hooks/*; do
+# `scripts/hooks-pin/*` was missing from this list while the header already claimed
+# "every other shell entrypoint under `scripts/`" — and that directory is the one
+# `core.hooksPath` actually points at on this machine, so a syntax error there breaks
+# every push rather than one gate. Added 2026-08-20 alongside the oracle-freeze lane.
+# `scripts/lib/*.sh` added 2026-08-20 with the measurement-provenance lane: the
+# header has always claimed "every other shell entrypoint under `scripts/`", and
+# `scripts/lib/` held three sourceable helpers that no `bash -n` ever reached.
+# Measured before widening: all three parse, so this adds coverage and no red.
+for script in scripts/*.sh scripts/lib/*.sh scripts/js262/*.sh scripts/tests/*.sh scripts/hooks/* scripts/hooks-pin/*; do
   [ -f "$script" ] || continue
-  case "$script" in *.md) continue ;; esac
+  # `scripts/hooks-pin/` holds a `.txt` waiver table beside its hooks. `bash -n` on a
+  # pipe-separated data file happens to parse today (`a|b|c` is a pipeline) and would
+  # start failing the moment a reason column contains an unmatched quote. Skip data.
+  case "$script" in *.md|*.txt) continue ;; esac
   TOTAL=$((TOTAL + 1))
   if ! bash -n "$script" 2>"$ERR_LOG"; then
     BAD+=("$script")

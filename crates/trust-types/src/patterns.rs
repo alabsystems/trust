@@ -314,7 +314,9 @@ fn operand_is_checked_field(checked_locals: &FxHashSet<usize>, op: &Operand) -> 
 fn rvalue_has_index_projection(rvalue: &Rvalue) -> bool {
     match rvalue {
         Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => operand_has_index(op),
-        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+        Rvalue::BinaryOp(_, lhs, rhs)
+        | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+        | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
             operand_has_index(lhs) || operand_has_index(rhs)
         }
         Rvalue::Ref { place, .. }
@@ -348,7 +350,9 @@ fn rvalue_read_locals(rvalue: &Rvalue) -> Vec<usize> {
         Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
             extend_operand_locals(&mut locals, op);
         }
-        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+        Rvalue::BinaryOp(_, lhs, rhs)
+        | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+        | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
             extend_operand_locals(&mut locals, lhs);
             extend_operand_locals(&mut locals, rhs);
         }

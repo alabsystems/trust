@@ -864,7 +864,15 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                 // arm above; assert-guarded blocks are covered via the Assert
                 // path (`overflow_guard_targets`) and skipped here to avoid
                 // double-emitting / false-failing precondition-bounded code.
+                // Trust (R2/C4): `UncheckedBinaryOp` — the preserved UB-on-overflow
+                // provenance — takes the SAME obligation as the plain form. Under a
+                // proved absence of overflow the unchecked, wrapping and mathematical
+                // results coincide, so this arm is exactly the old collapsed behavior;
+                // it is defense-in-depth only — measured 2026-08-20, `rustc_mir_build`
+                // emits no arithmetic `*Unchecked`, and `LowerIntrinsics` (which does)
+                // runs after this lane's extraction point.
                 Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), lhs, rhs)
+                | Rvalue::UncheckedBinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), lhs, rhs)
                     if !v2_is_float_operand(func, lhs)
                         && !v2_is_float_operand(func, rhs)
                         && !overflow_guard_targets.contains(&block.id) =>
@@ -1210,9 +1218,10 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             // Trust (bounds ARM): each of these four conjoins is a pure
             // `And([facts.., formula])` push (facts LAST) or identity when it has no
             // facts, so mirror each onto the recorded obligation as a `ConjoinFactsLast`
-            // read back from the before/after pair (`ob_record_conjoin_wrap`). No-op when
-            // the VC carries no obligation (the ArithmeticOverflow arm is still `None`
-            // here), so this only threads the now-recorded bounds VCs.
+            // read back from the before/after pair (`ob_record_conjoin_wrap`). No-op
+            // when the VC carries no obligation; the UNSIGNED var*var mul
+            // `ArithmeticOverflow` arm carries a record (the UMUL RECORD), so these
+            // mirrors are load-bearing for it as well as for the bounds VCs.
             let before = vc.formula.clone();
             vc.formula = conjoin_arg_type_ranges(func, vc.formula.clone());
             let after = vc.formula.clone();

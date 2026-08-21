@@ -24,11 +24,13 @@ use std::time::Instant;
 
 use arg_file_command::ArgFileCommand;
 use shared_helpers::{
-    activate_cargo_test_shim_environment, cargo_test_no_verify_requested,
+    RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV, activate_cargo_test_shim_environment,
+    canonicalize_trust_verify_on, cargo_test_no_verify_requested,
     compile_uses_trust_bootstrap_no_verify, dylib_path, dylib_path_var, exe, expand_rustc_argfiles,
     finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
-    parse_rustc_verbose, parse_value_from_args, strip_trust_no_verify,
-    trust_bootstrap_shim_marker_enabled,
+    parse_rustc_verbose, parse_value_from_args, retired_trust_bootstrap_shim_target_only_refusal,
+    strip_trust_no_verify, trust_bootstrap_no_verify_applies, trust_bootstrap_shim_marker_enabled,
+    trust_bootstrap_verify_unit_requested,
 };
 
 #[path = "../utils/shared_helpers.rs"]
@@ -44,7 +46,61 @@ mod proc_macro_deps;
 #[path = "rustc/tests.rs"]
 mod tests;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustVerifyEnvAction {
+    Preserve,
+    Remove,
+    SetOff,
+}
+
+/// Finalize the verifier control at the concrete compiler boundary.
+///
+/// Snapshot drivers are version-skewed by definition, so they must receive the
+/// version-invariant environment transport rather than this tree's current
+/// command-line spelling. Keeping this dispatch in one testable function avoids
+/// a particularly dangerous branch inversion: the library opt-in can never use
+/// a snapshot, so placing snapshot finalization inside that branch leaves every
+/// actual stage0 compile on the incompatible current spelling.
+fn finalize_trust_verify_control(
+    args: &mut Vec<OsString>,
+    bootstrap_verify_unit_applies: bool,
+    targeted_rustc_is_snapshot: bool,
+    targeted_rustc_supports_trust_no_verify: bool,
+    bootstrap_no_verify_applies: bool,
+) -> TrustVerifyEnvAction {
+    if bootstrap_verify_unit_applies {
+        canonicalize_trust_verify_on(args);
+        TrustVerifyEnvAction::Remove
+    } else if targeted_rustc_is_snapshot {
+        if finalize_trust_no_verify_snapshot(
+            args,
+            targeted_rustc_supports_trust_no_verify,
+            bootstrap_no_verify_applies,
+        ) {
+            TrustVerifyEnvAction::SetOff
+        } else {
+            TrustVerifyEnvAction::Preserve
+        }
+    } else {
+        finalize_trust_no_verify(
+            args,
+            targeted_rustc_supports_trust_no_verify,
+            bootstrap_no_verify_applies,
+        );
+        TrustVerifyEnvAction::Preserve
+    }
+}
+
 fn main() {
+    // Refuse the retired marker on the AMBIENT environment, before the
+    // Cargo-test sidecar can rewrite anything. A stale name that does nothing
+    // is indistinguishable from one that worked.
+    if let Some(message) = retired_trust_bootstrap_shim_target_only_refusal(
+        env::var_os(RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV).as_deref(),
+    ) {
+        panic!("{message}");
+    }
+
     // Targo marks descendants after config/env processing. Capture that final
     // boundary before the Cargo-test sidecar hides fixture-authored TRUST_*
     // controls from this shim. Verified Targo invocations must never be
@@ -155,19 +211,43 @@ fn main() {
     // `enforce_trust_no_verify_capability`.
     enforce_trust_no_verify_capability(&rustc_driver, &mut args);
 
-    let bootstrap_no_verify_applies = trust_bootstrap_no_verify_applies(
+    let bootstrap_shim_marker = trust_bootstrap_shim_marker_enabled(
+        env::var_os("TRUST_BOOTSTRAP_SHIM_NO_VERIFY").as_deref(),
+    );
+
+    // Trust: the per-unit `library/` verification opt-in
+    // (`TRUST_BOOTSTRAP_VERIFY_LIBRARY=core[,...]` on the `x.py` side). Bootstrap has
+    // already refused this for compiler/bootstrap/tool invocations and scrubbed
+    // the channel; this is the per-unit half, and it is the ONLY thing that can
+    // turn verification on inside a bootstrap-driven compile.
+    let driver_is_in_tree_staged =
+        targeted_rustc_supports_trust_no_verify && !targeted_rustc_is_snapshot;
+    let bootstrap_verify_unit_applies = trust_bootstrap_verify_unit_applies(
         target.is_some(),
-        cargo_test_no_verify_requested(
-            trust_bootstrap_shim_marker_enabled(
-                env::var_os("TRUST_BOOTSTRAP_SHIM_NO_VERIFY").as_deref(),
-            ),
-            authenticated_targo_frontend,
-        ),
-        targeted_rustc_supports_trust_no_verify,
-        rustc_driver_supports_trust_no_verify,
+        bootstrap_shim_marker,
+        authenticated_targo_frontend,
+        env::var_os(TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV).as_deref(),
+        driver_is_in_tree_staged,
         &orig_args,
         crate_name,
     );
+
+    let bootstrap_no_verify_applies = !bootstrap_verify_unit_applies
+        && trust_bootstrap_no_verify_applies(
+            target.is_some(),
+            cargo_test_no_verify_requested(bootstrap_shim_marker, authenticated_targo_frontend),
+            targeted_rustc_supports_trust_no_verify,
+            rustc_driver_supports_trust_no_verify,
+            &orig_args,
+            crate_name,
+        );
+
+    if bootstrap_verify_unit_applies && verbose > 0 {
+        eprintln!(
+            "[RUSTC-SHIM] trust: verifying library unit `{}` (-Ztrust-verify=on)",
+            crate_name.unwrap_or("<unnamed>")
+        );
+    }
 
     let mut cmd = match env::var_os("RUSTC_WRAPPER_REAL") {
         Some(wrapper) if !wrapper.is_empty() => {
@@ -335,20 +415,39 @@ fn main() {
     // spelling it may not parse — the pinned seed predates the
     // `-Ztrust-verify=off` rename, and handing it the new spelling aborted
     // every fresh-machine build at the first build script.
-    if targeted_rustc_is_snapshot {
-        if finalize_trust_no_verify_snapshot(
-            cmd.args_mut(),
-            targeted_rustc_supports_trust_no_verify,
-            bootstrap_no_verify_applies,
-        ) {
-            cmd.env("TRUST_NO_VERIFY", "1");
-        }
-    } else {
-        finalize_trust_no_verify(
-            cmd.args_mut(),
-            targeted_rustc_supports_trust_no_verify,
-            bootstrap_no_verify_applies,
-        );
+    //
+    // A unit named by the `library/` opt-in takes the third branch: it is
+    // never a snapshot compile (`trust_bootstrap_verify_unit_applies` requires
+    // an in-tree stage>=1 driver) and it must end up with exactly one verifier
+    // control, `-Ztrust-verify=on`, replacing the invocation-wide off-switch
+    // that reached it through rustflags.
+    let trust_verify_env_action = finalize_trust_verify_control(
+        cmd.args_mut(),
+        bootstrap_verify_unit_applies,
+        targeted_rustc_is_snapshot,
+        targeted_rustc_supports_trust_no_verify,
+        bootstrap_no_verify_applies,
+    );
+    if trust_verify_env_action == TrustVerifyEnvAction::Remove {
+        // THE ARGV ON-SWITCH IS NOT ENOUGH — the env transport outranks it.
+        //
+        // Adversarial review measured this as a blocking defect: the comment above
+        // deliberately leaves the build environment byte-for-byte intact, INCLUDING
+        // `TRUST_NO_VERIFY`. That is correct for the OFF direction and inverts meaning
+        // here. `rustc_driver_impl/src/lib.rs:1453` reads `TRUST_NO_VERIFY` and applies
+        // it AFTER every argv-derived option (its own comment at :1465 says the
+        // inherited `TRUST_NO_VERIFY=1` "override below forces" the result), so a unit
+        // named by the opt-in would get `-Ztrust-verify=on` on the command line and
+        // then be silently switched back off.
+        //
+        // That failure mode is the worst available one: the experiment reports success
+        // and verifies nothing. An opt-in that silently does not run is indistinguishable
+        // from one that ran and found no obligations — which is the same
+        // silence-reads-as-success shape that cost a3d 95 unverified rows. Scrub the
+        // transport for exactly the authorized units, so argv is the only authority.
+        cmd.env_remove("TRUST_NO_VERIFY");
+    } else if trust_verify_env_action == TrustVerifyEnvAction::SetOff {
+        cmd.env("TRUST_NO_VERIFY", "1");
     }
 
     let is_test = args.iter().any(|a| a == "--test");
@@ -507,21 +606,51 @@ fn should_strip_cargo_rustc_arg(
     false
 }
 
-fn trust_bootstrap_no_verify_applies(
+/// Bootstrap -> shim IPC for the per-unit `library/` verification opt-in. Kept
+/// in sync with `core::builder::cargo::TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV`;
+/// the shims cannot depend on the bootstrap library.
+const TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV: &str = "TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS";
+
+/// Whether THIS unit is one the `library/` opt-in named, i.e. the one case where
+/// a bootstrap-driven compile runs with the verifier ON.
+///
+/// Every conjunct is a refusal that matters, and the whole predicate is
+/// fail-closed — an unset or unparsable channel yields `false`, which is
+/// today's behaviour exactly:
+///
+/// * `shim_marker` — we are inside a bootstrap cargo invocation. Outside one,
+///   an ambient `TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS` means nothing.
+/// * `!authenticated_targo_frontend` — a verified Targo frontend has already
+///   committed to its own argv at the driver boundary; bootstrap's shim never
+///   rewrites it, in either direction.
+/// * `has_target` — target units only. Build scripts and proc macros are host
+///   units, run on the build compiler, and stay on the no-verify lane.
+/// * `driver_is_in_tree_staged` — `targeted_rustc_supports_trust_no_verify &&
+///   !targeted_rustc_is_stage0_snapshot`, i.e. the driver is an in-tree stage>=1
+///   `trustc`. A stage0 SEED must never be asked to verify: its vintage is the
+///   pin's, not this tree's, so a proof it produced would be evidence about an
+///   artifact nobody in this tree built. This is also what keeps the lane from
+///   becoming a self-proof by another route.
+/// * `compile_uses_trust_bootstrap_no_verify` — a real compilation, not a
+///   `-vV`/`--print` query.
+/// * `trust_bootstrap_verify_unit_requested` — and finally the unit's own
+///   `--crate-name` must be in the authorized list, which is what keeps std's
+///   third-party dependency graph (compiled by the same cargo invocation) off.
+fn trust_bootstrap_verify_unit_applies(
     has_target: bool,
-    requested: bool,
-    targeted_rustc_supports_no_verify: bool,
-    no_target_rustc_supports_no_verify: bool,
+    shim_marker: bool,
+    authenticated_targo_frontend: bool,
+    units: Option<&OsStr>,
+    driver_is_in_tree_staged: bool,
     args: &[OsString],
-    _crate_name: Option<&str>,
+    crate_name: Option<&str>,
 ) -> bool {
-    // Trust: `-Ztrust-verify=off` only exists in Trust drivers. With a
-    // bring-your-own stage0 (bootstrap/trust-stage0/README.md), targeted
-    // stage0 invocations run a stock upstream rustc, which rejects the flag.
-    requested
+    shim_marker
+        && !authenticated_targo_frontend
+        && has_target
+        && driver_is_in_tree_staged
         && compile_uses_trust_bootstrap_no_verify(args)
-        && ((has_target && targeted_rustc_supports_no_verify)
-            || (!has_target && no_target_rustc_supports_no_verify))
+        && trust_bootstrap_verify_unit_requested(units, crate_name)
 }
 
 fn rustc_driver_supports_trust_no_verify(rustc_driver: &OsString) -> bool {

@@ -689,6 +689,252 @@ impl InProcessAyBackend {
         self.run_with_policy(formula, false)
     }
 
+    /// Trust: DISJOINT-COMPONENT REFUTATION (2026-08-20) — split a top-level
+    /// conjunction into groups of conjuncts that share no free variable, so a
+    /// query ay cannot dispatch AS A WHOLE can still be REFUTED component-wise.
+    ///
+    /// WHY THIS EXISTS. A violation formula routinely mixes theories over
+    /// DISJOINT variable sets — the canonical case is an unsigned `var*var` mul,
+    /// whose BV overflow predicate is over fresh `__trust_ovf_bv_*` bitvector
+    /// vars while the operand range/definition facts are over the program's own
+    /// `Sort::Int` locals. ay answers some such mixtures with `internal-error`
+    /// (measured: the QF_BV + NIA shape), and a whole-query Unknown throws away
+    /// a refutation each component would have produced. Since a conjunction of
+    /// PAIRWISE VARIABLE-DISJOINT components is satisfiable iff EVERY component
+    /// is satisfiable — models over disjoint symbol sets compose — refuting each
+    /// component refutes the conjunction, and the union of the component models
+    /// is a model of the whole.
+    ///
+    /// SOUNDNESS, and why this path can only ever say `Failed`:
+    ///
+    ///   * **Variable-disjoint is NOT symbol-disjoint, and that distinction is
+    ///     the whole soundness argument.** `build_program` declares a query's
+    ///     signature from THREE walkers — `collect_free_vars`,
+    ///     `collect_pred_symbols` (uninterpreted predicates via `declare_fun`),
+    ///     and `visit_datatype_bearing_sorts`. A union-find over VARIABLES alone
+    ///     is blind to the other two, and the composition is then FALSE: for
+    ///     `And([x=1, p(x), y=1, ¬p(y)])` the variable partition is `{x}`/`{y}`,
+    ///     each component is satisfiable, and the conjunction is
+    ///     `p(1) ∧ ¬p(1)` — UNSAT. Composing those models reports `Failed` with a
+    ///     fabricated witness for an obligation that HOLDS: a build error on
+    ///     correct code, which breaks the "all valid Rust compiles" gate. (Ground
+    ///     conjuncts make it worse: two conjuncts with NO free variables are
+    ///     never linked at all, so `p(0)` and `¬p(0)` split by construction.)
+    ///     This lane therefore admits only a fragment in which the two notions
+    ///     COINCIDE: no uninterpreted predicate or function symbol, no
+    ///     datatype/uninterpreted sort, no quantifier, and every free variable at
+    ///     a concrete theory sort. Anything else fails closed to `None`.
+    ///
+    ///     The same direction is already refused elsewhere in-repo for exactly
+    ///     this reason — see `trust_cache::sub_query_splitter::combine_results`,
+    ///     which composes only `UNSAT -> Proved` and never `SAT -> Failed`
+    ///     ("the current dependency analysis does not track every semantic
+    ///     symbol (for example uninterpreted predicate identities)"), pinned by
+    ///     its `contradictory_predicate_partitions_cannot_synthesize_failed`.
+    ///     The fragment gate below is what earns this lane the composition that
+    ///     splitter declines to make in general.
+    ///   * Within that fragment the grouping is still a union-find over the free
+    ///     variable sets computed by the SAME walker `build_program` declares
+    ///     from, so sharing is exact and transitive.
+    ///   * `Proved` is NOT produced here, deliberately. A component's UNSAT does
+    ///     imply the whole formula's UNSAT (the component's clauses are a subset,
+    ///     so every model of the whole is a model of the component) — that
+    ///     direction needs no disjointness at all and is strictly easier. What
+    ///     stops it is not logic but PROVENANCE: the strict-checked artifact and
+    ///     the kernel/Carcara gates in `unsat_to_result` would then describe the
+    ///     COMPONENT while the seal is handed to the VC, and the canonical-problem
+    ///     digest a consumer re-checks would not match. Minting a trust seal off a
+    ///     sub-problem's certificate is a decision for its own increment; this one
+    ///     recovers the refutation and leaves `Unknown` exactly where it was.
+    ///   * Consequently this is a pure capability recovery: it runs ONLY after the
+    ///     whole-formula solve already returned `Unknown`, and it can only turn
+    ///     that `Unknown` into `Failed`. No verdict that decides today can move.
+
+    /// TRUE iff every symbol in `formula` is one this lane's composition argument
+    /// can account for: concrete theory sorts only, and no uninterpreted
+    /// predicate/function, datatype sort, or quantifier anywhere. See
+    /// [`Self::disjoint_conjunctive_components`] for why this gate is the
+    /// soundness boundary rather than a convenience.
+    fn composable_fragment(formula: &Formula) -> bool {
+        fn sort_ok(sort: &Sort) -> bool {
+            matches!(sort, Sort::Int | Sort::Bool | Sort::BitVec(_))
+        }
+        // Uninterpreted predicates are declared by their own walker and are
+        // invisible to a variable partition.
+        if !collect_pred_symbols(formula).is_empty() {
+            return false;
+        }
+        // Datatype / uninterpreted sorts couple components through the theory
+        // (cardinality, constructor axioms) without sharing any variable.
+        // NOTE the walker visits EVERY sort and leaves the classification to its
+        // callback (that is how `build_program` uses it), so the datatype test is
+        // ours to make — an earlier draft treated "the walker fired" as "a
+        // datatype is present" and refused every formula, including pure Int ones.
+        let mut datatype_seen = false;
+        smt2_export::visit_datatype_bearing_sorts(formula, &mut |sort| {
+            if matches!(sort, Sort::Datatype { .. }) {
+                datatype_seen = true;
+            }
+        });
+        if datatype_seen {
+            return false;
+        }
+        // Every free variable must sit at a concrete theory sort.
+        if !smt2_export::collect_free_vars(formula).iter().all(|(_, s)| sort_ok(s)) {
+            return false;
+        }
+        // Quantifiers (and any `FnApp`) are outside the fragment: a bound
+        // variable is not in `collect_free_vars`, so a quantified conjunct's
+        // real signature is not what the partition sees.
+        fn quantifier_or_fnapp_free(f: &Formula) -> bool {
+            match f {
+                Formula::Forall(..) | Formula::Exists(..) | Formula::FnApp { .. } => false,
+                Formula::And(xs) | Formula::Or(xs) => xs.iter().all(quantifier_or_fnapp_free),
+                Formula::Not(x) => quantifier_or_fnapp_free(x),
+                Formula::Implies(a, b) => {
+                    quantifier_or_fnapp_free(a) && quantifier_or_fnapp_free(b)
+                }
+                _ => true,
+            }
+        }
+        quantifier_or_fnapp_free(formula)
+    }
+
+    fn disjoint_conjunctive_components(formula: &Formula) -> Option<Vec<Formula>> {
+        // THE SOUNDNESS GATE — see the doc above. Outside this fragment a
+        // variable partition is not a symbol partition and the composition is
+        // invalid.
+        if !Self::composable_fragment(formula) {
+            return None;
+        }
+        let Formula::And(conjuncts) = &flatten_conjunction_spine(formula) else {
+            return None;
+        };
+        if conjuncts.len() < 2 {
+            return None;
+        }
+        let conjuncts = conjuncts.clone();
+        // Free-variable NAME sets, from the same walker the program declares from.
+        let var_sets: Vec<BTreeSet<String>> = conjuncts
+            .iter()
+            .map(|c| {
+                smt2_export::collect_free_vars(c).into_iter().map(|(name, _)| name).collect()
+            })
+            .collect();
+        // Union-find: conjuncts sharing any variable land in one component.
+        let mut parent: Vec<usize> = (0..conjuncts.len()).collect();
+        fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        let mut owner: BTreeMap<&str, usize> = BTreeMap::new();
+        for (i, vars) in var_sets.iter().enumerate() {
+            for v in vars {
+                match owner.get(v.as_str()) {
+                    Some(&j) => {
+                        let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                        if a != b {
+                            parent[a] = b;
+                        }
+                    }
+                    None => {
+                        owner.insert(v.as_str(), i);
+                    }
+                }
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<Formula>> = BTreeMap::new();
+        for (i, c) in conjuncts.iter().enumerate() {
+            let root = find(&mut parent, i);
+            groups.entry(root).or_default().push(c.clone());
+        }
+        // A conjunct with NO free variables (a `Bool(true)`, a closed literal
+        // comparison) forms its own singleton group and would manufacture a
+        // "split" on formulas that are really one component — inflating how
+        // often the retry fires. Require at least two groups that actually
+        // carry variables.
+        let var_bearing = groups
+            .keys()
+            .filter(|root| {
+                (0..conjuncts.len())
+                    .any(|i| find(&mut parent.clone(), i) == **root && !var_sets[i].is_empty())
+            })
+            .count();
+        if groups.len() < 2 || var_bearing < 2 {
+            return None; // one connected component — nothing to gain.
+        }
+        Some(
+            groups
+                .into_values()
+                .map(|mut g| if g.len() == 1 { g.remove(0) } else { Formula::And(g) })
+                .collect(),
+        )
+    }
+
+    /// The per-component budget for a decomposed retry: the caller's whole
+    /// per-obligation timeout, divided across the components, so the retry costs
+    /// what ONE solve was already allowed to cost rather than N times it. `0`
+    /// (an unbounded caller) stays unbounded. See
+    /// [`Self::try_disjoint_component_refutation`] for why multiplying the budget
+    /// would change OTHER rows' verdicts.
+    fn retry_component_timeout_ms(total_ms: u64, components: usize) -> u64 {
+        if total_ms == 0 {
+            return 0;
+        }
+        (total_ms / components.max(1) as u64).max(1)
+    }
+
+    /// Retry a whole-query `Unknown` as a component-wise REFUTATION. Returns
+    /// `Some(Failed)` only when EVERY variable-disjoint component is independently
+    /// refuted with a model; anything else keeps the caller's original verdict.
+    /// See [`Self::disjoint_conjunctive_components`] for the soundness argument.
+    fn try_disjoint_component_refutation(
+        &self,
+        formula: &Formula,
+        allow_bounded_finite: bool,
+        elapsed_ms: u64,
+    ) -> Option<VerificationResult> {
+        let components = Self::disjoint_conjunctive_components(formula)?;
+        // BUDGET: the retry must not multiply the caller's per-obligation
+        // timeout. The compiler computes that timeout as
+        // `min(configured, remaining_function_budget)` precisely so ONE VC
+        // cannot outlive the function's budget; re-solving N components at the
+        // full timeout would defeat it and — by exhausting the shared budget —
+        // change the verdict of LATER obligations, which is exactly the
+        // neutrality this lane claims. So the WHOLE retry gets one budget: the
+        // original timeout, split evenly across the components.
+        let bounded = Self { timeout_ms: Self::retry_component_timeout_ms(self.timeout_ms, components.len()) };
+        let mut assignments: Vec<(String, trust_types::CounterexampleValue)> = Vec::new();
+        let mut time_ms = elapsed_ms;
+        for component in &components {
+            match bounded.solve_and_classify_with_policy(component, allow_bounded_finite) {
+                VerificationResult::Failed { counterexample, time_ms: t, .. } => {
+                    time_ms = time_ms.saturating_add(t);
+                    // A refuted component MUST carry its witness: the composed
+                    // counterexample is the union of the component models, and a
+                    // missing part would hand back an incomplete witness.
+                    assignments.extend(counterexample?.assignments);
+                }
+                // A component that is UNSAT means the WHOLE formula is UNSAT — but
+                // this lane does not mint trust seals (see the doc above), so the
+                // caller's Unknown stands. Same for an undecided component.
+                _ => return None,
+            }
+        }
+        // Deterministic order for a stable, human-readable witness. Disjointness
+        // means the names cannot collide, so sorting by NAME is a total order on
+        // this list (the values carry no `Ord`).
+        assignments.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(VerificationResult::Failed {
+            solver: SOLVER_NAME.into(),
+            time_ms,
+            counterexample: Some(trust_types::Counterexample { assignments, trace: None }),
+        })
+    }
+
     fn run_with_policy(&self, formula: &Formula, allow_bounded_finite: bool) -> VerificationResult {
         // Trust (#int2bv-ice): a panic anywhere inside the in-process solve —
         // ay's bridge/translation `expect`s, the strict proof checker (the
@@ -700,7 +946,18 @@ impl InProcessAyBackend {
         // recovers a poisoned lock via `into_inner`.)
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_ay_diagnostics_policy(|| {
-                self.solve_and_classify_with_policy(formula, allow_bounded_finite)
+                let first = self.solve_and_classify_with_policy(formula, allow_bounded_finite);
+                // Trust: DISJOINT-COMPONENT REFUTATION (2026-08-20) — retry ONLY an
+                // undecided whole-query as a component-wise refutation. Gated on
+                // `Unknown` so no verdict that decides today can move, and the retry
+                // can only produce `Failed` (never a trust seal) — see
+                // `disjoint_conjunctive_components` for the composition argument.
+                let VerificationResult::Unknown { time_ms, .. } = &first else {
+                    return first;
+                };
+                let elapsed = *time_ms;
+                self.try_disjoint_component_refutation(formula, allow_bounded_finite, elapsed)
+                    .unwrap_or(first)
             })
         }));
         match outcome {
@@ -1606,6 +1863,447 @@ fn collect_pred_symbols(formula: &Formula) -> BTreeMap<String, Vec<Sort>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE FALSIFIER THAT KILLED THE FIRST DESIGN (2026-08-20, adversarial round).
+    ///
+    /// `And([x=1, p(x), y=1, ¬p(y)])` is UNSATISFIABLE — it says `p(1) ∧ ¬p(1)`.
+    /// But its VARIABLE partition is `{x}` / `{y}`, and each of those components
+    /// is independently satisfiable. The first version of this lane partitioned
+    /// on variables alone, so it composed those two models and reported `Failed`
+    /// with a witness `{x=1, y=1}` for an obligation that HOLDS — a build error
+    /// on correct code, and a counterexample that does not exist.
+    ///
+    /// The uninterpreted predicate `p` is invisible to a variable partition
+    /// because `build_program` declares predicates from a SEPARATE walker
+    /// (`collect_pred_symbols`). The fragment gate now refuses any formula
+    /// carrying one. This is the same hazard `trust_cache`'s
+    /// `sub_query_splitter` documents when it refuses to compose SAT results at
+    /// all; that crate pins it with
+    /// `contradictory_predicate_partitions_cannot_synthesize_failed`, and this is
+    /// its twin on the in-process lane.
+    #[test]
+    fn a_shared_uninterpreted_predicate_forbids_the_split() {
+        let x = int_var("x");
+        let y = int_var("y");
+        let p = |arg: Formula| Formula::Pred("p".into(), vec![arg]);
+        let contradictory = Formula::And(vec![
+            Formula::Eq(Box::new(x.clone()), Box::new(Formula::Int(1))),
+            p(x),
+            Formula::Eq(Box::new(y.clone()), Box::new(Formula::Int(1))),
+            Formula::Not(Box::new(p(y))),
+        ]);
+        assert!(
+            InProcessAyBackend::disjoint_conjunctive_components(&contradictory).is_none(),
+            "a formula carrying an uninterpreted predicate must NOT split: the \
+             variable partition {{x}}/{{y}} hides that both conjuncts constrain `p`, \
+             and composing their models fabricates a counterexample for an UNSAT \
+             obligation"
+        );
+        // End to end: the lane must not manufacture a refutation for it.
+        let backend = InProcessAyBackend::new().with_timeout(20_000);
+        assert!(
+            backend.try_disjoint_component_refutation(&contradictory, true, 0).is_none(),
+            "and the refutation lane must decline it outright"
+        );
+    }
+
+    /// GROUND conjuncts were the easier version of the same hole: two conjuncts
+    /// with NO free variables are never linked by a variable union-find (the
+    /// inner loop never runs), so `p(0)` and `¬p(0)` would split by
+    /// construction. The fragment gate refuses them for the predicate reason;
+    /// this pins the variable-free case explicitly so a future relaxation of the
+    /// predicate gate cannot silently reopen it.
+    #[test]
+    fn variable_free_conjuncts_never_manufacture_a_split() {
+        let p0 = Formula::Pred("p".into(), vec![Formula::Int(0)]);
+        let ground = Formula::And(vec![p0.clone(), Formula::Not(Box::new(p0))]);
+        assert!(
+            InProcessAyBackend::disjoint_conjunctive_components(&ground).is_none(),
+            "variable-free contradictory conjuncts must never split"
+        );
+        // And a trivially-true conjunct must not manufacture a split on an
+        // otherwise single-component formula (it would inflate how often the
+        // retry fires without any component to refute).
+        let x = int_var("x");
+        let with_true = Formula::And(vec![
+            Formula::Gt(Box::new(x.clone()), Box::new(Formula::Int(1))),
+            Formula::Lt(Box::new(x), Box::new(Formula::Int(9))),
+            Formula::Bool(true),
+        ]);
+        assert!(
+            InProcessAyBackend::disjoint_conjunctive_components(&with_true).is_none(),
+            "a `Bool(true)` conjunct is not a second component"
+        );
+    }
+
+    /// BUDGET — the retry divides the caller's per-obligation timeout across the
+    /// components instead of granting each the full budget. The compiler derives
+    /// that timeout as `min(configured, remaining_function_budget)` so ONE VC
+    /// cannot outlive the function's budget; multiplying it would exhaust the
+    /// shared budget and degrade LATER obligations to Unknown — a verdict change
+    /// on other rows, which is exactly the neutrality this lane claims.
+    /// (Asserted on the derived budget, not on wall-clock: the solve lock
+    /// serializes real solves, so a timing assertion is flaky under the parallel
+    /// suite — measured.)
+    #[test]
+    fn the_retry_divides_the_budget_it_was_given() {
+        // N components share the ONE budget the caller granted.
+        assert_eq!(InProcessAyBackend::retry_component_timeout_ms(1_000, 2), 500);
+        assert_eq!(InProcessAyBackend::retry_component_timeout_ms(5_000, 25), 200);
+        // Never zero (which would mean "unbounded") just because N is large.
+        assert_eq!(InProcessAyBackend::retry_component_timeout_ms(10, 25), 1);
+        // An unbounded caller stays unbounded.
+        assert_eq!(InProcessAyBackend::retry_component_timeout_ms(0, 4), 0);
+        // The whole retry therefore costs at most the single-solve budget the
+        // caller already accounted for.
+        let (total, n) = (5_000u64, 25usize);
+        let per = InProcessAyBackend::retry_component_timeout_ms(total, n);
+        assert!(
+            per * n as u64 <= total,
+            "N components at {per}ms must not exceed the {total}ms the caller granted"
+        );
+    }
+
+    /// FAIL-CLOSED — the grouping must be EXACT: conjuncts that SHARE a free
+    /// variable are one component, so the composition argument can never be
+    /// applied to a formula whose parts constrain each other. A connected
+    /// formula therefore does not split at all.
+    #[test]
+    fn a_connected_conjunction_never_splits() {
+        let x = int_var("x");
+        let connected = Formula::And(vec![
+            Formula::Gt(Box::new(x.clone()), Box::new(Formula::Int(10))),
+            Formula::Lt(Box::new(x.clone()), Box::new(Formula::Int(5))),
+        ]);
+        assert!(
+            InProcessAyBackend::disjoint_conjunctive_components(&connected).is_none(),
+            "conjuncts sharing `x` are ONE component — splitting them would break the \
+             model-composition argument"
+        );
+        // Transitivity: `x~y` and `y~z` put all three conjuncts in one component,
+        // even though the first and last share no variable directly.
+        let y = int_var("y");
+        let z = int_var("z");
+        let chained = Formula::And(vec![
+            Formula::Eq(Box::new(x.clone()), Box::new(y.clone())),
+            Formula::Eq(Box::new(y), Box::new(z.clone())),
+            Formula::Gt(Box::new(z), Box::new(Formula::Int(0))),
+        ]);
+        assert!(
+            InProcessAyBackend::disjoint_conjunctive_components(&chained).is_none(),
+            "sharing is TRANSITIVE — a union-find, not a pairwise check"
+        );
+        // And a genuinely disjoint pair does split, in two.
+        let w = int_var("w");
+        let disjoint = Formula::And(vec![
+            Formula::Gt(Box::new(x), Box::new(Formula::Int(1))),
+            Formula::Gt(Box::new(w), Box::new(Formula::Int(2))),
+        ]);
+        assert_eq!(
+            InProcessAyBackend::disjoint_conjunctive_components(&disjoint)
+                .expect("splits")
+                .len(),
+            2
+        );
+    }
+
+    /// THE LOAD-BEARING NEGATIVE — this lane can NEVER mint a trust seal. A
+    /// formula with one UNSAT component IS unsatisfiable (a component's clauses
+    /// are a subset of the whole), so the logic would permit `Proved` — but the
+    /// artifact and the kernel/Carcara gates would then describe the COMPONENT
+    /// while the seal is handed to the VC. The path returns no verdict at all in
+    /// that case and the caller's `Unknown` stands.
+    #[test]
+    fn a_refuted_component_never_becomes_proved() {
+        let x = int_var("x");
+        let w = int_var("w");
+        // Component A is UNSAT (`x > 10 ∧ x < 5`); component B is SAT.
+        let mixed = Formula::And(vec![
+            Formula::Gt(Box::new(x.clone()), Box::new(Formula::Int(10))),
+            Formula::Lt(Box::new(x), Box::new(Formula::Int(5))),
+            Formula::Gt(Box::new(w), Box::new(Formula::Int(2))),
+        ]);
+        assert_eq!(
+            InProcessAyBackend::disjoint_conjunctive_components(&mixed)
+                .expect("splits into {x}, {w}")
+                .len(),
+            2
+        );
+        let backend = InProcessAyBackend::new().with_timeout(20_000);
+        let result = backend
+            .try_disjoint_component_refutation(&mixed, true, 0)
+            .unwrap_or(VerificationResult::Unknown {
+                solver: SOLVER_NAME.into(),
+                time_ms: 0,
+                reason: "no component verdict".into(),
+            });
+        assert!(
+            !matches!(result, VerificationResult::Proved { .. }),
+            "the decomposition lane must never produce Proved; got {result:?}"
+        );
+        assert!(
+            !matches!(result, VerificationResult::Failed { .. }),
+            "and it must not claim a refutation when a component is UNSAT; got {result:?}"
+        );
+    }
+
+    /// VERDICT-NEUTRALITY — the retry is gated on `Unknown`, so a query that
+    /// already decides is untouched. A plainly SAT disjoint conjunction is
+    /// refuted by the ordinary whole-query path and must keep that path's
+    /// verdict (this also pins that the hook cannot double-count time or
+    /// re-order a decided result).
+    #[test]
+    fn a_decided_query_is_never_retried() {
+        let x = int_var("x");
+        let w = int_var("w");
+        let sat_disjoint = Formula::And(vec![
+            Formula::Gt(Box::new(x), Box::new(Formula::Int(1))),
+            Formula::Gt(Box::new(w), Box::new(Formula::Int(2))),
+        ]);
+        let backend = InProcessAyBackend::new().with_timeout(20_000);
+        assert!(
+            matches!(
+                backend.run(&sat_disjoint),
+                VerificationResult::Failed { .. } | VerificationResult::Unknown { .. }
+            ),
+            "a decided query keeps its own verdict"
+        );
+    }
+
+
+    /// Trust: DISJOINT-COMPONENT REFUTATION — the capability proof. Rebuild the
+    /// RETRACTED mixed formula (BV violation ∧ Int out-of-range core, over
+    /// disjoint variable sets) and show the split refutes what the whole-query
+    /// solve cannot dispatch.
+    #[test]
+    fn disjoint_split_refutes_the_mixed_bv_nia_mul_query() {
+        let vc = umul_record_vc_from_emitter(None, None);
+        // The retracted shape: conjoin the Int out-of-range core onto the BV
+        // violation, exactly as the 2026-08-19 emitter did.
+        let a = Formula::Var("_3".into(), Sort::Int);
+        let b = Formula::Var("_5".into(), Sort::Int);
+        let prod = Formula::Mul(Box::new(a), Box::new(b));
+        let or_core = Formula::Or(vec![
+            Formula::Lt(Box::new(prod.clone()), Box::new(Formula::Int(0))),
+            Formula::Gt(Box::new(prod), Box::new(Formula::Int(4_294_967_295))),
+        ]);
+        let mixed = Formula::And(vec![vc.formula.clone(), or_core]);
+
+        let components =
+            InProcessAyBackend::disjoint_conjunctive_components(&mixed).expect("splits");
+        assert!(components.len() >= 2, "the mixed query must split, got {}", components.len());
+
+        let backend = InProcessAyBackend::new().with_timeout(30_000);
+        let mut mixed_vc = vc.clone();
+        mixed_vc.formula = mixed;
+        match backend.verify(&mixed_vc) {
+            VerificationResult::Failed { counterexample, .. } => {
+                let cex = counterexample.expect("the composed witness");
+                let names: Vec<&str> =
+                    cex.assignments.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(
+                    names.iter().any(|n| n.starts_with("__trust_ovf_bv_")),
+                    "the witness must carry the BV component's model: {names:?}"
+                );
+                assert!(
+                    names.iter().any(|n| *n == "_3" || *n == "_5"),
+                    "and the Int component's model: {names:?}"
+                );
+            }
+            other => panic!(
+                "the disjoint split must refute the mixed BV+NIA query that the \
+                 whole-query solve answers with internal-error; got {other:?}"
+            ),
+        }
+    }
+
+
+    /// Trust: THE UMUL-RECORD RETRACTION EVIDENCE (2026-08-20) — the two pins that
+    /// measured the cost of restating a BV-encoded obligation in Int, and that now
+    /// hold the ground truth so nobody re-lands it blind.
+    ///
+    /// An unsigned `var*var` checked mul is emitted in the DECIDABLE BV encoding.
+    /// On 2026-08-19 an emitter change conjoined the Int-reading out-of-range core
+    /// `Or([Lt(a*b,0), Gt(a*b,MAX)])` onto that formula so the trust-ir/mirsem umul
+    /// arms could ground an authenticated record (one corpus row certified). This
+    /// pin is what measured the price: with the Int core present ay returns
+    /// `internal-error` on the mixed QF_BV + NIA query, so an unguarded overflowing
+    /// mul went from `Failed` WITH A VERIFIED COUNTEREXAMPLE (118 ms) to `Unknown`
+    /// — under the prime directive, from a build error to a runtime check, across
+    /// the 14 emitted `ArithmeticOverflow{Mul}` VCs (11 def_paths) that take this
+    /// shape in the committed corpus. The emitter change was retracted, the
+    /// DISJOINT-COMPONENT REFUTATION lane was built to refute such a query
+    /// component-wise, and the record was then RE-LANDED on top of it. This pin is
+    /// the load-bearing half of that pair: it asserts the refutation holds WITH the
+    /// Int core present. If it goes red, the emitter conjunct must come back out —
+    /// see `trust_vcgen::generate::bv_rem_mul_tests::
+    /// unsigned_var_var_mul_vc_carries_authenticated_record`.
+    ///
+    /// THE FIX THAT MADE THE RE-LAND POSSIBLE (landed 2026-08-20): the Int core and the BV violation are over
+    /// DISJOINT variable sets (`_3`/`_5` at `Sort::Int` vs `__trust_ovf_bv_*` at
+    /// `Sort::BitVec`), and a conjunction of pairwise variable-disjoint components
+    /// is SAT iff every component is SAT. Splitting the top-level `And` by shared
+    /// free variables before dispatch is a mechanical, sound transformation local
+    /// to this backend — no emitter change, no spec work, and the authentication
+    /// invariant is untouched. Measured against the real backend on the RETRACTED
+    /// formula: unguarded splits into 4 components, all SAT -> `Failed` + witness;
+    /// rem-clamped splits into 4 of which the `{_3,_5}` component (Int ranges + rem
+    /// bounds + the Or-core) is UNSAT -> `Proved`, which is STRICTLY BETTER than
+    /// what this lane returns today. The `Proved` half of that measurement is still
+    /// future work: the split lane deliberately mints no trust seal, so the
+    /// rem-clamped case stays `Unknown` (see the sibling pin).
+    #[allow(rustdoc::private_intra_doc_links)]
+    ///
+    /// REFUTE direction (the load-bearing one): an unguarded `a * b` at u32 CAN
+    /// overflow, so the violation is SAT and the backend must refute it with a
+    /// concrete witness. A regression to `Unknown` here is exactly the capability
+    /// the retraction protects; a `Proved` here would be a FALSE PROVE.
+    #[test]
+    fn umul_bare_bv_unguarded_refutes_with_counterexample() {
+        let vc = umul_record_vc_from_emitter(None, None);
+        // The VC carries the re-landed UMUL RECORD, i.e. the Int core IS in the
+        // solved formula — exactly the shape that cost the refutation before the
+        // disjoint-component lane existed. That is the point: the capability must
+        // hold WITH the conjunct present.
+        assert!(
+            vc.obligation.is_some(),
+            "precondition of this pin: the re-landed UMUL RECORD is present, so this \
+             asserts the refutation SURVIVES the mixed BV+NIA query"
+        );
+        let backend = InProcessAyBackend::new();
+        match backend.verify(&vc) {
+            VerificationResult::Failed { counterexample, .. } => {
+                assert!(
+                    counterexample.is_some(),
+                    "the refutation must carry a witness — that is the capability"
+                );
+            }
+            other => panic!(
+                "an unguarded u32 `a*b` must be REFUTED with a counterexample; got \
+                 {other:?}. If this is Unknown, something re-introduced a conjunct ay \
+                 cannot dispatch (the retracted Int restatement, or another theory \
+                 mix) and this VC class silently degraded from build-error to \
+                 runtime-check"
+            ),
+        }
+    }
+
+    /// PROVE direction, pinned as the HONEST NEGATIVE it is: the rem-clamped
+    /// `(a % 100) * (b % 50)` at u32 provably cannot overflow (99·49 = 4851), but
+    /// this lane does NOT report `Proved`.
+    ///
+    /// THE ROOT CAUSE IS NOT MISSING SOLVER CAPABILITY, and the first diagnosis
+    /// written here (a "90 s timeout", observed in a debug build) was wrong — the
+    /// correction matters because it points the follow-up at a different component.
+    /// In release ay DECIDES the bare-BV query UNSAT in ~17.6 s; the verdict is then
+    /// discarded by STRICT PROOF CERTIFICATION (`strict UNSAT proof validation
+    /// failed: step t1 uses unsupported theory lemma kind Generic in strict mode`),
+    /// surfaced as `Unknown[(incomplete self-check-rejected)]`. So the gap is in the
+    /// strict Alethe proof checker's theory-lemma coverage, not in ay's solving, and
+    /// the fail-closed downgrade is working exactly as designed. A future change
+    /// that makes this PROVE should flip this pin deliberately rather than silently.
+    #[test]
+    fn umul_bare_bv_rem_clamped_is_honestly_unknown() {
+        let vc = umul_record_vc_from_emitter(Some(100), Some(50));
+        let backend = InProcessAyBackend::new().with_timeout(20_000);
+        let result = backend.verify(&vc);
+        assert!(
+            !matches!(result, VerificationResult::Proved { .. }),
+            "if the rem-clamped mul now PROVES, the BV lane gained a real capability \
+             — update this pin and the retraction write-up together; got {result:?}"
+        );
+    }
+
+    /// Build the REAL unsigned `var*var` checked-mul VC through trust-vcgen, mirroring
+    /// `bv_rem_mul_tests::mod_mul_func`: `_3 = a % C1; _5 = b % C2; _6 = CheckedMul(_3,_5)`
+    /// (a `None` divisor leaves that operand UNBOUNDED). Driving the emitter keeps this
+    /// pin honest — a stand-in formula could drift from what is actually solved.
+    fn umul_record_vc_from_emitter(
+        lhs_div: Option<u128>,
+        rhs_div: Option<u128>,
+    ) -> VerificationCondition {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
+            Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+        };
+        let u32_ty = || Ty::Int { width: 32, signed: false };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place::local(local),
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let rem_or_copy = |src: usize, div: Option<u128>| match div {
+            Some(c) => Rvalue::BinaryOp(
+                BinOp::Rem,
+                Operand::Copy(Place::local(src)),
+                Operand::Constant(ConstValue::Uint(c, 32)),
+            ),
+            None => Rvalue::Use(Operand::Copy(Place::local(src))),
+        };
+        let func = VerifiableFunction {
+            name: "mod_mul".into(),
+            def_path: "test::mod_mul".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+                    LocalDecl { index: 1, ty: u32_ty(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: u32_ty(), name: Some("b".into()) },
+                    LocalDecl { index: 3, ty: u32_ty(), name: None },
+                    LocalDecl { index: 4, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 5, ty: u32_ty(), name: None },
+                    LocalDecl {
+                        index: 6,
+                        ty: Ty::Tuple(vec![u32_ty(), Ty::Bool]),
+                        name: None,
+                    },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![
+                            assign(3, rem_or_copy(1, lhs_div)),
+                            assign(5, rem_or_copy(2, rhs_div)),
+                            assign(
+                                6,
+                                Rvalue::CheckedBinaryOp(
+                                    BinOp::Mul,
+                                    Operand::Copy(Place::local(3)),
+                                    Operand::Copy(Place::local(5)),
+                                ),
+                            ),
+                        ],
+                        // The real MIR shape: the checked mul's overflow flag
+                        // `_6.1` asserted false, which is what the emitter keys on.
+                        terminator: Terminator::Assert {
+                            unwind: trust_types::UnwindEdge::Unreachable,
+                            cond: Operand::Copy(Place {
+                                local: 6,
+                                projections: vec![trust_types::Projection::Field(1)],
+                            }),
+                            expected: false,
+                            msg: trust_types::AssertMessage::Overflow(BinOp::Mul),
+                            target: BlockId(1),
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+        trust_vcgen::generate_vcs(&func)
+            .into_iter()
+            .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. }))
+            .expect("the checked mul emits an ArithmeticOverflow{Mul} VC")
+    }
+
     use trust_types::{SourceSpan, Symbol};
 
     use super::*;

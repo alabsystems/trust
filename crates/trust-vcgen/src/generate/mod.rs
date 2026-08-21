@@ -1214,6 +1214,12 @@ impl OrdWitnessItem {
 // Each family is re-exported flat, so `generate::<name>` resolves exactly as it
 // did when this module was a single file.
 mod call_facts;
+// Trust (std-intrinsics lane): EXACT bitvector semantics for the body-less
+// rustc arithmetic/bit intrinsics, replacing the boolean "cannot panic" model
+// with a definition. Its own module because it is the only place in this crate
+// that ADDS facts to the hypothesis set — see its header for the soundness
+// discipline that follows from that.
+mod intrinsic_semantics;
 mod ite;
 mod int_conversion;
 mod semantic_guard;
@@ -1248,8 +1254,13 @@ pub(crate) mod callee_write_set;
 mod witness_grounding;
 mod contract_vcs;
 mod entry_hypothesis;
+// Trust (coroutine resume-state contract): the refutation-lane prover for the
+// compiler-inserted `ResumedAfter*` executor-protocol sentinels. Deliberately a
+// module of its own — see its header.
+pub(crate) mod coroutine_sentinel;
 
 use call_facts::*;
+use intrinsic_semantics::*;
 use ite::*;
 use int_conversion::*;
 pub(crate) use semantic_guard::*;
@@ -1287,7 +1298,19 @@ use contract_vcs::*;
 use entry_hypothesis::*;
 
 #[cfg(test)]
+mod coroutine_sentinel_tests;
+// Trust (coroutine resume-state contract): the same lane against the REAL
+// compiler-extracted resume body of the falsification fixture, not a synthetic
+// one. See the file header for why that distinction is load-bearing.
+#[cfg(test)]
+mod coroutine_sentinel_real_mir_tests;
+#[cfg(test)]
 mod clamp_upper_bound_tests;
+// Trust (std-intrinsics lane): the EXHAUSTIVE width-8 differential against the
+// real Rust operations, plus the recognizer-strictness and vacuity checks. This
+// is the module that makes the added facts auditable — see its header.
+#[cfg(test)]
+mod intrinsic_semantics_tests;
 #[cfg(test)]
 mod recursion_decreases_production_variant_tests;
 #[cfg(test)]
@@ -1321,6 +1344,8 @@ mod early_return_postcondition_tests;
 mod float_range_tests;
 #[cfg(test)]
 mod bounds_const_index_tests;
+#[cfg(test)]
+mod trait_object_unsize_cast_tests;
 #[cfg(test)]
 mod round14_stability_tests;
 #[cfg(test)]
@@ -1392,6 +1417,12 @@ mod ord_method_tests;
 // ======================================================================
 #[cfg(test)]
 mod int_wrapping_neg_tests;
+// ======================================================================
+// Clean-origin WrappingBinOp summary: the encoding pin against the
+// extractor's own wrapping model (tests)
+// ======================================================================
+#[cfg(test)]
+mod clean_origin_wrapping_summary_tests;
 // ======================================================================
 // Const-return summaries: lower/upper bound + exact const set (tests)
 // ======================================================================

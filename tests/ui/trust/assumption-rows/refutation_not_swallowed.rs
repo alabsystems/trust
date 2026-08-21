@@ -7,6 +7,14 @@
 // fires at BUILD time (the check build passes — only metadata-encoded bodies
 // like the async closure are visited there).
 //
+// RE-PINNED 2026-08-20 (D2). THE GUARD THIS FILE EXISTS FOR IS UNTOUCHED: `mid`'s
+// `a / b` is still refuted and still warns, and the coroutine ASSUMPTION row is
+// RESTORED (`ca53846043` had replaced it with a CONTRACT row in every lane).
+// Only the coroutine body's own WARN pin was deleted, and only because its count
+// described a vanished inventory — see the sibling `async_fn_records_assumption.rs`
+// for the full reasoning. The refutation pin on `mid` below is the falsifiable
+// half and is deliberately left exactly as it was.
+//
 // RE-PINNED 2026-08-15 for upstream 983bc1a3b6 (merged here as f1182b2285), which
 // REMOVED the whole-function panic-freedom subsumption as a false proof. THE GUARD
 // STILL HOLDS AND WAS RE-MEASURED: `mid` is still refuted with a live model
@@ -23,7 +31,6 @@
 //@ build-pass
 //@ dont-check-compiler-stderr
 pub async fn helper(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `refutation_not_swallowed::helper::{closure#0}`: 1 obligation(s) were not proved
     x
 }
 pub fn mid(a: u64, b: u64) -> u64 {

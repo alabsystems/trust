@@ -1,0 +1,62 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-clean-origin — increment I5 of
+# docs/design/2026-08-04-two-language-compiler-architecture.md.
+#
+# THE TWO DECISION POINTS OF THE CLEAN-ORIGIN CALL LANE.
+#
+# Every other direction in Trust is refutation-shaped: it can only decline to
+# prove something, so a disagreement costs a failed build. This is the ONE
+# direction that can PRODUCE A VALUE, so a disagreement is a WRONG BINARY.
+# The two decisions live here, and both fail closed:
+#
+#   1. `mint`  — may a `DefId` be minted for a Clean island declaration at all?
+#                Requires `KernelChecked` AND an audited-empty axiom closure AND
+#                a total carrier. Any missing precondition => no `DefId`.
+#   2. `gate`  — does the lowered body agree with the Clean `def`? Decided by
+#                kernel definitional equality, ADMITTED AT THE CARRIER TYPE.
+#
+# WHY BOTH, AND WHY NEITHER SUFFICES ALONE.
+# I4's `tests/control_b_defeq_insufficiency.rs` executes the proof that kernel
+# defeq does NOT subsume representation faithfulness: `UInt64.toNat (UInt64.ofNat
+# (2^64))` is defeq to `0` against the real `clean_kernel::TypeChecker`, so a
+# defeq-only gate admits a term whose emitted value wrapped. The carrier
+# obligation catches that and does not consult the kernel. Conversely the
+# carrier says nothing about whether the LOWERING was faithful — that is what
+# defeq decides. The gate therefore requires a `Carrier` (which I4 seals so it
+# cannot exist without `CarrierEvidence::Total`) *and* a defeq verdict.
+#
+# THE DEPENDENCY LIST IS PART OF THE ARGUMENT.
+# `clean-kernel` is here because the faithfulness question must be put to the
+# REAL definitional-equality checker, never a Rust imitation of one.
+# `trust-clean-carrier` is here because the gate's admitted statement is at the
+# CARRIER type. `trust-symbols` is here because the mint decision reads
+# `KernelStatus` and `AxiomClosure`. There is no elaborator, no parser, and no
+# solver: this crate decides admissibility and faithfulness, never a proposition.
+
+[package]
+name = "trust-clean-origin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Clean-origin CALL lane (I5): the gated DefId-mint decision and the carrier-typed faithfulness gate."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Exactly five. See the header before adding a sixth.
+clean-kernel = { workspace = true }
+trust-clean-carrier = { path = "../trust-clean-carrier" }
+trust-symbols = { path = "../trust-symbols" }
+trust-types = { path = "../trust-types", default-features = false }
+# The FIFTH, added with `emit.rs`: side B's producer. `admit_projection_function`
+# reflects the EMITTED body back into a Clean term, and it is the same function
+# the E6 Rust->Clean kernel-import lane has always used — which is exactly why
+# the comparison is not co-authored. It is a dependency of this crate, never a
+# thing this crate may edit to make a Clean-origin body agree; doing so would
+# turn the gate into a round trip. See `emit.rs`'s module docs.
+trust-spec-elab = { path = "../trust-spec-elab" }

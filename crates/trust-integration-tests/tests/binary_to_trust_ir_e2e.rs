@@ -2936,9 +2936,13 @@ fn test_targo_trust_convert_trust_cg_release_transcript_attempt_assembles_select
         .collect::<Vec<_>>();
     let unique_blocker_codes: std::collections::BTreeSet<&str> =
         target_consumer_blocker_codes.iter().copied().collect();
+    // The fixture's one symbolic formula — the byte-assembled load of [RDI] —
+    // is now CONSUMED by the entry-register-binding lowering (a real
+    // Opcode::Load of the RDI entry param), so its unconsumed blocker is gone
+    // and its record flips to accepted. Certificate and replay evidence stay
+    // unconsumed: consuming one formula does not consume the artifact.
     let expected_codes: std::collections::BTreeSet<&str> = [
         "target-semantics-not-consumed",
-        "symbolic-formula-not-consumed-by-target-semantics",
         "checked-certificate-not-consumed-by-target-semantics",
         "proof-replay-not-consumed-by-target-semantics",
     ]
@@ -2954,8 +2958,19 @@ fn test_targo_trust_convert_trust_cg_release_transcript_attempt_assembles_select
         .expect("target proof-consumer records should be an array");
     assert_json_record_kinds_rejected(
         target_consumer_records,
-        &["target_semantics", "symbolic_formula", "checked_certificate", "proof_replay"],
+        &["target_semantics", "checked_certificate", "proof_replay"],
         "trust-cg selected-slice target proof-consumer evidence",
+    );
+    assert!(
+        !target_consumer_records.iter().any(|record| {
+            record["kind"].as_str() == Some("symbolic_formula")
+                && record["accepted"].as_bool() == Some(false)
+        }),
+        "no formula may remain awaiting consumption: {target_consumer_records:?}"
+    );
+    assert!(
+        json.to_string().contains("entry-register-binding-trust_cg-target-consumed"),
+        "the artifact must disclose WHICH bridge-owned consumer discharged the load formula"
     );
     assert_eq!(
         json["conversion_gate"]["target_proof_consumer_evidence"],

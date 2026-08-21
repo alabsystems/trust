@@ -19,6 +19,14 @@
 // FALSIFIED 2026-08-15: with `scaled(x, x)` in place of `scaled(x, 4)` this
 // file emits a SECOND warning, `... incomplete for `..::scaled``, and fails —
 // the same shape an R1-poisoned scan produces.
+// RE-PIN 2026-08-20 (D2). THE R1 DISCRIMINATION IS INTACT AND IS WHY THIS FILE
+// EXISTS: `scaled` must emit NOTHING. An R1-poisoned scan makes `scaled`'s
+// `x / divisor` undischarged, which emits a warning this file does not expect
+// and therefore FAILS — exactly as before. The coroutine's own WARN pin moved to
+// the RAW assumption pin below (its "1 obligation(s)" count described a vanished
+// inventory; see the assumption-rows siblings), so the discrimination now rests
+// on "no diagnostic from `scaled`" plus a positive pin on the coroutine's
+// assumption row, rather than on counting the coroutine's own warning.
 fn scaled(x: u32, divisor: u32) -> u32 {
     x / divisor
 }
@@ -29,6 +37,6 @@ pub fn api(x: u32) -> u32 {
 }
 
 pub async fn helper(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete
     x
 }
+//~? RAW Trust: ASSUMPTION [coroutine]

@@ -643,6 +643,7 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "rustc-demangle",
     "rustc-literal-escaper",
     "shlex",
+    "trust-bignum", // Trust (I6): the bignum carrier runtime, shipped into the sysroot via library/sysroot
     "unwinding",
     "vex-sdk",
     "wasip1",

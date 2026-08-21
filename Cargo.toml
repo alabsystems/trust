@@ -326,7 +326,7 @@ warnings = "warn"
 
 # trust: workspace-level package metadata for verification pipeline crates
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alabsystems/trust"
@@ -347,6 +347,12 @@ trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
 trust-certify = { path = "crates/trust-certify" }
 trust-cert-meter = { path = "crates/trust-cert-meter" }
 trust-spec-elab = { path = "crates/trust-spec-elab" }
+# Trust (I5): the two Clean-origin CALL-lane decisions — the gated `DefId` mint
+# and the carrier-typed faithfulness gate. Named from `rustc_mir_transform`,
+# whose `clean_origin_mir.rs` is the sole constructor of a Clean-origin `Body`
+# and cannot return one without a `trust_clean_origin::Faithful`.
+trust-clean-origin = { path = "crates/trust-clean-origin" }
+trust-clean-carrier = { path = "crates/trust-clean-carrier" }
 clean-kernel = { path = "first-party/clean/crates/clean-kernel", features = ["math-overlays"] }
 clean-auto = { path = "first-party/clean/crates/clean-auto" }
 clean-verify = { path = "first-party/clean/crates/clean-verify" }

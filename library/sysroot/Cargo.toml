@@ -17,6 +17,15 @@ proc_macro = { path = "../proc_macro", public = true }
 profiler_builtins = { path = "../profiler_builtins", optional = true }
 std = { path = "../std", public = true }
 test = { path = "../test", public = true }
+# Trust (I6): the bignum carrier runtime. The compiler INJECTS `trust_bignum`
+# (creader, `CrateOrigin::Injected`) whenever a Clean-origin mint carries
+# `Nat`, and its loader requires the rlib to reside in the sysroot target lib
+# dir — this dependency is what puts it there. A path dep into crates/ rather
+# than a library/ member on purpose: the crate keeps inheriting
+# `workspace.package` from crates/Cargo.toml, and the fast dev lane there
+# stays the same package the sysroot ships. `rustc-dep-of-std` remaps its
+# core/alloc onto the in-tree crates (the cfg-if pattern).
+trust-bignum = { path = "../../crates/trust-bignum", features = ["rustc-dep-of-std"], public = true }
 
 # Forward features to the `std` crate as necessary
 [features]

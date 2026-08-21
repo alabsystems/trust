@@ -1,0 +1,174 @@
+{
+ "name": "ctlz_u32_nonzero_lt32",
+ "def_path": "fx::ctlz_u32_nonzero_lt32",
+ "span": {
+  "file": "<dump-root>/fx.rs",
+  "line_start": 42,
+  "col_start": 0,
+  "line_end": 45,
+  "col_end": 14
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "x"
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "@trust-rustc-intrinsic::core::intrinsics::ctlz::<u32>",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "<dump-root>/fx.rs",
+       "line_start": 45,
+       "col_start": 2,
+       "line_end": 45,
+       "col_end": 12
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [
+  {
+   "kind": "Requires",
+   "span": {
+    "file": "<dump-root>/fx.rs",
+    "line_start": 43,
+    "col_start": 13,
+    "line_end": 43,
+    "col_end": 19
+   },
+   "body": "__trust_lowered_compiler_contract__:x >= 1"
+  },
+  {
+   "kind": "Ensures",
+   "span": {
+    "file": "<dump-root>/fx.rs",
+    "line_start": 44,
+    "col_start": 12,
+    "line_end": 44,
+    "col_end": 24
+   },
+   "body": "__trust_lowered_compiler_contract__:(result) <= (31)"
+  }
+ ],
+ "preconditions": [
+  {
+   "Ge": [
+    {
+     "Var": [
+      "x",
+      "Int"
+     ]
+    },
+    {
+     "Int": 1
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [
+  {
+   "Le": [
+    {
+     "Var": [
+      "_0",
+      "Int"
+     ]
+    },
+    {
+     "Int": 31
+    }
+   ]
+  }
+ ],
+ "spec": {
+  "requires": [
+   "x >= 1"
+  ],
+  "ensures": [
+   "(result) <= (31)"
+  ],
+  "invariants": []
+ }
+}

@@ -334,7 +334,9 @@ impl TaintPropagator {
                 }
             }
             Rvalue::UnaryOp(_, operand) => self.propagate_operand(operand, local_taint),
-            Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+            Rvalue::BinaryOp(_, lhs, rhs)
+            | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+            | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
                 if self.propagate_binary_ops {
                     let l = self.propagate_operand(lhs, local_taint);
                     let r = self.propagate_operand(rhs, local_taint);
@@ -843,7 +845,9 @@ fn rvalue_sources(rvalue: &Rvalue) -> Vec<(usize, FlowKind)> {
                 .into_iter()
                 .collect()
         }
-        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => [lhs, rhs]
+        Rvalue::BinaryOp(_, lhs, rhs)
+        | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+        | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => [lhs, rhs]
             .into_iter()
             .filter_map(|operand| {
                 operand_local(operand)

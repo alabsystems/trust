@@ -29,3 +29,28 @@ smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
 thin-vec = "0.2.18"
 tracing = "0.1"
 # tidy-alphabetical-end
+
+# Trust (I5): the Clean-origin mint decision runs at the root-fragment seam in
+# `src/trust_clean_origin.rs`, because the three mint preconditions
+# (`KernelChecked`, audited-empty axiom closure, total carrier) are facts about
+# the crate's Clean ENVIRONMENT and `def_collector` is the only point where the
+# answer changes anything.
+#
+# THE COST IS REAL AND IS STATED HERE. §8 of
+# `docs/design/2026-08-04-two-language-compiler-architecture.md` budgeted
+# `trust-symbols` under the resolver; this is the whole Clean closure —
+# `trust-certify` pulls `clean-kernel`, `clean-elab`, `clean-parser`,
+# `clean-auto`, `clean-verify`, `trust-spec-elab`, `trust-ir` and
+# `trust-cert-meter`. None of them names a rustc crate, so there is no cycle.
+# At RUNTIME the decision returns before allocating anything for a crate with no
+# `clean { … }` island, so ordinary Rust never pays the kernel.
+#
+# tidy-alphabetical-start
+clean-kernel = { workspace = true }
+trust-certify = { workspace = true }
+trust-clean-carrier = { workspace = true }
+trust-clean-origin = { workspace = true }
+trust-spec-elab = { workspace = true }
+trust-symbols = { path = "../../crates/trust-symbols" }
+trust-types = { workspace = true }
+# tidy-alphabetical-end

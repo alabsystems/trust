@@ -62,6 +62,14 @@ impl PanicRuntimeSymbols {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoweringOptions {
     pub panic_symbols: PanicRuntimeSymbols,
+    /// Function-entry register bindings for a binary-lifted body (see
+    /// `crate::entry_binding`). `None` — the default, and the only value the
+    /// MIR lane ever passes — leaves lowering byte-identical to before the
+    /// field existed. `Some` makes bare bound register `Var`s and the 8-byte
+    /// little-endian load shape lowerable against real LIR parameters, each
+    /// use individually justified by the per-block write-freedom certificate
+    /// computed over the body being lowered.
+    pub entry_bindings: Option<crate::entry_binding::BinaryEntryBindings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +205,49 @@ struct LoweringCtx<'a> {
     pending_blocks: Vec<(Block, LirBlock)>,
     /// Next available block ID (tracks the highest block ID seen + 1).
     next_block_id: u32,
+    /// Entry-register binding state for a binary-lifted body (None on the MIR
+    /// lane and when the per-body analysis refused the table).
+    entry_bindings: Option<EntryBindingState>,
+    /// When the entry-binding table was supplied but refused for this body,
+    /// the reason — attached to symbolic-operand refusals so they carry the
+    /// fix instead of a bare "unsupported".
+    entry_binding_refusal: Option<String>,
+    /// Source block id currently being lowered (drives the per-block
+    /// write-freedom gate on entry-register uses).
+    current_block: usize,
+    /// Statement index within the current block (keys consumption records).
+    current_statement: usize,
+    /// True while the current block's TERMINATOR is being lowered. Entry-binding
+    /// lowering is refused in this position: consumption records are keyed by
+    /// statement index, terminator operands have none (and no evidence rows to
+    /// mark), so consuming here would misattribute the consumption. Production
+    /// discriminants are flag formulas that refuse regardless; this keeps the
+    /// latent bare-Var-discriminant path fail-closed instead of mis-keyed.
+    in_terminator: bool,
+    /// Symbolic formulas this lowering consumed with target semantics.
+    consumed_symbolic: Vec<crate::entry_binding::ConsumedSymbolicLowering>,
+}
+
+/// Materialized entry-register bindings: the params' LIR values plus the
+/// per-block write-freedom certificate that justifies each use.
+struct EntryBindingState {
+    bindings: crate::entry_binding::BinaryEntryBindings,
+    /// var name (e.g. "X7") -> (param index, the param's LIR Value).
+    params_by_var: FxHashMap<String, (usize, Value)>,
+    preservation: crate::entry_binding::EntryPreservation,
+}
+
+/// Outcome of the per-body entry-binding analysis, fed into `LoweringCtx`.
+enum EntryBindingInputs {
+    /// The table cross-checked against the body and the certificate computed:
+    /// params become real LIR formals.
+    Justified {
+        bindings: crate::entry_binding::BinaryEntryBindings,
+        preservation: crate::entry_binding::EntryPreservation,
+    },
+    /// The table was supplied but refused for this body; lowering proceeds
+    /// without params and symbolic refusals carry the reason.
+    Refused { reason: String },
 }
 
 impl<'a> LoweringCtx<'a> {
@@ -205,6 +256,7 @@ impl<'a> LoweringCtx<'a> {
         arg_count: usize,
         max_block_id: u32,
         options: &'a LoweringOptions,
+        entry: Option<EntryBindingInputs>,
     ) -> Self {
         let mut ctx = Self {
             locals,
@@ -217,8 +269,34 @@ impl<'a> LoweringCtx<'a> {
             options,
             pending_blocks: Vec::new(),
             next_block_id: max_block_id + 1,
+            entry_bindings: None,
+            entry_binding_refusal: None,
+            current_block: 0,
+            current_statement: 0,
+            in_terminator: false,
+            consumed_symbolic: Vec::new(),
         };
-        // trust_cg ISel convention: Value(0)..Value(arg_count-1) are formal arguments.
+        // trust_cg ISel convention: Value(0)..Value(k-1) are formal arguments.
+        // Entry-register binding params come first (the binary lane, where
+        // arg_count is 0 by the lift's observations-not-arguments rule); MIR
+        // argument locals follow the same convention below. The two lanes are
+        // mutually exclusive, enforced in lower_body_to_lir_with_options.
+        match entry {
+            Some(EntryBindingInputs::Justified { bindings, preservation }) => {
+                let mut params_by_var = FxHashMap::default();
+                for (param_index, param) in bindings.params.iter().enumerate() {
+                    let value = Value(ctx.next_value);
+                    ctx.next_value += 1;
+                    params_by_var.insert(param.var_name.clone(), (param_index, value));
+                }
+                ctx.entry_bindings =
+                    Some(EntryBindingState { bindings, params_by_var, preservation });
+            }
+            Some(EntryBindingInputs::Refused { reason }) => {
+                ctx.entry_binding_refusal = Some(reason);
+            }
+            None => {}
+        }
         // Trust-types convention: local 0 is the return slot, locals 1..=arg_count are args.
         // Assign argument locals first to match ISel expectations.
         for i in 1..=arg_count {
@@ -396,7 +474,7 @@ impl<'a> LoweringCtx<'a> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => self.resolve_place(place, instructions),
             Operand::Constant(cv) => self.emit_const(cv, instructions),
-            Operand::Symbolic(formula) => self.emit_ground_symbolic_constant(formula, instructions),
+            Operand::Symbolic(formula) => self.resolve_symbolic_operand(formula, instructions),
             _ => Err(BridgeError::UnsupportedOp("unknown operand variant".to_string())),
         }
     }
@@ -1334,6 +1412,210 @@ impl<'a> LoweringCtx<'a> {
             results: vec![result],
         });
         Ok(result)
+    }
+
+    /// Lower a symbolic operand: first the entry-register-binding shapes
+    /// (each use justified by the per-block write-freedom certificate), then
+    /// exact ground constants; everything else refuses, with the refusal
+    /// carrying the closest missing justification instead of a bare
+    /// "unsupported".
+    fn resolve_symbolic_operand(
+        &mut self,
+        formula: &Formula,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Value, BridgeError> {
+        if let Some(value) = self.try_entry_binding_lowering(formula, instructions) {
+            return Ok(value);
+        }
+        self.emit_ground_symbolic_constant(formula, instructions)
+            .map_err(|err| self.enrich_symbolic_refusal(formula, err))
+    }
+
+    /// The two entry-binding shapes: a bare bound register `Var`, and the
+    /// exact 8-byte little-endian load over the machine memory seed rooted at
+    /// a bound register (optionally plus a constant displacement). Returns
+    /// `None` — falling through to the fail-closed refusal — on ANY missing
+    /// justification; nothing here substitutes a value.
+    fn try_entry_binding_lowering(
+        &mut self,
+        formula: &Formula,
+        instructions: &mut Vec<Instruction>,
+    ) -> Option<Value> {
+        use crate::entry_binding::{recognize_bare_reg_var, recognize_le_load};
+
+        // No consumption from terminator position: the records are keyed by
+        // statement index, which a terminator operand does not have, and no
+        // evidence row exists to mark — falling through to the refusal keeps
+        // the latent bare-Var-discriminant path fail-closed.
+        if self.in_terminator {
+            return None;
+        }
+        let entry = self.entry_bindings.as_ref()?;
+
+        if let Some(name) = recognize_bare_reg_var(formula) {
+            let &(param_index, value) = entry.params_by_var.get(name)?;
+            if !entry.preservation.is_preserved(self.current_block, param_index) {
+                return None;
+            }
+            let param = &entry.bindings.params[param_index];
+            self.record_symbolic_consumption(
+                formula,
+                format!(
+                    "bare {var} lowered to LIR param {param_index} ({reg} at function entry); \
+                     justified: {reg} proven write-free on every entry\u{2192}block-{block} path \
+                     (Assign-derived kill sets over the lifted body); candidacy from the \
+                     entry-block read-before-write observation",
+                    var = param.var_name,
+                    reg = param.reg_name,
+                    block = self.current_block,
+                ),
+            );
+            return Some(value);
+        }
+
+        if let Some(root) = recognize_le_load(formula) {
+            let &(param_index, base_value) = entry.params_by_var.get(&root.base_var)?;
+            if !entry.preservation.is_preserved(self.current_block, param_index) {
+                return None;
+            }
+            let param_reg = entry.bindings.params[param_index].reg_name.clone();
+            let param_var = entry.bindings.params[param_index].var_name.clone();
+            let address = match root.displacement {
+                None => base_value,
+                Some(displacement) => {
+                    let imm = i64::try_from(displacement).ok()?;
+                    let displacement_const = self.fresh_value();
+                    instructions.push(Instruction {
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm },
+                        args: vec![],
+                        results: vec![displacement_const],
+                    });
+                    let address = self.fresh_value();
+                    instructions.push(Instruction {
+                        opcode: Opcode::Iadd,
+                        args: vec![base_value, displacement_const],
+                        results: vec![address],
+                    });
+                    address
+                }
+            };
+            let loaded = self.fresh_value();
+            instructions.push(Instruction {
+                opcode: Opcode::Load { ty: LirType::I64, align: None },
+                args: vec![address],
+                results: vec![loaded],
+            });
+            self.record_symbolic_consumption(
+                formula,
+                format!(
+                    "8-byte little-endian load lowered to Opcode::Load{{ty: I64}} at address \
+                     LIR param {param_index} ({reg} at function entry){disp}; justified: {reg} \
+                     ({var}) proven write-free on every entry\u{2192}block-{block} path \
+                     (Assign-derived kill sets over the lifted body); candidacy from the \
+                     entry-block read-before-write observation",
+                    reg = param_reg,
+                    var = param_var,
+                    block = self.current_block,
+                    disp = match root.displacement {
+                        Some(d) => format!(" + {d}"),
+                        None => String::new(),
+                    },
+                ),
+            );
+            return Some(loaded);
+        }
+
+        None
+    }
+
+    fn record_symbolic_consumption(&mut self, formula: &Formula, detail: String) {
+        self.consumed_symbolic.push(crate::entry_binding::ConsumedSymbolicLowering {
+            block: self.current_block,
+            statement_index: self.current_statement,
+            formula: formula.clone(),
+            detail,
+        });
+    }
+
+    /// Attach the closest missing justification to a symbolic-operand
+    /// refusal, so the error names the fix (and its options) instead of only
+    /// the fact of refusal. Never changes WHETHER lowering refuses.
+    fn enrich_symbolic_refusal(&self, formula: &Formula, err: BridgeError) -> BridgeError {
+        use crate::entry_binding::{recognize_bare_reg_var, recognize_le_load};
+
+        let BridgeError::UnsupportedOp(message) = err else {
+            return err;
+        };
+        let mut message = message;
+
+        if let Some(reason) = &self.entry_binding_refusal {
+            message.push_str(&format!(
+                "; entry-register bindings were supplied but refused for this body: {reason}"
+            ));
+        } else if let Some(entry) = &self.entry_bindings {
+            let base_var = recognize_le_load(formula)
+                .map(|root| root.base_var)
+                .or_else(|| recognize_bare_reg_var(formula).map(str::to_string));
+            match base_var {
+                Some(var) => match entry.params_by_var.get(&var) {
+                    Some(&(param_index, _)) => {
+                        let param = &entry.bindings.params[param_index];
+                        let kills = entry.preservation.kill_sites(param_index);
+                        if kills.is_empty() {
+                            message.push_str(&format!(
+                                "; the shape is modeled but {reg} ({var})'s function-entry \
+                                 binding is not established at block {block} (no concrete kill \
+                                 located: the block is unreachable from entry or a structural \
+                                 gate voided the certificate)",
+                                reg = param.reg_name,
+                                block = self.current_block,
+                            ));
+                        } else {
+                            let sites = kills
+                                .iter()
+                                .map(|(block, stmt)| format!("block {block} statement {stmt}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            message.push_str(&format!(
+                                "; the shape is modeled but {reg} ({var}) is assigned at {sites}, \
+                                 so its function-entry value is not what reaches block {block} on \
+                                 every path; only a use whose block the write-freedom certificate \
+                                 covers can bind",
+                                reg = param.reg_name,
+                                block = self.current_block,
+                            ));
+                        }
+                    }
+                    None => {
+                        let candidates = entry
+                            .bindings
+                            .params
+                            .iter()
+                            .map(|param| {
+                                format!("{} ({})", param.reg_name, param.var_name)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        message.push_str(&format!(
+                            "; the shape is modeled but its base register {var} is outside the \
+                             bound ABI argument-register prefix [{candidates}]; a non-argument \
+                             base needs its own justified binding before it can lower"
+                        ));
+                    }
+                },
+                None => {
+                    message.push_str(
+                        "; the modeled target-semantic shapes are: a bare bound 64-bit register \
+                         Var, and the 8-byte little-endian load over the machine memory seed \
+                         rooted at a bound register (optionally plus a constant displacement); \
+                         extending the recognizer requires extending its mutation battery in the \
+                         same change",
+                    );
+                }
+            }
+        }
+
+        BridgeError::UnsupportedOp(message)
     }
 }
 
@@ -2485,6 +2767,18 @@ pub fn lower_body_to_lir_with_options(
     body: &VerifiableBody,
     options: &LoweringOptions,
 ) -> Result<LirFunction, BridgeError> {
+    lower_body_to_lir_with_options_and_consumptions(name, body, options).map(|(lir, _)| lir)
+}
+
+/// Like [`lower_body_to_lir_with_options`], but also returns the symbolic
+/// formulas the lowering consumed with target semantics (entry-register
+/// bindings and recognized loads), keyed by source block and statement so the
+/// binary-conversion evidence rows can be marked consumed.
+pub fn lower_body_to_lir_with_options_and_consumptions(
+    name: &str,
+    body: &VerifiableBody,
+    options: &LoweringOptions,
+) -> Result<(LirFunction, Vec<crate::entry_binding::ConsumedSymbolicLowering>), BridgeError> {
     // Trust: Validate that the function body is not empty.
     if body.blocks.is_empty() {
         return Err(BridgeError::EmptyBody);
@@ -2501,10 +2795,36 @@ pub fn lower_body_to_lir_with_options(
         }
     }
 
+    // Entry-register bindings: cross-check the table against this body and
+    // compute the per-block write-freedom certificate. A refused table keeps
+    // lowering param-free (symbolic refusals then carry the reason); a
+    // justified one makes the params real LIR formals. Mixing with MIR
+    // argument locals is refused outright — the two parameter conventions
+    // must never coexist in one function.
+    let entry_inputs = match &options.entry_bindings {
+        Some(bindings) if !bindings.params.is_empty() => {
+            if body.arg_count != 0 {
+                return Err(BridgeError::UnsupportedOp(format!(
+                    "entry-register bindings cannot be combined with MIR argument locals \
+                     (arg_count {}); a body has exactly one parameter convention",
+                    body.arg_count
+                )));
+            }
+            match crate::entry_binding::compute_entry_preservation(body, bindings) {
+                Ok(preservation) => Some(EntryBindingInputs::Justified {
+                    bindings: bindings.clone(),
+                    preservation,
+                }),
+                Err(refusal) => Some(EntryBindingInputs::Refused { reason: refusal.reason }),
+            }
+        }
+        _ => None,
+    };
+
     // Compute the maximum block ID so the context can allocate new blocks
     // (e.g., the panic block for Assert) without collisions.
     let max_block_id = body.blocks.iter().map(|bb| bb.id.0 as u32).max().unwrap_or(0);
-    let mut ctx = LoweringCtx::new(&body.locals, body.arg_count, max_block_id, options);
+    let mut ctx = LoweringCtx::new(&body.locals, body.arg_count, max_block_id, options, entry_inputs);
     let initial_local_values = ctx.local_values.clone();
     let predecessors = collect_predecessors(body);
     let return_lowering = return_lowering_for(body);
@@ -2517,6 +2837,12 @@ pub fn lower_body_to_lir_with_options(
         ReturnLowering::NoValue => None,
     };
     let mut param_types = Vec::with_capacity(body.arg_count);
+    // Entry-register binding params come first, mirroring the Value(0..k)
+    // allocation in LoweringCtx::new: LIR param i is the function-entry value
+    // of the i-th bound ABI argument register, always a 64-bit machine word.
+    if let Some(entry) = &ctx.entry_bindings {
+        param_types.extend(entry.bindings.params.iter().map(|_| LirType::I64));
+    }
     for i in 1..=body.arg_count {
         let local =
             body.locals.iter().find(|l| l.index == i).ok_or(BridgeError::MissingLocal(i))?;
@@ -2578,7 +2904,9 @@ pub fn lower_body_to_lir_with_options(
     // SAFETY: body.blocks is non-empty (validated above).
     let entry_block = Block(body.blocks[0].id.0 as u32);
 
-    Ok(LirFunction {
+    let consumed_symbolic = std::mem::take(&mut ctx.consumed_symbolic);
+
+    Ok((LirFunction {
         name: name.to_string(),
         signature,
         blocks,
@@ -2602,7 +2930,7 @@ pub fn lower_body_to_lir_with_options(
         // trust-cg Function carries per-function exception-handling info; the bridge does
         // not emit EH metadata yet — Default (empty) is the validated no-EH baseline.
         eh_info: Default::default(),
-    })
+    }, consumed_symbolic))
 }
 
 // ---------------------------------------------------------------------------
@@ -2618,15 +2946,22 @@ fn lower_block(
     block_params: &FxHashMap<usize, Vec<BlockParam>>,
 ) -> Result<LirBlock, BridgeError> {
     ctx.local_values = entry_values.clone();
+    ctx.current_block = bb.id.0;
     let mut instructions = Vec::new();
 
     // Lower each statement.
-    for stmt in &bb.stmts {
+    for (stmt_index, stmt) in bb.stmts.iter().enumerate() {
+        ctx.current_statement = stmt_index;
         lower_statement(stmt, ctx, &mut instructions)?;
     }
 
-    // Lower the terminator.
-    lower_terminator(&bb.terminator, ctx, &mut instructions, return_lowering, block_params)?;
+    // Lower the terminator. Entry-binding lowering is off in this position
+    // (see `LoweringCtx::in_terminator`).
+    ctx.in_terminator = true;
+    let terminator_result =
+        lower_terminator(&bb.terminator, ctx, &mut instructions, return_lowering, block_params);
+    ctx.in_terminator = false;
+    terminator_result?;
 
     Ok(LirBlock {
         params: params.iter().map(|param| (param.value, param.ty.clone())).collect(),
@@ -3993,6 +4328,7 @@ mod terminator_runtime_tests {
                 add_overflow: Some("__trust_panic_add_overflow".to_string()),
                 ..PanicRuntimeSymbols::default()
             },
+            ..LoweringOptions::default()
         };
 
         let lir = lower_to_lir_with_options(&func, &options)
@@ -4457,7 +4793,7 @@ mod aggregate_projection_tests {
     fn raw_ptr_aggregate_rejects_dyn_vtable_metadata() {
         let data_ptr_ty = Ty::RawPtr { pointee: Box::new(Ty::u8()), mutable: false };
         let dyn_ptr_ty = Ty::RawPtr {
-            pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into() }),
+            pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
             mutable: false,
         };
         let func = unit_function(
@@ -4472,7 +4808,7 @@ mod aggregate_projection_tests {
                 place: Place::local(3),
                 rvalue: Rvalue::Aggregate(
                     AggregateKind::RawPtr {
-                        pointee_ty: Ty::Dynamic { trait_name: "Debug".into() },
+                        pointee_ty: Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) },
                         mutable: false,
                     },
                     vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -4522,5 +4858,481 @@ mod aggregate_projection_tests {
             err,
             BridgeError::UnsupportedOp(msg) if msg.contains("fieldless ADT aggregate")
         ));
+    }
+}
+
+/// The entry-register binding lowering battery: the fixture shape lowered for
+/// real, every mutation refused, and both directions of the certificate gates
+/// exercised end to end through `lower_body_to_lir_with_options`.
+#[cfg(test)]
+mod entry_binding_lowering_tests {
+    use trust_types::{BlockId, ConstValue, Operand, Place, Rvalue, Sort, SourceSpan};
+
+    use super::*;
+    use crate::entry_binding::{BinaryEntryBindings, BinaryEntryParam, BindingArch};
+
+    fn u64_ty() -> Ty {
+        Ty::Int { width: 64, signed: false }
+    }
+
+    /// A body shaped like the decompiled `trust_fixture_x86_load` after frame
+    /// reconstruction: machine-register locals (the x86_64 LocalLayout names
+    /// that matter here), arg_count 0, one surviving statement — the 8-byte
+    /// little-endian load of [RDI] into RAX — and a bare return.
+    fn x86_load_fixture_body(stmts: Vec<Statement>, blocks: Option<Vec<TrustBlock>>) -> VerifiableBody {
+        let mut locals = vec![LocalDecl { index: 0, ty: u64_ty(), name: Some("_lifted_result".into()) }];
+        for (index, name) in [(1, "RAX"), (8, "RDI")] {
+            locals.push(LocalDecl { index, ty: u64_ty(), name: Some(name.to_string()) });
+        }
+        VerifiableBody {
+            locals,
+            blocks: blocks.unwrap_or_else(|| {
+                vec![TrustBlock { id: BlockId(0), stmts, terminator: Terminator::Return }]
+            }),
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        }
+    }
+
+    fn mem_seed() -> Formula {
+        Formula::Var(
+            "MEM".to_string(),
+            Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))),
+        )
+    }
+
+    fn reg_var(name: &str) -> Formula {
+        Formula::Var(name.to_string(), Sort::BitVec(64))
+    }
+
+    /// Mirror of the lifters' little-endian byte-assembled load
+    /// (`trust-machine-sem::load_le_bytes`).
+    fn le_load(root: &Formula) -> Formula {
+        let mem = mem_seed();
+        let mut result = Formula::BitVec { value: 0, width: 64 };
+        for i in 0..8u32 {
+            let addr = if i == 0 {
+                root.clone()
+            } else {
+                Formula::BvAdd(
+                    Box::new(root.clone()),
+                    Box::new(Formula::BitVec { value: i128::from(i), width: 64 }),
+                    64,
+                )
+            };
+            let byte = Formula::Select(Box::new(mem.clone()), Box::new(addr));
+            let extended = Formula::BvZeroExt(Box::new(byte), 56);
+            result = if i == 0 {
+                extended
+            } else {
+                Formula::BvOr(
+                    Box::new(result),
+                    Box::new(Formula::BvShl(
+                        Box::new(extended),
+                        Box::new(Formula::BitVec { value: i128::from(i * 8), width: 64 }),
+                        64,
+                    )),
+                    64,
+                )
+            };
+        }
+        result
+    }
+
+    fn load_rax_from(root: &Formula) -> Statement {
+        Statement::Assign {
+            place: Place::local(1),
+            rvalue: Rvalue::Use(Operand::Symbolic(le_load(root))),
+            span: SourceSpan::default(),
+        }
+    }
+
+    fn clobber_rdi() -> Statement {
+        Statement::Assign {
+            place: Place::local(8),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+            span: SourceSpan::default(),
+        }
+    }
+
+    fn rdi_bindings() -> BinaryEntryBindings {
+        BinaryEntryBindings {
+            arch: BindingArch::X86_64,
+            params: vec![BinaryEntryParam {
+                var_name: "X7".to_string(),
+                reg_name: "RDI".to_string(),
+                local_index: 8,
+            }],
+        }
+    }
+
+    fn options_with(bindings: BinaryEntryBindings) -> LoweringOptions {
+        LoweringOptions { entry_bindings: Some(bindings), ..LoweringOptions::default() }
+    }
+
+    /// The capability itself, asserted at the instruction level: the fixture
+    /// body lowers to exactly [Load{ty: I64} of param Value(0), Return], with
+    /// the signature carrying the one bound param — and the consumption
+    /// record names the load. The bindings are also asserted NON-EMPTY
+    /// explicitly, so an empty-table bug can never hide behind a refusal
+    /// that this battery also expects elsewhere.
+    #[test]
+    fn fixture_load_lowers_to_a_real_load_of_the_entry_param() {
+        let body = x86_load_fixture_body(vec![load_rax_from(&reg_var("X7"))], None);
+        let bindings = rdi_bindings();
+        assert!(!bindings.params.is_empty(), "the binding table must be non-empty");
+        let (lir, consumed) = lower_body_to_lir_with_options_and_consumptions(
+            "trust_fixture_x86_load",
+            &body,
+            &options_with(bindings),
+        )
+        .expect("the justified load must lower");
+
+        assert_eq!(lir.signature.params, vec![LirType::I64], "one entry-register param");
+        let entry_block = &lir.blocks[&Block(0)];
+        assert_eq!(
+            entry_block.instructions.len(),
+            2,
+            "exactly the load and the return: {:?}",
+            entry_block.instructions
+        );
+        let load = &entry_block.instructions[0];
+        assert_eq!(load.opcode, Opcode::Load { ty: LirType::I64, align: None });
+        assert_eq!(load.args, vec![Value(0)], "the address is the RDI entry param");
+        assert_eq!(entry_block.instructions[1].opcode, Opcode::Return);
+
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].block, 0);
+        assert_eq!(consumed[0].statement_index, 0);
+        assert!(consumed[0].detail.contains("Opcode::Load"), "{}", consumed[0].detail);
+        assert!(consumed[0].detail.contains("RDI"), "{}", consumed[0].detail);
+
+        crate::validation::validate_lir(&lir).expect("emitted LIR must validate");
+    }
+
+    /// A constant displacement on the base register lowers as
+    /// Iconst; Iadd; Load.
+    #[test]
+    fn displacement_load_lowers_with_iconst_iadd() {
+        let root = Formula::BvAdd(
+            Box::new(reg_var("X7")),
+            Box::new(Formula::BitVec { value: 16, width: 64 }),
+            64,
+        );
+        let body = x86_load_fixture_body(vec![load_rax_from(&root)], None);
+        let (lir, _) = lower_body_to_lir_with_options_and_consumptions(
+            "disp",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect("the displaced load must lower");
+        let instructions = &lir.blocks[&Block(0)].instructions;
+        assert_eq!(instructions.len(), 4, "{instructions:?}");
+        assert_eq!(instructions[0].opcode, Opcode::Iconst { ty: LirType::I64, imm: 16 });
+        assert_eq!(instructions[1].opcode, Opcode::Iadd);
+        assert_eq!(instructions[1].args[0], Value(0), "base is the entry param");
+        assert_eq!(instructions[2].opcode, Opcode::Load { ty: LirType::I64, align: None });
+        assert_eq!(instructions[3].opcode, Opcode::Return);
+    }
+
+    /// The anti-"silently wrong otherwise" control: a two-block body whose
+    /// first block clobbers RDI must REFUSE the load in the second block, and
+    /// the refusal must name the concrete kill.
+    #[test]
+    fn clobbered_path_refuses_and_names_the_kill() {
+        let blocks = vec![
+            TrustBlock {
+                id: BlockId(0),
+                stmts: vec![clobber_rdi()],
+                terminator: Terminator::Goto(BlockId(1)),
+            },
+            TrustBlock {
+                id: BlockId(1),
+                stmts: vec![load_rax_from(&reg_var("X7"))],
+                terminator: Terminator::Return,
+            },
+        ];
+        let body = x86_load_fixture_body(vec![], Some(blocks));
+        let err = lower_body_to_lir_with_options_and_consumptions(
+            "clobbered",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect_err("a clobbered base register must refuse");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(message.contains("RDI"), "{message}");
+        assert!(message.contains("block 0 statement 0"), "{message}");
+        assert!(
+            message.contains("not what reaches block 1"),
+            "the refusal must carry the justification gap: {message}"
+        );
+    }
+
+    /// Converse of the clobber control: the same two-block CFG with the
+    /// clobber removed must LOWER — refusing here would be over-correction.
+    #[test]
+    fn preserved_multiblock_load_lowers() {
+        let blocks = vec![
+            TrustBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Goto(BlockId(1)),
+            },
+            TrustBlock {
+                id: BlockId(1),
+                stmts: vec![load_rax_from(&reg_var("X7"))],
+                terminator: Terminator::Return,
+            },
+        ];
+        let body = x86_load_fixture_body(vec![], Some(blocks));
+        let (lir, consumed) = lower_body_to_lir_with_options_and_consumptions(
+            "preserved",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect("a preserved multi-block load must lower");
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].block, 1);
+        crate::validation::validate_lir(&lir).expect("emitted LIR must validate");
+    }
+
+    /// The panel's blocker control: the ENTRY block is its own loop head and
+    /// clobbers RDI after the load. `Var("X7")` there denotes the value at
+    /// every arrival — iteration 2 sees the clobber — so binding it to the
+    /// function-entry param would emit a different program. Must refuse.
+    #[test]
+    fn entry_as_loop_head_with_clobber_refuses() {
+        let blocks = vec![
+            TrustBlock {
+                id: BlockId(0),
+                stmts: vec![load_rax_from(&reg_var("X7")), clobber_rdi()],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Constant(ConstValue::Bool(true)),
+                    targets: vec![(1, BlockId(0))],
+                    otherwise: BlockId(1),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+        ];
+        let body = x86_load_fixture_body(vec![], Some(blocks));
+        let err = lower_body_to_lir_with_options_and_consumptions(
+            "entry_loop_clobber",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect_err("a back edge into the entry block carries the clobber to the load");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(message.contains("RDI"), "{message}");
+    }
+
+    /// Converse of the blocker control: the same self-loop that never writes
+    /// RDI keeps the binding and lowers.
+    #[test]
+    fn entry_as_loop_head_without_clobber_lowers() {
+        let blocks = vec![
+            TrustBlock {
+                id: BlockId(0),
+                stmts: vec![load_rax_from(&reg_var("X7"))],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Constant(ConstValue::Bool(true)),
+                    targets: vec![(1, BlockId(0))],
+                    otherwise: BlockId(1),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+        ];
+        let body = x86_load_fixture_body(vec![], Some(blocks));
+        let (lir, _) = lower_body_to_lir_with_options_and_consumptions(
+            "entry_loop_clean",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect("a clean self-loop must not strip the binding");
+        crate::validation::validate_lir(&lir).expect("emitted LIR must validate");
+    }
+
+    /// A base register outside the bound ABI argument prefix refuses with
+    /// guidance naming the candidate set.
+    #[test]
+    fn non_abi_base_refuses_with_guidance() {
+        let body = x86_load_fixture_body(vec![load_rax_from(&reg_var("X3"))], None);
+        let err = lower_body_to_lir_with_options_and_consumptions(
+            "rbx_base",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect_err("an unbound base register must refuse");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(message.contains("X3"), "{message}");
+        assert!(message.contains("RDI (X7)"), "the guidance names the candidates: {message}");
+    }
+
+    /// Without bindings the behavior is byte-identical to before the field
+    /// existed: the same refusal, no params, no consumptions — the MIR-lane
+    /// no-op control.
+    #[test]
+    fn default_options_are_unchanged() {
+        let body = x86_load_fixture_body(vec![load_rax_from(&reg_var("X7"))], None);
+        let err =
+            lower_body_to_lir_with_options("mir_lane", &body, &LoweringOptions::default())
+                .expect_err("the load still refuses without bindings");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(
+            message.contains("symbolic operand requires target-semantic lowering"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("entry-register"),
+            "no binding enrichment without a table: {message}"
+        );
+    }
+
+    /// Mixing entry bindings with MIR argument locals refuses outright.
+    #[test]
+    fn mixing_bindings_with_mir_args_refuses() {
+        let mut body = x86_load_fixture_body(vec![], None);
+        body.arg_count = 1;
+        let err = lower_body_to_lir_with_options_and_consumptions(
+            "mixed",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect_err("two parameter conventions in one body must refuse");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(message.contains("one parameter convention"), "{message}");
+    }
+
+    /// A refused binding table (here: a name mismatch against the body) keeps
+    /// lowering param-free and attaches the refusal reason to the symbolic
+    /// refusal.
+    #[test]
+    fn refused_table_attaches_the_reason() {
+        let mut bindings = rdi_bindings();
+        bindings.params[0].local_index = 1; // RAX's local, named differently
+        let body = x86_load_fixture_body(vec![load_rax_from(&reg_var("X7"))], None);
+        let err = lower_body_to_lir_with_options_and_consumptions(
+            "refused_table",
+            &body,
+            &options_with(bindings),
+        )
+        .expect_err("the load refuses when the table was refused");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(
+            message.contains("refused for this body"),
+            "the refusal carries the table's rejection: {message}"
+        );
+        assert!(message.contains("does not match"), "{message}");
+    }
+
+    /// The bare bound register Var lowers to the param value itself.
+    #[test]
+    fn bare_bound_var_lowers_to_the_param() {
+        let body = x86_load_fixture_body(
+            vec![Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Use(Operand::Symbolic(reg_var("X7"))),
+                span: SourceSpan::default(),
+            }],
+            None,
+        );
+        let (lir, consumed) = lower_body_to_lir_with_options_and_consumptions(
+            "mov_rax_rdi",
+            &body,
+            &options_with(rdi_bindings()),
+        )
+        .expect("a bare bound Var must lower to the param");
+        assert_eq!(lir.signature.params, vec![LirType::I64]);
+        assert_eq!(consumed.len(), 1);
+        let instructions = &lir.blocks[&Block(0)].instructions;
+        assert_eq!(instructions.len(), 1, "just the return: {instructions:?}");
+        assert_eq!(instructions[0].opcode, Opcode::Return);
+    }
+}
+
+/// Terminator-position gate: a symbolic operand in a TERMINATOR never lowers
+/// through entry bindings (consumption records are statement-keyed; a
+/// terminator has no statement index and no evidence row), so a bare bound
+/// Var used as a SwitchInt discriminant refuses exactly as it does today.
+#[cfg(test)]
+mod entry_binding_terminator_position_tests {
+    use trust_types::{BlockId, ConstValue, Operand, Place, Rvalue, Sort, SourceSpan};
+
+    use super::*;
+    use crate::entry_binding::{BinaryEntryBindings, BinaryEntryParam, BindingArch};
+
+    #[test]
+    fn bare_bound_var_discriminant_refuses_in_terminator_position() {
+        let u64_ty = Ty::Int { width: 64, signed: false };
+        let body = VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: u64_ty.clone(), name: Some("_lifted_result".into()) },
+                LocalDecl { index: 8, ty: u64_ty, name: Some("RDI".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Symbolic(Formula::Var(
+                            "X7".to_string(),
+                            Sort::BitVec(64),
+                        )),
+                        targets: vec![(1, BlockId(1))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        };
+        let options = LoweringOptions {
+            entry_bindings: Some(BinaryEntryBindings {
+                arch: BindingArch::X86_64,
+                params: vec![BinaryEntryParam {
+                    var_name: "X7".to_string(),
+                    reg_name: "RDI".to_string(),
+                    local_index: 8,
+                }],
+            }),
+            ..LoweringOptions::default()
+        };
+        let err = lower_body_to_lir_with_options_and_consumptions("discr", &body, &options)
+            .expect_err("a terminator-position symbolic operand must refuse");
+        let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
+        assert!(
+            message.contains("symbolic operand requires target-semantic lowering"),
+            "{message}"
+        );
+        // A statement-position use of the SAME formula in the SAME body shape
+        // still lowers — the gate is positional, not a blanket regression.
+        let mut statement_body = body;
+        statement_body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Symbolic(Formula::Var(
+                "X7".to_string(),
+                Sort::BitVec(64),
+            ))),
+            span: SourceSpan::default(),
+        });
+        statement_body.blocks[0].terminator = Terminator::SwitchInt {
+            discr: Operand::Constant(ConstValue::Bool(true)),
+            targets: vec![(1, BlockId(1))],
+            otherwise: BlockId(1),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        };
+        let (_, consumed) =
+            lower_body_to_lir_with_options_and_consumptions("stmt", &statement_body, &options)
+                .expect("statement-position use lowers");
+        assert_eq!(consumed.len(), 1, "converse control: the gate is positional");
     }
 }

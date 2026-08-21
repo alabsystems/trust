@@ -3455,12 +3455,52 @@ fn callee_is_std_raw_ptr_inherent(lower: &str) -> bool {
         || c.starts_with("*mut ")
 }
 
-/// The compiler-generated `core::fmt::Arguments::{new_v1,new_const,new_v1_formatted}`
+/// The compiler-generated `core::fmt::Arguments::{new,new_v1,new_const,new_v1_formatted}`
 /// constructors (`format_args!` machinery). CRATE-ANCHORED: the bare
 /// `contains("fmt::arguments::")` this replaces was FORGEABLE by a nested user module
 /// `mycrate::fmt::arguments::…`, which would SUPPRESS the `[unsafe:unmodeled-call]`
 /// completeness VC (via `call_is_modeled`). Genuine renders
 /// `core::fmt::Arguments::new_v1` (lowercased `core::fmt::arguments::…`) — crate-rooted.
+///
+/// `new` IS THE CURRENT SPELLING — RENAME DRIFT, not a widening. `format_args!`
+/// lowering moved from `new_v1`/`new_const` to `new`/`from_str`.
+/// trust-ir-bridge's `total_no_panic_call_summary` was updated for that move and
+/// says so verbatim ("these two were missed when the `format_args!` lowering moved
+/// from `new_v1`/`new_const` to `new`/`from_str`"); THIS predicate was not. The two
+/// lists then disagreed: the bridge modeled the call total while the compiler's
+/// unsafe-call completeness check (`synthetic_unmodeled_unsafe_call_vcs` ->
+/// `call_has_unsafe_model`) still called it unmodeled, so every `format!`,
+/// `write!` and `Display`/`Debug` impl paid one ALWAYS-REFUTING
+/// `[unsafe:unmodeled-call]` finding per call site.
+///
+/// MEASURED (ay `ay-proof-common`, sealed toolchain trust-e9ca4908, 2026-08-20):
+/// `TRUST_UNSAFE_CALL_DEBUG=1` reports `call core::fmt::Arguments::<'a>::new
+/// unsafe=true (sig=true tf=false) foreign=false modeled=false` at 14 call sites —
+/// 14 of that crate's 27 `failed` obligations and 100% of its
+/// `hardened_unsafe_operation` failures, all on this one callee.
+///
+/// SAME BODY CLASS as `new_v1`, which this predicate has always covered:
+/// `library/core/src/fmt/mod.rs`'s `Arguments::new` is exactly
+/// `unsafe { Arguments { template: mem::transmute(template), args: mem::transmute(args) } }`
+/// — two transmutes, no branch, no allocation, no formatter dispatch. Its only
+/// safety precondition (the template/args encoding) is upheld by `format_args!`,
+/// which is its only caller: the impl is `#[doc(hidden)]`, `#[unstable(feature =
+/// "fmt_internals")]` and carries `#[rustc_diagnostic_item = "FmtArgumentsNew"]`.
+/// Running the formatter — and any user `Display`/`Debug` panic — remains a
+/// SEPARATE call (`extern_fmt_dispatch_call`) with its own honest may-panic
+/// obligation, exactly the boundary the `new_v1` entry already drew.
+///
+/// `from_str`/`from_str_nonconst` are deliberately absent: they are SAFE fns, so
+/// `synthetic_unmodeled_unsafe_call_vcs` never asks about them (it gates on
+/// `fn_sig().safety()` first) and listing them here would claim coverage nothing
+/// requests.
+///
+/// ANCHORING IS UNCHANGED. The ` as ` reject plus the `core::fmt::arguments` /
+/// `std::fmt::arguments` crate root still gate every arm; `Arguments` is the only
+/// item under that path, so `::new` cannot alias another callee. The
+/// `format_args!` VALUE packers render `core::fmt::rt::argument::…` and do not
+/// match this prefix at all. A nested `mycrate::fmt::arguments::new` still fails
+/// the crate-root test.
 fn is_std_fmt_arguments_ctor(lower: &str) -> bool {
     if lower.contains(" as ") {
         return false;
@@ -3469,7 +3509,7 @@ fn is_std_fmt_arguments_ctor(lower: &str) -> bool {
     (c.starts_with("core::fmt::arguments") || c.starts_with("std::fmt::arguments"))
         && matches!(
             c.rsplit("::").next(),
-            Some("new_v1" | "new_const" | "new_v1_formatted")
+            Some("new" | "new_v1" | "new_const" | "new_v1_formatted")
         )
 }
 
@@ -7819,6 +7859,14 @@ mod tests {
             "core::mem::transmute",
             "core::mem::maybeuninit::<t>::assume_init",
             "core::fmt::arguments::new_v1",
+            // The CURRENT `format_args!` constructor spelling, exactly as
+            // `call_has_unsafe_model` lowercases it from
+            // `trust_mir_extract::safe_def_path_str` (MEASURED at 14 call sites in
+            // ay-proof-common). Same two-transmute body class as `new_v1`; the
+            // lifetime segment sits between the type and the method, so the
+            // `rsplit("::")` method test still sees `new`.
+            "core::fmt::arguments::<'a>::new",
+            "std::fmt::arguments::<'a>::new",
             "std::os::fd::fromrawfd::from_raw_fd",
             "<std::fs::file as std::os::fd::fromrawfd>::from_raw_fd",
             // Native-TLS lazy-init `get_or_init` (LOWERCASED, as `call_has_unsafe_model`
@@ -7839,11 +7887,59 @@ mod tests {
             "mycrate::fmt::arguments::new_v1",
             "<core::fmt::arguments as mycrate::evil>::new_v1",
             "core::fmt::arguments::forged_ctor",
+            // Same forgery attempts against the NEW `new` spelling: a nested user
+            // module and an orphan trait impl must not claim coverage, and a
+            // near-miss method under the genuine root must still fail closed.
+            "mycrate::fmt::arguments::<'a>::new",
+            "<core::fmt::arguments as mycrate::evil>::new",
+            "core::fmt::arguments::<'a>::new_forged",
             "mycrate::std::os::fd::fromrawfd::from_raw_fd",
             "<mycrate::file as mycrate::std::os::fd::fromrawfd>::from_raw_fd",
             "mycrate::from_raw_fd_wrapper",
         ] {
             assert!(!call_is_modeled(unmodeled), "should NOT be modeled: {unmodeled}");
+        }
+    }
+
+    // Trust (rename drift, 2026-08-20): `format_args!` lowering moved from
+    // `new_v1`/`new_const` to `new`/`from_str`. trust-ir-bridge's
+    // `total_no_panic_call_summary` was updated; this predicate was not, so the two
+    // lists disagreed and every `format!`/`write!`/`Display` impl paid an
+    // always-refuting `[unsafe:unmodeled-call]` finding per call site. This test
+    // pins BOTH spellings and the anchoring, so a future lowering rename fails here
+    // instead of silently costing obligations again.
+    #[test]
+    fn fmt_arguments_ctor_covers_both_lowering_spellings_and_stays_anchored() {
+        for covered in [
+            // Historical spellings.
+            "core::fmt::arguments::new_v1",
+            "core::fmt::arguments::new_const",
+            "core::fmt::arguments::new_v1_formatted",
+            // Current spelling, with and without the lifetime segment rustc renders.
+            "core::fmt::arguments::new",
+            "core::fmt::arguments::<'a>::new",
+            "std::fmt::arguments::<'a>::new",
+        ] {
+            assert!(is_std_fmt_arguments_ctor(covered), "should be covered: {covered}");
+        }
+        for rejected in [
+            // Forged crate root.
+            "mycrate::fmt::arguments::<'a>::new",
+            "mycrate::fmt::arguments::new_v1",
+            // Orphan trait impl on the genuine type.
+            "<core::fmt::arguments as mycrate::evil>::new",
+            // Near-miss method under the genuine root.
+            "core::fmt::arguments::<'a>::new_forged",
+            "core::fmt::arguments::estimated_capacity",
+            "core::fmt::arguments::as_str",
+            // The `format_args!` VALUE packers live under `core::fmt::rt::Argument`,
+            // a DIFFERENT path — they must not ride this predicate. They are safe
+            // fns, so the compiler's unsafe-call completeness check never asks about
+            // them; their panic-freedom is trust-ir-bridge's `fmt_value_packing_call`.
+            "core::fmt::rt::argument::<'_>::new_display",
+            "core::fmt::rt::argument::<'_>::new_debug",
+        ] {
+            assert!(!is_std_fmt_arguments_ctor(rejected), "must fail closed: {rejected}");
         }
     }
 

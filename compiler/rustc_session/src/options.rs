@@ -3297,6 +3297,20 @@ written to standard error output)"),
     trust_certified_test_monitors: bool = (false, parse_bool, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "reserved internal Targo phase-A fingerprint for a non-`--test` monitor subject; it has no independent authority and requires the paired -Ztrust-targo-test-monitor session-consistency selector"),
+    // Trust (lane CTFE): a MEASUREMENT probe, never a code path. `mir_built`
+    // returns early for a trivial const, so the CTFE flip seam
+    // (`try_flip_ctfe`, the single call site of the CTFE flip) is never
+    // demanded for one and the whole population is invisible to any
+    // log-reading instrument. This flag replays the seam's decision over
+    // exactly those bodies and DISCARDS the result, so it can only add log
+    // lines. TRACKED_NO_CRATE_HASH, like `-Ztrust-dump`: it is dependency-
+    // tracked evidence production that changes no emitted byte.
+    trust_ctfe_trivial_probe: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "MEASUREMENT ONLY: replay the CTFE flip seam's decision procedure over every trivial \
+         const in the crate (a body `mir_built` fast-paths, so the seam is never demanded for \
+         it) and log what it WOULD decide, discarding the derived body; installs nothing and \
+         changes no emitted code (default: no)"),
     trust_dump: TrustDump = (TrustDump::default(), parse_trust_dump, [TRACKED_NO_CRATE_HASH]
         { TRUST_AUTHORITY: EvidenceControl },
         "publish one Trust verification artifact to a non-empty directory: `mir:<dir>` writes each \
@@ -3322,7 +3336,7 @@ written to standard error output)"),
     // driver option-domain validation).
     trust_sat_perturb: Option<String> = (None, parse_opt_string, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
-        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|payload-tramp) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
+        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|payload-tramp|dr-tramp|dr-retire) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
     // Trust: tri-state because no single static default is true of this option.
     // The direct frontend is not optional under verification, so an unset
     // request follows verification; only the explicit `-Ztrust-verify=off`
@@ -3367,6 +3381,12 @@ written to standard error output)"),
     trust_proof_artifact_root: Option<PathBuf> = (None, parse_trust_nonempty_path, [UNTRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "write externalized proof materializations beneath this explicit private root; without it proof bytes remain inline and rustc never writes an ambient working-directory store"),
+    trust_clean_origin_mutate_emitter: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY (#65/C3): perturb the Clean-origin emitted body post-plan so the \
+         faithfulness gate's fatal refusal is exercisable end-to-end from a ui fixture; \
+         mutates side A (the emission) only, never the recognizer/admitters/extractor, \
+         and can only make a build FAIL that would have passed — never the reverse"),
     trust_targo_test_monitor: bool = (false, parse_bool, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "reserved internal Targo per-unit session-consistency selector (direct use is rejected): \

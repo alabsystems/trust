@@ -1,0 +1,11 @@
+error: Clean unit `clean_unit_syntax_error_helper.clean` failed to parse: Unexpected token at 4:206: strict file parsing rejected recovery `parser.recovery`: Unexpected token at 4:206: unexpected token: ColonEq
+  --> $DIR/clean_unit_syntax_error_helper.clean:4:1
+   |
+LL | theorem bad : :=
+   | ^
+   |
+   = note: `clean mod …;` names an out-of-line compilation unit: the whole file is Clean (Lean) source and is parsed by the real Clean parser when the unit is loaded, so this is a syntax error, not a failed proof
+   = help: options: fix the Clean syntax at the marked position; or move the declarations into the including file as an inline `clean { … }` island
+
+error: aborting due to 1 previous error
+

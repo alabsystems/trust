@@ -68,7 +68,10 @@
 use std::panic::AssertUnwindSafe;
 
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir::{AnalysisPhase, Body, MirPhase, RuntimePhase};
+use rustc_middle::mir::{
+    AnalysisPhase, Body, Const as MirConst, MirPhase, Operand, Place, RETURN_PLACE, RuntimePhase,
+    Rvalue, START_BLOCK, StatementKind, TerminatorKind,
+};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use tracing::{info, warn};
@@ -311,6 +314,248 @@ fn advance_built_to_runtime<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> R
         return Err(format!("phase advance ended at {:?}", body.phase));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Trust (lane CTFE): the TRIVIAL-CONST flip probe — MEASUREMENT ONLY
+// ---------------------------------------------------------------------------
+
+/// Trust (lane CTFE, `-Ztrust-ctfe-trivial-probe`, default OFF): decide, by
+/// measurement, what the CTFE flip seam WOULD do for every TRIVIAL CONST in
+/// this crate — the population that produces no flip event and no fallback
+/// event, and is therefore invisible to every log-reading instrument.
+///
+/// # The population this exists to measure
+///
+/// [`crate::mir_built`] returns early for a trivial const (`_0 = const X;
+/// return`), so `mir_promoted` / `mir_drops_elaborated_and_const_checked` /
+/// `mir_for_ctfe` are never demanded for it and [`try_flip_ctfe`] — the single
+/// call site of the CTFE flip — never fires. `derive_flip_body` is never
+/// reached, so its `NotCandidate` arm (a bare `return None`, no log line) is
+/// not even the reason: the seam simply never runs. A body that produces no
+/// event is not a body that was refused, and a log-reading method cannot tell
+/// the two apart. This probe closes that gap by running the seam's OWN decision
+/// procedure over exactly those bodies.
+///
+/// # Why a probe and not a forced seam
+///
+/// Forcing `mir_for_ctfe` for a trivial const would demand a body that NOTHING
+/// consumes. All three consumers branch on `trivial_const` BEFORE they can
+/// reach MIR:
+///
+/// * `rustc_const_eval::const_eval::eval_queries::eval_to_const_value_raw_provider`
+///   returns `tcx.trivial_const(def)` as its first act;
+/// * `…::eval_in_interpreter` calls `eval_trivial_const_using_ecx` INSTEAD of
+///   `ecx.load_mir(..)` — the const-eval interpreter never loads a body;
+/// * `rustc_metadata`'s encoder records the `ConstValue` into
+///   `tables.trivial_const` instead of `tables.mir_for_ctfe`, and `prefetch_mir`
+///   skips the def outright.
+///
+/// So a "flipped" trivial const could not change one emitted byte, and running
+/// the real pipeline for effect would add ICE risk to a measurement that cannot
+/// pay it back. The probe therefore replays the seam's decision — the same
+/// [`try_flip_ctfe`] pre-gates, the same `derive_flip_body`, the same
+/// [`advance_built_to_runtime`] — and DISCARDS the body. It decides exactly
+/// what the seam would decide; it does not pretend the decision matters.
+///
+/// # What it emits
+///
+/// One line per trivial const, on this module's tracing target, with `verdict`
+/// and a `stage` partition key (`no-hir-body`, `mir-built-stolen`, `pre-taint`,
+/// `pre-const-context`, `not-candidate`, `gate`, `pipeline`, `pipeline-panic`,
+/// or `SURVIVES`), plus a `SUMMARY` line with the tallies. For a survivor it
+/// also reports whether the derived body's single return constant is EQUAL to
+/// the `ConstValue` `tcx.trivial_const` already publishes — the direct test of
+/// whether a flip here could displace any const-evaluation at all.
+///
+/// Installs nothing, mutates nothing, and is off by default.
+pub fn probe_trivial_const_flips(tcx: TyCtxt<'_>) {
+    if !tcx.sess.opts.unstable_opts.trust_ctfe_trivial_probe {
+        return;
+    }
+    if !trust_thir_lower::flip_registry::flip_session_enabled(tcx) {
+        // The registry is empty in this session, so every answer would be
+        // `not-candidate` for a reason that has nothing to do with the gates.
+        // Say so once instead of 856 times.
+        warn!("trust-ctfe-trivial-probe: SESSION OFF (flip disabled) — nothing to measure");
+        return;
+    }
+
+    let mut trivial = 0usize;
+    let mut no_hir_body = 0usize;
+    let mut stolen = 0usize;
+    let mut pre_taint = 0usize;
+    let mut pre_ctx = 0usize;
+    let mut not_candidate = 0usize;
+    let mut gate = 0usize;
+    let mut pipeline = 0usize;
+    let mut pipeline_panic = 0usize;
+    let mut survives = 0usize;
+    let mut value_equal = 0usize;
+    let mut value_unequal = 0usize;
+    let mut value_indeterminate = 0usize;
+
+    // Deterministic order, so two runs of the same crate produce the same log.
+    let mut keys: Vec<LocalDefId> = tcx.mir_keys(()).iter().copied().collect();
+    keys.sort_by_key(|d| d.local_def_index.as_u32());
+
+    for def in keys {
+        let Some((trivial_value, trivial_ty)) = tcx.trivial_const(def.to_def_id()) else {
+            continue;
+        };
+        trivial += 1;
+
+        // A Clean-origin def has no HIR body; `hir_body_const_context` would
+        // `bug!` on it. It also cannot be a flip candidate (the producer hook
+        // runs off THIR), so record it and move on.
+        if tcx.hir_maybe_body_owned_by(def).is_none() {
+            no_hir_body += 1;
+            warn!(?def, stage = "no-hir-body", "trust-ctfe-trivial-probe: REFUSED");
+            continue;
+        }
+        let steal = tcx.mir_built(def);
+        if steal.is_stolen() {
+            // Expected to be zero: `mir_promoted` is what steals `mir_built`,
+            // and it is never demanded for a trivial const.
+            stolen += 1;
+            warn!(?def, stage = "mir-built-stolen", "trust-ctfe-trivial-probe: REFUSED");
+            continue;
+        }
+
+        // Scope the built-body borrow: it must be released before the pipeline
+        // replay below, which may itself read `mir_built` through other queries.
+        let attempt = {
+            let normal = steal.borrow();
+            // `try_flip_ctfe` pre-gate 1 — the taint guard.
+            if normal.tainted_by_errors.is_some() {
+                pre_taint += 1;
+                warn!(?def, stage = "pre-taint", "trust-ctfe-trivial-probe: REFUSED");
+                continue;
+            }
+            // `try_flip_ctfe` pre-gate 2 — only const/static ITEMS are CTFE-seam
+            // candidates. An `AnonConst`/`InlineConst` reaches this as
+            // `ConstContext::Const`, a const FN does not reach it at all.
+            match tcx.hir_body_const_context(def) {
+                Some(
+                    rustc_hir::ConstContext::Const { .. } | rustc_hir::ConstContext::Static(_),
+                ) => {}
+                _ => {
+                    pre_ctx += 1;
+                    warn!(?def, stage = "pre-const-context", "trust-ctfe-trivial-probe: REFUSED");
+                    continue;
+                }
+            }
+            trust_thir_lower::flip::derive_flip_body(tcx, def, &normal)
+        };
+
+        match attempt {
+            trust_thir_lower::flip::FlipAttempt::NotCandidate => {
+                not_candidate += 1;
+                warn!(?def, stage = "not-candidate", "trust-ctfe-trivial-probe: REFUSED");
+            }
+            trust_thir_lower::flip::FlipAttempt::Rejected { reason } => {
+                gate += 1;
+                warn!(
+                    ?def,
+                    stage = "gate",
+                    reason = %reason,
+                    "trust-ctfe-trivial-probe: REFUSED"
+                );
+            }
+            trust_thir_lower::flip::FlipAttempt::Derived { body, asserts, lineage } => {
+                // Read the derived constant BEFORE the pipeline replay, so the
+                // value comparison is against what the shim actually produced.
+                let derived = single_return_constant(&body);
+                let advanced = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    let mut body = body;
+                    advance_built_to_runtime(tcx, &mut body).map(|()| body)
+                }));
+                match advanced {
+                    Ok(Ok(_discarded)) => {
+                        survives += 1;
+                        let value = match derived {
+                            Some(MirConst::Val(v, ty)) => {
+                                if v == trivial_value && ty == trivial_ty {
+                                    value_equal += 1;
+                                    "equal"
+                                } else {
+                                    value_unequal += 1;
+                                    "UNEQUAL"
+                                }
+                            }
+                            _ => {
+                                value_indeterminate += 1;
+                                "indeterminate"
+                            }
+                        };
+                        info!(
+                            ?def,
+                            asserts,
+                            lineage = %lineage,
+                            value,
+                            "trust-ctfe-trivial-probe: SURVIVES"
+                        );
+                    }
+                    Ok(Err(reason)) => {
+                        pipeline += 1;
+                        warn!(
+                            ?def,
+                            stage = "pipeline",
+                            reason = %reason,
+                            "trust-ctfe-trivial-probe: REFUSED"
+                        );
+                    }
+                    Err(_panic) => {
+                        pipeline_panic += 1;
+                        warn!(?def, stage = "pipeline-panic", "trust-ctfe-trivial-probe: REFUSED");
+                    }
+                }
+            }
+        }
+    }
+
+    warn!(
+        trivial,
+        no_hir_body,
+        stolen,
+        pre_taint,
+        pre_ctx,
+        not_candidate,
+        gate,
+        pipeline,
+        pipeline_panic,
+        survives,
+        value_equal,
+        value_unequal,
+        value_indeterminate,
+        "trust-ctfe-trivial-probe: SUMMARY"
+    );
+}
+
+/// The `_0 = const X; return` constant of a single-block body, if it has that
+/// exact shape — the same shape `trivial_const` recognises, re-decided on the
+/// DERIVED body so the two constants can be compared value-for-value.
+fn single_return_constant<'tcx>(body: &Body<'tcx>) -> Option<MirConst<'tcx>> {
+    if body.basic_blocks.len() != 1 {
+        return None;
+    }
+    let block = &body.basic_blocks[START_BLOCK];
+    if block.statements.len() != 1 {
+        return None;
+    }
+    if !matches!(block.terminator().kind, TerminatorKind::Return) {
+        return None;
+    }
+    let StatementKind::Assign((place, rvalue)) = &block.statements[0].kind else {
+        return None;
+    };
+    if *place != Place::from(RETURN_PLACE) {
+        return None;
+    }
+    let Rvalue::Use(Operand::Constant(constant), _) = rvalue else {
+        return None;
+    };
+    Some(constant.const_)
 }
 
 #[cfg(test)]

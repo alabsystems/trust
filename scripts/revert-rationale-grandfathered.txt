@@ -1,0 +1,53 @@
+# Reverts that predate `scripts/check_revert_rationale.sh` and carry no reason.
+#
+# Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
+#
+# This is a census of silence, not a permission list. Every row is a revert
+# whose entire commit body was the generated "This reverts commit <sha>." line
+# and nothing else — measured 2026-08-20, 11 of 15 reverts in the whole history.
+# They are listed so that pushing a branch which carries them does not fail on
+# somebody else's old omission.
+#
+# THIS FILE MAY ONLY EVER SHRINK. A row here for a NEW revert is not a waiver,
+# it is a deletion of the gate: the gate exists precisely because the reason is
+# the part of a revert that does not survive in the diff. Fix the message
+# (`git commit --amend`, or reword during a rebase) instead. There is no
+# expiry date and no owner column on purpose — a row is not something to
+# maintain, it is something to have made impossible.
+#
+# One full 40-character sha per line. `#` starts a comment.
+
+# --- 2026-08-20, and the reason this gate exists ---------------------------
+# Reverted `8e214e90d5`, the wave-SG struct-interior offset gate — a CONFIRMED
+# miscompile mechanism — two and a half hours after it landed, with no reason
+# in the message, in any report, in any lane note, or in a commit comment on
+# the remote. The class was ungated again for 2h10m and was restored only
+# because another lane independently re-derived the evidence and re-landed it
+# as `52cf9c47db`. The revert was very likely correct (the crate's `--lib`
+# suite was RED at `8e214e90d5`: a widened binding silently invalidated the
+# literal that
+# `zero_displacement_tests::test_the_zero_displacement_guard_runs_after_the_offset_query`
+# searches for). One sentence would have saved the re-derivation.
+31814afa35d08abd02d41052a4dbf7af215dbda8
+
+# --- earlier bare reverts, oldest first ------------------------------------
+# Revert "Verifier: closure VC-gen consumer (#31 partial)"
+9b3ec58a5bb41b2cbf3071415e84e21df51ae296
+# Revert "tests: adopt upstream x86/LLVM-compat revisions (llvm-current/llvm-next)..."
+f77817cce9fbac48f518150804d455d61a1268c3
+# Revert "feat(trust-vcgen): #2 result-linking site A — SetDiscriminant emits {place, variant}"
+4ef889333183df24aff489d83beb9067ddb96e39
+# Revert "b62: native trust-mc lane solves in Chc mode (the only proof mode the evidence supports)"
+5ba37a9244b9065a032f1054a36f09da6b651a32
+# Revert "b62: BV128 render for wide-int equality guards — de-poison the u128::MAX-guarded remainder VC (#57)"
+a10fe9e52a2054f55f9df99892015d6746c6800d
+# Revert "b62: residual-scoped CHC/PDR retry — the SOUND version of the reverted adapter-wide mode flip"
+a50ff5431141fb33f7be48015ff3c29467421aa9
+# Revert "b62: enum-return resolver searches the unique-predecessor chain (the real bb13 window miss)"
+b06b33940f6839f228f8c1e91ac8a5731dd90ca5
+# Revert "b62: trusted-total recognizers for the ny-cert rc tail (all-proved layer)"
+c13b8cc366c705d4b01c48ad8236a90b5d87d54d
+# Revert "fix(build): refresh targo-trust Cargo.lock for the advanced AY rev (0.1.0 -> 0.11.0)"
+921841f19c733b6d2bea3694378dd750542c0e3d
+# Revert "fix(rustc): debox native proof snapshots"
+a34e2c180578759d476d82e39212e3c3a6695d08

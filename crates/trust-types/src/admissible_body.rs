@@ -1388,6 +1388,54 @@ mod tests {
         );
     }
 
+    /// R2/C4 provenance pins: no recognizer arm reads the raw-binop spelling,
+    /// and the two forms that LOOK like it must never be admitted as wrapping
+    /// arithmetic by any future widening:
+    ///
+    /// * `Rvalue::UncheckedBinaryOp` is `unsafe { a.unchecked_add(b) }` under
+    ///   `-O` — UB on overflow, its own variant since the R2/C4 extractor fix
+    ///   (it used to extract indistinguishably from the wrapping op);
+    /// * `Rvalue::CheckedBinaryOp` returns `(result, overflowed)`.
+    ///
+    /// The third pin holds TODAY's boundary: a bare `BinaryOp(Add)` sole
+    /// statement is unrecognized (the C4 emitter emits the marker-
+    /// authenticated call form; `control_5`'s natural-lowering trap pins the
+    /// same fact from the emit lane). A widening that flips the third pin
+    /// must carry the binop-form faithfulness argument (no name to forge;
+    /// MIR `Add`/`Sub`/`Mul` wrapping-defined; provenance preserved at
+    /// extraction) — and must NEVER flip the first two: if either admits, a
+    /// false definitional import has been armed. Soundness incident, not a
+    /// test update.
+    #[test]
+    fn binop_provenance_pins_never_admit() {
+        let one_stmt = |rvalue: Rvalue| {
+            func(
+                2,
+                vec![assign(Place::local(0), rvalue)],
+                Terminator::Return,
+            )
+        };
+        let ops = || (Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2)));
+
+        let (a, b) = ops();
+        assert!(
+            recognize_admissible_body(&one_stmt(Rvalue::UncheckedBinaryOp(BinOp::Add, a, b)))
+                .is_none(),
+            "UB-on-overflow provenance admitted as arithmetic"
+        );
+        let (a, b) = ops();
+        assert!(
+            recognize_admissible_body(&one_stmt(Rvalue::CheckedBinaryOp(BinOp::Add, a, b)))
+                .is_none(),
+            "pair-returning checked op admitted as arithmetic"
+        );
+        let (a, b) = ops();
+        assert!(
+            recognize_admissible_body(&one_stmt(Rvalue::BinaryOp(BinOp::Add, a, b))).is_none(),
+            "the raw-binop spelling is outside the recognized fragment today"
+        );
+    }
+
     #[test]
     fn wrapping_arithmetic_marker_width_and_carrier_gate_fail_closed() {
         let marked_u64 =

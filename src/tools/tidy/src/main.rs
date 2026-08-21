@@ -105,6 +105,7 @@ fn main() {
         check!(tests_placement, &root_path);
         check!(tests_revision_unpaired_stdout_stderr, &tests_path);
         check!(debug_artifacts, &tests_path);
+        check!(trust_prose_annotations, &tests_path);
         check!(ui_tests, &root_path);
         check!(mir_opt_tests, &tests_path);
         check!(rustdoc_gui_tests, &tests_path);

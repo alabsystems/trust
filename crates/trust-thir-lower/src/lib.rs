@@ -622,6 +622,96 @@ pub(crate) fn zero_displacement_agrees(field: u32) -> bool {
     field == 0
 }
 
+/// Trust (wave-SG): the STRUCT counterpart of [`declared_variant_field_offset`] — the byte the
+/// CONSUMER'S declaration table records for `(struct, field)`, or `None` when it records none.
+///
+/// The struct lane's descriptor is not a side table like [`trust_ir::EnumDef::layout`]; it is
+/// `FieldDef::offset` itself, filled at `register_struct` from rustc's reorder-aware
+/// `layout.fields.offset` (lib.rs, the `offset:` fill). `None` is the honest absent-fill for a
+/// struct whose layout query declined, and it is exactly what makes this a PRESENCE question as
+/// well as an agreement one — see [`struct_field_offset_agrees`].
+///
+/// `TyCtxt`-free, so the decision is invertible in a `--lib` test on its own.
+pub(crate) fn declared_struct_field_offset(
+    structs: &[trust_ir::StructDef],
+    sid: trust_ir::StructId,
+    field: usize,
+) -> Option<u64> {
+    let sd = structs.iter().find(|sd| sd.id == sid)?;
+    sd.fields.get(field)?.offset
+}
+
+/// Trust (wave-SG): **the struct-lane agreement predicate** — does the byte offset this producer
+/// is about to GEP equal the byte offset the CONSUMER'S own table records for that same
+/// `(struct, field)`?
+///
+/// This is [`variant_field_offset_agrees`] for the class wave-DA explicitly left open. Quoting its
+/// own doc: *"For a STRUCT it has no descriptor path at all: `interpret::struct_layout` ignores
+/// `FieldDef::offset` entirely and lays fields out C-style in DECLARATION order."* So the struct
+/// class had **neither** of the two gates the enum class carries — not wave-NRF's PRESENCE gate,
+/// and not wave-DA's AGREEMENT gate — and was for a time held out of the shipping lane by a
+/// coverage skip. **THAT SKIP IS GONE, and this comment used to say otherwise.**
+/// `to_mir::interior_field_at_offset_zero` has since been generalised to
+/// `to_mir::interior_field_at_offset`, which takes the displacement and inverts the emission at
+/// ANY of them — wave-25b's `off != 0` and wave-DZ's reordered `off == 0` included. So the claim
+/// that "a non-zero interior GEP never reaches a flip" is FALSE at this tree, the class is LIVE
+/// rather than latent, and the cost of these refusals is a number that has to be MEASURED on the
+/// whole crate, not argued away. A coverage skip was never a soundness argument; there is no
+/// longer even a skip. This is the gate.
+///
+/// # It is a PRESENCE gate too, and that half is not hypothetical
+///
+/// `Some(emitted)` equality refuses a `None` table entry as well as a disagreeing one, and the two
+/// producer sites that fill and read this number DO NOT USE THE SAME PRE-GATE:
+///
+/// * `register_struct` records the offset behind [`layout_query_is_reentrant_safe_deep`] and
+///   `tcx.layout_of`, and additionally DROPS the offset when rustc placed the field at exactly the
+///   struct size (the #204 trailing-ZST rule);
+/// * [`LowerCx::field_byte_offset`] reads it behind the strictly weaker
+///   [`layout_query_is_reentrant_safe`] and `cycle_safe_layout_of`.
+///
+/// The second admits strictly more types than the first. So a struct can reach an emission site
+/// with a usable rustc offset while its registered `StructDef` carries `offset: None` on every
+/// field — a module that GEPs into an ADT whose own declaration table asserts nothing about where
+/// that byte is. That is precisely the state wave-NRF closed for enums (*"the interpreter uses the
+/// producer's descriptor when one is present and otherwise derives trust-ir's own CANONICAL
+/// layout, which is not a claim of rustc parity"*), and it is why this predicate demands
+/// `Some(emitted)` rather than `!= Some(other)`.
+///
+/// # Why the SOLE-FIELD tautology is deliberately NOT routed through here
+///
+/// `field_byte_offset` short-circuits `nfields == 1` to `Some(0)` **without a layout query**,
+/// because a single-field struct's sole field is at offset 0 by construction — nothing to
+/// reorder, and structs carry no leading padding. That number is a PROOF, not a measurement:
+/// there is no rustc read that could be wrong and no consumer table it could disagree with, and
+/// the shortcut exists so a GENERIC single-field newtype (whose layout query is unavailable, hence
+/// `offset: None`) still lowers. Gating it would refuse the deployed `<LevelArc as Deref>::deref`
+/// shape for a table entry whose absence carries no information. So the gate binds exactly the
+/// offsets that came OUT OF A LAYOUT QUERY — see [`FieldOffsetSource`].
+///
+/// `TyCtxt`-free, so the refusal is invertible in a `--lib` test with a deliberately disagreeing
+/// (or absent) `FieldDef::offset`.
+pub(crate) fn struct_field_offset_agrees(
+    structs: &[trust_ir::StructDef],
+    sid: trust_ir::StructId,
+    field: usize,
+    emitted: u64,
+) -> bool {
+    declared_struct_field_offset(structs, sid, field) == Some(emitted)
+}
+
+/// Trust (wave-SG): where a `field_byte_offset` number CAME FROM. The gate binds one of these two
+/// and not the other, and the distinction is a soundness argument rather than a convenience — see
+/// [`struct_field_offset_agrees`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldOffsetSource {
+    /// A single-field struct's sole field, `0` by construction. No layout query was made.
+    SoleFieldTautology,
+    /// Read from rustc's `layout.fields.offset` — a MEASUREMENT that a consumer table must agree
+    /// with before it is committed to the instruction stream as an address.
+    RustcLayout,
+}
+
 /// Trust (wave-L4G): the single-level by-REF payload lane's tag for each offset refusal. A
 /// function rather than three inline `return Err`s so the two pre-existing tags are provably
 /// UNCHANGED by the wave-NR extraction and each tag has exactly one production site.
@@ -1399,9 +1489,10 @@ pub(crate) fn union_lane_struct_transitive(
 /// Trust (union lane): does this mapped `Ty` CONTAIN BY VALUE a struct carrying a union placeholder
 /// lane, at any depth?
 ///
-/// `Ty::Tuple` is walked because `map_ty` spells `[T; N]` (`N > 0`) as `Ty::Tuple([T; N])` — an
-/// array of lane-bearing structs is a tuple here, not a `Ty::Array`, and the only `Ty::Array`
-/// `map_ty` ever produces is the zero-length ZST (`Ty::Array(TyId, 0)`), which holds no bytes.
+/// `Ty::Tuple` is walked because `map_ty` still spells an AGGREGATE-element `[T; N>0]` as
+/// `Ty::Tuple([T; N])` — an array of lane-bearing structs is a tuple here. A `Ty::Array` is the
+/// slice-15 SCALAR-element spelling (or the zero-length ZST), which cannot carry a struct's
+/// bytes — see the `Ty::Array` arm below for why `false` is an invariant, not an assumption.
 ///
 /// Pointer-like variants (`Ty::Ptr`, `Ty::Ref`, `Ty::RefMut`, `Ty::PtrConst`, `Ty::PtrMut`) are
 /// deliberately NOT walked: copying an aggregate that merely POINTS at a lane-bearing struct copies
@@ -1414,6 +1505,15 @@ pub(crate) fn union_lane_ty_transitive(
     match ty {
         Ty::Struct(sid) => union_lane_struct_transitive(taint, *sid),
         Ty::Tuple(elems) => elems.iter().any(|t| union_lane_ty_transitive(taint, t)),
+        // Trust (vtable slice 15): a FIRST-CLASS `Ty::Array` carries no taint WITHOUT resolving
+        // its element, and that is an INVARIANT, not an assumption: `map_ty` spells `[T; N>0]`
+        // as `Ty::Array` only for `seed_constant`-scalar `T` (scalars cannot carry a struct's
+        // union bytes), and an `N == 0` array holds no bytes at all. Widening the spelling gate
+        // to aggregate elements MUST teach this walker (and `param_lane_ty_transitive`) to
+        // resolve the pending/module types table first — `false` here would then be a soundness
+        // hole, exactly the "answer false rather than refuse" failure the pre-slice-15 `map_ty`
+        // comment recorded. Pinned by `array_spelling_gate_matches_walker_assumption`.
+        Ty::Array(..) => false,
         _ => false,
     }
 }
@@ -1728,6 +1828,10 @@ pub(crate) fn param_lane_ty_transitive(
         Ty::Tuple(elems) => {
             elems.iter().any(|t| param_lane_ty_transitive(enum_taint, struct_taint, t))
         }
+        // Trust (vtable slice 15): taint-free without element resolution — sound on the same
+        // invariant `union_lane_ty_transitive` documents (scalar-gated `N>0` spelling; `N == 0`
+        // holds no bytes). A spelling-gate widening must extend BOTH walkers together.
+        Ty::Array(..) => false,
         _ => false,
     }
 }
@@ -1974,9 +2078,21 @@ pub struct Lowered {
     /// body instead carries a PLACEHOLDER `Inst::Const` per entry and the `crate_module`
     /// finalizer — running at the `rustc_interface` `analysis` seam, where every body's MIR is
     /// already built and const eval is reentrancy-safe — patches in the real value before dump.
-    /// Non-empty ⇒ the module is NOT yet executable ("pending-const" body): both differentials
-    /// must skip it (a placeholder is never interpreted), and splicing without a successful
-    /// finalizer patch is forbidden.
+    /// Non-empty ⇒ the module is NOT yet executable AT THE HOOK ("pending-const" body): a
+    /// placeholder is never interpreted, and splicing without a successful finalizer patch is
+    /// forbidden.
+    ///
+    /// Trust (slice 20): "not yet" is now literal for the INTERPRETATION differential, and the
+    /// three consumers have come apart — do not read them as one rule any more.
+    ///   * `differential::compare` still refuses the body at the hook (gate 0.45), but it now
+    ///     takes the MIR-side snapshot FIRST and `differential::deferred_to_seam` routes the body
+    ///     to the crate-finalize seam, which re-adjudicates it AFTER `resolve_pending_consts` has
+    ///     patched in the real values. Emptiness is re-tested there, because that pass bumps
+    ///     `unsupported` on failure and a body still holding a placeholder must never be linked.
+    ///   * `mir_differential` and `flip_registry::record_green` refuse it OUTRIGHT, unchanged.
+    ///     That is what still carries the wave-SC str-lane argument below: the manufactured
+    ///     comparator DISAGREE it describes is a `to_mir` re-derivation hazard, so it is closed by
+    ///     those two refusals and never depended on the interpretation differential.
     pub pending_consts: Vec<PendingConst>,
     /// Trust (enum-switch provenance): the block id of every `Inst::Switch` this body emitted
     /// for an EXHAUSTIVE enum match — one whose `default` edge carries the arm of the LAST
@@ -2052,10 +2168,12 @@ pub struct PendingConst {
     /// `GlobalId` is `Copy` and lifetime-free, so the `'static`-registry invariant in this
     /// struct's doc above holds. NOTE the DEFERRAL IS THE POINT, not an accident of reentrancy:
     /// the whole str lane routes through `pending_consts` — local AND non-local alike — because a
-    /// non-empty `pending_consts` is what the interpretation differential
-    /// (`differential::deferred_to_seam` / `run_body_differential`), the derived-MIR differential
-    /// (`mir_differential`) and the flip registry (`flip_registry::record_green`) each already
-    /// read to refuse the body. An EAGER str-const lane emitting a real `Constant::Int` length
+    /// non-empty `pending_consts` is what the derived-MIR differential (`mir_differential`) and
+    /// the flip registry (`flip_registry::record_green`) each already read to refuse the body.
+    /// (Before slice 20 the interpretation differential belonged in that list too. It no longer
+    /// does: it defers the body to the crate-finalize seam and re-adjudicates it once the values
+    /// are patched. The argument below is unaffected — it is about `to_mir` RE-DERIVING MIR, so
+    /// the two refusals that still hold are exactly the two it needs.) An EAGER str-const lane emitting a real `Constant::Int` length
     /// would be byte-indistinguishable from a str LITERAL's chain, so `to_mir`'s
     /// `recognize_str_return` / `str_operand` would rewrite it to `_0 = const "…"` while built MIR
     /// keeps `_0 = const names::NAME` UNEVALUATED — a manufactured comparator DISAGREE. The
@@ -2995,6 +3113,29 @@ fn option_flag_lanes_enabled() -> bool {
 /// addressable set behind `EnumCtor(non-enum mapped ty)` cannot be split into its root causes
 /// without re-deriving them by hand from source. This channel restores the reason WITHOUT putting
 /// it in `unsupported` — a body that merely MENTIONS a declined enum must not flip clean → dirty.
+/// Trust (wave-COV): the STRUCT-INTERIOR OFFSET GATE's decision census — **OFF BY DEFAULT**.
+/// Set `TRUST_INTERIOR_OFFSET_CENSUS=1` to record it; absent, empty, `0`, `true` all keep it off.
+///
+/// Same default and same strictness as [`enum_decline_census_enabled`], and for a stronger
+/// reason: this channel writes to **stderr only** and never touches the coverage artifact, so the
+/// dump is byte-identical whether it is on or off. What it exists for is the one question the
+/// artifact cannot answer — when the wave-SG gate refuses an interior GEP, WHICH of its two
+/// failure modes fired. Those have opposite fixes:
+///
+/// * the owner has a declaration table that records a DIFFERENT byte (or none) — a real conflict,
+///   which must stay refused however much coverage it costs;
+/// * the owner has no table at all because this site never registered it — a missing witness,
+///   which [`LowerCx::struct_id_for_interior_offset`] now produces.
+///
+/// Nothing downstream reads this. It is a measurement, and a refusal is unaffected by whether
+/// anyone is listening.
+fn interior_offset_census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        enum_decline_census_from_env(std::env::var_os("TRUST_INTERIOR_OFFSET_CENSUS").as_deref())
+    })
+}
+
 fn enum_decline_census_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3660,7 +3801,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// coverage tag). A wrong-but-plausible id is the one failure mode the verbatim
     /// splice clone cannot catch — `remap_ty` copies the kind BECAUSE ids are
     /// content-stable, never positional.
-    fn trait_object_id(&mut self, principal: rustc_span::def_id::DefId) -> Option<u32> {
+    /// Trust (vtable slice 17, SOUNDNESS): takes the WHOLE existential predicate list,
+    /// not a bare principal `DefId`, because a bare `DefId` cannot distinguish
+    /// `dyn Convert<u32>` from `dyn Convert<u64>` — and this id IS the trait object's
+    /// TYPE IDENTITY (`FatPtrKind::TraitObject { trait_id }`), which `differential.rs`'s
+    /// `tys_agree` compares with `Ok(x == y)`. Erasure here therefore made `tys_agree`
+    /// return TRUE for two genuinely different types: a path to a FALSE AGREED.
+    ///
+    /// THE TRIPWIRE BELOW WAS AIMED AT THE WRONG FAILURE DIRECTION, and is kept because
+    /// it still guards its own: it refuses two DISTINCT def paths hashing to ONE id (an
+    /// FNV collision, which faithful rendering does not eliminate). Generics erasure is
+    /// the OPPOSITE direction — two distinct trait objects rendering the SAME path —
+    /// which lands in its `Some(_) => Ok(id)` arm and was ACTIVELY APPROVED. The missing
+    /// twin is supplied by rendering faithfully in the first place.
+    ///
+    /// `Err` carries the caller's coverage tag so the two refusals stay distinguishable.
+    fn trait_object_id(
+        &mut self,
+        preds: &ty::List<ty::PolyExistentialPredicate<'tcx>>,
+    ) -> Result<u32, &'static str> {
         // Trust (B3-4 gate catch, 2026-07-20): the SPELLING must match the oracle's
         // `safe_def_path_str` wrapper stack EXACTLY (no_trimmed + no_visible +
         // resolve_crate_name) — the mint is shared but a re-exported principal
@@ -3675,14 +3834,23 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // `with_def_path_disambiguators` (see `safe_def_path_str`), and a hand-copy
         // that missed that flag would spell a block-scoped principal differently on
         // the two sides and fail the differential for no semantic reason.
-        let path = trust_mir_extract::safe_def_path_str(self.tcx, principal);
+        // Trust (vtable slice 17): ONE renderer, shared with the extractor — the same
+        // discipline the comment above adopted for `safe_def_path_str`, applied one level
+        // up. `faithful_principal_key` renders the whole predicate list injectively
+        // (principal path + non-lifetime args + assoc bindings + auto traits) and returns
+        // an args-free principal's `sysroot_authenticated_def_path_str` VERBATIM, so every
+        // existing `trait_id` is byte-identical by construction.
+        let owner = trust_mir_extract::safe_def_path_str(self.tcx, self.body_def);
+        let path = trust_mir_extract::faithful_principal_key(self.tcx, preds, &owner)?;
         let id = trust_ir::stable_trait_object_id(&path);
         match self.trait_object_ids.iter().find(|(existing_id, _)| *existing_id == id) {
-            Some((_, existing_path)) if *existing_path != path => None,
-            Some(_) => Some(id),
+            Some((_, existing_path)) if *existing_path != path => {
+                Err("Ty(dyn trait-id collision)")
+            }
+            Some(_) => Ok(id),
             None => {
                 self.trait_object_ids.push((id, path));
-                Some(id)
+                Ok(id)
             }
         }
     }
@@ -3940,13 +4108,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             {
                 let ty::Dynamic(preds, ..) = pointee.kind() else { unreachable!() };
                 match preds.principal_def_id() {
-                    Some(principal) => match self.trait_object_id(principal) {
-                        Some(trait_id) => {
+                    Some(_) => match self.trait_object_id(preds) {
+                        Ok(trait_id) => {
                             Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id })
                         }
-                        None => {
-                            self.unsupported
-                                .push((format!("{ty:?}"), "Ty(dyn trait-id collision)"));
+                        Err(tag) => {
+                            self.unsupported.push((format!("{ty:?}"), tag));
                             Ty::Unit
                         }
                     },
@@ -4076,13 +4243,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // no def path to hash (the oracle keeps its thin `"dyn"` sentinel there, so that
                 // pair must stay uncompared rather than share a sentinel id).
                 ty::Dynamic(preds, ..) => match preds.principal_def_id() {
-                    Some(principal) => match self.trait_object_id(principal) {
-                        Some(trait_id) => {
+                    Some(_) => match self.trait_object_id(preds) {
+                        Ok(trait_id) => {
                             Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id })
                         }
-                        None => {
-                            self.unsupported
-                                .push((format!("{ty:?}"), "Ty(dyn trait-id collision)"));
+                        Err(tag) => {
+                            self.unsupported.push((format!("{ty:?}"), tag));
                             Ty::Unit
                         }
                     },
@@ -4124,29 +4290,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                 },
             },
-            // Trust: a FIXED-SIZE array `[T; N]` → a `Ty::Tuple([T; N])` of N identical (recursively
-            // mapped) element types, built directly, which the pinned interpreter materializes from a
-            // `Const`-seeded aggregate (the exact tuple/struct machinery). Construction
-            // (`ExprKind::Array`/`Repeat`) and CONSTANT indexing (`ExprKind::Index`) operate over this
-            // tuple aggregate via `InsertField`/`ExtractField`.
+            // Trust: a FIXED-SIZE array `[T; N]`. Trust (vtable slice 15, #202 first half): a
+            // SCALAR element type (`seed_constant`'s set) spells FIRST-CLASS
+            // `Ty::Array(pend_ty(T), N)` — the oracle's convention — with construction/indexing
+            // on the element ops (`InsertElement`/`ExtractElement`, format-legal for Array). An
+            // AGGREGATE element type keeps the legacy `Ty::Tuple([T; N])` spelling over the
+            // tuple `InsertField`/`ExtractField` machinery, because `Ty::Array` is NOT a legal
+            // field-op aggregate and the aggregate-element ctor needs the recursive seeder —
+            // that half is still two-sided work (its rows hold at the slice-12 differential
+            // quarantine, never a verdict).
             //
-            // Trust (#202): this comment used to justify the spelling with "`Ty::Array(TyId, N)` needs
-            // an interned `TyId` this single-function producer never mints". That is FALSE — there are
-            // ten live `pend_ty` call sites, and two of them already mint NON-zero-length `Ty::Array`
-            // (`lower_repeat_compact` for `N >= REPEAT_COMPACT_MIN`, and `emit_bytes_global`). Anyone
-            // re-deriving the array spelling from that sentence would conclude the respell is easy.
-            //
-            // The REAL blocker is the opposite shape: `Ty::Array` is not a legal `InsertField` /
-            // `ExtractField` aggregate, so respelling would make CONSTRUCTION and the CONST-index path
-            // ill-formed in exchange for fixing the dynamic-index path — circular. It would also
-            // silently break three walkers that match `Ty::Tuple` (`union_lane_ty_transitive` and
-            // `param_lane_ty_transitive`, both SOUNDNESS gates that would answer `false` rather than
-            // refuse, and `def_field_ok`, which would drop bodies from the splice with no tag).
-            // Retiring the tuple spelling therefore requires FIRST widening the format to give
-            // `Ty::Array` field ops, and moving the oracle (`trust-ir-bridge/src/lower.rs:2218`
-            // already spells arrays first-class) in the same batch. That is a two-sided change.
-            //
-            // The consequence today: DYNAMIC indexing fails closed — see the `ExprKind::Index` arm.
+            // The dynamic-index path stays fail-closed on BOTH spellings — the bounds `Assert`
+            // is unmodeled (see the `ExprKind::Index` arm; #191's lesson).
             //
             // FAIL-CLOSED: a non-const length (a generic const param `[T; N]` whose `N` is not a
             // concrete usize — `try_to_target_usize` returns `None`), or a non-scalar element type whose
@@ -4200,6 +4355,30 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         return Ty::Unit;
                     }
                     return Ty::Array(self.pend_ty(elem_ty), 0);
+                }
+                // Trust (vtable slice 15, #202 first half): a SCALAR-element `[T; N>0]` is now
+                // first-class `Ty::Array(pend_ty(T), N)` — the MIR-side oracle's exact spelling
+                // (`map_type_ctx`), retiring the (Tuple, Array) signature quarantine for this
+                // subset. The gate is `seed_constant` (int/bool/float/isize/usize/char —
+                // `lower_repeat_compact`'s existing admission), and it is LOAD-BEARING for two
+                // soundness walkers: `union_lane_ty_transitive` / `param_lane_ty_transitive`
+                // answer `false` for `Ty::Array` WITHOUT resolving the element, which is correct
+                // only because (a) an N>0 element is scalar by THIS gate (scalars carry no
+                // struct/enum taint) and (b) an N=0 array holds no bytes. Widening this gate to
+                // aggregate elements requires teaching both walkers to resolve `pending_tys`
+                // FIRST — see `array_spelling_gate_matches_walker_assumption` (test pin).
+                //
+                // AGGREGATE-element arrays keep the legacy `Ty::Tuple([T; N])` spelling and the
+                // slice-12 differential quarantine: their construction/index/match lanes still
+                // run on the tuple `InsertField`/`ExtractField` machinery, and `Ty::Array` is not
+                // a legal field-op aggregate (the circularity the pre-slice-15 comment recorded).
+                // Element ops (`InsertElement`/`ExtractElement` with `Const I64` indexes) are the
+                // format-legal spelling for the scalar subset — `supports_element_ops()` is
+                // `Vector | Array`, and the pinned interpreter is element-op-native over
+                // `InterpretValueKind::Array` (measured: eval_insert_element/eval_extract_element,
+                // encode/decode_value, byte_size/byte_align all resolve `Ty::Array`).
+                if seed_constant(&elem_ty).is_some() {
+                    return Ty::Array(self.pend_ty(elem_ty), n as u64);
                 }
                 Ty::Tuple(vec![elem_ty; n])
             }
@@ -8248,7 +8427,23 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// reordering-aware) — never hand-computed. The `&self.field` interior-borrow-return recognizer
     /// returns the base ptr verbatim on `Some(0)` (wave-25 tautology) and emits a flat-I8 `GEP` of
     /// this offset otherwise (wave-25b).
-    fn field_byte_offset(&self, struct_rty: RustcTy<'tcx>, field: u32) -> Option<u64> {
+    ///
+    /// Trust (wave-SG): the number now carries its PROVENANCE. The computation and every refusal
+    /// are byte-for-byte what they were; what is new is that the two ways this function can
+    /// produce a number are told apart, because only ONE of them is a rustc layout READ that a
+    /// consumer table has to agree with before it becomes an address:
+    ///
+    /// * [`FieldOffsetSource::SoleFieldTautology`] — `nfields == 1`, offset 0 by construction, no
+    ///   layout query made. Nothing to disagree with.
+    /// * [`FieldOffsetSource::RustcLayout`] — `layout.fields.offset(field)`. A measurement.
+    ///
+    /// Every emission site goes through [`Self::field_byte_offset_agreeing`], never this directly.
+    /// See [`struct_field_offset_agrees`] for why exactly that line is the right one to draw.
+    fn field_byte_offset(
+        &self,
+        struct_rty: RustcTy<'tcx>,
+        field: u32,
+    ) -> Option<(u64, FieldOffsetSource)> {
         let ty::Adt(adt, _) = struct_rty.kind() else {
             return None;
         };
@@ -8260,7 +8455,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return None;
         }
         if nfields == 1 {
-            return Some(0);
+            return Some((0, FieldOffsetSource::SoleFieldTautology));
         }
         if !layout_query_is_reentrant_safe(struct_rty) {
             return None;
@@ -8272,7 +8467,62 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if field as usize >= layout.fields.count() {
             return None;
         }
-        Some(layout.fields.offset(field as usize).bytes())
+        Some((layout.fields.offset(field as usize).bytes(), FieldOffsetSource::RustcLayout))
+    }
+
+    /// Trust (wave-SG): the `StructId` ALREADY REGISTERED for this exact instantiation, or `None`.
+    ///
+    /// A plain `&self` scan of the two registration tables — deliberately NOT `map_ty` /
+    /// `struct_ty_rmw_opaque`, which MUTATE (they intern, and can perturb `StructId` assignment for
+    /// bodies that already lower). The same discipline, and the same two-table spelling, the
+    /// aggregate-lane check at the `ExtractField` site already uses. Keyed on `(DefId,
+    /// GenericArgs)` because a `DefId`-only probe would alias a different instantiation's layout.
+    ///
+    /// `None` is a REFUSAL at every call site, never a pass: an unregistered instantiation has no
+    /// declaration table for [`struct_field_offset_agrees`] to consult.
+    fn registered_struct_id(&self, struct_rty: RustcTy<'tcx>) -> Option<trust_ir::StructId> {
+        let ty::Adt(adt, args) = struct_rty.kind() else {
+            return None;
+        };
+        self.struct_ids
+            .iter()
+            .find(|(d, a, _)| *d == adt.did() && a == args)
+            .map(|(_, _, id)| *id)
+    }
+
+    /// Trust (wave-SG): THE STRUCT-INTERIOR OFFSET GATE, in one place, called by BOTH struct
+    /// interior-borrow emission sites (the wave-25/25b shared `&self.field` return and the wave-DP
+    /// `Deref`-accessor `&mut (*self).field`) — for the same reason wave-DA gave for sharing
+    /// [`variant_field_offset_agrees`] between its two by-REF enum lanes: a hand-copied twin is
+    /// exactly the edit that lets one lane's check drift from the other's.
+    ///
+    /// A PREDICATE over an offset already in hand, rather than a wrapper that fetches one, because
+    /// the two sites resolve the `StructId` differently and neither resolution may move:
+    ///
+    /// * the wave-25/25b site never registers the struct at all, so it passes
+    ///   [`Self::registered_struct_id`] — a pure ledger scan — and `None` there is a REFUSAL:
+    ///   an unregistered instantiation has no declaration table to agree with.
+    /// * the wave-DP site registers it itself, one line later, via `struct_ty_rmw_opaque`. It
+    ///   passes the id THAT call yields, so the check compares against the table the module will
+    ///   actually carry instead of refusing on a registration-order accident. Its offset query
+    ///   still runs FIRST, unchanged: hoisting the registration above it would register a struct
+    ///   on the path where the query declines, which is an artifact change, not a check.
+    ///
+    /// FAIL-CLOSED on both remaining ways the invariant can be missing: no id (`None`), and a table
+    /// that has no offset for that field or has a DIFFERENT one. The sole-field tautology passes
+    /// ungated, by construction and not by omission — see [`struct_field_offset_agrees`].
+    fn struct_interior_offset_admissible(
+        &self,
+        sid: Option<trust_ir::StructId>,
+        field: u32,
+        off: u64,
+        source: FieldOffsetSource,
+    ) -> bool {
+        if source == FieldOffsetSource::SoleFieldTautology {
+            return true;
+        }
+        let Some(sid) = sid else { return false };
+        struct_field_offset_agrees(&self.pending_structs, sid, field as usize, off)
     }
 
     /// Trust (wave-DP): is the body CURRENTLY being lowered a `Deref::deref` /
@@ -8285,6 +8535,166 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let Some(t) = self.tcx.impl_opt_trait_id(impl_did) else { return false };
         let li = self.tcx.lang_items();
         Some(t) == li.deref_trait() || Some(t) == li.deref_mut_trait()
+    }
+
+    /// Trust (wave-COV): the byte [`Self::register_struct`] WOULD record for
+    /// `(instantiation, field)` — asked WITHOUT registering anything.
+    ///
+    /// `&self`, no interning, no `map_ty`: the whole point is to decide whether a registration is
+    /// worth making before making one, because a registration that does not rescue the site still
+    /// perturbs `StructId` assignment for every struct the body registers after it. Reads the ONE
+    /// shared fill ([`registered_struct_layout_fill`] + [`declared_field_offset_fill`]) that
+    /// `register_struct` itself reads, so this is a projection of that function rather than a
+    /// prediction about it.
+    ///
+    /// It is NOT the gate. Nothing downstream trusts this answer: the caller registers and then
+    /// re-asks [`Self::struct_interior_offset_admissible`] against the table the module will
+    /// actually carry. If this were wrong in the permissive direction the emission would still be
+    /// refused; being wrong in the conservative direction only costs the coverage it was written
+    /// to recover.
+    fn would_declare_struct_field_offset(
+        &self,
+        adt: ty::AdtDef<'tcx>,
+        args: ty::GenericArgsRef<'tcx>,
+        field: usize,
+    ) -> Option<u64> {
+        let (layout, size, _align) = registered_struct_layout_fill(self.tcx, adt, args);
+        declared_field_offset_fill(layout.as_ref(), size, field)
+    }
+
+    /// Trust (wave-COV): resolve the `StructId` the wave-25/25b interior-borrow site must check its
+    /// byte against — **registering the struct on a ledger miss** instead of refusing the body.
+    ///
+    /// # The coverage this recovers, and why the refusal it replaces was the wrong half
+    ///
+    /// wave-SG's gate is correct and stays: an interior GEP into an ADT whose declaration table
+    /// says nothing about that byte is exactly the miscompile mechanism it closed
+    /// (`RawVecInner { ptr, cap }` — rustc `ptr@8 cap@0`, `interpret::struct_layout` `ptr@0 cap@8`;
+    /// the producer's own spelling of `&self.ptr` returns `cap`). But the gate had TWO ways to
+    /// fail and only one of them is a disagreement:
+    ///
+    /// * the table records a DIFFERENT byte, or records none — a real conflict, still refused, and
+    ///   no amount of registering can make it not a conflict;
+    /// * **no table exists yet**, because this site — unlike the wave-DP accessor site one screen
+    ///   up — never registered the struct it was GEPping into. That is a missing *witness*, not a
+    ///   missing *agreement*, and the fix for a missing witness is to produce it.
+    ///
+    /// MEASURED on clean-kernel at the gate's landing: the second class is the bulk of the
+    /// −1,187-body splice cost (`cert::bundle::CertBundle`'s four interior GEPs,
+    /// `ArchiveVariantStats`, `CertArchiveEnvelope`, …), while "owner has a `StructDef` but not
+    /// that byte" was **2 sites**.
+    ///
+    /// # Why registering here is sound, in the order the code does it
+    ///
+    /// 1. `registered_struct_id` first — a pure `&self` ledger scan. An already-registered
+    ///    instantiation is answered without touching anything, so the common path is byte-identical
+    ///    to wave-SG and no dedup-order behaviour moves.
+    /// 2. `SoleFieldTautology` never gets here with a miss it needs: the tautology passes the gate
+    ///    ungated, so registering for it would be a pure perturbation. Refused explicitly.
+    /// 3. **The pre-check.** [`Self::would_declare_struct_field_offset`] asks the SAME layout query
+    ///    that produced `off` what `register_struct` would record. Only an exact `Some(off)` earns
+    ///    a registration. This is what keeps the recovery from costing coverage elsewhere: a
+    ///    registration that would not rescue the site is never made, so the ids of every struct the
+    ///    body registers afterwards are untouched.
+    /// 4. The registration itself goes through `struct_ty_rmw_opaque(adt, args, None)` — **the same
+    ///    funnel the wave-DP site uses**, deliberately not a direct `register_struct` with a
+    ///    hand-built field list. Two funnels registering the same `(DefId, GenericArgs)` with
+    ///    different field types is how `Field(aggregate lane disagrees)` is minted; there is one
+    ///    builder for this shape and this uses it. In `written_field: None` mode that builder is
+    ///    also tag-neutral — every path that could push an `unsupported` tag rolls it back
+    ///    (`truncate(before)`) or never fired — so a registration cannot dirty a body.
+    /// 5. The caller then re-runs [`Self::struct_interior_offset_admissible`] against the id this
+    ///    returns. **That, not the pre-check, is the gate.** If `struct_ty_rmw_opaque` declines, if
+    ///    the `StructDef` it minted carries no offset for the field, or if it carries a different
+    ///    one, the emission is refused exactly as before. Fail-closed is preserved by construction:
+    ///    this function can only ever hand back an id whose table is then checked.
+    fn struct_id_for_interior_offset(
+        &mut self,
+        struct_rty: RustcTy<'tcx>,
+        field: u32,
+        off: u64,
+        source: FieldOffsetSource,
+    ) -> Option<trust_ir::StructId> {
+        if let Some(sid) = self.registered_struct_id(struct_rty) {
+            return Some(sid);
+        }
+        // The tautology is admitted by the gate without consulting any table (see
+        // `struct_field_offset_agrees`), so a registration on its behalf would buy nothing and
+        // move ids for free.
+        if source != FieldOffsetSource::RustcLayout {
+            return None;
+        }
+        let ty::Adt(adt, args) = struct_rty.kind() else {
+            return None;
+        };
+        if self.would_declare_struct_field_offset(*adt, *args, field as usize) != Some(off) {
+            return None;
+        }
+        match self.struct_ty_rmw_opaque(*adt, *args, None) {
+            Some(Ty::Struct(sid)) => Some(sid),
+            _ => None,
+        }
+    }
+
+    /// Trust (wave-COV): the PRE-RESOLUTION half of the interior-offset census — the ledger and
+    /// table state as the gate found it, captured BEFORE
+    /// [`Self::struct_id_for_interior_offset`] can register anything and therefore before it can
+    /// change the answer. `None` when the census is off ([`interior_offset_census_enabled`]), so
+    /// the default build makes no layout query and formats no path.
+    ///
+    /// The classification is a PARTITION with no remainder, which is the whole point: every
+    /// evaluation of the gate lands in exactly one of the classes below, and the two halves of
+    /// the refusal — the recoverable missing witness and the unrecoverable disagreement — are
+    /// separated by construction rather than by a name-join heuristic over the dumps.
+    fn interior_offset_census_row(
+        &self,
+        struct_rty: RustcTy<'tcx>,
+        field: u32,
+        off: u64,
+        source: FieldOffsetSource,
+    ) -> Option<String> {
+        if !interior_offset_census_enabled() {
+            return None;
+        }
+        let reg = self.registered_struct_id(struct_rty);
+        let declared = reg.and_then(|sid| {
+            declared_struct_field_offset(&self.pending_structs, sid, field as usize)
+        });
+        let (would, name) = match struct_rty.kind() {
+            ty::Adt(adt, args) => (
+                self.would_declare_struct_field_offset(*adt, *args, field as usize),
+                rustc_middle::ty::print::with_no_trimmed_paths!(
+                    self.tcx.def_path_str_with_args(adt.did(), *args)
+                ),
+            ),
+            _ => (None, "<non-adt>".to_string()),
+        };
+        let class = match (source, reg, declared) {
+            // Passes the gate with no table consulted, by construction. Not a refusal and not
+            // recoverable-or-not: there is nothing to recover.
+            (FieldOffsetSource::SoleFieldTautology, _, _) => "TAUTOLOGY",
+            // The owner IS registered. Whatever happens now is an AGREEMENT question, and no
+            // registration can change it.
+            (FieldOffsetSource::RustcLayout, Some(_), Some(d)) if d == off => "REGISTERED_AGREES",
+            (FieldOffsetSource::RustcLayout, Some(_), Some(_)) => "REGISTERED_DISAGREES",
+            (FieldOffsetSource::RustcLayout, Some(_), None) => "REGISTERED_NO_OFFSET",
+            // The owner is NOT registered — the presence hole. Split by what a registration
+            // WOULD record, which is what decides whether the coverage is recoverable.
+            (FieldOffsetSource::RustcLayout, None, _) if would == Some(off) => {
+                "UNREGISTERED_RECOVERABLE"
+            }
+            (FieldOffsetSource::RustcLayout, None, _) if would.is_none() => {
+                "UNREGISTERED_NO_OFFSET"
+            }
+            (FieldOffsetSource::RustcLayout, None, _) => "UNREGISTERED_WOULD_DISAGREE",
+        };
+        Some(format!(
+            "TRUSTCOV25 class={class} off={off} declared={declared:?} would={would:?} \
+             field={field} struct={name} body={}",
+            rustc_middle::ty::print::with_no_trimmed_paths!(
+                self.tcx.def_path_str(self.body_def)
+            ),
+        ))
     }
 
     /// Trust (wave-UB, upvar shared borrow): `&x` / `x.clone()` on a variable captured BY REF by
@@ -8766,9 +9176,30 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         {
             return None;
         }
-        let off = self.field_byte_offset(struct_rty, field)?;
+        let (off, off_source) = self.field_byte_offset(struct_rty, field)?;
+        // Trust (wave-COV): the census row, captured BEFORE the registration below — same
+        // channel and same partition as the wave-25/25b site, so the two gate call sites are
+        // measured on one scale. Off by default; stderr only; the artifact never moves.
+        let census_row = self.interior_offset_census_row(struct_rty, field, off, off_source);
         let struct_ty = self.struct_ty_rmw_opaque(adt, gargs, None)?;
         let Ty::Struct(sid) = struct_ty.clone() else { return None };
+        // Trust (wave-SG): AGREEMENT + PRESENCE on the struct-interior byte — the gate wave-DA
+        // built for the enum lanes and explicitly recorded as ABSENT here. The emitted number is
+        // rustc's `layout.fields.offset`; the consumer's is `FieldDef::offset` in the registered
+        // `StructDef` — and `interpret::struct_layout` reads NEITHER, laying fields out in
+        // declaration order, so an unwitnessed byte here is a byte no consumer table asserts.
+        // Checked against the id `struct_ty_rmw_opaque` just resolved, i.e. the table the module
+        // will actually carry; the offset QUERY above still runs first, so the registration is
+        // reached on exactly the paths it was reached on before. Placed before
+        // `lower_expr(ptr_expr)`, so a refusal pushes no nodes. Refusing costs one arm; a wrong
+        // interior address is a miscompile.
+        let admitted = self.struct_interior_offset_admissible(Some(sid), field, off, off_source);
+        if let Some(row) = census_row {
+            eprintln!("{row} site=wave-DP admitted={admitted}");
+        }
+        if !admitted {
+            return None;
+        }
         let leaf_ty = self.registered_struct_field_tys(sid)?.get(field as usize)?.clone();
         // The projected lane must be a registered STRUCT holder — the deref-projection fold
         // steps only through struct lanes (an opaque/scalar Target is not a foldable hop).
@@ -10153,38 +10584,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // reorder-aware; never hand-compute — the wave-25b rule). The
         // re-entrancy pre-gate mirrors `lower_offset_of`: `layout_of` on a
         // param/infer/opaque/bound-bearing type can ICE in a query, not `Err`.
-        let struct_rty = ty::Ty::new_adt(self.tcx, adt, args);
-        let layout = if layout_query_is_reentrant_safe_deep(self.tcx, struct_rty) {
-            let te = ty::TypingEnv::fully_monomorphized();
-            self.tcx.layout_of(te.as_query_input(struct_rty)).ok()
-        } else {
-            None
-        };
-        let (size, align) = match &layout {
-            Some(l) => (Some(l.size.bytes()), Some(l.align.abi.bytes())),
-            // Trust (#167 residue): a struct with NO FIELDS is zero-sized for EVERY
-            // instantiation. `layout_of` fails on an unmonomorphized generic, so `PhantomData<T>`
-            // and `Global` were emitted with no size at all — and a def of unknown size correctly
-            // counts as NON-ZST (`ty_is_zero_sized_in` will not assume unknown means zero, and
-            // its own test pins that: "a companion struct of UNPROVEN size must still count as
-            // non-ZST (fail-closed)"). So `Unique<T> { NonNull<T>, PhantomData<T> }` reported two
-            // non-ZST fields under `repr(transparent)` and was rejected.
-            //
-            // Fieldlessness settles the size WITHOUT a layout query and WITHOUT monomorphization:
-            // no fields, nothing to store, size 0. Generic params cannot change that.
-            //
-            // Guarded on the absence of an explicit `repr(align(N))`/`repr(packed(N))` so this
-            // stays a FACT and never a layout claim: with an alignment attribute the size is still
-            // 0 but the ALIGN is not 1, and recording a wrong align is exactly the kind of false
-            // ABI assertion #180 exists to avoid. Those keep the honest `None`.
-            None if adt.non_enum_variant().fields.is_empty()
-                && adt.repr().align.is_none()
-                && adt.repr().pack.is_none() =>
-            {
-                (Some(0), Some(1))
-            }
-            None => (None, None),
-        };
+        // Trust (wave-COV): the layout read and the size/align fill now live in ONE place,
+        // `registered_struct_layout_fill`, so the read-only pre-check that decides whether a
+        // registration-on-miss will record the byte an interior GEP is about to emit consults
+        // THE SAME query rather than a second spelling of it. Lifted verbatim; see that fn.
+        let (layout, size, align) = registered_struct_layout_fill(self.tcx, adt, args);
         // Repr hint: `#[repr(transparent)]` > packed clamp > `#[repr(C)]` >
         // default Rust. `repr(C, packed(N))` collapses to `Packed` — the
         // StructRepr carrier holds ONE hint; the filled size/align/offsets
@@ -10240,11 +10644,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 //
                 // Note the ordering: `offset == size` is checked against the DECLARED size, so
                 // this only fires when a layout was actually filled.
-                offset: layout
-                    .as_ref()
-                    .filter(|l| i < l.fields.count())
-                    .map(|l| l.fields.offset(i).bytes())
-                    .filter(|off| size.is_none_or(|sz| *off != sz)),
+                //
+                // Trust (wave-COV): the rule itself is now `declared_field_offset_fill`, lifted
+                // VERBATIM (both filters, same order, same operands) so the read-only pre-check
+                // at `LowerCx::struct_id_for_interior_offset` cannot drift from what this line
+                // actually records. One rule, two readers.
+                offset: declared_field_offset_fill(layout.as_ref(), size, i),
             })
             .collect();
         self.pending_structs.push(trust_ir::StructDef { id, name, fields, size, align, repr });
@@ -10673,6 +11078,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // wave-13 array-seed family; became_dirty == 0 (a `[T; 0]` field fell to the scalar `_`
             // arm → `None` → the caller's `…non-scalar field seed` tag before this wave).
             Ty::Array(_, 0) => Some(Constant::Array(Vec::new())),
+            // Trust (vtable slice 15): a FIRST-CLASS scalar-element array field/element
+            // `[T; N>0]` — `map_ty`'s Array spelling guarantees the pended element is in
+            // `seed_constant`'s set, so the seed is `Constant::Array` of N element zeros (the
+            // VARIANT is part of the interpreter's `(Ty::Array, Constant::Array)` pairing —
+            // the slice-12 `zero_const` convention). Resolved through the body's OWN pending
+            // types table; an unresolvable or non-scalar entry fails the WHOLE seed closed
+            // (`?`/`None`) rather than fabricating a placeholder — reachable only if a future
+            // `map_ty` gate widening forgets this site.
+            Ty::Array(tid, n) => {
+                let elem = self.pending_tys.get(tid.as_usize())?;
+                let zero = seed_constant(elem)?;
+                Some(Constant::Array(vec![zero; *n as usize]))
+            }
             // Trust (wave-UF): a `()` unit FIELD/element (a struct's `u: ()`, a tuple's `(a, ())`,
             // a nested unit) is a ZERO-SIZE type with a single inhabitant — seed it as the
             // interpreter's zero-size placeholder `Constant::PhantomData` (interpret.rs:1706 accepts
@@ -11863,13 +12281,20 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             }
             BindNode::Fields(fields) => {
-                // The aggregate we extract from must have mapped to a tuple/struct. `map_ty` lowers
-                // tuples, fixed arrays (N>0), and structs to these shapes; anything else (scalar, ptr,
-                // enum) is not `ExtractField`-able → fail closed.
+                // The aggregate we extract from must have mapped to a tuple/struct/first-class
+                // array. `map_ty` lowers tuples, aggregate-element fixed arrays (N>0), and
+                // structs to field-op shapes; Trust (vtable slice 15): a SCALAR-element array is
+                // `Ty::Array` and reads via the element ops instead. Anything else (scalar, ptr,
+                // enum) is not extractable → fail closed.
+                let first_class_array = matches!(&val_ty, Ty::Array(_, n) if *n > 0);
                 let elem_tys = match &val_ty {
                     Ty::Tuple(elem_tys) => elem_tys.clone(),
                     Ty::Struct(sid) => match self.registered_struct_field_tys(*sid) {
                         Some(f) => f,
+                        None => return false,
+                    },
+                    Ty::Array(tid, n) if *n > 0 => match self.pending_tys.get(tid.as_usize()) {
+                        Some(elem) => vec![elem.clone(); *n as usize],
                         None => return false,
                     },
                     _ => return false,
@@ -11902,13 +12327,33 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         return false;
                     }
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ExtractField {
-                            ty: fty.clone(),
-                            aggregate: val,
-                            field: *idx,
-                        })
-                        .with_result(res),
-                    );
+                    // Trust (vtable slice 15): a first-class array destructure reads its element
+                    // through the format-legal element op (`Const I64` + `ExtractElement`); the
+                    // tuple/struct shapes keep `ExtractField`. Same read, same index, same type.
+                    if first_class_array {
+                        let idx_val = self.fresh();
+                        self.push_node(InstrNode::new(Inst::Const {
+                                ty: Ty::I64,
+                                value: Constant::Int(i128::from(*idx)),
+                            })
+                            .with_result(idx_val),
+                        );
+                        self.push_node(InstrNode::new(Inst::ExtractElement {
+                                ty: fty.clone(),
+                                array: val,
+                                index: idx_val,
+                            })
+                            .with_result(res),
+                        );
+                    } else {
+                        self.push_node(InstrNode::new(Inst::ExtractField {
+                                ty: fty.clone(),
+                                aggregate: val,
+                                field: *idx,
+                            })
+                            .with_result(res),
+                        );
+                    }
                     if !self.emit_bind(sub, res, fty) {
                         return false;
                     }
@@ -14319,20 +14764,55 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // (scratch-verified, cmtest w4_struct (5)); no seed/InsertField machinery is
                 // needed for zero elements. Arity is cross-checked against the mapped length
                 // (defensive — both derive from the same rustc type).
-                if let Ty::Array(_, n) = &array_ty {
-                    if *n != 0 || !field_ids.is_empty() {
+                if let Ty::Array(elem_tid, n) = &array_ty {
+                    if *n as usize != field_ids.len() {
                         self.unsupported
                             .push((format!("{expr_span:?}"), "Array(len/shape desync)"));
                         return None;
                     }
-                    let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
-                            ty: array_ty.clone(),
-                            value: Constant::Array(Vec::new()),
-                        })
-                        .with_result(res),
-                    );
-                    return Some(res);
+                    if *n == 0 {
+                        let res = self.fresh();
+                        self.push_node(InstrNode::new(Inst::Const {
+                                ty: array_ty.clone(),
+                                value: Constant::Array(Vec::new()),
+                            })
+                            .with_result(res),
+                        );
+                        return Some(res);
+                    }
+                    // Trust (vtable slice 15): FIRST-CLASS scalar-element array construction —
+                    // the element-op twin of the tuple machinery below. Elements are lowered
+                    // FIRST with the exact guards the legacy path applies (fail-closed on an
+                    // unsupported element or a borrow pointer — never an aggregate hole).
+                    let elem_ty = match self.pending_tys.get(elem_tid.as_usize()) {
+                        Some(t) => t.clone(),
+                        None => {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "Array(unresolved elem ty)"));
+                            return None;
+                        }
+                    };
+                    let mut elem_vals: Vec<ValueId> = Vec::with_capacity(field_ids.len());
+                    for f in &field_ids {
+                        match self.lower_expr(*f) {
+                            Some(v) => {
+                                if self.is_borrow_ptr(v) {
+                                    self.unsupported.push((
+                                        format!("{expr_span:?}"),
+                                        "Array(borrow ptr element)",
+                                    ));
+                                    return None;
+                                }
+                                elem_vals.push(v)
+                            }
+                            None => {
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "Array(unsupported element)"));
+                                return None;
+                            }
+                        }
+                    }
+                    return self.build_array_first_class(expr_span, &array_ty, &elem_ty, &elem_vals);
                 }
                 let Ty::Tuple(elem_tys) = array_ty.clone() else {
                     self.unsupported.push((format!("{expr_span:?}"), "Array(non-tuple mapped ty)"));
@@ -14395,28 +14875,61 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `Ty::Tuple([])`-shaped behavior (elem lowered once, written zero times). The
                 // borrow-ptr escape guard is kept (conservative: the value goes nowhere, but a
                 // borrow pointer reaching here stays out of scope).
-                if let Ty::Array(_, 0) = &array_ty {
-                    match self.lower_expr(value) {
+                if let Ty::Array(elem_tid, n) = &array_ty {
+                    // The operand `x` is still LOWERED first for ANY N (rustc evaluates the
+                    // repeat operand even when its value is then discarded or replicated, so
+                    // any trap it carries must stay on the path), with the same borrow-ptr
+                    // escape guard as the legacy path.
+                    let elem = match self.lower_expr(value) {
                         Some(v) if self.is_borrow_ptr(v) => {
                             self.unsupported
                                 .push((format!("{expr_span:?}"), "Repeat(borrow ptr element)"));
                             return None;
                         }
-                        Some(_) => {}
+                        Some(v) => v,
                         None => {
                             self.unsupported
                                 .push((format!("{expr_span:?}"), "Repeat(unsupported element)"));
                             return None;
                         }
+                    };
+                    if *n == 0 {
+                        let res = self.fresh();
+                        self.push_node(InstrNode::new(Inst::Const {
+                                ty: array_ty.clone(),
+                                value: Constant::Array(Vec::new()),
+                            })
+                            .with_result(res),
+                        );
+                        return Some(res);
                     }
-                    let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
-                            ty: array_ty.clone(),
-                            value: Constant::Array(Vec::new()),
-                        })
-                        .with_result(res),
-                    );
-                    return Some(res);
+                    // Trust (vtable slice 15): first-class scalar-element `[x; N]` — the same
+                    // value written into all N slots via the element-op ctor (`x` is lowered
+                    // ONCE and reused; we only model scalar elements, which are `Copy`).
+                    // Defensive arity cross-check against the count, mirroring the legacy path.
+                    let n_count = match count.try_to_target_usize(self.tcx) {
+                        Some(c) => c,
+                        None => {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "Repeat(non-const count)"));
+                            return None;
+                        }
+                    };
+                    if n_count != *n {
+                        self.unsupported
+                            .push((format!("{expr_span:?}"), "Repeat(count/arity mismatch)"));
+                        return None;
+                    }
+                    let elem_ty = match self.pending_tys.get(elem_tid.as_usize()) {
+                        Some(t) => t.clone(),
+                        None => {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "Repeat(unresolved elem ty)"));
+                            return None;
+                        }
+                    };
+                    let elem_vals: Vec<ValueId> = vec![elem; *n as usize];
+                    return self.build_array_first_class(expr_span, &array_ty, &elem_ty, &elem_vals);
                 }
                 let Ty::Tuple(elem_tys) = array_ty.clone() else {
                     self.unsupported
@@ -14457,24 +14970,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 let elem_vals: Vec<ValueId> = vec![elem; n];
                 self.build_array_aggregate(expr_span, &array_ty, &elem_tys, &elem_vals)
             }
-            // Trust: array indexing `arr[i]` (the *non-overloaded* `ExprKind::Index`). The array value
-            // is a `Ty::Tuple` aggregate (see the construction arms); indexing reads one element out.
-            //   * CONSTANT index `arr[0]` → `Inst::ExtractField` at the literal offset (clean, like a
-            //     tuple `.0`). The interpreter's `eval_extract_field` reads aggregate field N directly.
-            //   * DYNAMIC index `arr[i]` (runtime `i`) → FAILS CLOSED since #202. It used to emit
-            //     `Inst::ExtractElement`, justified by the INTERPRETER: `eval_extract_element` does
-            //     accept a runtime index over an `Aggregate` and does trap on out-of-bounds, so the
-            //     bounds obligation really was discharged and the emitted code really did execute
-            //     correctly. What that argument never checked is the VALIDATOR — `ExtractElement`
-            //     requires `supports_element_ops()`, i.e. `Ty::Vector | Ty::Array`, and this array is
-            //     spelled `Ty::Tuple`. Every dynamic index therefore emitted an ill-formed module.
-            //     The full rationale, and why respelling arrays as `Ty::Array` is circular rather
-            //     than a fix, is on the dynamic branch below.
-            //
-            //     The general lesson, which is why this comment keeps its history: "the interpreter
-            //     accepts it" is an argument about EXECUTION and says nothing about WELL-FORMEDNESS.
-            //     #191 made the same mistake one branch up — it borrowed this comment's OOB-trap
-            //     justification for the CONSTANT path, where it did not hold at all.
+            // Trust: array indexing `arr[i]` (the *non-overloaded* `ExprKind::Index`). Trust
+            // (vtable slice 15): every index-admitted array is FIRST-CLASS `Ty::Array` (the
+            // `is_scalar_ty` element gate below is a subset of `map_ty`'s `seed_constant`
+            // spelling gate), so indexing reads one element out via the element ops.
+            //   * CONSTANT index `arr[K]` → `Const I64 K` + `Inst::ExtractElement`, behind the
+            //     #191 bounds gate (a constant index is NOT automatically in bounds — `arr[10]`
+            //     on a `[u32; 5]` is a guaranteed Rust panic, and built MIR diverges there).
+            //   * DYNAMIC index `arr[i]` (runtime `i`) → FAILS CLOSED: the bounds `Assert` is
+            //     unmodeled. The general lesson this comment keeps: "the interpreter traps OOB"
+            //     is an argument about EXECUTION inside the differential harness and says
+            //     nothing about the emitted module's obligations — #191 made that mistake on
+            //     the constant path, #202's original dynamic lane made the well-formedness twin
+            //     of it (ExtractElement over the then-Tuple spelling was ill-formed).
             //
             // FAIL-CLOSED: a non-array `lhs` (slice/`&[T]`/`Vec` — not `ty::Array`), a non-scalar element
             // type, an unsupported `lhs`, a borrow-ptr operand, or ANY dynamic index.
@@ -14541,55 +15049,47 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             return None;
                         }
                     }
+                    // Trust (vtable slice 15): the indexed base is FIRST-CLASS `Ty::Array` now —
+                    // `is_scalar_ty(elem)` (checked above) is a subset of `seed_constant`'s set,
+                    // which is exactly `map_ty`'s Array-spelling gate, so every index-admitted
+                    // array carries the Array spelling. Emit the format-legal element read
+                    // (`Const I64` + `ExtractElement`; `supports_element_ops()` = Vector|Array),
+                    // which the pinned interpreter serves natively and traps out-of-bounds —
+                    // though the #191 bounds gate above means an OOB index never reaches here.
+                    let idx = self.fresh();
+                    self.push_node(InstrNode::new(Inst::Const {
+                            ty: Ty::I64,
+                            value: Constant::Int(i128::from(k)),
+                        })
+                        .with_result(idx),
+                    );
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ExtractField {
+                    self.push_node(InstrNode::new(Inst::ExtractElement {
                             ty: elem_ty,
-                            aggregate: agg,
-                            field: k,
+                            array: agg,
+                            index: idx,
                         })
                         .with_result(res),
                     );
                     return Some(res);
                 }
-                // DYNAMIC index (`a[i]`, runtime `i`) — Trust (#202): FAIL CLOSED.
+                // DYNAMIC index (`a[i]`, runtime `i`) — FAIL CLOSED, but for a DIFFERENT reason
+                // than the retired #202 hold.
                 //
-                // This used to emit `Inst::ExtractElement { array: agg, .. }`, and `agg` is the
-                // ARRAY value, which `map_ty` spells `Ty::Tuple([T; N])` for `N > 0` (the
-                // `ty::Array` arm above). `ExtractElement` requires an operand whose type
-                // `supports_element_ops()`, and that is `Ty::Vector | Ty::Array` ONLY
-                // (first-party/trust-ir/crates/trust-ir/src/ty.rs:367-369) — so every dynamic
-                // index emitted an ILL-FORMED MODULE: `InvalidVectorElementOp`
-                // ("operand must be vector or array") from
-                // first-party/trust-ir/crates/trust-ir-build/src/validate.rs:3868.
-                // MEASURED: 7 occurrences over 2 files in the 2026-08-10 corpus run.
-                //
-                // NOT a live miscompile — the interpreter's `eval_extract_element` accepts an
-                // `Aggregate` value and traps out-of-bounds, so the emitted code executed
-                // correctly. But an ill-formed module is never acceptable, and the VALIDATOR is
-                // right: a runtime index over a TUPLE is ill-typed in general, because tuple
-                // elements may differ in type and `ExtractElement` carries a single result `ty`.
-                //
-                // WHY NOT JUST RESPELL ARRAYS AS `Ty::Array` (matching the MIR oracle, which
-                // does exactly that at trust-ir-bridge/src/lower.rs:2218)? Because it is
-                // CIRCULAR: `Ty::Array` is not a legal `InsertField`/`ExtractField` aggregate
-                // either, so array CONSTRUCTION (`build_array_aggregate`) and the CONST-index
-                // fast path immediately above — both of which work today — would become
-                // ill-formed in exchange. It also silently breaks three walkers that match
-                // `Ty::Tuple` and would simply stop matching: `union_lane_ty_transitive` and
-                // `param_lane_ty_transitive` (SOUNDNESS gates — they would answer `false`
-                // instead of refusing) and `def_field_ok` (bodies drop out of the splice with
-                // no tag). Retiring the tuple spelling therefore requires widening the FORMAT
-                // to give `Ty::Array` field ops FIRST; that is a two-sided change, not this fix.
-                //
-                // And do NOT "fix" this by widening `supports_element_ops` to accept a
-                // homogeneous `Ty::Tuple`: it clears the class at zero coverage cost, which is
-                // exactly why it is tempting, and it makes the producer/oracle spelling
-                // divergence PERMANENT in the format.
+                // Trust (vtable slice 15): the array is first-class `Ty::Array` now, so
+                // `ExtractElement` over it is FORMAT-LEGAL (`supports_element_ops()` =
+                // `Vector | Array`) — the #202 ill-formed-module class is gone. What remains
+                // unmodeled is the BOUNDS OBLIGATION: built MIR emits a bounds `Assert` and the
+                // function diverges on an OOB index, while a bare `ExtractElement` relies on the
+                // interpreter's OOB trap — the exact "the interpreter accepts it" argument #191
+                // rejected for the constant path, and nothing forces this module through the
+                // interpreter (codegen would just take the offset). Until the bounds `Assert` is
+                // modeled on this lane, a runtime index stays fail-closed.
                 //
                 // Refuse BEFORE lowering the index operand, so a body that is going to be
                 // discarded does not first accumulate dead index-computation instructions.
                 self.unsupported
-                    .push((format!("{expr_span:?}"), "Index(dynamic index over tuple-spelled array)"));
+                    .push((format!("{expr_span:?}"), "Index(dynamic index bounds unmodeled)"));
                 None
             }
             // Trust: `loop { body }` (and the `while c {b}` / `loop`-without-break-value that desugar
@@ -15067,7 +15567,63 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             let field_ref_thin = matches!(struct_rty.kind(), ty::Adt(adt, _) if adt.is_struct())
                                 && self.fat_shape(expr_ty, &mut Vec::new()) == FatShape::Thin;
                             if field_ref_thin {
-                                if let Some(off) = self.field_byte_offset(struct_rty, field) {
+                                // Trust (wave-SG): the struct lane's AGREEMENT + PRESENCE gate,
+                                // the one wave-DA named as missing here. The emitted byte must be
+                                // the byte the registered `StructDef` records for this exact
+                                // `(instantiation, field)`, or nothing is emitted — and this site
+                                // never registers, so `registered_struct_id` is a pure ledger scan
+                                // whose `None` is a refusal (the wave-NRF PRESENCE hole: an
+                                // interior address into an ADT the module does not describe).
+                                // MEASURED live on clean-kernel: `CertBundle::env`'s
+                                // `gep inbounds i8, +104` is exactly that, and
+                                // `cert::bundle::CertBundle` has no `StructDef` at all. A refusal
+                                // is indistinguishable, at this site, from the
+                                // `field_byte_offset(..) == None` refusal that has always been
+                                // here — same fall-through, same fail-closed escape guards
+                                // downstream — so this widens the existing refusal rather than
+                                // opening a new path. The sole-field tautology is unaffected.
+                                //
+                                // Trust (wave-COV): the PRESENCE half of that refusal is now
+                                // RECOVERED rather than paid. `struct_id_for_interior_offset`
+                                // registers the struct on a ledger miss — through the same
+                                // `struct_ty_rmw_opaque` funnel the wave-DP site uses, and only
+                                // when the SAME layout query that produced `off` says the
+                                // registration will record exactly `off` — so the module gains
+                                // the declaration table this GEP needs instead of the body being
+                                // dropped. What is checked is unchanged and is checked against
+                                // the table the module will actually carry: the gate below reads
+                                // `pending_structs` AFTER the registration, so a declined
+                                // registration, an absent offset and a disagreeing offset are all
+                                // still refusals. The AGREEMENT half is untouched — a table that
+                                // records a different byte is a conflict no registration can fix.
+                                //
+                                // ORDERING IS LOAD-BEARING, twice. The offset query still runs
+                                // FIRST, so no struct is registered on a path where the query
+                                // declines (that would be an artifact change, not a check). And
+                                // the gate still runs BEFORE `lower_expr(ptr_expr)`, so a refusal
+                                // pushes no nodes.
+                                let admissible = match self.field_byte_offset(struct_rty, field) {
+                                    Some((off, src)) => {
+                                        // Census FIRST: the ledger state as the gate found it,
+                                        // before a registration can change the answer. Off by
+                                        // default and stderr-only — the artifact never moves.
+                                        let row = self.interior_offset_census_row(
+                                            struct_rty, field, off, src,
+                                        );
+                                        let sid = self.struct_id_for_interior_offset(
+                                            struct_rty, field, off, src,
+                                        );
+                                        let ok = self.struct_interior_offset_admissible(
+                                            sid, field, off, src,
+                                        );
+                                        if let Some(row) = row {
+                                            eprintln!("{row} admitted={ok}");
+                                        }
+                                        ok.then_some((off, src))
+                                    }
+                                    None => None,
+                                };
+                                if let Some((off, _off_source)) = admissible {
                                     if let Some(pv) = self.lower_expr(ptr_expr) {
                                         if self.ref_param_ptrs.contains(&pv) {
                                             // Trust (wave-DZ): the wave-25 offset-0 tautology
@@ -16989,15 +17545,27 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let ty::Dynamic(preds, ..) = target_pointee.kind() else {
             return None;
         };
-        let principal = preds.principal_def_id()?;
-        let principal_path = trust_mir_extract::sysroot_authenticated_def_path_str(self.tcx, principal);
+        // Trust (vtable slice 17, SOUNDNESS): the principal half comes from the ONE
+        // shared renderer, not from the generics-ERASED def path. `dyn Convert<u32>` and
+        // `dyn Convert<u64>` used to render one string here, so two coercions of one
+        // source type minted ONE global name for TWO different vtables and asserted their
+        // `Load`s equal — false of every execution that has both. An args-free principal
+        // renders verbatim, so the three shipped slice-3 globals do not churn.
+        let owner = trust_mir_extract::safe_def_path_str(self.tcx, self.body_def);
+        let principal_path =
+            trust_mir_extract::faithful_principal_key(self.tcx, preds, &owner).ok()?;
         let (ty::Ref(_, src_pointee, _) | ty::RawPtr(src_pointee, _)) = src_ty.kind() else {
             return None;
         };
         let te = ty::TypingEnv::fully_monomorphized();
         let src_pointee = cycle_safe_normalize(self.tcx, te, *src_pointee);
         let key_ty = trust_mir_extract::faithful_vtable_key_ty(self.tcx, src_pointee);
-        let source_key = key_ty.vtable_source_type_key()?;
+        // Trust (vtable slice 17, part B): BODY-SCOPED source key — admits a bare
+        // `ty::Param` source, which within ONE body is a single fixed type (so two
+        // `T as dyn Tr` coercions there really do share one vtable), keyed with the
+        // owning body's def path so two bodies' `T/#0` can never merge. Every concrete
+        // source delegates to the owner-less renderer and is byte-identical.
+        let source_key = key_ty.vtable_source_type_key_in_body(&owner)?;
         let name = trust_ir::stable_vtable_global_name(&principal_path, &source_key)?;
         let global = match self.vtable_globals.iter().find(|(n, _)| *n == name) {
             Some((_, g)) => *g,
@@ -17713,7 +18281,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let ty = self.map_ty(rty);
         let coherent = match (rty.kind(), &ty) {
             (ty::Tuple(_), Ty::Tuple(_)) => true,
-            (ty::Array(..), Ty::Tuple(_) | Ty::Array(_, 0)) => true,
+            // Trust (vtable slice 15): a rustc array may map to the legacy aggregate-element
+            // `Ty::Tuple`, the zero-length `Ty::Array(_, 0)`, or the first-class scalar-element
+            // `Ty::Array(_, N>0)` — all three are decoder-handled pairings (the valtree branch
+            // decoder emits `Constant::Array` for the Array spellings, `Constant::Aggregate`
+            // for the tuple one).
+            (ty::Array(..), Ty::Tuple(_) | Ty::Array(..)) => true,
             (ty::Adt(adt, _), Ty::Struct(_)) if adt.is_struct() => true,
             (ty::Adt(adt, _), Ty::Enum(_)) if adt.is_enum() => true,
             _ => false,
@@ -17800,8 +18373,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///   * scalar leaves reuse the scalar const legs' spellings (`integer_constant_from_bits`
     ///     incl. the v24 U128 canonicality, char as an Int code-point leaf with the validator's
     ///     range check, floats behind the f32-carrier round-trip guard);
-    ///   * `(A, B)` and `[T; N > 0]` -> `Constant::Aggregate` under the mapped `Ty::Tuple`;
-    ///     `[T; 0]` -> the empty `Constant::Array` under `Ty::Array(_, 0)` (wave-FRU L3);
+    ///   * `(A, B)` and an AGGREGATE-element `[T; N > 0]` -> `Constant::Aggregate` under the
+    ///     mapped `Ty::Tuple`; `[T; 0]` and (vtable slice 15) a SCALAR-element `[T; N > 0]` ->
+    ///     `Constant::Array` under the first-class `Ty::Array` (wave-FRU L3, generalized);
     ///   * `struct` -> `Constant::Aggregate(fields)` in declaration order (the valtree Branch
     ///     order — rustc documents Branch as "the fields of any kind of aggregate ... in order");
     ///   * `enum` -> `Constant::Aggregate([Int(discriminant), fields...])`, the tag+payload
@@ -17865,10 +18439,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     .iter()
                     .map(|c| self.branch_elem_to_constant(c, *elem_ty, depth + 1))
                     .collect::<Option<Vec<_>>>()?;
-                // map_ty's array model: `[T; N > 0]` is a Ty::Tuple (Aggregate value);
-                // `[T; 0]` is the ZST Ty::Array (empty Array value, wave-FRU L3).
-                if elems.is_empty() {
-                    Some(Constant::Array(Vec::new()))
+                // Mirror map_ty's array model EXACTLY (the decoder contract above): `[T; 0]`
+                // and — Trust (vtable slice 15) — a SCALAR-element `[T; N>0]` are first-class
+                // `Ty::Array` and carry `Constant::Array` (the VARIANT is part of the
+                // interpreter's `(Ty::Array, Constant::Array)` pairing); an aggregate-element
+                // `[T; N>0]` is still the legacy `Ty::Tuple` and carries `Constant::Aggregate`.
+                // The spelling test re-asks map_ty's own gate on the mapped element (dedup makes
+                // the re-map side-effect-free for a type this const already mapped).
+                if elems.is_empty() || seed_constant(&self.map_ty(*elem_ty)).is_some() {
+                    Some(Constant::Array(elems))
                 } else {
                     Some(Constant::Aggregate(elems))
                 }
@@ -18147,18 +18726,26 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             consts.push(c);
         }
         // Every field promotable ⇒ the aggregate is a clean scalar/aggregate value, so `map_ty`
-        // maps it without recording a gap. Require a thin `Ty::Tuple`/`Ty::Struct` of matching
-        // arity (a fat/ptr/enum/array-0 mapping declines — the `Constant::Aggregate` would not match).
+        // maps it without recording a gap. Require a thin `Ty::Tuple`/`Ty::Struct` — or, Trust
+        // (vtable slice 15), a first-class scalar-element `Ty::Array(_, N>0)` — of matching
+        // arity (a fat/ptr/enum/array-0 mapping declines; the empty-array literal has no
+        // promotable-field walk to arrive here from). The constant VARIANT tracks the spelling:
+        // `Constant::Array` for the Array spelling (the interpreter pairing), `Aggregate` else.
         let agg_ty = self.map_ty(pointee);
         let expected = match &agg_ty {
             Ty::Tuple(elems) => elems.len(),
             Ty::Struct(sid) => self.registered_struct_field_tys(*sid)?.len(),
+            Ty::Array(_, n) if *n > 0 => *n as usize,
             _ => return None,
         };
         if expected != consts.len() {
             return None;
         }
-        Some((agg_ty, Constant::Aggregate(consts)))
+        let value = match &agg_ty {
+            Ty::Array(..) => Constant::Array(consts),
+            _ => Constant::Aggregate(consts),
+        };
+        Some((agg_ty, value))
     }
 
     /// Trust (wave-16): EAGER, non-emitting scalar const-eval for the promoted-borrow path.
@@ -18485,6 +19072,102 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         Some(agg)
     }
 
+    /// Trust (vtable slice 15): build a FIRST-CLASS `Ty::Array(TyId, N>0)` runtime value from
+    /// already-lowered element values — the element-op twin of [`Self::build_array_aggregate`].
+    /// Seeds ONE typed `Const { ty: Ty::Array, value: Constant::Array([elem_zero; N]) }`
+    /// (never `Inst::Undef` — the reference interpreter executes Undef as eager UB; the pinned
+    /// interpreter materializes `(Ty::Array, Constant::Array)` with an exact length check), then
+    /// overwrites every slot in index order with `Const I64 i` + `InsertElement` — the exact
+    /// instruction shape the slice-12 differential machinery already folds
+    /// (`fold_stored_constant`'s InsertElement arm) and the format validator ratifies
+    /// (`supports_element_ops()` = `Vector | Array`).
+    ///
+    /// Every lane is overwritten BY CONSTRUCTION (`elem_vals` is `&[ValueId]`, not `Option`; the
+    /// loop has no skip arm) — the same totality argument `build_array_aggregate` pins.
+    ///
+    /// FAIL-CLOSED: an element type outside `seed_constant`'s set. Unreachable from `map_ty`'s
+    /// scalar-gated `Ty::Array(N>0)` spelling, but CHECKED rather than assumed — a future gate
+    /// widening must not inherit a silent zero-seed here.
+    fn build_array_first_class(
+        &mut self,
+        span: rustc_span::Span,
+        array_ty: &Ty,
+        elem_ty: &Ty,
+        elem_vals: &[ValueId],
+    ) -> Option<ValueId> {
+        let Some(zero) = seed_constant(elem_ty) else {
+            self.unsupported.push((format!("{span:?}"), "Array(non-scalar element seed)"));
+            return None;
+        };
+        let mut agg = self.fresh();
+        self.push_node(InstrNode::new(Inst::Const {
+                ty: array_ty.clone(),
+                value: Constant::Array(vec![zero; elem_vals.len()]),
+            })
+            .with_result(agg),
+        );
+        for (i, val) in elem_vals.iter().enumerate() {
+            let idx = self.fresh();
+            self.push_node(InstrNode::new(Inst::Const {
+                    ty: Ty::I64,
+                    value: Constant::Int(i as i128),
+                })
+                .with_result(idx),
+            );
+            let next = self.fresh();
+            self.push_node(InstrNode::new(Inst::InsertElement {
+                    ty: array_ty.clone(),
+                    array: agg,
+                    index: idx,
+                    value: *val,
+                })
+                .with_result(next),
+            );
+            agg = next;
+        }
+        Some(agg)
+    }
+
+    /// Trust (vtable slice 15): read positional lane `idx` (typed `ty`) out of an aggregate
+    /// value — `ExtractField` for the tuple/struct shapes, `Const I64` + `ExtractElement` for a
+    /// first-class `Ty::Array` (the format-legal element read; `supports_element_ops()` =
+    /// `Vector | Array`). One helper so the tuple-match/destructure lanes cannot drift between
+    /// the two spellings per site.
+    fn emit_positional_lane_read(
+        &mut self,
+        first_class_array: bool,
+        agg: ValueId,
+        idx: u32,
+        ty: &Ty,
+    ) -> ValueId {
+        let v = self.fresh();
+        if first_class_array {
+            let idx_val = self.fresh();
+            self.push_node(InstrNode::new(Inst::Const {
+                    ty: Ty::I64,
+                    value: Constant::Int(i128::from(idx)),
+                })
+                .with_result(idx_val),
+            );
+            self.push_node(InstrNode::new(Inst::ExtractElement {
+                    ty: ty.clone(),
+                    array: agg,
+                    index: idx_val,
+                })
+                .with_result(v),
+            );
+        } else {
+            self.push_node(InstrNode::new(Inst::ExtractField {
+                    ty: ty.clone(),
+                    aggregate: agg,
+                    field: idx,
+                })
+                .with_result(v),
+            );
+        }
+        v
+    }
+
     /// Trust: materialize a FAITHFUL slice fat pointer `(data_ptr, len)` from an array-to-slice
     /// `PointerCoercion{Unsize}`. `source` is the coercion operand — a `&[T; N]` reference (a
     /// `Borrow{Shared}` of a fixed-size array local). We:
@@ -18652,15 +19335,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Slice(non-scalar element)"));
             return None;
         }
-        // Trust (#195): match `map_ty`'s ratified spelling at `len == 0`. `map_ty` maps `[T; 0]`
-        // to `Ty::Array(_, 0)` (deliberately, to agree with the MIR oracle), but
-        // `vec![elem; 0]` collapses to `Ty::Tuple([])` — so the `Alloca`/`Store` disagreed with the
-        // value's own declared type (`OperandTypeMismatch`). Zero-sized either way; spelling only.
-        let array_ty = if len == 0 {
-            Ty::Array(self.pend_ty(elem_ty.clone()), 0)
-        } else {
-            Ty::Tuple(vec![elem_ty.clone(); len as usize])
-        };
+        // Trust (#195, generalized by vtable slice 15): the `Alloca`/`Store` slot type must BE
+        // `map_ty`'s ratified spelling of the array type — a hand-derived spelling here diverged
+        // once already (`[T; 0]` as `Ty::Tuple([])` vs map_ty's `Ty::Array(_, 0)` →
+        // `OperandTypeMismatch`), and slice 15 moves scalar-element `[T; N>0]` to first-class
+        // `Ty::Array` too (`is_scalar_ty(elem)` above is a subset of the `seed_constant` spelling
+        // gate, so every array this lane admits takes the Array spelling). Ask the single source
+        // of truth instead of re-deriving; the elem/len gates above guarantee it maps cleanly,
+        // and `pend_ty` dedup makes the id identical to the one the lowered value carries.
+        let array_ty = self.map_ty(arr_rty);
         // Lower the literal as a value (the `ExprKind::Array`/`Repeat` arm).
         let arr_val = self.lower_expr(arr_expr)?;
         let data_ptr = self.fresh();
@@ -18728,15 +19411,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Slice(non-scalar element)"));
             return None;
         }
-        // Trust (#195): match `map_ty`'s ratified spelling at `len == 0`. `map_ty` maps `[T; 0]`
-        // to `Ty::Array(_, 0)` (deliberately, to agree with the MIR oracle), but
-        // `vec![elem; 0]` collapses to `Ty::Tuple([])` — so the `Alloca`/`Store` disagreed with the
-        // value's own declared type (`OperandTypeMismatch`). Zero-sized either way; spelling only.
-        let array_ty = if len == 0 {
-            Ty::Array(self.pend_ty(elem_ty.clone()), 0)
-        } else {
-            Ty::Tuple(vec![elem_ty.clone(); len as usize])
-        };
+        // Trust (#195, generalized by vtable slice 15): the `Alloca`/`Store` slot type must BE
+        // `map_ty`'s ratified spelling of the array type — a hand-derived spelling here diverged
+        // once already (`[T; 0]` as `Ty::Tuple([])` vs map_ty's `Ty::Array(_, 0)` →
+        // `OperandTypeMismatch`), and slice 15 moves scalar-element `[T; N>0]` to first-class
+        // `Ty::Array` too (`is_scalar_ty(elem)` above is a subset of the `seed_constant` spelling
+        // gate, so every array this lane admits takes the Array spelling). Ask the single source
+        // of truth instead of re-deriving; the elem/len gates above guarantee it maps cleanly,
+        // and `pend_ty` dedup makes the id identical to the one the lowered value carries.
+        let array_ty = self.map_ty(arr_rty);
         // Read the array local's CURRENT aggregate value directly (the `Ty::Tuple([T; N])` the
         // construction arms built and bound). We read the local rather than re-lowering the place
         // expression so the non-scalar `Borrow`/`Deref` chain is never traversed.
@@ -22187,6 +22870,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         //    mapped to `Ty::Unit` was handled above). A STRUCT scrutinee (`let P { x, y } = p` —
         //    the same `PatKind::Leaf` shape) maps to `Ty::Struct(id)`; its element types are the
         //    registered def's fields in declaration order — the exact indices `sp.field` carries.
+        // Trust (vtable slice 15): a SCALAR-element fixed array scrutinee is first-class
+        // `Ty::Array` now — positionally identical to the tuple shape (index = element
+        // position), but its lane reads are the element ops (`Const I64` + `ExtractElement`),
+        // steered by this flag at the two emission sites below.
+        let first_class_array = matches!(&mapped, Ty::Array(_, n) if *n > 0);
         let elem_tys = match &mapped {
             Ty::Tuple(elem_tys) => elem_tys.clone(),
             Ty::Struct(sid) => match self.registered_struct_field_tys(*sid) {
@@ -22194,6 +22882,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 None => {
                     self.unsupported
                         .push((format!("{span:?}"), "TupleMatch(unregistered struct id)"));
+                    return None;
+                }
+            },
+            Ty::Array(tid, n) if *n > 0 => match self.pending_tys.get(tid.as_usize()) {
+                Some(elem) => vec![elem.clone(); *n as usize],
+                None => {
+                    self.unsupported
+                        .push((format!("{span:?}"), "TupleMatch(unresolved array elem ty)"));
                     return None;
                 }
             },
@@ -22227,10 +22923,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
                 // Normalize the arm pattern into a POSITIONAL `(index, subpattern)` list, shared by
                 // the tuple/struct (`PatKind::Leaf`, index = declared field) and, Trust (wave-AM),
-                // the FIXED-LENGTH ARRAY (`PatKind::Array`, index = element position) forms. map_ty
-                // already lowered `[T; N]` (N>0) to `Ty::Tuple([T; N])` (lib.rs ~959), so the
-                // downstream `ExtractField idx` element read is IDENTICAL for both — a const array
-                // index is `ExtractField` too (the `ExprKind::Index` fast-path). A REST pattern
+                // the FIXED-LENGTH ARRAY (`PatKind::Array`, index = element position) forms. The
+                // classifier is spelling-blind: a scalar-element array scrutinee maps first-class
+                // `Ty::Array` (vtable slice 15) and its lane reads take the element ops via
+                // `emit_positional_lane_read`; an aggregate-element array still maps
+                // `Ty::Tuple([T; N])` with `ExtractField` reads. A REST pattern
                 // (`[a, .., c]` → `slice: Some`) binds a subslice (a distinct fat-slice shape) and is
                 // OUT OF SCOPE (fail-closed); a `PatKind::Slice` scrutinee (`&[T]`) is not `ty::Array`
                 // and never routes here.
@@ -22431,14 +23128,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         .push((format!("{span:?}"), "TupleMatch(non-scalar field binding)"));
                     return None;
                 }
-                let v = self.fresh();
-                self.push_node(InstrNode::new(Inst::ExtractField {
-                        ty: ety.clone(),
-                        aggregate: scrut_val,
-                        field: idx,
-                    })
-                    .with_result(v),
-                );
+                let v = self.emit_positional_lane_read(first_class_array, scrut_val, idx, &ety);
                 self.set_local(var, v, ety);
             }
             return self.lower_expr(body);
@@ -22611,14 +23301,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 self.unsupported.push((format!("{span:?}"), "TupleMatch(non-scalar field)"));
                 return None;
             }
-            let v = self.fresh();
-            self.push_node(InstrNode::new(Inst::ExtractField {
-                    ty: field_ty.clone(),
-                    aggregate: scrut_val,
-                    field: idx,
-                })
-                .with_result(v),
-            );
+            let v = self.emit_positional_lane_read(first_class_array, scrut_val, idx, &field_ty);
             extracted.push((idx, v, field_ty));
         }
         // Resolve a field index to its (once-extracted) SSA value + type. `needed` is the exact
@@ -25203,6 +25886,100 @@ fn unsigned_twin(ty: &Ty) -> Option<Ty> {
     })
 }
 
+/// Trust (wave-COV): **the ONE implementation of the layout read `register_struct` records** —
+/// lifted verbatim out of it so a read-only caller can ask, without mutating anything, exactly
+/// what that function *would* fill for a struct it has not registered yet.
+///
+/// That question is not cosmetic: [`LowerCx::struct_id_for_interior_offset`] registers a struct
+/// on a ledger miss so the wave-SG interior-offset gate has a declaration table to check against,
+/// and it must only do so when the registration will record **the same byte the emission site is
+/// about to GEP**. Answering that with a second spelling of rustc's layout rules would make the
+/// gate compare a number against itself computed twice — the exact failure the gate exists to
+/// prevent. There is one query here, one typing environment, one guard, and both callers read it.
+///
+/// The guard is [`layout_query_is_reentrant_safe_deep`] and the query is
+/// `tcx.layout_of(TypingEnv::fully_monomorphized())` — which is byte-for-byte what
+/// [`cycle_safe_layout_of`] (and therefore [`LowerCx::field_byte_offset`], the site that emits
+/// the number) performs. `layout_of` is a memoized query, so the two are not merely "the same
+/// rule": on a given `(DefId, GenericArgs)` they are literally the same `TyAndLayout`.
+pub(crate) fn registered_struct_layout_fill<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt: ty::AdtDef<'tcx>,
+    args: ty::GenericArgsRef<'tcx>,
+) -> (Option<ty::layout::TyAndLayout<'tcx>>, Option<u64>, Option<u64>) {
+    let struct_rty = ty::Ty::new_adt(tcx, adt, args);
+    let layout = if layout_query_is_reentrant_safe_deep(tcx, struct_rty) {
+        let te = ty::TypingEnv::fully_monomorphized();
+        tcx.layout_of(te.as_query_input(struct_rty)).ok()
+    } else {
+        None
+    };
+    let (size, align) = match &layout {
+        Some(l) => (Some(l.size.bytes()), Some(l.align.abi.bytes())),
+        // Trust (#167 residue): a struct with NO FIELDS is zero-sized for EVERY
+        // instantiation. `layout_of` fails on an unmonomorphized generic, so `PhantomData<T>`
+        // and `Global` were emitted with no size at all — and a def of unknown size correctly
+        // counts as NON-ZST (`ty_is_zero_sized_in` will not assume unknown means zero, and
+        // its own test pins that: "a companion struct of UNPROVEN size must still count as
+        // non-ZST (fail-closed)"). So `Unique<T> { NonNull<T>, PhantomData<T> }` reported two
+        // non-ZST fields under `repr(transparent)` and was rejected.
+        //
+        // Fieldlessness settles the size WITHOUT a layout query and WITHOUT monomorphization:
+        // no fields, nothing to store, size 0. Generic params cannot change that.
+        //
+        // Guarded on the absence of an explicit `repr(align(N))`/`repr(packed(N))` so this
+        // stays a FACT and never a layout claim: with an alignment attribute the size is still
+        // 0 but the ALIGN is not 1, and recording a wrong align is exactly the kind of false
+        // ABI assertion #180 exists to avoid. Those keep the honest `None`.
+        None if adt.non_enum_variant().fields.is_empty()
+            && adt.repr().align.is_none()
+            && adt.repr().pack.is_none() =>
+        {
+            (Some(0), Some(1))
+        }
+        None => (None, None),
+    };
+    (layout, size, align)
+}
+
+/// Trust (wave-COV): **the ONE implementation of the per-field offset rule `register_struct`
+/// records** — the `offset:` fill of [`trust_ir::FieldDef`], lifted verbatim for the same reason
+/// as [`registered_struct_layout_fill`].
+///
+/// Both filters are load-bearing and both are the #204/`FieldsShape` rules stated there:
+/// * `i < l.fields.count()` — a layout can carry FEWER field entries than the `AdtDef` declares
+///   (`#[rustc_scalable_vector]`), and `FieldsShape::offset` PANICS out of range;
+/// * `off != size` — rustc's legal placement for a ZERO-SIZED field is at exactly the struct
+///   size, and the producer's own model cannot prove such a field is a ZST, so the offset is
+///   dropped rather than asserted.
+///
+/// A `None` out of here is therefore a REFUSAL at the interior-offset gate, not a default: the
+/// consumer table would assert nothing about that byte, which is precisely the wave-NRF presence
+/// hole wave-SG closed.
+pub(crate) fn declared_field_offset_fill<'tcx>(
+    layout: Option<&ty::layout::TyAndLayout<'tcx>>,
+    size: Option<u64>,
+    i: usize,
+) -> Option<u64> {
+    layout
+        .filter(|l| i < l.fields.count())
+        .map(|l| l.fields.offset(i).bytes())
+        .and_then(|off| declared_field_offset_admits_size(size, off))
+}
+
+/// Trust (wave-COV): the #204 TRAILING-ZST half of [`declared_field_offset_fill`], split out
+/// `TyCtxt`-free so the one rule a `--lib` test can actually invert is directly invertible.
+///
+/// A `TyAndLayout` cannot be constructed in a unit test, so a fill that kept this inline would be
+/// pinned only by source-scan. It is worth inverting for real: `off == size` is rustc's legal
+/// placement for a ZERO-SIZED field, the producer's model cannot prove such a field is a ZST, and
+/// recording the offset anyway asserts a layout fact the model contradicts. Dropping it is what
+/// makes the interior-offset gate REFUSE that field rather than GEP a byte the consumer table
+/// declines to name.
+pub(crate) fn declared_field_offset_admits_size(size: Option<u64>, off: u64) -> Option<u64> {
+    Some(off).filter(|off| size.is_none_or(|sz| *off != sz))
+}
+
 /// Trust (RPIT cycle fix): pre-borrowck demand guards.
 ///
 /// The THIR→trust-ir lowering runs INSIDE `mir_built` (the builder/mod.rs hook)
@@ -25792,6 +26569,15 @@ fn ty_contains_func(ty: &Ty) -> bool {
     match ty {
         Ty::Func(_) => true,
         Ty::Tuple(elems) => elems.iter().any(ty_contains_func),
+        // Trust (vtable slice 15): a producer-minted `Ty::Array` is Func-free BY CONSTRUCTION,
+        // at BOTH mint gates: the `N == 0` arm runs `ty_contains_func` on the ELEMENT and
+        // refuses fn-ptr elements before pending, and the `N > 0` spelling gate is
+        // `seed_constant` (scalars only — `Func` is not in the set). Without this arm the
+        // conservative catch-all below would answer `true` and silently refuse fn-ptr
+        // signatures carrying arrays that the tuple spelling admitted — a regression, not a
+        // tightening. If a future mint path pends an unchecked element, IT must re-establish
+        // this invariant or delete this arm.
+        Ty::Array(..) => false,
         Ty::Bool
         | Ty::I8
         | Ty::I16
@@ -26262,9 +27048,11 @@ fn build_bind_node(pat: &Pat<'_>) -> Option<BindNode> {
             }
             Some(BindNode::Fields(fields))
         }
-        // Fixed-length array destructure WITHOUT a `..` rest (`[a, b, c]`). `map_ty` lowers `[T; N]`
-        // (N>0) to `Ty::Tuple`, so the element read is `ExtractField` at the positional index — exactly
-        // the tuple case. A REST pattern (`slice: Some`) binds a fat subslice → not modeled (fail closed).
+        // Fixed-length array destructure WITHOUT a `..` rest (`[a, b, c]`). Positionally identical
+        // to the tuple case; the read spelling is decided at `emit_bind`'s `Fields` arm (vtable
+        // slice 15: element ops for a first-class scalar-element `Ty::Array`, `ExtractField` for
+        // the aggregate-element `Ty::Tuple` spelling). A REST pattern (`slice: Some`) binds a fat
+        // subslice → not modeled (fail closed).
         PatKind::Array { prefix, slice: None, suffix } => {
             let mut fields = Vec::new();
             for (i, p) in prefix.iter().chain(suffix.iter()).enumerate() {
@@ -29776,6 +30564,74 @@ mod enum_field_read_tests {
         assert!(tainted(&taint, &enums, 2), "an array-as-tuple payload must propagate the lane");
     }
 
+    /// Trust (vtable slice 15): the SPELLING-GATE/WALKER contract. Both taint walkers answer
+    /// `false` for `Ty::Array` WITHOUT resolving the element id, which is sound only under
+    /// `map_ty`'s Array-spelling gate: an `N>0` array is spelled `Ty::Array` iff its element
+    /// is in `seed_constant`'s scalar set (scalars carry no struct/enum bytes), and an `N=0`
+    /// array holds no bytes at all. This test pins BOTH halves of the contract:
+    ///   * the walkers' `false` on `Ty::Array` — even when the taint set is non-empty and the
+    ///     SAME struct spelled as a tuple element IS refused (the contrast row: were an
+    ///     aggregate element ever Array-spelled, `false` here would be the soundness hole the
+    ///     pre-slice-15 `map_ty` comment recorded);
+    ///   * the gate set itself — every `seed_constant`-admitted scalar is walker-inert, so
+    ///     widening `seed_constant` alone cannot silently admit a taint carrier.
+    /// Anyone widening the `map_ty` gate to aggregate elements must teach the walkers to
+    /// resolve the pending/module types table FIRST, then rewrite this pin.
+    #[test]
+    fn array_spelling_gate_matches_walker_assumption() {
+        use crate::{param_lane_ty_transitive, seed_constant};
+        let taint: HashSet<StructId> = HashSet::from([StructId::new(7)]);
+        // The Array spelling is walker-inert...
+        assert!(!union_lane_ty_transitive(&taint, &Ty::Array(trust_ir::TyId::new(0), 4)));
+        assert!(!union_lane_ty_transitive(&taint, &Ty::Array(trust_ir::TyId::new(0), 0)));
+        // ...while the SAME struct as a tuple element is refused — the contrast that makes
+        // the scalar-element invariant load-bearing rather than decorative.
+        assert!(union_lane_ty_transitive(&taint, &Ty::Tuple(vec![Ty::Struct(StructId::new(7))])));
+
+        let enum_taint: HashSet<EnumId> = HashSet::from([EnumId::new(3)]);
+        let struct_taint: HashSet<StructId> = HashSet::from([StructId::new(7)]);
+        assert!(!param_lane_ty_transitive(
+            &enum_taint,
+            &struct_taint,
+            &Ty::Array(trust_ir::TyId::new(1), 8)
+        ));
+        assert!(param_lane_ty_transitive(
+            &enum_taint,
+            &struct_taint,
+            &Ty::Tuple(vec![Ty::Enum(EnumId::new(3))])
+        ));
+
+        // The gate set: every scalar `seed_constant` admits is walker-inert as a tuple
+        // element, so the Array arm's `false` matches what the same elements would answer
+        // if walked directly.
+        for scalar in [
+            Ty::Bool,
+            Ty::I8,
+            Ty::I16,
+            Ty::I32,
+            Ty::I64,
+            Ty::I128,
+            Ty::U8,
+            Ty::U16,
+            Ty::U32,
+            Ty::U64,
+            Ty::U128,
+            Ty::Isize,
+            Ty::Usize,
+            Ty::Char,
+            Ty::F32,
+            Ty::F64,
+        ] {
+            assert!(seed_constant(&scalar).is_some(), "gate set drifted: {scalar:?}");
+            assert!(!union_lane_ty_transitive(&taint, &Ty::Tuple(vec![scalar.clone()])));
+            assert!(!param_lane_ty_transitive(
+                &enum_taint,
+                &struct_taint,
+                &Ty::Tuple(vec![scalar])
+            ));
+        }
+    }
+
     /// NEGATIVE CONTROL, and the additivity claim: with an EMPTY taint set nothing is refused, so
     /// admitting the lane can never narrow a shape that already worked. The taint set is only ever
     /// non-empty when `register_union_lane` seeded it.
@@ -30211,16 +31067,65 @@ mod resolved_fn_ptr_wall_tests {
         FuncTy { params, returns, is_vararg: false }
     }
 
-    /// The table-free predicate is UNCHANGED, and this is the boundary the widening moves:
+    /// The table-free predicate is UNCHANGED at the boundary the widening moves:
     /// `Ty::Struct`/`Ty::Enum` were `true` there and stay `true` there.
+    ///
+    /// `Ty::Array` is deliberately NOT in this list any more. It was, until vtable slice 15
+    /// (`c51be58671`) gave [`ty_contains_func`] an `Array(..) => false` arm, at which point
+    /// this test went RED and stayed red — the assertion had become a record of a wall that
+    /// had moved, not of one that holds. The array answer and the two mint gates that license
+    /// it are asserted in
+    /// [`the_array_spelling_answers_func_free_and_both_mint_gates_license_it`]; what is left
+    /// here is exactly the set that is still UNRESOLVABLE without a table.
     #[test]
-    fn the_table_free_predicate_still_refuses_every_table_indexed_spelling() {
+    fn the_table_free_predicate_still_refuses_the_unresolvable_table_indexed_spellings() {
         assert!(ty_contains_func(&Ty::Struct(StructId::new(0))));
         assert!(ty_contains_func(&Ty::Enum(EnumId::new(0))));
-        assert!(ty_contains_func(&Ty::Array(trust_ir::TyId::new(0), 0)));
         assert!(ty_contains_func(&Ty::FatPtr(trust_ir::FatPtrKind::Str)));
         assert!(!ty_contains_func(&Ty::U64));
         assert!(!ty_contains_func(&Ty::Tuple(vec![Ty::U64, Ty::Bool])));
+    }
+
+    /// **The `Ty::Array` answer is `false`, and that is a CONSTRUCTION invariant rather than a
+    /// hole.** This is the claim that replaced the two assertions vtable slice 15 turned red.
+    ///
+    /// `false` is sound only because BOTH mint gates in `map_ty`'s `ty::Array` arm establish
+    /// it, so both are pinned here BY SOURCE TEXT. An answer whose licence lives only in a
+    /// comment is precisely what went stale the first time:
+    ///
+    ///   * `N == 0` runs [`ty_contains_func`] on the ELEMENT and refuses a fn-ptr element
+    ///     before pending the type;
+    ///   * `N > 0` admits only a `seed_constant` SCALAR element, and `seed_constant` has no
+    ///     `Func` arm.
+    ///
+    /// Delete or widen either gate and this goes red, instead of the predicate silently
+    /// starting to answer `false` for an array that can carry a `Ty::Func`. The walker-side
+    /// half of the same invariant is pinned by `array_spelling_gate_matches_walker_assumption`.
+    #[test]
+    fn the_array_spelling_answers_func_free_and_both_mint_gates_license_it() {
+        assert!(!ty_contains_func(&Ty::Array(trust_ir::TyId::new(0), 0)));
+        assert!(!ty_contains_func(&Ty::Array(trust_ir::TyId::new(0), 4)));
+        // ...and the table-bearing sibling DELEGATES here rather than re-deciding it.
+        assert!(!ty_contains_func_resolved(&Ty::Array(trust_ir::TyId::new(0), 4), &[], &[]));
+        // The fn-ptr spelling itself is still refused, table or no table.
+        assert!(ty_contains_func(&Ty::Func(FuncTyId::new(1))));
+
+        // WIRING. The needles are ASSEMBLED at run time, never written as literals: this
+        // test's own source is inside `include_str!("lib.rs")`, so a literal needle would
+        // match itself and the guard would pass with the production gate deleted.
+        let producer = include_str!("lib.rs");
+        let zero_gate = format!("if {}(&elem_ty) {{", "ty_contains_func");
+        assert_eq!(
+            producer.matches(zero_gate.as_str()).count(),
+            1,
+            "the `[T; 0]` mint gate must READ the table-free predicate on the element",
+        );
+        let scalar_gate = format!("if {}(&elem_ty).is_some() {{", "seed_constant");
+        assert_eq!(
+            producer.matches(scalar_gate.as_str()).count(),
+            1,
+            "the `[T; N>0]` mint gate must admit ONLY a `seed_constant` scalar element",
+        );
     }
 
     /// The target shape: `fn() -> name::Name`, where `Name` is `struct { enum.1, u64 }` and
@@ -30295,14 +31200,21 @@ mod resolved_fn_ptr_wall_tests {
             Ty::FatPtr(trust_ir::FatPtrKind::Slice(trust_ir::TyId::new(0))),
             Ty::Ref(Box::new(Ty::U64)),
         ] {
+            // The property is DELEGATION, so it is asserted as delegation. Hard-coding `true`
+            // here made this test a second copy of the table-free predicate's answer table,
+            // and it went red the moment that table changed (vtable slice 15 gave `Ty::Array`
+            // a `false` answer) — while the delegation it is named for never broke. Comparing
+            // against `ty_contains_func` states the invariant and cannot go stale with it.
             let structs = [sdef(0, &[probe.clone()])];
-            assert!(
+            assert_eq!(
                 ty_contains_func_resolved(&probe, &structs, &enums),
-                "{probe:?} must stay fail-closed on its own"
+                ty_contains_func(&probe),
+                "{probe:?} must keep the table-free answer on its own"
             );
-            assert!(
+            assert_eq!(
                 ty_contains_func_resolved(&Ty::Struct(StructId::new(0)), &structs, &enums),
-                "{probe:?} must stay fail-closed as a registered field"
+                ty_contains_func(&probe),
+                "{probe:?} must keep the table-free answer as a registered field"
             );
         }
         assert!(ty_contains_func_resolved(&Ty::Enum(EnumId::new(0)), &[], &enums));
@@ -32227,7 +33139,12 @@ mod zero_displacement_tests {
             "lower_deref_mut_chain_ptr",
         ));
         let query_at = accessor
-            .find("let off = self.field_byte_offset(struct_rty, field)?;")
+            // Trust (wave-SG): matched on the CALL, not on the binding pattern. wave-SG
+            // widened this line's binding from `let off` to `let (off, off_source)` when
+            // the offset started carrying its provenance, which silently invalidated the
+            // old literal and turned this ordering test RED. The ordering is the claim;
+            // the binding's shape is not.
+            .find("= self.field_byte_offset(struct_rty, field)?;")
             .expect("the accessor lane's offset query must exist");
         let guard_at = accessor
             .find(&format!("if off == 0 && {}(field)", "zero_displacement_agrees"))
@@ -33183,5 +34100,616 @@ mod option_flag_sibling_position_tests {
                  existed; `0a53c47bca` removed one.",
             );
         }
+    }
+}
+
+/// Trust (wave-SG): THE STRUCT-INTERIOR OFFSET GATE — the class CRYSTAL_STATUS §4h.6 records as
+/// *"ungated ... held out of the shipping lane by a coverage skip rather than a soundness
+/// argument"*, and §4h.7 as *"the enum class is checked and the struct class is not"*.
+///
+/// Two halves, tested two ways, because they fail two ways:
+///
+/// * the PURE PREDICATE (`declared_struct_field_offset` / `struct_field_offset_agrees`) is
+///   `TyCtxt`-free, so its refusal is directly invertible here — a table that DISAGREES, a table
+///   that is ABSENT, an unregistered id, an out-of-range field — each with an ACCEPT CONTROL on
+///   the same table, without which a predicate that returned `false` unconditionally would pass
+///   every refusal;
+/// * the WIRING (`field_byte_offset_agreeing`, and the two emission sites that must route through
+///   it) is a property of a `LowerCx` method no `--lib` test can construct, so it is source-pinned
+///   at the ARGUMENTS and at the ORDER — the emitter GEPs whatever it is handed, so a gate
+///   evaluated after the bind is not a gate.
+#[cfg(test)]
+mod wave_sg_struct_interior_offset_tests {
+    use super::nested_payload_lane_tests::{fn_span, production_code};
+    use super::{declared_struct_field_offset, struct_field_offset_agrees};
+    use trust_ir::Ty;
+
+    /// Stripped production text with every run of whitespace collapsed to ONE space, so a needle
+    /// can pin an ARGUMENT LIST without also pinning rustfmt's choice of line breaks.
+    fn flat(code: &str) -> String {
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn field(name: &str, ty: Ty, offset: Option<u64>) -> trust_ir::FieldDef {
+        trust_ir::FieldDef { name: name.to_string(), ty, offset }
+    }
+
+    /// The `smallvec::alloc::raw_vec::RawVecInner { ptr, cap }` shape, with the offsets MEASURED
+    /// in the real clean-kernel module: rustc reorders it to `cap@0 ptr@8`, while
+    /// `interpret::struct_layout` lays it out in declaration order at `ptr@0 cap@8`. This is the
+    /// divergence the lane's discriminating probe executes; it is the table a correct producer
+    /// records, and every accept control below reads from it.
+    fn raw_vec_inner(id: u32) -> trust_ir::StructDef {
+        trust_ir::StructDef {
+            id: trust_ir::StructId::new(id),
+            name: "RawVecInner".into(),
+            fields: vec![
+                field("ptr", Ty::Ptr, Some(8)),
+                field("cap", Ty::Usize, Some(0)),
+            ],
+            size: Some(16),
+            align: Some(8),
+            repr: Default::default(),
+        }
+    }
+
+    /// The SAME def with the layout query declined — every offset absent. This is not a contrived
+    /// state: `register_struct` fills offsets behind `layout_query_is_reentrant_safe_deep` while
+    /// `field_byte_offset` reads them behind the strictly weaker `layout_query_is_reentrant_safe`,
+    /// so a struct can reach an emission site with a usable rustc offset and a table that asserts
+    /// nothing. That is exactly wave-NRF's PRESENCE hole, still open on the struct lane until now.
+    fn raw_vec_inner_without_offsets(id: u32) -> trust_ir::StructDef {
+        let mut sd = raw_vec_inner(id);
+        for f in &mut sd.fields {
+            f.offset = None;
+        }
+        sd
+    }
+
+    /// **THE ACCEPT CONTROL, first.** Without it every refusal below is satisfied by a predicate
+    /// that returns `false` unconditionally — which would refuse the whole lane and read as a
+    /// soundness gate while being a deletion.
+    #[test]
+    fn test_struct_field_offset_agrees_accepts_the_declared_byte() {
+        let structs = vec![raw_vec_inner(3)];
+        let sid = trust_ir::StructId::new(3);
+        assert!(struct_field_offset_agrees(&structs, sid, 0, 8), "ptr is declared at 8");
+        assert!(struct_field_offset_agrees(&structs, sid, 1, 0), "cap is declared at 0");
+    }
+
+    /// **THE SOUNDNESS GATE.** A descriptor that REACHES the slot — so a presence-only gate is
+    /// satisfied — while the emitted byte differs. That is the state an upstream separation of
+    /// rustc's two field-offset projections would produce, and it is the state a hand-computed
+    /// offset would produce, and the gate must refuse it rather than mint an address.
+    ///
+    /// The wrong byte tested is `0` for field `ptr` — NOT an arbitrary number, but exactly what
+    /// `interpret::struct_layout`'s declaration-order rule computes for it. So this test refuses
+    /// the precise miscompile the lane's discriminating probe executes: an in-bounds, well-typed,
+    /// same-sized read that returns `cap` where the producer meant `ptr`.
+    #[test]
+    fn test_struct_field_offset_agrees_refuses_a_byte_the_table_does_not_declare() {
+        let structs = vec![raw_vec_inner(3)];
+        let sid = trust_ir::StructId::new(3);
+        assert!(
+            !struct_field_offset_agrees(&structs, sid, 0, 0),
+            "the consumer's own declaration-order byte for `ptr` is NOT rustc's, and emitting it \
+             would read `cap`",
+        );
+        assert!(!struct_field_offset_agrees(&structs, sid, 1, 8), "and symmetrically for `cap`");
+        assert!(!struct_field_offset_agrees(&structs, sid, 0, 7), "an off-by-one is refused too");
+        // ACCEPT CONTROL on the same table: the declared bytes still pass.
+        assert!(struct_field_offset_agrees(&structs, sid, 0, 8));
+        assert!(struct_field_offset_agrees(&structs, sid, 1, 0));
+    }
+
+    /// **THE PRESENCE HALF.** An absent `FieldDef::offset` is not "any byte is fine" — it is the
+    /// consumer declaring nothing, which leaves `interpret::struct_layout` deriving its own
+    /// declaration-order image. `Some(emitted)` equality is what makes absence a refusal; a
+    /// `!= Some(other)` spelling would let every one of these through.
+    #[test]
+    fn test_struct_field_offset_agrees_refuses_a_table_with_no_offset() {
+        let structs = vec![raw_vec_inner_without_offsets(3)];
+        let sid = trust_ir::StructId::new(3);
+        assert_eq!(declared_struct_field_offset(&structs, sid, 0), None);
+        assert!(!struct_field_offset_agrees(&structs, sid, 0, 8), "no declared byte to agree with");
+        assert!(!struct_field_offset_agrees(&structs, sid, 0, 0), "and 0 is not a default");
+        // ACCEPT CONTROL: the byte-identical def WITH offsets answers.
+        let ok = vec![raw_vec_inner(3)];
+        assert!(struct_field_offset_agrees(&ok, sid, 0, 8));
+    }
+
+    /// An id with no def behind it has no declaration table at all. `registered_struct_id`
+    /// returning `None` is a refusal at every call site for the same reason.
+    #[test]
+    fn test_struct_field_offset_agrees_refuses_an_unregistered_struct_id() {
+        let structs = vec![raw_vec_inner(3)];
+        assert_eq!(declared_struct_field_offset(&structs, trust_ir::StructId::new(4), 0), None);
+        assert!(!struct_field_offset_agrees(&structs, trust_ir::StructId::new(4), 0, 8));
+        // ACCEPT CONTROL: the id that IS registered answers.
+        assert!(struct_field_offset_agrees(&structs, trust_ir::StructId::new(3), 0, 8));
+    }
+
+    /// A field index past the table is as absent as no table: nothing declared, nothing to emit.
+    #[test]
+    fn test_struct_field_offset_agrees_refuses_a_field_the_table_does_not_reach() {
+        let structs = vec![raw_vec_inner(3)];
+        let sid = trust_ir::StructId::new(3);
+        assert_eq!(declared_struct_field_offset(&structs, sid, 2), None);
+        assert!(!struct_field_offset_agrees(&structs, sid, 2, 0));
+        // ACCEPT CONTROL: the last in-range field answers.
+        assert_eq!(declared_struct_field_offset(&structs, sid, 1), Some(0));
+    }
+
+    /// The lookup reads the NAMED field. A predicate that read field 0, or the first `Some` offset
+    /// it found, or the struct's own `size`, would pass every test above — the two fields are
+    /// deliberately given SWAPPED, non-equal, non-monotonic offsets so each of those is falsified.
+    #[test]
+    fn test_declared_struct_field_offset_reads_the_named_field() {
+        let structs = vec![raw_vec_inner(3)];
+        let sid = trust_ir::StructId::new(3);
+        assert_eq!(declared_struct_field_offset(&structs, sid, 0), Some(8), "field 0 is `ptr` @8");
+        assert_eq!(declared_struct_field_offset(&structs, sid, 1), Some(0), "field 1 is `cap` @0");
+    }
+
+    /// The lookup is by `sd.id`, not by POSITION in the table. `StructId` is not a `structs`
+    /// index — `register_struct` mints ids off `pending_structs.len()` while other funnels
+    /// (`mint_alias_opaque_struct`) register defs with no ledger key — so a positional read would
+    /// hand out another struct's layout the moment the two diverge.
+    #[test]
+    fn test_declared_struct_field_offset_resolves_by_id_not_by_position() {
+        let mut other = raw_vec_inner(0);
+        other.name = "Decoy".into();
+        other.fields[0].offset = Some(4096);
+        // Position 0 is the DECOY; the def whose id is 3 is at position 1.
+        let structs = vec![other, raw_vec_inner(3)];
+        assert_eq!(
+            declared_struct_field_offset(&structs, trust_ir::StructId::new(3), 0),
+            Some(8),
+            "id 3 must resolve to the def whose `id` is 3, not to position 3 or position 0",
+        );
+        assert!(!struct_field_offset_agrees(&structs, trust_ir::StructId::new(3), 0, 4096));
+    }
+
+    /// **THE PREDICATE IS NOT CONSTANT.** Both a `true`-always and a `false`-always body are
+    /// falsified on ONE table in ONE test, so neither degenerate rewrite can be mistaken for the
+    /// gate. This is the mutation proof stated as an assertion rather than as a procedure.
+    #[test]
+    fn test_struct_field_offset_agrees_is_neither_always_true_nor_always_false() {
+        let structs = vec![raw_vec_inner(3)];
+        let sid = trust_ir::StructId::new(3);
+        let accepts = struct_field_offset_agrees(&structs, sid, 0, 8);
+        let refuses = struct_field_offset_agrees(&structs, sid, 0, 0);
+        assert!(accepts, "a `false`-always gate refuses the whole lane and is a deletion");
+        assert!(!refuses, "a `true`-always gate admits the miscompile and is also a deletion");
+    }
+
+    /// **WIRING, NOT DECLARATION — (1) EVERY emitted struct-interior offset passes the gate.**
+    ///
+    /// The pure predicate above is green no matter what the compiler emits: a gate that is defined
+    /// but never read leaves every assertion untouched. The property that matters is not a caller
+    /// count — it is that between each raw offset query and the `Inst::GEP` it feeds there stands
+    /// an admissibility check. Asserted that way, site-agnostically, so a THIRD emission site
+    /// added later is covered by the same test rather than needing a new one. Deleting the gate at
+    /// either site fails HERE.
+    #[test]
+    fn every_struct_interior_offset_query_is_gated_before_its_gep() {
+        let code = flat(&production_code());
+        let query = format!("self.{}(struct_rty, field)", "field_byte_offset");
+        let gate = format!("self.{}(", "struct_interior_offset_admissible");
+        let gep = "Inst::GEP {";
+        let mut at = 0usize;
+        let mut seen = 0usize;
+        while let Some(rel) = code[at..].find(query.as_str()) {
+            let q = at + rel;
+            let g = code[q..]
+                .find(gep)
+                .unwrap_or_else(|| panic!("offset query at {q} reaches no GEP"));
+            let window = &code[q..q + g];
+            assert!(
+                window.contains(gate.as_str()),
+                "an offset query reaches an Inst::GEP with no admissibility check between them",
+            );
+            seen += 1;
+            at = q + query.len();
+        }
+        assert_eq!(
+            seen, 2,
+            "there are exactly two struct interior-borrow emission sites (wave-25/25b and wave-DP)",
+        );
+    }
+
+    /// **WIRING — (2) ONE gate implementation, called by BOTH sites.**
+    ///
+    /// wave-DA's reason for sharing `variant_field_offset_agrees` between its two by-REF enum
+    /// lanes applies verbatim: a hand-copied twin is exactly the edit that lets one lane's check
+    /// drift from the other's.
+    #[test]
+    fn test_both_struct_interior_emission_sites_call_the_gate() {
+        let code = flat(&production_code());
+        assert_eq!(
+            code.matches(&format!("self.{}(", "struct_interior_offset_admissible")).count(),
+            2,
+            "both emission sites must call the ONE gate implementation",
+        );
+        // One DEFINITION plus one CALL. The definition matches the same needle, so it is
+        // subtracted rather than assumed away.
+        let agrees = format!("{}(", "struct_field_offset_agrees");
+        assert_eq!(
+            code.matches(agrees.as_str()).count() - code.matches(&format!("fn {agrees}")).count(),
+            1,
+            "and the agreement predicate must have exactly one production caller: that gate",
+        );
+    }
+
+    /// **WIRING — (3) THE GATE'S OWN SHAPE, which is the whole soundness argument.**
+    ///
+    /// The tautology short-circuits FIRST (it consults no table by construction); a `None` id is a
+    /// REFUSAL, not a pass; and the answer is the agreement predicate rather than an advisory
+    /// read. A gate that returned `true` on a missing id would leave every pure test green while
+    /// admitting exactly the `CertBundle::env` shape — an interior address into an ADT the module
+    /// does not describe.
+    #[test]
+    fn test_the_gate_short_circuits_the_tautology_and_refuses_a_missing_id() {
+        let code = production_code();
+        let gate =
+            flat(fn_span(&code, "struct_interior_offset_admissible", "body_is_deref_accessor"));
+        let taut = gate
+            .find("if source == FieldOffsetSource::SoleFieldTautology { return true; }")
+            .expect("the tautology short-circuit");
+        let none = gate
+            .find("let Some(sid) = sid else { return false };")
+            .expect("a missing id must be a REFUSAL");
+        let agree = gate
+            .find(&format!("{}(", "struct_field_offset_agrees"))
+            .expect("the agreement predicate");
+        assert!(taut < none, "the tautology answers before any table lookup");
+        assert!(none < agree, "the id is proved present before it is used");
+    }
+
+    /// **WIRING — (4) the id lookup does not MUTATE.** `registered_struct_id` must be a plain
+    /// scan of the registration ledger. Calling `map_ty` or `struct_ty_rmw_opaque` there would
+    /// intern a type as a side effect of a soundness check, perturbing `StructId` assignment for
+    /// bodies that already lower — a check that changes the artifact it is checking.
+    #[test]
+    fn test_the_registered_struct_id_lookup_is_a_pure_scan() {
+        let code = production_code();
+        let lookup =
+            flat(fn_span(&code, "registered_struct_id", "struct_interior_offset_admissible"));
+        for mutator in ["map_ty", "struct_ty_rmw_opaque", "register_struct", "push"] {
+            assert!(
+                !lookup.contains(&format!("self.{mutator}(")),
+                "`registered_struct_id` must not call the mutating `{mutator}`",
+            );
+        }
+        assert!(lookup.contains("self.struct_ids"), "it reads the registration ledger directly");
+    }
+
+    /// **WIRING — (5) the wave-DP site's REGISTRATION still runs after its offset QUERY.**
+    ///
+    /// That site resolves its own `StructId` through `struct_ty_rmw_opaque`, which REGISTERS. It
+    /// is what lets the gate there compare numbers instead of refusing on a registration-order
+    /// accident — but hoisting it above the offset query would register a struct on the path
+    /// where the query declines, and that is an artifact change, not a check. The order is
+    /// pinned, and so is the gate landing before `lower_expr(ptr_expr)`, which is what makes a
+    /// refusal push no nodes.
+    #[test]
+    fn test_the_deref_accessor_site_registers_after_it_queries_and_gates_before_it_lowers() {
+        let code = production_code();
+        let site = flat(fn_span(
+            &code,
+            "try_lower_deref_accessor_interior_mut",
+            "lower_deref_mut_chain_ptr",
+        ));
+        let query = site
+            .find(&format!("self.{}(struct_rty, field)", "field_byte_offset"))
+            .expect("the offset query");
+        let register = site
+            .find(&format!("self.{}(", "struct_ty_rmw_opaque"))
+            .expect("the registration");
+        let gate = site
+            .find(&format!("self.{}(", "struct_interior_offset_admissible"))
+            .expect("the gate");
+        let lower =
+            site.find(&format!("self.{}(ptr_expr)", "lower_expr")).expect("the base lowering");
+        assert!(query < register, "the query must not be moved below the registration");
+        assert!(register < gate, "the gate reads the id the registration resolved");
+        assert!(gate < lower, "a refusal must push no nodes");
+    }
+
+    /// **WIRING — (6) the SOLE-FIELD TAUTOLOGY stays ungated, by construction.**
+    ///
+    /// `field_byte_offset` short-circuits `nfields == 1` to `Some(0)` WITHOUT a layout query,
+    /// because a single-field struct's sole field is at offset 0 by construction. There is no
+    /// rustc read there that could be wrong and no table it could disagree with, and the shortcut
+    /// is what keeps a GENERIC single-field newtype (layout unavailable, so `offset: None`)
+    /// lowering at all — including the deployed `<LevelArc as Deref>::deref` shape the MIR shim
+    /// names. Gating it would refuse a lane for the absence of information that carries none.
+    #[test]
+    fn test_the_sole_field_tautology_is_not_routed_through_the_table() {
+        let code = production_code();
+        let query = flat(fn_span(&code, "field_byte_offset", "registered_struct_id"));
+        assert!(
+            query.contains(
+                "if nfields == 1 { return Some((0, FieldOffsetSource::SoleFieldTautology)); }",
+            ),
+            "the sole-field answer must carry its own provenance and take no layout query",
+        );
+        assert!(
+            !query.contains(&format!("{}(", "struct_field_offset_agrees")),
+            "the raw query must not consult the table; that is the gate's job",
+        );
+    }
+}
+
+/// Trust (wave-COV): **REGISTRATION-ON-MISS — recovering the coverage the wave-SG soundness gate
+/// cost, without recovering a single byte it could not check.**
+///
+/// wave-SG closed a confirmed miscompile mechanism and its flip cost was measured at exactly
+/// ZERO (221→221 at `-O3`, 234→234 at `-O0`, sets identical by name). Its *coverage* cost was
+/// not zero: `spliced 6392 -> 5205` on `clean-kernel`. This module pins the half of that cost
+/// that was recoverable, and — more importantly — pins the boundary, because the two halves have
+/// OPPOSITE fixes:
+///
+/// * **the owner's table records a different byte, or records none.** A disagreement. It stays
+///   refused. No registration can make a conflict not be a conflict, and the tests that prove
+///   that live in [`wave_sg_struct_interior_offset_tests`] and are untouched here.
+/// * **no table exists**, because the wave-25/25b site never registered the ADT it was GEPping
+///   into. A missing WITNESS, not a missing agreement — and the fix for a missing witness is to
+///   produce one, from the same layout query that produced the byte.
+///
+/// Everything below is one of three kinds of claim, and they are separated on purpose:
+/// the RULE (pure, `TyCtxt`-free, directly invertible), the SINGLE SOURCE (there is one layout
+/// query and one offset rule, and both the registrar and the pre-check read them), and the
+/// WIRING (the gate still runs, still runs LAST, and still reads the table the module will
+/// actually carry — a property of a `LowerCx` method no `--lib` test can construct, so it is
+/// source-pinned at the ORDER).
+#[cfg(test)]
+mod wave_cov_registration_on_miss_tests {
+    use super::nested_payload_lane_tests::{fn_span, production_code};
+    use super::declared_field_offset_admits_size;
+
+    /// Stripped production text with every run of whitespace collapsed to ONE space, so a needle
+    /// can pin an ARGUMENT LIST without also pinning rustfmt's choice of line breaks.
+    fn flat(code: &str) -> String {
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The stripped production text of `lower_expr`'s wave-25/25b interior-borrow window: from
+    /// the offset query that is NOT the wave-DP one, up to the `Inst::GEP` it feeds.
+    fn wave25_window(code: &str) -> String {
+        let flat = flat(code);
+        let query = format!("self.{}(struct_rty, field)", "field_byte_offset");
+        // Two sites; the wave-DP accessor is the FIRST in source order (it is defined next to the
+        // gate, thousands of lines above `lower_expr`). Take the LAST.
+        let at = flat.rfind(query.as_str()).expect("the wave-25/25b offset query");
+        let gep = flat[at..].find("Inst::GEP {").expect("the wave-25b interior GEP");
+        flat[at..at + gep].to_string()
+    }
+
+    // ---- THE RULE: pure, and neither always-Some nor always-None -------------------------
+
+    /// **THE #204 TRAILING-ZST RULE, INVERTED FOR REAL.** A `TyAndLayout` cannot be built in a
+    /// `--lib` test, so this is the one part of the offset fill a test can actually execute —
+    /// which is exactly why it was split out rather than left inline behind a source scan.
+    ///
+    /// Both directions are asserted on ONE size, so neither a `Some`-always nor a `None`-always
+    /// body survives: the first would let the gate admit a byte the consumer table declines to
+    /// name, the second would refuse every field of every struct and read as a gate while being
+    /// a deletion.
+    #[test]
+    fn test_the_trailing_zst_rule_admits_an_interior_byte_and_refuses_the_one_at_size() {
+        assert_eq!(declared_field_offset_admits_size(Some(16), 8), Some(8), "an interior byte");
+        assert_eq!(declared_field_offset_admits_size(Some(16), 0), Some(0), "byte 0 is interior");
+        assert_eq!(
+            declared_field_offset_admits_size(Some(16), 16),
+            None,
+            "rustc's legal placement for a ZERO-SIZED field is at exactly the struct size, and \
+             the producer's model cannot prove that field is a ZST — so it declares nothing",
+        );
+        assert_eq!(
+            declared_field_offset_admits_size(Some(0), 0),
+            None,
+            "and a zero-sized struct's field at 0 is that same case, not an exception",
+        );
+        assert_eq!(
+            declared_field_offset_admits_size(None, 16),
+            Some(16),
+            "with no declared size there is no `offset == size` to fire; the rule is about the \
+             SIZE it was checked against, and `None` is not a size that anything equals",
+        );
+    }
+
+    // ---- THE SINGLE SOURCE: one query, one rule, read by BOTH the registrar and the check ----
+
+    /// **ONE LAYOUT QUERY.** The whole soundness argument of the wave-SG gate is that the byte
+    /// the producer GEPs equals the byte the consumer's table declares. If the pre-check that
+    /// decides whether to register asked a SECOND spelling of rustc's layout rules, the gate
+    /// would end up comparing a number against itself computed twice — the exact failure it
+    /// exists to prevent. So `register_struct` must not carry its own `layout_of` call any more:
+    /// it and the pre-check read one function.
+    #[test]
+    fn test_there_is_one_layout_query_and_the_registrar_no_longer_owns_it() {
+        let code = production_code();
+        let flat_code = flat(&code);
+        let registrar = flat(fn_span(&code, "register_struct", "enum_variant_field_admissible"));
+        assert!(
+            !registrar.contains("tcx.layout_of("),
+            "`register_struct` must not re-implement the layout read; it reads the shared fill",
+        );
+        assert!(
+            registrar
+                .contains(&format!("{}(self.tcx, adt, args)", "registered_struct_layout_fill")),
+            "and it must read that fill for THIS instantiation",
+        );
+        assert!(
+            registrar
+                .contains(&format!("{}(layout.as_ref(), size, i)", "declared_field_offset_fill")),
+            "and record the per-field byte through the shared offset rule",
+        );
+        let precheck = flat(fn_span(
+            &code,
+            "would_declare_struct_field_offset",
+            "struct_id_for_interior_offset",
+        ));
+        assert!(
+            precheck.contains(&format!("{}(self.tcx, adt, args)", "registered_struct_layout_fill")),
+            "the pre-check must read the SAME fill the registrar reads",
+        );
+        assert!(
+            precheck.contains(&format!(
+                "{}(layout.as_ref(), size, field)",
+                "declared_field_offset_fill",
+            )),
+            "and the SAME per-field rule",
+        );
+        assert!(
+            !precheck.contains("tcx.layout_of("),
+            "a second layout query here would make the gate compare a number to itself",
+        );
+        // And the shared fill really is shared: one definition, exactly two production callers.
+        let calls = flat_code.matches(&format!("{}(", "registered_struct_layout_fill")).count()
+            - flat_code.matches(&format!("fn {}(", "registered_struct_layout_fill")).count();
+        assert_eq!(calls, 2, "the layout fill has exactly two production readers");
+    }
+
+    // ---- THE WIRING: the gate still runs, LAST, against the table the module will carry ------
+
+    /// **THE RECOVERY IS WIRED, AND IT IS A RESOLUTION — NOT A VERDICT.**
+    ///
+    /// Order is the whole claim. `struct_id_for_interior_offset` may only hand back an id; the
+    /// admissibility gate then reads the table for that id and decides. A recovery that decided
+    /// anything itself would be a second gate, and the two could disagree.
+    #[test]
+    fn test_the_wave25_site_resolves_its_id_through_the_resolver_and_gates_after_it() {
+        let code = production_code();
+        let window = wave25_window(&code);
+        let resolve = window
+            .find(&format!("self.{}(", "struct_id_for_interior_offset"))
+            .expect("the wave-25/25b site must resolve its id through the registering resolver");
+        let gate = window
+            .find(&format!("self.{}(", "struct_interior_offset_admissible"))
+            .expect("and the gate must still be there");
+        let lower =
+            window.find(&format!("self.{}(ptr_expr)", "lower_expr")).expect("the base lowering");
+        assert!(resolve < gate, "the gate reads the id the resolver produced, never the reverse");
+        assert!(gate < lower, "a refusal must still push no nodes");
+        assert!(
+            !window.contains(&format!("self.{}(struct_rty)", "registered_struct_id")),
+            "the bare ledger scan at this site was the refusal wave-COV replaces; a leftover call \
+             to it would mean the recovery is dead code",
+        );
+    }
+
+    /// **THE RESOLVER'S OWN SHAPE — scan, then decide whether to register, then register.**
+    ///
+    /// 1. the ledger scan answers first, so an already-registered instantiation is byte-identical
+    ///    to wave-SG and no dedup-order behaviour moves;
+    /// 2. the SOLE-FIELD TAUTOLOGY is refused a registration — it passes the gate without
+    ///    consulting any table, so registering for it would be pure `StructId` perturbation;
+    /// 3. the PRE-CHECK runs before the registration, which is what keeps the recovery from
+    ///    costing coverage elsewhere: a registration that would not rescue the site is never
+    ///    made, so the ids of every struct the body registers afterwards are untouched;
+    /// 4. the registration goes through `struct_ty_rmw_opaque` — the SAME funnel the wave-DP
+    ///    site uses. Two funnels registering one `(DefId, GenericArgs)` with different field
+    ///    types is how `Field(aggregate lane disagrees)` is minted.
+    #[test]
+    fn test_the_resolver_scans_then_prechecks_then_registers_through_the_shared_funnel() {
+        let code = production_code();
+        let body = flat(fn_span(
+            &code,
+            "struct_id_for_interior_offset",
+            "interior_offset_census_row",
+        ));
+        let scan = body
+            .find(&format!("self.{}(struct_rty)", "registered_struct_id"))
+            .expect("the ledger scan");
+        let taut = body
+            .find("if source != FieldOffsetSource::RustcLayout { return None; }")
+            .expect("the tautology must be refused a registration it cannot use");
+        let precheck = body
+            .find(&format!("self.{}(", "would_declare_struct_field_offset"))
+            .expect("the pre-check");
+        let register =
+            body.find(&format!("self.{}(", "struct_ty_rmw_opaque")).expect("the registration");
+        assert!(scan < taut, "an already-registered instantiation is answered without a query");
+        assert!(taut < precheck, "the tautology never reaches the layout query");
+        assert!(precheck < register, "nothing is registered that would not rescue the site");
+        assert!(
+            !body.contains(&format!("self.{}(", "register_struct")),
+            "the registration must use the SAME funnel as the wave-DP site, not a second one",
+        );
+    }
+
+    /// **THE RESOLVER NEVER WRITES THE BYTE IT WILL BE CHECKED AGAINST.**
+    ///
+    /// This is the property that keeps the recovery from quietly defeating the gate. If the
+    /// resolver could push a `FieldDef` carrying the emitted offset, the subsequent agreement
+    /// check would compare the emitted number against a copy of itself and pass unconditionally
+    /// — a gate-shaped hole. It cannot: it computes no offset of its own, constructs no
+    /// `FieldDef`, and pushes into no table. Its only registration is a delegation to the shared
+    /// builder, which fills offsets from rustc's layout and never from a caller's argument.
+    #[test]
+    fn test_the_resolver_never_writes_the_offset_it_will_be_checked_against() {
+        let code = production_code();
+        let body = flat(fn_span(
+            &code,
+            "struct_id_for_interior_offset",
+            "interior_offset_census_row",
+        ));
+        for forbidden in [
+            "FieldDef {",
+            "offset:",
+            ".offset =",
+            "iter_mut",
+            "pending_structs.push",
+            "struct_ids.push",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the resolver must not write a declaration table entry (`{forbidden}`) — the byte \
+                 it hands back must come from rustc's layout via `register_struct`, or the gate \
+                 that checks it is comparing a number to itself",
+            );
+        }
+        // And the gate it feeds reads the REAL table, not anything the resolver returned.
+        let gate =
+            flat(fn_span(&code, "struct_interior_offset_admissible", "body_is_deref_accessor"));
+        assert!(
+            gate.contains("&self.pending_structs"),
+            "the gate must read the table the module will actually carry",
+        );
+    }
+
+    /// **THE CENSUS CANNOT MOVE THE DECISION.** It is a measurement: `&self`, off by default,
+    /// stderr only, and it never touches `unsupported` (a body that merely *mentions* a refused
+    /// interior offset must not go dirty because someone was watching). Its output is a `String`
+    /// the caller may print; the verdict is computed by the gate, independently.
+    #[test]
+    fn test_the_interior_offset_census_is_inert() {
+        let code = production_code();
+        let body =
+            flat(fn_span(&code, "interior_offset_census_row", "try_lower_upvar_shared_borrow"));
+        assert!(body.contains("&self,"), "the census may not take `&mut self`");
+        assert!(
+            body.contains(&format!(
+                "if !{}() {{ return None; }}",
+                "interior_offset_census_enabled",
+            )),
+            "and it must answer `None` — making no layout query and formatting no path — when off",
+        );
+        for mutator in ["unsupported.push", "pending_structs.push", "struct_ids.push", "= true"] {
+            assert!(!body.contains(mutator), "the census must not mutate (`{mutator}`)");
+        }
+        // The flag is the STRICT parser: only the exact `1` arms it. Shared with the enum-decline
+        // census so the two measurement channels cannot drift on what "on" means.
+        let flag = flat(fn_span(
+            &code,
+            "interior_offset_census_enabled",
+            "enum_decline_census_enabled",
+        ));
+        assert!(
+            flag.contains(&format!("{}(std::env::var_os(", "enum_decline_census_from_env")),
+            "the census flag must reuse the strict `=1` parser, not invent a second one",
+        );
     }
 }

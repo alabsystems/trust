@@ -128,6 +128,7 @@ fn mutate_trust_control(opts: &mut UnstableOptions, field: &str) {
         "trust_cg_frontend" => opts.trust_cg_frontend = "trust-ir".to_string(),
         "trust_cg_output_gate" => opts.trust_cg_output_gate = "allow-unknown".to_string(),
         "trust_certified_test_monitors" => opts.trust_certified_test_monitors = true,
+        "trust_ctfe_trivial_probe" => opts.trust_ctfe_trivial_probe = true,
         "trust_dump" => {
             opts.trust_dump = TrustDump {
                 mir: Some(PathBuf::from("callback-dump-mir")),

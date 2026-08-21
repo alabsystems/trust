@@ -2913,6 +2913,16 @@ fn parse_exact_legacy_vc_kind(kind: &str, description: &str) -> Option<VcKind> {
         s if s == trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND => {
             Some(VcKind::UnsupportedMir { kind: s.to_string(), detail: description.to_string() })
         }
+        // Trust (D2 part B): a row whose formula consumed the coroutine
+        // resume-state entry `Assume`. Same rationale as the two arms above,
+        // and load-bearing here: the row's ORIGINAL kind survives after the
+        // prefix (`…:assert`), so without this arm it would fall through and
+        // could be folded back to `Assertion` — handing conditional evidence a
+        // runtime fallback nothing enforces, which is how it would re-acquire a
+        // `RuntimeChecked` relabel. `UnsupportedMir` has no runtime fallback.
+        s if trust_types::assumption::is_coroutine_resume_conditional_row_kind(s) => {
+            Some(VcKind::UnsupportedMir { kind: s.to_string(), detail: description.to_string() })
+        }
         _ => None,
     }
 }
@@ -2976,6 +2986,11 @@ fn terminal_result_line(result: &VerificationResult) -> String {
         // row, PROVED). Display-only, like ASSUMED above: the partition still
         // counts a defective row as unknown.
         "CONTRACT"
+    } else if trust_types::assumption::is_coroutine_resume_conditional_row_kind(&result.kind) {
+        // Trust (D2 part B): discharged under the coroutine resume-state entry
+        // assumption — conditional evidence, never an unconditional proof.
+        // Display-only, like the two labels above.
+        "CONDITIONAL"
     } else {
         result.outcome.label()
     };

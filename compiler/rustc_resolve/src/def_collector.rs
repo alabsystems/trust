@@ -205,7 +205,31 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
             // Trust: a Clean island occupies a def slot like global asm — a
             // nameless, untypecheckable, non-codegen blob (HIR kind differs,
             // so asm-specific consumers never see it).
-            ItemKind::CleanIsland(..) => DefKind::GlobalAsm,
+            ItemKind::CleanIsland(island) => {
+                // Trust (I5): mint the island's callable declarations BEFORE
+                // `with_owner`.
+                //
+                // ORDER IS LOAD-BEARING, TWICE OVER.
+                //
+                // `with_owner` -> `with_owner_tables` (`lib.rs`) swaps
+                // `current_owner`, and `Resolver::create_def` files its
+                // `node_id -> def_id` entry into whichever table is current. A
+                // child minted inside would therefore be filed under the
+                // ISLAND's table, where nothing looks for it, and would be
+                // invisible for the rest of the compilation.
+                //
+                // The same call also makes the mint's PARENT the enclosing
+                // module rather than the island — `DefCollector::create_def`
+                // reads `self.invocation_parent.parent_def`, which `with_owner`
+                // does not change but which the island's own def would become
+                // if the mint moved inside. That placement is what makes the
+                // `DefPath` `m::f` line up with the Clean path `Crate.m.f`
+                // (the parity criterion) and what makes a same-module Rust
+                // `fn f` collide with `E0428`. One placement decision satisfies
+                // both, and getting it wrong breaks both.
+                self.trust_mint_clean_island_decls(island);
+                DefKind::GlobalAsm
+            }
             ItemKind::Use(_) => {
                 return self.with_owner(i.id, None, DefKind::Use, i.span, |this, feed| {
                     this.brg_visit_item(i, feed);

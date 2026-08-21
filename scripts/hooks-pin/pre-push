@@ -26,9 +26,26 @@
 # moving two DIVERGENT submodule pointers that the standing safety rules forbid
 # anyone to move. That is how a gate teaches people `--no-verify`.
 #
-# This directory is the pin gate WITHOUT that blast radius. It runs exactly one
-# checker, `scripts/check_pin_coherence.sh` (0.49s measured), and nothing else.
-# No pr_gate. No bridge replay. No x.py. No build of any kind.
+# This directory is the pin gate WITHOUT that blast radius. It runs four
+# checkers and nothing else — `scripts/check_pin_coherence.sh` (0.49s measured),
+# `scripts/check_revert_rationale.sh` (0.49s measured over the whole
+# 7,089-commit history), `scripts/check_frozen_files.sh`, and
+# `scripts/check_measurement_provenance.sh` (0.95s measured over 7,112 commits
+# in the wider --history mode) — for a combined budget of about two seconds. No
+# pr_gate. No bridge replay. No x.py. No build of any kind.
+#
+# THE SECOND CHECKER, and why it is here rather than in the full gate: on
+# 2026-08-20 `31814afa35` reverted `8e214e90d5`, the wave-SG struct-interior
+# offset gate — a CONFIRMED miscompile mechanism — with a commit body that was
+# the generated "This reverts commit ..." line and nothing else. No reason in
+# the message, in a report, in a lane note, or in a commit comment. The class
+# was ungated again for 2h10m and came back only because another lane
+# independently re-derived the evidence. The revert was probably CORRECT (that
+# tree's `--lib` suite was red); the silence is what cost the hours. This is
+# the hook that is actually installed on the machines that push, so this is
+# where the requirement has to live. A commit-msg hook would be earlier and
+# would catch nothing: these lanes land through `git commit-tree`, which runs
+# no commit-msg hook at all.
 #
 # BLOCKING, not advisory — and why that is safe here
 # --------------------------------------------------
@@ -55,9 +72,12 @@
 set -uo pipefail
 
 # pre-push is fed "<local-ref> <local-sha> <remote-ref> <remote-sha>" lines on
-# stdin. Drain them so git never sees EPIPE. The verdict does not depend on
-# which refs are being pushed: an incoherent pin is incoherent for all of them.
-cat >/dev/null 2>&1 || true
+# stdin. Read every one of them so git never sees EPIPE — and KEEP them: the
+# PIN verdict does not depend on which refs are being pushed (an incoherent pin
+# is incoherent for all of them), but the revert-rationale lane judges exactly
+# the commits this push would introduce, so discarding the lines would cost it
+# its subject.
+PUSHED_REFS="$(cat 2>/dev/null || true)"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "pin-hook: not inside a git worktree" >&2
@@ -73,6 +93,47 @@ for git_local_var in $(git rev-parse --local-env-vars); do
   unset "$git_local_var"
 done
 cd "$REPO_ROOT" || exit 1
+
+# ------------------------------------------------------- lane: revert rationale
+# Judged on exactly the commits this push would introduce. Fails CLOSED: a
+# missing checker is a state in which a revert could land unexplained, which is
+# the whole failure this lane exists to end, so it is a refusal and not a shrug.
+REVERT_CHECKER="scripts/check_revert_rationale.sh"
+if [ -f "$REVERT_CHECKER" ]; then
+  revert_out="$(printf '%s\n' "$PUSHED_REFS" | bash "$REVERT_CHECKER" --pre-push 2>&1)"
+  revert_rc=$?
+else
+  revert_out="pin-hook: $REVERT_CHECKER is missing — a revert could land with no reason recorded"
+  revert_rc=1
+fi
+
+# --------------------------------------------------- lane: measurement provenance
+# Same subject as the revert lane (the commits this push introduces) and the
+# same cost class: one `git log` over the range plus one `git rev-parse` per
+# trailer. Measured 2026-08-20 at 0.95s over the whole 7,112-commit history in
+# --history mode; a push range is a handful of commits.
+#
+# WHY IT IS HERE. On 2026-08-19 a lane published "599 passed, 0 failed" — a real
+# run — of a tree it had edited and never committed. The commit body described
+# the WORKING TREE rather than the COMMIT, `8e214e90d5` was RED at exactly one
+# test, and a confirmed-miscompile-class gate was reverted on the strength of
+# that number. The RCA (reports/revert-silence-rca-2026-08-20.md) called the fix
+# "a lane-runner convention, not something a pre-push hook can enforce". It is
+# enforceable, and this is where: a `Measured-on: <path>@<blob>` trailer is a
+# claim about a blob, and a claim about a blob is checkable against the commit
+# that carries it. A stamp that names a tree the commit does not carry is a
+# refused push.
+#
+# Fails CLOSED for the same reason the revert lane does: a missing checker is a
+# state in which an unfounded number could land, which is the whole failure.
+PROV_CHECKER="scripts/check_measurement_provenance.sh"
+if [ -f "$PROV_CHECKER" ]; then
+  prov_out="$(printf '%s\n' "$PUSHED_REFS" | bash "$PROV_CHECKER" --pre-push 2>&1)"
+  prov_rc=$?
+else
+  prov_out="pin-hook: $PROV_CHECKER is missing — a measurement could land naming no tree"
+  prov_rc=1
+fi
 
 CHECKER="scripts/check_pin_coherence.sh"
 WAIVERS="scripts/hooks-pin/pin-waivers.txt"
@@ -186,6 +247,10 @@ if [ "$rc" -ne 0 ] && [ "$PROBLEM_ROWS" -eq 0 ]; then
 fi
 
 # ------------------------------------------------------------------ the report
+printf '%s\n' "$revert_out"
+echo
+printf '%s\n' "$prov_out"
+echo
 echo "=== pin-coherence (pin-only hook; no pr_gate, no bridge replay, no x.py) ==="
 
 if [ "${#STEPPED_OVER[@]}" -gt 0 ]; then
@@ -194,10 +259,12 @@ if [ "${#STEPPED_OVER[@]}" -gt 0 ]; then
   for s in "${STEPPED_OVER[@]}"; do echo "  ~ $s"; done
 fi
 
+PIN_RC=0
 if [ "${#BLOCKING[@]}" -eq 0 ] && [ "${#STALE_WAIVERS[@]}" -eq 0 ]; then
   echo
   echo "PIN GATE: GREEN — no unwaived submodule pin drift."
-  exit 0
+else
+  PIN_RC=1
 fi
 
 if [ "${#STALE_WAIVERS[@]}" -gt 0 ]; then
@@ -224,6 +291,56 @@ if [ "${#BLOCKING[@]}" -gt 0 ]; then
   echo "    $WAIVERS"
 fi
 
+if [ "$PIN_RC" -ne 0 ]; then
+  echo
+  echo "PIN GATE: RED."
+fi
+
+# ==========================================================================
+# LANE 3 — THE ORACLE FREEZE (added 2026-08-20)
+# ==========================================================================
+# Why a THIRD lane belongs in the file whose header argues for exactly one:
+#
+#   * It costs the same order as the pin lane — four `git hash-object` and four
+#     `git rev-parse`, no build, no cargo, no x.py, no network.
+#   * It NEVER MUTATES, which is this file's other standing property.
+#   * It carries the same waiver shape, so pre-existing movement someone else
+#     owns cannot hold a push hostage, while NEW movement blocks immediately.
+#     That is the whole recurrence class this hook was written for.
+#
+# And it cannot wait for the full `scripts/hooks/pre-push`: by this file's own
+# header that directory is not installed here and must not be, so "the oracle
+# freeze is enforced at push time" and "the full gate is installed" would
+# otherwise be the same switch — which is exactly the coupling this file exists
+# to break.
+#
+# The defect it closes, MEASURED 2026-08-20: three commits (e73d7d0553,
+# 5b38ded9d9, 65f2577dca) moved two of the four frozen oracle files with nothing
+# recorded anywhere. All three were adjudicated legitimate on their merits, which
+# is the point — a freeze that fires only when a lane remembers it cannot
+# distinguish the three good commits from the one it exists to catch, because it
+# does not fire at all. See reports/freeze-adjudication-2026-08-20.md.
+FREEZE_CHECKER="scripts/check_frozen_files.sh"
+FREEZE_RC=0
 echo
-echo "PIN GATE: RED. 'git push --no-verify' skips this hook and leaves no record of why."
+if [ -f "$FREEZE_CHECKER" ]; then
+  bash "$FREEZE_CHECKER" || FREEZE_RC=1
+else
+  echo "freeze-gate: $FREEZE_CHECKER is missing — refusing to certify the oracle freeze." >&2
+  FREEZE_RC=1
+fi
+
+if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ]; then
+  exit 0
+fi
+
+echo
+echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc)."
+if [ "$revert_rc" -ne 0 ]; then
+  echo "  revert: a revert above does not say WHY."
+fi
+if [ "$prov_rc" -ne 0 ]; then
+  echo "  provenance: a measurement above does not name the tree it was taken on."
+fi
+echo "'git push --no-verify' skips this hook and leaves no record of why."
 exit 1

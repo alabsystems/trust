@@ -111,7 +111,9 @@ fn rvalue_references_local(rvalue: &Rvalue, local: usize) -> bool {
         Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::UnaryOp(_, op) => {
             operand_references_local(op, local)
         }
-        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+        Rvalue::BinaryOp(_, a, b)
+        | Rvalue::CheckedBinaryOp(_, a, b)
+        | Rvalue::UncheckedBinaryOp(_, a, b) => {
             operand_references_local(a, local) || operand_references_local(b, local)
         }
         Rvalue::Ref { place, .. }

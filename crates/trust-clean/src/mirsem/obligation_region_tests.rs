@@ -630,18 +630,19 @@ fn a_precondition_can_never_supply_the_certified_signed_width() {
     }
 }
 
-/// UNSIGNED-MUL. A `var*var` mul is emitted as a BITVECTOR obligation that carries no
-/// `Gt(Mul(a,b), MAX)` leaf at all, and MUST stay fail-closed (the `mul_*`/`sq_nonneg`
-/// corpus's honest not-faithful). A `#[requires]` supplying that leaf minted
-/// `UnsignedMulOverflow` for an obligation the bridge never inspected.
+/// UNSIGNED-MUL. The VC carries its authenticated Or-range record (the UMUL
+/// RECORD), so this arm certifies the BASE body — from the RECORD, never from a
+/// hypothesis. The pinned base == hostile EQUALITY keeps the original
+/// adversarial direction: a `#[requires]` supplying the leaf changes NOTHING.
+/// The raw PRECONDITION-INJECTION channel stays pinned on the SIGNED var*var
+/// mul, which remains record-less (BV-only) and fail-closed.
 #[test]
 fn a_precondition_can_never_certify_the_deferred_bitvector_mul() {
     let base = binop_func("umul", 32, false, BinOp::Mul);
+    let honest = certified_kinds(&base);
     assert!(
-        !certified_kinds(&base)
-            .iter()
-            .any(|k| matches!(k, SafetyVcKind::UnsignedMulOverflow(_))),
-        "a bare `a * b` u32 mul is emitted in BITVECTOR form and must stay fail-closed"
+        honest.iter().any(|k| matches!(k, SafetyVcKind::UnsignedMulOverflow(UWidth::W32))),
+        "the recorded var*var u32 mul core certifies from its OWN record, got {honest:?}"
     );
 
     let mut hostile = base.clone();
@@ -649,12 +650,33 @@ fn a_precondition_can_never_certify_the_deferred_bitvector_mul() {
         Box::new(Formula::Mul(Box::new(var("a")), Box::new(var("b")))),
         Box::new(Formula::Int(4294967295)),
     )];
+    assert_eq!(
+        certified_kinds(&hostile),
+        honest,
+        "a `#[requires] a * b > u32::MAX` must change NOTHING — the certificate's \
+         source is the authenticated record, never a hypothesis conjunct"
+    );
+
+    // The SIGNED var*var mul is emitted record-less: the bare body must not mint,
+    // and a hostile precondition supplying the signed core must mint NOTHING.
+    let sbase = binop_func("smul", 32, true, BinOp::Mul);
+    let smul = |a: &str, b: &str| Formula::Mul(Box::new(var(a)), Box::new(var(b)));
     assert!(
-        !certified_kinds(&hostile)
+        !certified_kinds(&sbase)
             .iter()
-            .any(|k| matches!(k, SafetyVcKind::UnsignedMulOverflow(_))),
-        "a `#[requires] a * b > u32::MAX` minted an adequacy certificate for a bitvector \
-         obligation whose own formula has no such leaf"
+            .any(|k| matches!(k, SafetyVcKind::SignedOverflow(SignedOp::Mul, _))),
+        "a var*var SIGNED mul is BV-only and must stay fail-closed"
+    );
+    let mut shostile = sbase.clone();
+    shostile.preconditions = vec![Formula::Or(vec![
+        Formula::Lt(Box::new(smul("a", "b")), Box::new(Formula::Int(-2_147_483_648))),
+        Formula::Gt(Box::new(smul("a", "b")), Box::new(Formula::Int(2_147_483_647))),
+    ])];
+    assert!(
+        !certified_kinds(&shostile)
+            .iter()
+            .any(|k| matches!(k, SafetyVcKind::SignedOverflow(SignedOp::Mul, _))),
+        "a `#[requires]` supplying the signed core must not certify the record-less BV mul"
     );
 }
 

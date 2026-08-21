@@ -15291,6 +15291,238 @@ fn violated_loop_invariant_aborts_on_backedge() {{
     std::fs::remove_dir_all(root).expect("remove loop monitor Cargo fixture");
 }
 
+/// Evidence-grade Cargo integration for the semantic monitor extensions that
+/// used to stop at native UI/run-make coverage. One satisfying target crosses
+/// the wrapping boundaries of every extended carrier. Four separately
+/// selected negative targets then prove that phase B executes the E5 loop,
+/// direct-recursion, and explicit-TailCall checks. Separate Cargo selections
+/// are intentional: one process abort must not hide a later monitor lane.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_executes_e5_tailcall_and_extended_carriers() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("certified-monitor-deep-lanes-cargo-test");
+    std::fs::create_dir_all(root.join("src")).expect("create library source directory");
+    std::fs::create_dir_all(root.join("tests")).expect("create integration-test directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='certified-monitor-deep-fixture'\nversion='0.1.0'\nedition='2021'\n\n[lib]\ncrate-type=['rlib']\n",
+    )
+    .expect("write deep-monitor fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"#![feature(explicit_tail_calls)]
+
+pub fn wrapping_i128(x: i128) -> i128
+    ensures result == x + 1
+{
+    x.wrapping_add(1)
+}
+
+pub fn wrapping_u128(x: u128) -> u128
+    ensures result == x + 1
+{
+    x.wrapping_add(1)
+}
+
+pub fn wrapping_isize(x: isize) -> isize
+    ensures result == x + 1
+{
+    x.wrapping_add(1)
+}
+
+pub fn wrapping_usize(x: usize) -> usize
+    ensures result == x + 1
+{
+    x.wrapping_add(1)
+}
+
+pub fn violated_i128_identity(x: i128) -> i128
+    ensures result == x
+{
+    x.wrapping_add(1)
+}
+
+pub fn stalled_u128_loop(measure: u128, mut again: bool) -> u128 {
+    while again decreases measure {
+        again = false;
+    }
+    measure
+}
+
+#[inline(never)]
+pub fn stalled_isize_recursion(measure: isize, again: bool) -> isize
+    decreases measure
+{
+    if !again {
+        return measure;
+    }
+    stalled_isize_recursion(measure, false)
+}
+
+#[inline(never)]
+fn usize_successor(x: usize) -> usize {
+    x.wrapping_add(1)
+}
+
+pub fn violated_usize_tailcall(x: usize) -> usize
+    ensures result == x
+{
+    become usize_successor(x);
+}
+"#,
+    )
+    .expect("write deep-monitored library");
+
+    let positive_started = root.join("extended-positive-started");
+    let positive_returned = root.join("extended-positive-returned");
+    std::fs::write(
+        root.join("tests/extended_positive.rs"),
+        format!(
+            r#"#[test]
+fn exact_extended_carriers_return_through_monitors() {{
+    std::fs::write({positive_started:?}, b"started").unwrap();
+    assert_eq!(certified_monitor_deep_fixture::wrapping_i128(i128::MAX), i128::MIN);
+    assert_eq!(certified_monitor_deep_fixture::wrapping_u128(u128::MAX), 0);
+    assert_eq!(certified_monitor_deep_fixture::wrapping_isize(isize::MAX), isize::MIN);
+    assert_eq!(certified_monitor_deep_fixture::wrapping_usize(usize::MAX), 0);
+    std::fs::write({positive_returned:?}, b"returned").unwrap();
+}}
+"#
+        ),
+    )
+    .expect("write extended-carrier positive integration test");
+
+    let i128_started = root.join("i128-ensures-started");
+    let i128_returned = root.join("i128-ensures-returned");
+    std::fs::write(
+        root.join("tests/i128_ensures_violation.rs"),
+        format!(
+            r#"#[test]
+fn violated_i128_ensures_aborts_before_return() {{
+    std::fs::write({i128_started:?}, b"started").unwrap();
+    let _ = certified_monitor_deep_fixture::violated_i128_identity(-7);
+    std::fs::write({i128_returned:?}, b"returned").unwrap();
+}}
+"#
+        ),
+    )
+    .expect("write i128 ensures violation integration test");
+
+    let loop_started = root.join("e5-loop-started");
+    let loop_returned = root.join("e5-loop-returned");
+    std::fs::write(
+        root.join("tests/e5_loop_violation.rs"),
+        format!(
+            r#"#[test]
+fn stalled_u128_loop_aborts_on_its_backedge() {{
+    std::fs::write({loop_started:?}, b"started").unwrap();
+    let _ = certified_monitor_deep_fixture::stalled_u128_loop(2, true);
+    std::fs::write({loop_returned:?}, b"returned").unwrap();
+}}
+"#
+        ),
+    )
+    .expect("write E5 loop violation integration test");
+
+    let recursion_started = root.join("e5-recursion-started");
+    let recursion_returned = root.join("e5-recursion-returned");
+    std::fs::write(
+        root.join("tests/e5_recursion_violation.rs"),
+        format!(
+            r#"#[test]
+fn stalled_isize_recursion_aborts_on_its_call_edge() {{
+    std::fs::write({recursion_started:?}, b"started").unwrap();
+    let _ = certified_monitor_deep_fixture::stalled_isize_recursion(2, true);
+    std::fs::write({recursion_returned:?}, b"returned").unwrap();
+}}
+"#
+        ),
+    )
+    .expect("write E5 recursion violation integration test");
+
+    let tailcall_started = root.join("tailcall-started");
+    let tailcall_returned = root.join("tailcall-returned");
+    std::fs::write(
+        root.join("tests/tailcall_violation.rs"),
+        format!(
+            r#"#[test]
+fn violated_usize_tailcall_aborts_before_return() {{
+    std::fs::write({tailcall_started:?}, b"started").unwrap();
+    let _ = certified_monitor_deep_fixture::violated_usize_tailcall(7);
+    std::fs::write({tailcall_returned:?}, b"returned").unwrap();
+}}
+"#
+        ),
+    )
+    .expect("write TailCall violation integration test");
+
+    let run_target = |target: &str| {
+        run_subcommand(
+            Subcommand::Test,
+            &[
+                "--allow-l0-gaps".to_string(),
+                "--manifest-path".to_string(),
+                root.join("Cargo.toml").display().to_string(),
+                "--target-dir".to_string(),
+                root.join("target").display().to_string(),
+                "--test".to_string(),
+                target.to_string(),
+            ],
+        )
+    };
+
+    assert_eq!(
+        run_target("extended_positive"),
+        ExitCode::SUCCESS,
+        "satisfying extended-carrier monitors must pass authenticated Cargo test"
+    );
+    assert!(positive_started.is_file(), "extended-carrier integration test did not execute");
+    assert!(positive_returned.is_file(), "satisfying extended-carrier monitors did not return");
+
+    for (target, started, returned, lane) in [
+        (
+            "i128_ensures_violation",
+            &i128_started,
+            &i128_returned,
+            "i128 ensures",
+        ),
+        ("e5_loop_violation", &loop_started, &loop_returned, "u128 E5 loop"),
+        (
+            "e5_recursion_violation",
+            &recursion_started,
+            &recursion_returned,
+            "isize direct-recursion E5",
+        ),
+        (
+            "tailcall_violation",
+            &tailcall_started,
+            &tailcall_returned,
+            "usize explicit-TailCall ensures",
+        ),
+    ] {
+        assert_ne!(
+            run_target(target),
+            ExitCode::SUCCESS,
+            "the violated {lane} monitor must fail authenticated Cargo test"
+        );
+        assert!(
+            started.is_file(),
+            "{lane} integration test did not execute; this was only a compile failure"
+        );
+        assert!(
+            !returned.exists(),
+            "violated {lane} returned normally; its certified monitor was not executed"
+        );
+    }
+
+    std::fs::remove_dir_all(root).expect("remove deep-monitor Cargo fixture");
+}
+
 /// Positive companion to the violated-monitor fixture above.  This proves
 /// that authenticated phase-A transport reaches the fresh-only phase-B replay
 /// and that the exact authorized integration-test executable is actually run;

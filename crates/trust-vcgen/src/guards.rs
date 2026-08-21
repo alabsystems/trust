@@ -1991,16 +1991,43 @@ fn conservative_snapshot_writes(
 /// skip-edge value of a local the switch block does not itself assign (see the
 /// augmentation block below). Pass an empty map to disable that augmentation;
 /// clean diamonds and same-block-init shapes are unaffected by it.
+///
+/// # Two lanes
+///
+/// This is the dispatcher. [`single_switch_branch_merge_definitions`] handles the
+/// original shape — every join arm descends from ONE `SwitchInt`. When it declines
+/// (empty vec), [`nested_switch_branch_merge_definitions`] retries the join as a
+/// *nested* switch chain (`if / else if / else`, whose arms descend from two or
+/// more switches). The nested lane requires at least two distinct switches, so it
+/// can never fire on a shape the single-switch lane already models: the two lanes
+/// are disjoint and the single-switch lane's behaviour is unchanged.
 pub(crate) fn branch_merge_definitions(
     func: &VerifiableFunction,
     join: BlockId,
     incoming: &FxHashMap<BlockId, Vec<Formula>>,
 ) -> Vec<Formula> {
+    // ONE predecessor computation shared by both lanes. It is an O(blocks) scan
+    // and this dispatcher runs once per block of the function, so recomputing it
+    // per lane doubles a hot loop for no benefit.
+    let preds = block_predecessors(func);
+    let single = single_switch_branch_merge_definitions(func, join, incoming, &preds);
+    if !single.is_empty() {
+        return single;
+    }
+    nested_switch_branch_merge_definitions(func, join, &preds)
+}
+
+/// The single-`SwitchInt` merge recogniser — see [`branch_merge_definitions`].
+fn single_switch_branch_merge_definitions(
+    func: &VerifiableFunction,
+    join: BlockId,
+    incoming: &FxHashMap<BlockId, Vec<Formula>>,
+    preds: &[Vec<BlockId>],
+) -> Vec<Formula> {
     let blocks = &func.body.blocks;
     if join.0 >= blocks.len() {
         return Vec::new();
     }
-    let preds = block_predecessors(func);
     let join_preds = &preds[join.0];
     // A merge needs at least two incoming arms.
     if join_preds.len() < 2 {
@@ -2211,65 +2238,8 @@ pub(crate) fn branch_merge_definitions(
     // parent/target/switch identity already admitted above, and
     // `extract_assert_passed_semantics` itself requires the checked-op tuple
     // and overflow-flag projection shape.
-    let arm_definition_map_with_checked_assert = |arm: BlockId| {
-        let mut defs = arm_definition_map(func, arm);
-        let [parent] = preds[arm.0].as_slice() else {
-            return defs;
-        };
-        let Terminator::Assert { target, unwind, .. } = &blocks[parent.0].terminator else {
-            return defs;
-        };
-        if *target != arm
-            || unwind.cleanup_target() == Some(arm)
-            || preds[parent.0] != [switch_id]
-        {
-            return defs;
-        }
-
-        let Some((tuple_local, _, _, _, _)) =
-            exact_asserted_checked_binary_op(func, &blocks[parent.0])
-        else {
-            return defs;
-        };
-        let tuple_name = func
-            .body
-            .locals
-            .get(tuple_local)
-            .and_then(|decl| decl.name.as_deref())
-            .map_or_else(|| format!("_{tuple_local}"), str::to_string);
-        let result_name = format!("{tuple_name}.0");
-        let Some(result_rhs) = extract_assert_passed_semantics(func, &blocks[parent.0])
-            .into_iter()
-            .find_map(|semantic| match semantic {
-                Formula::Eq(lhs, rhs) if lhs.var_name() == Some(result_name.as_str()) => Some(*rhs),
-                _ => None,
-            })
-        else {
-            return defs;
-        };
-
-        // Substitution must preserve the value snapshot taken by CheckedBinaryOp.
-        // If the success arm writes either the checked field or any operand used
-        // by its mathematical RHS, replacing `checked.0` with the arm-exit name
-        // would read the *new* value and could manufacture a false proof. Use the
-        // canonical alias-aware write set, plus every explicit place destination
-        // (including rvalues the definition extractor intentionally declines).
-        let Some(arm_writes) = conservative_snapshot_writes(func, &blocks[arm.0]) else {
-            return defs;
-        };
-        let snapshot_names =
-            result_rhs.free_variables().into_iter().chain(std::iter::once(result_name.clone()));
-        if snapshot_names.into_iter().any(|name| {
-            arm_writes.iter().any(|written| crate::generate::place_names_overlap(&name, written))
-        }) {
-            return defs;
-        }
-
-        for (_, _, value) in &mut defs {
-            *value = crate::quantifier_tiers::substitute(value, &result_name, &result_rhs);
-        }
-        defs
-    };
+    let arm_definition_map_with_checked_assert =
+        |arm: BlockId| arm_definition_map_with_checked_assert_impl(func, &preds, arm, switch_id);
     let mut arm_defs: Vec<Vec<(String, Sort, Formula)>> =
         explicit.iter().map(|(b, _)| arm_definition_map_with_checked_assert(*b)).collect();
     arm_defs.push(arm_definition_map_with_checked_assert(else_source));
@@ -2375,6 +2345,811 @@ pub(crate) fn branch_merge_definitions(
         out.push(Formula::Eq(Box::new(Formula::Var(name.clone(), sort.clone())), Box::new(acc)));
     }
     out
+}
+
+/// An arm's `(name, sort, value)` map, with the checked-arithmetic
+/// `Assert`-success semantics inlined when the arm hangs off `switch_id` through
+/// exactly one successful `Assert`.
+///
+///   checked = CheckedAdd(a, b); Assert(!checked.1) -> arm
+///   arm: merged = checked.0; Goto(join)
+///
+/// `checked.0` is not defined on the sibling arm, so the ordinary intersection
+/// correctly drops its definition and would leave the merged value free. Inline
+/// only the semantic equalities authenticated by that unique Assert-success edge
+/// (`checked.0 == a + b`, etc.) into that arm's values. This is not a general
+/// predecessor walk: it requires the exact parent/target/switch identity, and
+/// `extract_assert_passed_semantics` itself requires the checked-op tuple and
+/// overflow-flag projection shape.
+fn arm_definition_map_with_checked_assert_impl(
+    func: &VerifiableFunction,
+    preds: &[Vec<BlockId>],
+    arm: BlockId,
+    switch_id: BlockId,
+) -> Vec<(String, Sort, Formula)> {
+    let blocks = &func.body.blocks;
+    let mut defs = arm_definition_map(func, arm);
+    let [parent] = preds[arm.0].as_slice() else {
+        return defs;
+    };
+    let Terminator::Assert { target, unwind, .. } = &blocks[parent.0].terminator else {
+        return defs;
+    };
+    if *target != arm || unwind.cleanup_target() == Some(arm) || preds[parent.0] != [switch_id] {
+        return defs;
+    }
+
+    let Some((tuple_local, _, _, _, _)) = exact_asserted_checked_binary_op(func, &blocks[parent.0])
+    else {
+        return defs;
+    };
+    let tuple_name = func
+        .body
+        .locals
+        .get(tuple_local)
+        .and_then(|decl| decl.name.as_deref())
+        .map_or_else(|| format!("_{tuple_local}"), str::to_string);
+    let result_name = format!("{tuple_name}.0");
+    let Some(result_rhs) = extract_assert_passed_semantics(func, &blocks[parent.0])
+        .into_iter()
+        .find_map(|semantic| match semantic {
+            Formula::Eq(lhs, rhs) if lhs.var_name() == Some(result_name.as_str()) => Some(*rhs),
+            _ => None,
+        })
+    else {
+        return defs;
+    };
+
+    // Substitution must preserve the value snapshot taken by CheckedBinaryOp.
+    // If the success arm writes either the checked field or any operand used
+    // by its mathematical RHS, replacing `checked.0` with the arm-exit name
+    // would read the *new* value and could manufacture a false proof. Use the
+    // canonical alias-aware write set, plus every explicit place destination
+    // (including rvalues the definition extractor intentionally declines).
+    let Some(arm_writes) = conservative_snapshot_writes(func, &blocks[arm.0]) else {
+        return defs;
+    };
+    let snapshot_names =
+        result_rhs.free_variables().into_iter().chain(std::iter::once(result_name.clone()));
+    if snapshot_names.into_iter().any(|name| {
+        arm_writes.iter().any(|written| crate::generate::place_names_overlap(&name, written))
+    }) {
+        return defs;
+    }
+
+    for (_, _, value) in &mut defs {
+        *value = crate::quantifier_tiers::substitute(value, &result_name, &result_rhs);
+    }
+    defs
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nested-`SwitchInt` branch merge — the `if / else if / else` partition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Depth cap on the nested-switch decision tree. Hitting it DECLINES the join
+/// (no facts emitted); it never approximates the partition.
+const NESTED_MERGE_MAX_DEPTH: usize = 8;
+
+/// One arm of an admitted nested decision tree.
+enum MergeArm {
+    /// A block whose EXIT state supplies this arm's merged values.
+    ///
+    /// `source` is that block — a `Goto(join)` arm, or (for a switch's direct
+    /// skip edge to the join) the switch block itself. `parent_switch` is the
+    /// switch this arm hangs off; the checked-arithmetic `Assert`-success
+    /// inlining is authenticated against exactly that switch.
+    Leaf { source: BlockId, parent_switch: BlockId },
+    /// A further `SwitchInt` that partitions this arm.
+    Node(Box<MergeNode>),
+}
+
+/// One `SwitchInt` level of an admitted nested decision tree. EVERY table entry
+/// and the `otherwise` resolve to an arm — the nested lane never drops a
+/// destination, so its arms are a total partition of the switch by construction.
+struct MergeNode {
+    /// `(route guard, arm)` grouped by destination, in first-seen table order.
+    /// The guard is the exact characteristic function of that destination's
+    /// routing values, resolved ONCE during the walk (see
+    /// [`nested_switch_route_guard`]) so the write-set checks and the emitted
+    /// `Ite` can never disagree about which symbols the selector reads.
+    explicit: Vec<(Formula, MergeArm)>,
+    otherwise: MergeArm,
+}
+
+/// `[b, pred(b), pred(pred(b)), …]` while every step has exactly one
+/// predecessor. Stops at the first block with zero or several predecessors, at a
+/// repeat (so a back edge terminates), and at the depth cap.
+fn unique_predecessor_chain(preds: &[Vec<BlockId>], start: BlockId) -> Vec<BlockId> {
+    let mut chain = vec![start];
+    let mut seen: FxHashSet<BlockId> = FxHashSet::default();
+    seen.insert(start);
+    let mut cur = start;
+    while let [p] = preds[cur.0].as_slice() {
+        if !seen.insert(*p) || chain.len() > 2 * NESTED_MERGE_MAX_DEPTH + 2 {
+            break;
+        }
+        chain.push(*p);
+        cur = *p;
+    }
+    chain
+}
+
+/// Builder for one join's nested decision tree. Every field is accumulated
+/// during the walk and inspected by the driver *after* it, so a partial walk can
+/// never leak facts: [`nested_switch_branch_merge_definitions`] returns an empty
+/// vec unless the completed tree passes every side condition.
+struct NestedMergeBuilder<'a> {
+    func: &'a VerifiableFunction,
+    preds: &'a [Vec<BlockId>],
+    join: BlockId,
+    /// Every block admitted into the tree. A repeat means the region is not a
+    /// tree (shared arm or back edge) and declines the join.
+    visited: FxHashSet<BlockId>,
+    /// Blocks admitted STRICTLY BELOW the root switch, for the write-set checks.
+    region: Vec<BlockId>,
+    switch_count: usize,
+}
+
+impl NestedMergeBuilder<'_> {
+    fn build_node(
+        &mut self,
+        switch: BlockId,
+        discrs_above: &[String],
+        depth: usize,
+    ) -> Option<MergeNode> {
+        if depth > NESTED_MERGE_MAX_DEPTH {
+            return None;
+        }
+        let func = self.func;
+        let blocks = &func.body.blocks;
+        let Terminator::SwitchInt { discr, targets, otherwise, .. } = &blocks[switch.0].terminator
+        else {
+            return None;
+        };
+        let otherwise_target = *otherwise;
+        // An `otherwise` that also appears as an explicit target tangles the
+        // partition (one block reached by a value *and* the complement).
+        if targets.iter().any(|(_, t)| *t == otherwise_target) {
+            return None;
+        }
+        // A duplicate table value is malformed however TrustIR routes it.
+        let mut seen_values = FxHashSet::default();
+        if targets.iter().any(|(value, _)| !seen_values.insert(*value)) {
+            return None;
+        }
+        // Group by destination, preserving first-seen order (an or-pattern routes
+        // several values to one arm), resolving each routing value's exact guard.
+        // A value with no exact guard declines the whole join.
+        let mut grouped: Vec<(BlockId, Vec<Formula>)> = Vec::new();
+        for (value, target) in targets {
+            let guard = nested_switch_route_guard(func, &blocks[switch.0], discr, *value)?;
+            if let Some((_, guards)) = grouped.iter_mut().find(|(b, _)| b == target) {
+                guards.push(guard);
+            } else {
+                grouped.push((*target, vec![guard]));
+            }
+        }
+        if grouped.is_empty() {
+            return None;
+        }
+        // Blocks BELOW this switch must not clobber its discriminant either. The
+        // switch block's own write of it is fine: that write precedes the
+        // terminator that reads it, which is why `discrs_above` excludes it here.
+        // Both spellings are pinned: the raw discriminant place AND every symbol
+        // the resolved guards actually read (they differ once a boolean
+        // discriminant's defining comparison is inlined — see
+        // `nested_switch_route_guard`).
+        let mut discrs_below = discrs_above.to_vec();
+        discrs_below.extend(operand_to_formula(func, discr).free_variables());
+        for (_, guards) in &grouped {
+            for guard in guards {
+                discrs_below.extend(guard.free_variables());
+            }
+        }
+
+        self.switch_count += 1;
+        let mut explicit = Vec::with_capacity(grouped.len());
+        for (target, mut guards) in grouped {
+            // One destination, one guard: a single routing value, or the
+            // disjunction of an or-pattern's values (they are distinct, so the
+            // disjunction is still exactly this destination's characteristic
+            // function).
+            let guard = match guards.len() {
+                0 => return None,
+                1 => guards.pop()?,
+                _ => Formula::Or(guards),
+            };
+            explicit.push((guard, self.build_arm(switch, target, &discrs_below, depth)?));
+        }
+        let otherwise = self.build_arm(switch, otherwise_target, &discrs_below, depth)?;
+        Some(MergeNode { explicit, otherwise })
+    }
+
+    fn build_arm(
+        &mut self,
+        parent_switch: BlockId,
+        target: BlockId,
+        discrs_above: &[String],
+        depth: usize,
+    ) -> Option<MergeArm> {
+        let func = self.func;
+        let preds = self.preds;
+        let blocks = &func.body.blocks;
+
+        // The switch's own direct edge to the join — the skip edge of an `if`
+        // without an `else`. No statement runs between the switch and the join, so
+        // the switch block's exit state supplies this arm's values.
+        if target == self.join {
+            return Some(MergeArm::Leaf { source: parent_switch, parent_switch });
+        }
+        if target.0 >= blocks.len() {
+            return None;
+        }
+        // Tree, not DAG: this block is entered only from its parent switch, and
+        // only once anywhere in the region.
+        if !matches!(preds[target.0].as_slice(), [p] if *p == parent_switch)
+            || !self.visited.insert(target)
+        {
+            return None;
+        }
+        // No discriminant read above this block may be clobbered by it. Unknown
+        // statement effects fail closed.
+        let writes = conservative_snapshot_writes(func, &blocks[target.0])?;
+        if discrs_above
+            .iter()
+            .any(|d| writes.iter().any(|w| crate::generate::place_names_overlap(d, w)))
+        {
+            return None;
+        }
+        self.region.push(target);
+
+        match &blocks[target.0].terminator {
+            Terminator::Goto(t) if *t == self.join => {
+                Some(MergeArm::Leaf { source: target, parent_switch })
+            }
+            Terminator::SwitchInt { .. } => {
+                Some(MergeArm::Node(Box::new(self.build_node(target, discrs_above, depth + 1)?)))
+            }
+            // The exact `SwitchInt -> checked-op/Assert -> value arm -> Goto(join)`
+            // extension the single-switch lane already admits: the Assert's failure
+            // edge does not reach the join, so every execution that does reach it
+            // through this branch took the authenticated success edge.
+            Terminator::Assert { target: success, unwind, .. } => {
+                let success = *success;
+                if unwind.cleanup_target() == Some(success) || success.0 >= blocks.len() {
+                    return None;
+                }
+                if !matches!(preds[success.0].as_slice(), [p] if *p == target)
+                    || !self.visited.insert(success)
+                {
+                    return None;
+                }
+                if !matches!(blocks[success.0].terminator, Terminator::Goto(t) if t == self.join) {
+                    return None;
+                }
+                let arm_writes = conservative_snapshot_writes(func, &blocks[success.0])?;
+                if discrs_above
+                    .iter()
+                    .any(|d| arm_writes.iter().any(|w| crate::generate::place_names_overlap(d, w)))
+                {
+                    return None;
+                }
+                self.region.push(success);
+                Some(MergeArm::Leaf { source: success, parent_switch })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Every leaf of an admitted tree as `(def-source block, its parent switch)`, in
+/// tree order.
+fn nested_merge_leaves(node: &MergeNode, out: &mut Vec<(BlockId, BlockId)>) {
+    fn walk(arm: &MergeArm, out: &mut Vec<(BlockId, BlockId)>) {
+        match arm {
+            MergeArm::Leaf { source, parent_switch } => out.push((*source, *parent_switch)),
+            MergeArm::Node(node) => nested_merge_leaves(node, out),
+        }
+    }
+    for (_, arm) in &node.explicit {
+        walk(arm, out);
+    }
+    walk(&node.otherwise, out);
+}
+
+/// The exact route guard for one `SwitchInt` table value, with a BOOLEAN
+/// discriminant's same-block defining comparison inlined.
+///
+/// [`exact_switch_value_guard`] renders a boolean discriminant as the opaque
+/// temp itself (`_4` / `Not(_4)`). That is exact, and the refute lane separately
+/// pins `_4 == (col < width)`, so the two spellings are interderivable — but only
+/// for a consumer that propagates boolean definitions. MEASURED: with the opaque
+/// spelling, `trust_certify::certify_violation` refuses two of
+/// `proved/cursor_clamp_assert.rs`'s three grounded path residuals AND their
+/// disjunction (the catch-all's residual), so the kernel mints no certificate
+/// and a `Proved` without a kernel token reports `Unknown`
+/// (`convert_result`). With the comparison inlined, all three parts and the
+/// disjunction certify. The `Ite`-definition case-split fragment reasons about
+/// the selector it is GIVEN, so handing it the arithmetic predicate rather than
+/// a boolean alias is what closes the fixture.
+///
+/// # Exactness
+///
+/// [`latest_same_block_bool_definition`] is the same resolver
+/// [`guard_to_formula`] already uses, and it is *definitional*, not
+/// assumption-strengthening: it lowers a comparison (or a single-block
+/// `BitAnd`/`BitOr` of comparisons) to its exact truth condition and returns
+/// `None` for every other rvalue.
+///
+/// Its own staleness gates, however, are NOT sufficient here and are not relied
+/// on. Both are PLAIN-LOCAL gates: `compared_operand_reassigned_after` collects
+/// only projection-free comparison operands and matches only projection-free
+/// writes, and `value_local_is_unstable` is consulted only for projection-free
+/// operands. A switch block that rewrites a PROJECTED operand between the
+/// comparison and its own terminator —
+///
+/// ```text
+///   bb0: _4 = col < t.0;   t.0 = 0;   SwitchInt(_4) -> [0: …] otherwise …
+/// ```
+///
+/// — therefore slips past every one of them, and the inlined `col < t.0` read at
+/// the JOIN denotes a `t.0` the switch never compared against. That is a FALSE
+/// merge equality, and a false equality manufactures a spurious UNSAT: a false
+/// proof of panic-freedom on exactly the safe-looking shapes this lane serves.
+/// (An earlier revision of this lane shipped without the check below and was
+/// rejected for precisely that reason.)
+///
+/// Three restrictions are therefore imposed HERE, because this guard is read at
+/// the JOIN rather than at the switch:
+///
+///  * the defining assignment must live in the SWITCH BLOCK itself (checked
+///    below), so the resolver can never take its cross-block fallback and the
+///    value read by the terminator is exactly the one inlined;
+///  * [`switch_block_preserves_inlined_guard`] REFUSES the inlining whenever the
+///    switch block writes anything that overlaps a symbol the resolved
+///    comparison reads — projected writes and projected reads included, on both
+///    sides, via the canonical alias-aware write set and
+///    `place_names_overlap`; and
+///  * the caller adds every free variable of the returned guard to the
+///    `discrs_below` clobber set, so no block STRICTLY BELOW the switch may
+///    rewrite a symbol the selector reads either.
+///
+/// Together those cover every program point between the comparison and the join:
+/// writes in the switch block (second bullet, conservatively the whole block),
+/// and writes on the way down to the join (third). A write that PRECEDES the
+/// comparison needs no treatment — the comparison already reads its result — but
+/// is refused anyway, since refusing is always safe.
+///
+/// Falls back to [`exact_switch_value_guard`] whenever the discriminant is not a
+/// same-block-defined boolean local, or whenever the switch block could have
+/// disturbed the comparison — never to a weaker predicate. The fallback spelling
+/// is the opaque SSA temp itself, which the `discrs_below` clobber set pins
+/// directly, so declining costs precision and never soundness.
+fn nested_switch_route_guard(
+    func: &VerifiableFunction,
+    switch_block: &BasicBlock,
+    discr: &Operand,
+    value: u128,
+) -> Option<Formula> {
+    let plain_local = match discr {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
+            Some(place.local)
+        }
+        _ => None,
+    };
+    if value <= 1
+        && let Some(local) = plain_local
+        && matches!(crate::operand_ty_cow(func, discr).as_deref(), Some(Ty::Bool))
+        // Defined in the switch block itself: no cross-block fallback, and the
+        // resolver's `.rev()` scan finds exactly the def the terminator reads.
+        && switch_block.stmts.iter().any(|stmt| {
+            matches!(stmt, Statement::Assign { place, .. }
+                if place.local == local && place.projections.is_empty())
+        })
+        && bool_definition_is_switch_block_local(func, switch_block, local, 8)
+        && let Some(definition) = latest_same_block_bool_definition(func, switch_block, local)
+        && switch_block_preserves_inlined_guard(func, switch_block, &definition)
+    {
+        return Some(if value == 0 { Formula::Not(Box::new(definition)) } else { definition });
+    }
+    exact_switch_value_guard(func, discr, value)
+}
+
+/// May the comparison resolved out of `switch_block` be read at the JOIN?
+///
+/// Only if the block itself writes NOTHING the comparison reads. This is the
+/// staleness check the plain-local gates inside
+/// [`latest_same_block_bool_definition`] cannot make (see its call site above):
+/// it is stated over the RESOLVED formula's free variables — so a `BitAnd`
+/// leaf's operands are covered as well as the top comparison's — and it uses
+/// [`conservative_snapshot_writes`] + `place_names_overlap`, which see PROJECTED
+/// places on BOTH sides (`t.0 = 0` is a write that overlaps a read of `t.0`, and
+/// a write of the whole `t` overlaps it too).
+///
+/// Deliberately whole-block rather than "after the defining statement": with the
+/// `BitAnd`/`BitOr` recursion the leaf comparisons sit at EARLIER indices than
+/// the definition of the switch's own discriminant, so a cut point taken at that
+/// definition would miss a write that is after a leaf but before it. A write
+/// that precedes every read is harmless, so this is strictly conservative — and
+/// conservative here means falling back to the opaque bool temp, never a weaker
+/// predicate.
+///
+/// Fails closed (`false`) when the block has an effect
+/// [`conservative_snapshot_writes`] cannot bound.
+fn switch_block_preserves_inlined_guard(
+    func: &VerifiableFunction,
+    switch_block: &BasicBlock,
+    definition: &Formula,
+) -> bool {
+    let Some(writes) = conservative_snapshot_writes(func, switch_block) else {
+        return false;
+    };
+    !definition.free_variables().iter().any(|read| {
+        writes.iter().any(|written| crate::generate::place_names_overlap(read, written))
+    })
+}
+
+/// Was every leaf of this switch discriminant resolved WITHIN the switch block?
+///
+/// SWITCH-BLOCK WRITE-DISJOINTNESS IS NOT ENOUGH — this lever leaked twice.
+/// [`switch_block_preserves_inlined_guard`] checks the switch block's own writes, but
+/// [`latest_same_block_bool_definition`] recurses through `BitAnd`/`BitOr` leaves via
+/// [`resolve_same_block_bool_operand`], which may take the CROSS-BLOCK unique-defining
+/// -block fallback. That fallback's soundness argument is about the BOOL local — a
+/// single static definition dominates its uses — and says nothing about the
+/// comparison's OPERANDS. Adversarial review measured the resulting false equality:
+///
+/// ```text
+/// bb0: _7.0 = width; _8 = col < _7.0;   Goto bb1
+/// bb1: _7.0 = 0;                        Goto bb2
+/// bb2: _9 = width > 0; _4 = _8 & _9;    SwitchInt(_4)
+/// ```
+///
+/// `_8` is uniquely defined in bb0 and flows forward, so the leaf resolves — but `_7.0`
+/// is rewritten in bb1, so inlining `col < _7.0` at bb2 reads a value the program no
+/// longer holds. At `col=0 width=2` the emitted `Ite` evaluates to 1 where the program
+/// computes 0: a FALSE merge equality, hence a spurious UNSAT and a false proof of
+/// panic-freedom.
+///
+/// Two attempts to bound this by SCOPE both leaked (writes after the defining statement;
+/// then writes anywhere in the switch block), and bounding it by VARIABLES is too blunt —
+/// it refuses the defining block's own initializing write, which establishes the value
+/// rather than staling it. So bound it at the RESOLVER: every bool leaf must be defined
+/// in the switch block itself. Then every read is same-block and
+/// [`switch_block_preserves_inlined_guard`]'s whole-block check is exactly sufficient.
+///
+/// Refusing costs precision only — the caller falls back to `exact_switch_value_guard`'s
+/// opaque SSA temp, which `discrs_below` already pins directly.
+fn bool_definition_is_switch_block_local(
+    func: &VerifiableFunction,
+    switch_block: &BasicBlock,
+    local: usize,
+    fuel: usize,
+) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    let Some(stmt) = switch_block.stmts.iter().rev().find(|stmt| {
+        matches!(stmt, Statement::Assign { place, .. }
+            if place.local == local && place.projections.is_empty())
+    }) else {
+        // Not defined here at all — the resolver would have gone cross-block.
+        return false;
+    };
+    let Statement::Assign { rvalue, .. } = stmt else { return false };
+    match rvalue {
+        Rvalue::BinaryOp(BinOp::BitAnd | BinOp::BitOr, lhs, rhs) => {
+            [lhs, rhs].into_iter().all(|operand| match operand {
+                Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
+                    bool_definition_is_switch_block_local(
+                        func,
+                        switch_block,
+                        place.local,
+                        fuel - 1,
+                    )
+                }
+                // A constant or projected leaf is not resolved through the bool
+                // resolver, so it cannot carry a cross-block comparison.
+                _ => true,
+            })
+        }
+        // Any other rvalue (a comparison, a cast, a use) is read directly out of this
+        // block by the resolver, so it is same-block by construction.
+        _ => true,
+    }
+}
+
+/// The nested `Ite` for one merged local, or `None` if some arm does not define
+/// it. The guards were resolved during the walk and are reused verbatim, so the
+/// selector the caller checked for clobbering is the selector emitted.
+fn nested_merge_value(
+    func: &VerifiableFunction,
+    node: &MergeNode,
+    name: &str,
+    values: &FxHashMap<BlockId, Vec<(String, Sort, Formula)>>,
+) -> Option<Formula> {
+    let mut acc = nested_merge_arm_value(func, &node.otherwise, name, values)?;
+    for (guard, arm) in node.explicit.iter().rev() {
+        let arm_value = nested_merge_arm_value(func, arm, name, values)?;
+        acc = Formula::Ite(Box::new(guard.clone()), Box::new(arm_value), Box::new(acc));
+    }
+    Some(acc)
+}
+
+fn nested_merge_arm_value(
+    func: &VerifiableFunction,
+    arm: &MergeArm,
+    name: &str,
+    values: &FxHashMap<BlockId, Vec<(String, Sort, Formula)>>,
+) -> Option<Formula> {
+    match arm {
+        MergeArm::Leaf { source, .. } => {
+            values.get(source)?.iter().find(|(n, _, _)| n == name).map(|(_, _, v)| v.clone())
+        }
+        MergeArm::Node(node) => nested_merge_value(func, node, name, values),
+    }
+}
+
+/// Recover the merged-local invariant at a join whose arms descend from a
+/// *chain* of `SwitchInt`s — `if c { a } else if d { b } else { e }`, which
+/// lowers to a NESTED partition (arm `a` under the outer switch, `b`/`e` under an
+/// inner one). [`single_switch_branch_merge_definitions`] requires all arms to
+/// share one switch, so it declines this shape and the merged local stays a free
+/// variable that false-refutes a safe assert over it.
+///
+/// The emitted fact is the nested Ite
+/// `x == Ite(g_outer, x_0, Ite(g_inner, x_1, x_2))`, one per local defined at the
+/// exit of *every* leaf.
+///
+/// # Why this is sound in both directions
+///
+/// The fact is a genuinely-true equality on every execution that reaches `join`,
+/// so conjoining it only SHRINKS the model set:
+///  * proving (UNSAT) — a true fact cannot turn a real violation into a proof;
+///  * refuting (SAT) — every surviving model still corresponds to a reachable
+///    execution, so a counterexample stays real.
+///
+/// That is the same argument the single-switch lane rests on, and it holds only
+/// if the equality really is true on every reaching path. The side conditions are
+/// RE-DERIVED for the chain, not inherited from the single-switch lane:
+///
+///  1. **Tree, not DAG.** Every admitted block's predecessor list is exactly
+///     `[its parent switch]`, and no block is admitted twice (`visited`). So each
+///     leaf is reached by exactly one route and no path enters the region from
+///     outside it.
+///  2. **Total partition at every level.** Per switch: the `otherwise` must not
+///     also be an explicit target, every raw table value must have an exact
+///     characteristic guard, duplicate values are rejected, and — unlike the
+///     single-switch lane — EVERY destination must resolve to an arm. Because no
+///     destination is dropped, the "switch totality" reasoning the single-switch
+///     lane needs for its catch-all does not arise: the explicit guards are
+///     mutually exclusive and the `otherwise` guard is their exact complement.
+///  3. **Every join predecessor is a leaf.** `covered == expected` over the
+///     join's predecessor set, with distinct leaf sources. With (1), the tree
+///     therefore describes *every* way to reach `join`.
+///  4. **No discriminant is clobbered after its switch reads it.** Formulas here
+///     are unversioned, so an Ite guard read at the JOIN must denote what the
+///     switch actually branched on. Each admitted block is checked against the
+///     discriminants of every switch STRICTLY ABOVE it in the chain — the
+///     single-switch lane's check covers only the arm block and its unique
+///     `Assert` parent, which is NOT enough once there are intermediate switch
+///     blocks on the path. The pinned set is BOTH spellings: the raw
+///     discriminant place AND every free variable of the RESOLVED guard, which
+///     differ once a boolean discriminant's defining comparison is inlined (see
+///     [`nested_switch_route_guard`]). A switch computing its own discriminant is
+///     fine (that write precedes its own terminator), so a switch block is never
+///     checked against itself.
+///  5. **No merged value reads a variable the region rewrites.** A leaf's value
+///     is an expression over that leaf's own block, but in a chain the blocks
+///     between the root switch and the leaf can reassign a variable the value
+///     mentions — and then the two spellings of that symbol denote different
+///     values and the Ite is a FALSE equality. A false equality is unsound in
+///     BOTH directions (it can manufacture a spurious UNSAT, i.e. a false proof
+///     of panic-freedom, on exactly the safe shapes this lane is meant to serve).
+///     So every free variable of every emitted arm value must be unwritten by
+///     every block of the region. The check runs AFTER the checked-arithmetic
+///     substitution, so the `Assert`-authenticated `t.0 -> a - b` rewrite is
+///     judged on its result rather than on the intermediate tuple. Switch
+///     discriminants need no such treatment: (4) already pins them, and they
+///     appear only in guards, where reading the switch's own routing value is
+///     exactly what selects the arm.
+///
+/// Any deviation yields an empty vec.
+fn nested_switch_branch_merge_definitions(
+    func: &VerifiableFunction,
+    join: BlockId,
+    preds: &[Vec<BlockId>],
+) -> Vec<Formula> {
+    let blocks = &func.body.blocks;
+    if join.0 >= blocks.len() {
+        return Vec::new();
+    }
+    let join_preds = preds[join.0].clone();
+    if join_preds.len() < 2 {
+        return Vec::new();
+    }
+
+    // The root: the OUTERMOST `SwitchInt` on the unique-predecessor ancestor
+    // chain of EVERY join predecessor. `unique_predecessor_chain` runs
+    // outermost-last, so scan it in reverse.
+    let chains: Vec<Vec<BlockId>> =
+        join_preds.iter().map(|p| unique_predecessor_chain(preds, *p)).collect();
+    let Some(first_chain) = chains.first() else {
+        return Vec::new();
+    };
+    let Some(root) = first_chain.iter().rev().copied().find(|cand| {
+        matches!(blocks[cand.0].terminator, Terminator::SwitchInt { .. })
+            && chains.iter().all(|c| c.contains(cand))
+    }) else {
+        return Vec::new();
+    };
+
+    let mut builder = NestedMergeBuilder {
+        func,
+        preds,
+        join,
+        visited: FxHashSet::default(),
+        region: Vec::new(),
+        switch_count: 0,
+    };
+    let Some(tree) = builder.build_node(root, &[], 0) else {
+        return Vec::new();
+    };
+    // Strictly disjoint from the single-switch lane, which models exactly one
+    // switch: this lane never re-decides a shape that one already models.
+    if builder.switch_count < 2 {
+        return Vec::new();
+    }
+
+    // (3) every join predecessor is a leaf, and the leaves are distinct.
+    let mut leaves: Vec<(BlockId, BlockId)> = Vec::new();
+    nested_merge_leaves(&tree, &mut leaves);
+    let expected: FxHashSet<BlockId> = join_preds.iter().copied().collect();
+    let covered: FxHashSet<BlockId> = leaves.iter().map(|(source, _)| *source).collect();
+    if covered.len() != leaves.len() || covered != expected {
+        return Vec::new();
+    }
+
+    // (5) the region's write set. Every admitted block already yielded `Some`
+    // during the walk; fail closed anyway rather than assume it.
+    let mut region_writes: FxHashSet<String> = FxHashSet::default();
+    for block in &builder.region {
+        let Some(writes) = conservative_snapshot_writes(func, &blocks[block.0]) else {
+            return Vec::new();
+        };
+        region_writes.extend(writes);
+    }
+
+    let mut values: FxHashMap<BlockId, Vec<(String, Sort, Formula)>> = FxHashMap::default();
+    for (source, parent_switch) in &leaves {
+        values.insert(
+            *source,
+            arm_definition_map_with_checked_assert_impl(func, preds, *source, *parent_switch),
+        );
+    }
+
+    let Some((first_source, _)) = leaves.first() else {
+        return Vec::new();
+    };
+    let Some(first_defs) = values.get(first_source).cloned() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    'name: for (name, sort, _) in &first_defs {
+        for (source, _) in &leaves {
+            // Defined at the exit of EVERY leaf, or it does not merge.
+            let Some(defs) = values.get(source) else {
+                continue 'name;
+            };
+            let Some((_, _, value)) = defs.iter().find(|(n, _, _)| n == name) else {
+                continue 'name;
+            };
+            // (5) every free variable of the arm value survives the region intact.
+            if value
+                .free_variables()
+                .iter()
+                .any(|v| region_writes.iter().any(|w| crate::generate::place_names_overlap(v, w)))
+            {
+                continue 'name;
+            }
+        }
+        let Some(ite) = nested_merge_value(func, &tree, name, &values) else {
+            continue 'name;
+        };
+        out.push(Formula::Eq(Box::new(Formula::Var(name.clone(), sort.clone())), Box::new(ite)));
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-path split of a grounded panic-path feasibility formula
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Above this many paths the split is declined and the caller keeps the single
+/// combined obligation — the pre-split behaviour, never a weaker one.
+const MAX_SPLIT_PATHS: usize = 32;
+
+/// Split a grounded panic-path feasibility formula into ONE FORMULA PER PATH.
+///
+/// The assert-refutation lane builds the failure block's feasibility formula as
+/// `And(defs…, Or(path_0, …, path_n))` — the shared definitional facts, plus the
+/// disjunction of every control-flow path that reaches the failure block. This
+/// returns `[And(defs…, path_0), …, And(defs…, path_n)]`.
+///
+/// # This is an EXACT rewriting, not an approximation
+///
+/// `And(C ∪ {Or(d_0 … d_n)})` and `Or_i And(C ∪ {d_i})` are the same predicate
+/// (distributivity of `∧` over `∨`), so for the two verdicts the lane consumes:
+///
+///  * **UNSAT / proof.** The combined formula is UNSAT **iff** every part is
+///    UNSAT. The caller must therefore require ALL parts to be proved before it
+///    treats the assert as discharged — proving a subset proves nothing, and
+///    `refute_full_assert_obligations` already demands `refuted == 0 &&
+///    left_unknown == 0`, i.e. a definite verdict on every emitted VC.
+///  * **SAT / refutation.** Any model of `And(C ∪ {d_i})` satisfies
+///    `And(C ∪ {Or(d…)})` verbatim — the same assignment, no relaxation. So a
+///    part's counterexample is a counterexample of the whole: splitting can
+///    never manufacture a SPURIOUS refutation, and it never drops a genuine one
+///    (a model of the whole satisfies at least one `d_i`).
+///
+/// Nothing about grounding changes: the caller splits only a formula it has
+/// already accepted as grounded, and every part carries the same `C`.
+///
+/// # Why the lane needs it
+///
+/// The parts are not merely easier — for this shape they are the difference
+/// between a certificate and none. MEASURED on
+/// `proved/cursor_clamp_assert.rs`'s real MIR: the combined 3-path formula
+/// makes the in-process ay compute UNSAT and then REJECT its own proof
+/// (`strict UNSAT proof validation failed: step t3 uses unverified trust rule`
+/// -> `Unknown`), while each of the three parts is `Proved` with an SmtBacked
+/// certificate. An uncertified UNSAT is not a proof, so without the split the
+/// assert stays undischarged.
+///
+/// Declines (returning the input unchanged, so the caller behaves exactly as
+/// before) when there is no top-level `Or` conjunct to split, when the
+/// disjunction is trivial, or when it would produce more than
+/// [`MAX_SPLIT_PATHS`] obligations.
+pub(crate) fn split_path_feasibility_disjuncts(formula: &Formula) -> Vec<Formula> {
+    // A bare `Or` — no definitional conjuncts to redistribute.
+    split_on_first_conjoined_or(formula).unwrap_or_else(|| vec![formula.clone()])
+}
+
+/// Rebuild `formula` once per disjunct of its first `Or` reachable through
+/// `And` nodes only, leaving every other node byte-identical.
+///
+/// Descending through `And` is what makes the rewriting exact: `And(…, X, …)`
+/// with `X = Or(d…)` equals `Or_i And(…, d_i, …)` by distributivity, and that
+/// identity composes up an arbitrarily nested `And` spine. It deliberately does
+/// NOT descend through `Or`, `Not`, `Ite` or any atom — distributivity does not
+/// apply there, so a disjunction under one is left alone.
+fn split_on_first_conjoined_or(formula: &Formula) -> Option<Vec<Formula>> {
+    match formula {
+        Formula::Or(paths) if paths.len() >= 2 && paths.len() <= MAX_SPLIT_PATHS => {
+            Some(paths.clone())
+        }
+        Formula::And(conjuncts) => {
+            for (index, conjunct) in conjuncts.iter().enumerate() {
+                let Some(parts) = split_on_first_conjoined_or(conjunct) else {
+                    continue;
+                };
+                return Some(
+                    parts
+                        .into_iter()
+                        .map(|part| {
+                            let mut rebuilt = conjuncts.clone();
+                            rebuilt[index] = part;
+                            Formula::And(rebuilt)
+                        })
+                        .collect(),
+                );
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Exact raw route guard for one `SwitchInt` table value.
@@ -5135,6 +5910,865 @@ mod tests {
             formula.var_name() == Some("cond"),
             "nondominating bool definitions must not rewrite the switch guard, got {formula:?}"
         );
+    }
+
+    // ── Nested-`SwitchInt` merge (`if / else if / else`) ──────────────────────
+
+    /// The `proved/cursor_clamp_assert.rs` MIR, built block-for-block to match the
+    /// real `-Ztrust-dump=mir` artifact:
+    ///
+    /// ```text
+    ///   bb0: _4 = col < width;  SwitchInt(_4) -> [0: bb2] otherwise bb1
+    ///   bb1: clamped = col;                                    Goto bb6
+    ///   bb2: _5 = width > 0;    SwitchInt(_5) -> [0: bb5] otherwise bb3
+    ///   bb3: _6 = CheckedSub(width, 1);  Assert(!_6.1)      -> bb4
+    ///   bb4: clamped = _6.0;                                   Goto bb6
+    ///   bb5: clamped = 0;                                      Goto bb6
+    ///   bb6: (join)                                            Return
+    /// ```
+    fn nested_clamp_func() -> VerifiableFunction {
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::u32(), name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u32(), name: Some("col".into()) },
+            LocalDecl { index: 2, ty: Ty::u32(), name: Some("width".into()) },
+            LocalDecl { index: 3, ty: Ty::u32(), name: Some("clamped".into()) },
+            LocalDecl { index: 4, ty: Ty::Bool, name: None },
+            LocalDecl { index: 5, ty: Ty::Bool, name: None },
+            LocalDecl { index: 6, ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]), name: None },
+        ];
+        func.body.arg_count = 2;
+        func.body.return_ty = Ty::u32();
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place::local(local),
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        func.body.blocks = vec![
+            BasicBlock {
+                id: trust_types::BlockId(0),
+                stmts: vec![assign(
+                    4,
+                    Rvalue::BinaryOp(
+                        BinOp::Lt,
+                        Operand::Copy(Place::local(1)),
+                        Operand::Copy(Place::local(2)),
+                    ),
+                )],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Move(Place::local(4)),
+                    targets: vec![(0, trust_types::BlockId(2))],
+                    otherwise: trust_types::BlockId(1),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            BasicBlock {
+                id: trust_types::BlockId(1),
+                stmts: vec![assign(3, Rvalue::Use(Operand::Copy(Place::local(1))))],
+                terminator: Terminator::Goto(trust_types::BlockId(6)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(2),
+                stmts: vec![assign(
+                    5,
+                    Rvalue::BinaryOp(
+                        BinOp::Gt,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Uint(0, 32)),
+                    ),
+                )],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Move(Place::local(5)),
+                    targets: vec![(0, trust_types::BlockId(5))],
+                    otherwise: trust_types::BlockId(3),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            BasicBlock {
+                id: trust_types::BlockId(3),
+                stmts: vec![assign(
+                    6,
+                    Rvalue::CheckedBinaryOp(
+                        BinOp::Sub,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Uint(1, 32)),
+                    ),
+                )],
+                terminator: Terminator::Assert {
+                    cond: Operand::Move(Place {
+                        local: 6,
+                        projections: vec![trust_types::Projection::Field(1)],
+                    }),
+                    expected: false,
+                    msg: AssertMessage::Overflow(BinOp::Sub),
+                    target: trust_types::BlockId(4),
+                    span: SourceSpan::default(),
+                    unwind: UnwindEdge::Continue,
+                },
+            },
+            BasicBlock {
+                id: trust_types::BlockId(4),
+                stmts: vec![assign(
+                    3,
+                    Rvalue::Use(Operand::Copy(Place {
+                        local: 6,
+                        projections: vec![trust_types::Projection::Field(0)],
+                    })),
+                )],
+                terminator: Terminator::Goto(trust_types::BlockId(6)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(5),
+                stmts: vec![assign(3, Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))))],
+                terminator: Terminator::Goto(trust_types::BlockId(6)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(6),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            },
+        ];
+        func
+    }
+
+    /// Total ground evaluation of the fragment these merge facts live in
+    /// (booleans are 0/1). `None` means "outside the fragment", which fails the
+    /// test loudly rather than guessing a semantics.
+    fn eval_ground(formula: &Formula, env: &[(&str, i128)]) -> Option<i128> {
+        let look = |name: &str| env.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+        let bin = |l: &Formula, r: &Formula, op: fn(i128, i128) -> Option<i128>| {
+            op(eval_ground(l, env)?, eval_ground(r, env)?)
+        };
+        match formula {
+            Formula::Bool(value) => Some(i128::from(*value)),
+            Formula::Int(value) => Some(*value),
+            Formula::UInt(value) => i128::try_from(*value).ok(),
+            Formula::Var(name, _) => look(name),
+            Formula::SymVar(symbol, _) => look(symbol.as_str()),
+            Formula::Not(inner) => Some(1 - eval_ground(inner, env)?),
+            Formula::Or(parts) => {
+                let mut any = 0;
+                for part in parts {
+                    any |= eval_ground(part, env)?;
+                }
+                Some(any)
+            }
+            Formula::And(parts) => {
+                let mut all = 1;
+                for part in parts {
+                    all &= eval_ground(part, env)?;
+                }
+                Some(all)
+            }
+            Formula::Eq(l, r) => bin(l, r, |l, r| Some(i128::from(l == r))),
+            Formula::Lt(l, r) => bin(l, r, |l, r| Some(i128::from(l < r))),
+            Formula::Le(l, r) => bin(l, r, |l, r| Some(i128::from(l <= r))),
+            Formula::Gt(l, r) => bin(l, r, |l, r| Some(i128::from(l > r))),
+            Formula::Ge(l, r) => bin(l, r, |l, r| Some(i128::from(l >= r))),
+            Formula::Add(l, r) => bin(l, r, i128::checked_add),
+            Formula::Sub(l, r) => bin(l, r, i128::checked_sub),
+            Formula::Mul(l, r) => bin(l, r, i128::checked_mul),
+            // Lazy, like the machine: the untaken arm may be a value the branch
+            // guard specifically prevents from being computed (`width - 1` when
+            // `width == 0`).
+            Formula::Ite(cond, then_branch, else_branch) => {
+                if eval_ground(cond, env)? != 0 {
+                    eval_ground(then_branch, env)
+                } else {
+                    eval_ground(else_branch, env)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The merged local of an `if / else if / else` must be recovered as a NESTED
+    /// `Ite`, and that equality must hold on EVERY concrete execution — checked
+    /// by running the program and the formula side by side over a dense input box.
+    /// This is the property the whole lane rests on: a fact that is true on every
+    /// reaching path only shrinks the model set, so it can neither false-prove
+    /// (UNSAT direction) nor make a counterexample spurious (SAT direction).
+    #[test]
+    fn nested_switch_merge_matches_every_concrete_execution() {
+        let func = nested_clamp_func();
+        let merged = branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default());
+        assert_eq!(merged.len(), 1, "expected exactly the `clamped` merge, got {merged:?}");
+        let Formula::Eq(lhs, rhs) = &merged[0] else {
+            panic!("expected an equality, got {:?}", merged[0]);
+        };
+        assert_eq!(lhs.var_name(), Some("clamped"));
+        let Formula::Ite(_, inner, _) = rhs.as_ref() else {
+            panic!("expected an Ite, got {rhs:?}");
+        };
+        assert!(
+            matches!(inner.as_ref(), Formula::Ite(..)),
+            "the inner switch must nest inside the outer one, got {inner:?}"
+        );
+
+        for col in 0i128..=40 {
+            for width in 0i128..=40 {
+                // The program.
+                let clamped = if col < width {
+                    col
+                } else if width > 0 {
+                    width - 1
+                } else {
+                    0
+                };
+                // The state the formula's variables denote on that execution.
+                let env = [
+                    ("col", col),
+                    ("width", width),
+                    ("_4", i128::from(col < width)),
+                    ("_5", i128::from(width > 0)),
+                    ("_6.0", if width > 0 { width - 1 } else { 0 }),
+                    ("_6.1", 0),
+                ];
+                assert_eq!(
+                    eval_ground(rhs, &env),
+                    Some(clamped),
+                    "merge equality is false at col={col} width={width}: {rhs:?}"
+                );
+            }
+        }
+    }
+
+    /// NEGATIVE. An intermediate block on the chain reassigns the OUTER switch's
+    /// discriminant. Formulas here are unversioned, so the emitted Ite guard would
+    /// read a value the outer switch never saw — a FALSE equality, which is
+    /// unsound in BOTH directions (it can manufacture a spurious UNSAT, i.e. a
+    /// false proof of panic-freedom, on exactly the safe shapes this lane serves).
+    /// The single-switch lane's check covers only the arm block and its unique
+    /// `Assert` parent, which is why the chain check had to be re-derived.
+    #[test]
+    fn nested_switch_merge_declines_clobbered_outer_discriminant() {
+        let mut func = nested_clamp_func();
+        func.body.blocks[2].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place::local(2)),
+                    Operand::Copy(Place::local(1)),
+                ),
+                span: SourceSpan::default(),
+            },
+        );
+        assert!(
+            branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default())
+                .is_empty(),
+            "a chain whose intermediate block clobbers an outer discriminant must yield nothing"
+        );
+    }
+
+    /// NEGATIVE. An intermediate block rewrites a variable that ANOTHER arm's
+    /// merged value reads (`if c { x = k } else { k = 7; if d { x = 0 } else { x = k } }`).
+    /// The two `k`s denote different values but spell one symbol, so the Ite would
+    /// again be a false equality. Nothing in the single-switch lane covers this:
+    /// there, an arm's writes cannot precede a sibling arm.
+    #[test]
+    fn nested_switch_merge_declines_value_variable_rewritten_on_the_chain() {
+        let mut func = nested_clamp_func();
+        func.body.blocks[2].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
+                span: SourceSpan::default(),
+            },
+        );
+        assert!(
+            branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default())
+                .is_empty(),
+            "`col` is read by the bb1 arm value and rewritten on the bb2 chain"
+        );
+    }
+
+    /// NEGATIVE. The nested lane never DROPS a switch destination: every target
+    /// and the `otherwise` must resolve to an arm, so the partition is total by
+    /// construction and no switch-totality reasoning is needed. A destination that
+    /// leaves the region declines the join.
+    #[test]
+    fn nested_switch_merge_declines_destination_that_leaves_the_region() {
+        let mut func = nested_clamp_func();
+        func.body.blocks[5].terminator = Terminator::Return;
+        assert!(
+            branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default())
+                .is_empty(),
+            "an unresolved switch destination must decline the whole join"
+        );
+    }
+
+    /// NEGATIVE. A back edge into the chain (`bb5 -> bb2`) makes the region a
+    /// loop rather than a tree: the merged local would be re-established each
+    /// iteration under guards read at a different iteration. Fail closed.
+    #[test]
+    fn nested_switch_merge_declines_back_edge_into_the_chain() {
+        let mut func = nested_clamp_func();
+        func.body.blocks[5].terminator = Terminator::Goto(trust_types::BlockId(2));
+        assert!(
+            branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default())
+                .is_empty(),
+            "a back edge into the switch chain must decline the join"
+        );
+    }
+
+    /// NEGATIVE. A loop header is a join with two predecessors and no switch
+    /// partition at all; the lane must not invent one.
+    #[test]
+    fn nested_switch_merge_declines_loop_header_join() {
+        let mut func = nested_clamp_func();
+        // bb0 -> bb1(header) ; bb1 -> bb2 (body) or bb3 (exit) ; bb2 -> bb1
+        func.body.blocks = vec![
+            BasicBlock {
+                id: trust_types::BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(3),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(0))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Goto(trust_types::BlockId(1)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(1),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(4),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Lt,
+                        Operand::Copy(Place::local(3)),
+                        Operand::Copy(Place::local(2)),
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Move(Place::local(4)),
+                    targets: vec![(0, trust_types::BlockId(3))],
+                    otherwise: trust_types::BlockId(2),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            BasicBlock {
+                id: trust_types::BlockId(2),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(3),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(1))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Goto(trust_types::BlockId(1)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(3),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            },
+        ];
+        assert!(
+            branch_merge_definitions(&func, trust_types::BlockId(1), &Default::default())
+                .is_empty(),
+            "a loop header is not a switch partition"
+        );
+    }
+
+    /// The two lanes are DISJOINT: the nested lane requires at least two switches,
+    /// so a plain diamond is still decided entirely by the single-switch lane and
+    /// its result is byte-identical to before this extension.
+    #[test]
+    fn nested_switch_merge_leaves_the_single_switch_lane_untouched() {
+        let mut func = nested_clamp_func();
+        // Collapse the chain to one switch: bb0 -> bb1 / bb5, both Goto(bb6).
+        func.body.blocks[0].terminator = Terminator::SwitchInt {
+            discr: Operand::Move(Place::local(4)),
+            targets: vec![(0, trust_types::BlockId(5))],
+            otherwise: trust_types::BlockId(1),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        };
+        func.body.blocks[2].terminator = Terminator::Return;
+        func.body.blocks[3].terminator = Terminator::Return;
+        func.body.blocks[4].terminator = Terminator::Return;
+        let preds = block_predecessors(&func);
+        assert!(
+            nested_switch_branch_merge_definitions(&func, trust_types::BlockId(6), &preds)
+                .is_empty(),
+            "one switch is not a chain"
+        );
+        assert_eq!(
+            branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default()),
+            single_switch_branch_merge_definitions(
+                &func,
+                trust_types::BlockId(6),
+                &Default::default(),
+                &preds
+            ),
+            "the single-switch lane must still decide the plain diamond"
+        );
+    }
+
+    /// The emitted `Ite` selector must be the boolean discriminant's DEFINING
+    /// COMPARISON, not the opaque temp. This is not cosmetic: MEASURED on the real
+    /// MIR of `proved/cursor_clamp_assert.rs`, the opaque spelling makes
+    /// `trust_certify::certify_violation` refuse two of the three grounded path
+    /// residuals AND their disjunction (the whole-function panic-freedom
+    /// catch-all's residual), so the kernel mints no certificate and a `Proved`
+    /// without a kernel token reports `Unknown`. With the comparison inlined all
+    /// three, and the disjunction, certify.
+    #[test]
+    fn nested_switch_merge_inlines_the_boolean_discriminant_definition() {
+        let func = nested_clamp_func();
+        let merged = branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default());
+        assert_eq!(merged.len(), 1, "expected exactly the `clamped` merge, got {merged:?}");
+        let Formula::Eq(_, rhs) = &merged[0] else {
+            panic!("expected an equality, got {:?}", merged[0]);
+        };
+        let Formula::Ite(outer_guard, inner, _) = rhs.as_ref() else {
+            panic!("expected an Ite, got {rhs:?}");
+        };
+        // Outer switch routes value 0 (`!(col < width)`) to the inner chain.
+        assert_eq!(
+            outer_guard.as_ref(),
+            &Formula::Not(Box::new(Formula::Lt(
+                Box::new(Formula::Var("col".into(), Sort::Int)),
+                Box::new(Formula::Var("width".into(), Sort::Int)),
+            ))),
+            "outer selector must carry the comparison, not the bool temp `_4`"
+        );
+        let Formula::Ite(inner_guard, ..) = inner.as_ref() else {
+            panic!("expected a nested Ite, got {inner:?}");
+        };
+        assert_eq!(
+            inner_guard.as_ref(),
+            &Formula::Not(Box::new(Formula::Gt(
+                Box::new(Formula::Var("width".into(), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ))),
+            "inner selector must carry the comparison, not the bool temp `_5`"
+        );
+    }
+
+    /// FALLBACK, not a false equality. When a compared operand is reassigned
+    /// anywhere in the function the inlined comparison would be STALE — a false
+    /// merge equality, unsound in both directions. `latest_same_block_bool_definition`
+    /// declines, and the lane falls back to the opaque discriminant, which the
+    /// clobber check pins directly.
+    #[test]
+    fn nested_switch_merge_falls_back_to_the_opaque_discriminant_when_an_operand_moves() {
+        let mut func = nested_clamp_func();
+        func.body.locals.push(LocalDecl { index: 7, ty: Ty::u32(), name: None });
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place::local(local),
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        // `_7 = width` in bb0, and the outer test becomes `col < _7`.
+        func.body.blocks[0].stmts.insert(0, assign(7, Rvalue::Use(Operand::Copy(Place::local(2)))));
+        func.body.blocks[0].stmts[1] = assign(
+            4,
+            Rvalue::BinaryOp(
+                BinOp::Lt,
+                Operand::Copy(Place::local(1)),
+                Operand::Copy(Place::local(7)),
+            ),
+        );
+        // A SECOND write to `_7`, below the switch: the block-0 comparison no longer
+        // describes `_7`'s value at the join.
+        func.body.blocks[2].stmts.push(assign(7, Rvalue::Use(Operand::Copy(Place::local(1)))));
+        let merged = branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default());
+        assert_eq!(merged.len(), 1, "expected exactly the `clamped` merge, got {merged:?}");
+        let Formula::Eq(_, rhs) = &merged[0] else {
+            panic!("expected an equality, got {:?}", merged[0]);
+        };
+        let Formula::Ite(outer_guard, ..) = rhs.as_ref() else {
+            panic!("expected an Ite, got {rhs:?}");
+        };
+        assert_eq!(
+            outer_guard.as_ref(),
+            &Formula::Not(Box::new(Formula::Var("_4".into(), Sort::Bool))),
+            "a stale comparison must NOT be inlined; the opaque temp is the sound \
+             fallback, got {outer_guard:?}"
+        );
+    }
+
+    /// The clobber check must cover the symbols the RESOLVED guard reads, not just
+    /// the raw discriminant place. A PROJECTED comparison operand (`_7.0`) is
+    /// invisible to the plain-local staleness gates, so without adding the guard's
+    /// own free variables to the below-switch write set the lane would emit
+    /// `Ite(!(_7.0 < width), …)` while an arm block rewrites `_7.0` — a FALSE
+    /// equality, and a false proof of panic-freedom on exactly this shape.
+    #[test]
+    fn nested_switch_merge_declines_clobbered_inlined_guard_operand() {
+        let mut func = nested_clamp_func();
+        func.body.locals.push(LocalDecl {
+            index: 7,
+            ty: Ty::Tuple(vec![Ty::u32(), Ty::u32()]),
+            name: None,
+        });
+        let field0 = || Place { local: 7, projections: vec![trust_types::Projection::Field(0)] };
+        // Outer test reads a tuple FIELD: `col < _7.0`.
+        func.body.blocks[0].stmts[0] = Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Lt,
+                Operand::Copy(Place::local(1)),
+                Operand::Copy(field0()),
+            ),
+            span: SourceSpan::default(),
+        };
+        let clobbered = |func: &VerifiableFunction| {
+            branch_merge_definitions(func, trust_types::BlockId(6), &Default::default())
+        };
+        // Control: with no write to `_7.0`, the guard inlines and the merge is emitted.
+        let clean = clobbered(&func);
+        assert_eq!(clean.len(), 1, "control: the merge must be emitted, got {clean:?}");
+        // Now an on-chain block rewrites the field the inlined guard reads.
+        func.body.blocks[2].stmts.push(Statement::Assign {
+            place: field0(),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            clobbered(&func).is_empty(),
+            "a below-switch write to the inlined guard's operand must DECLINE the join"
+        );
+    }
+
+    /// The MIR shape whose inlined guard is stale WITHIN the switch block itself:
+    ///
+    /// ```text
+    ///   bb0: _7.0 = width;  _4 = col < _7.0;  _7.0 = 0;  SwitchInt(_4)
+    /// ```
+    ///
+    /// A revision of this lane that trusted
+    /// `latest_same_block_bool_definition`'s own staleness gates emitted
+    /// `Ite(!(col < _7.0), col, …)` here and was REJECTED for minting a false
+    /// proof. All three of those gates miss this shape by construction:
+    /// `compared_operand_reassigned_after` collects only projection-free
+    /// comparison operands AND matches only projection-free writes (`_7.0` fails
+    /// both halves), `value_local_is_unstable` is consulted only for plain
+    /// locals, and the `discrs_below` clobber set is checked only against blocks
+    /// STRICTLY BELOW the switch — never the switch block itself.
+    ///
+    /// Two things are asserted, and the second is the real one: the guard must be
+    /// the opaque temp, and the emitted equality must hold on EVERY concrete
+    /// execution. The stale spelling fails the second at (col=10, width=5) —
+    /// `_7.0` is 0 at the join, so `!(col < _7.0)` is vacuously true and the
+    /// formula claims `clamped == col == 10` where the program computes 4.
+    #[test]
+    fn nested_switch_merge_refuses_a_guard_the_switch_block_itself_staled() {
+        let mut func = nested_clamp_func();
+        func.body.locals.push(LocalDecl {
+            index: 7,
+            ty: Ty::Tuple(vec![Ty::u32(), Ty::u32()]),
+            name: None,
+        });
+        let field0 = || Place { local: 7, projections: vec![trust_types::Projection::Field(0)] };
+        let stmt = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        func.body.blocks[0].stmts = vec![
+            stmt(field0(), Rvalue::Use(Operand::Copy(Place::local(2)))),
+            stmt(
+                Place::local(4),
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Copy(field0()),
+                ),
+            ),
+            // The clobber: AFTER the comparison, in the switch block, through a
+            // projection.
+            stmt(field0(), Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32)))),
+        ];
+
+        let merged = branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default());
+        assert_eq!(merged.len(), 1, "expected exactly the `clamped` merge, got {merged:?}");
+        let Formula::Eq(_, rhs) = &merged[0] else {
+            panic!("expected an equality, got {:?}", merged[0]);
+        };
+
+        // FIRST, the property the whole lane rests on: the emitted equality must
+        // hold on every concrete execution. Asserted before the spelling check so
+        // this test reports the FALSE EQUALITY itself, not merely a spelling
+        // regression. (Measured: with the staleness check removed, this fires at
+        // col=10 width=5 — the formula claims `clamped == 10`, the program
+        // computes 4.)
+        for col in 0i128..=40 {
+            for width in 0i128..=40 {
+                let clamped = if col < width {
+                    col
+                } else if width > 0 {
+                    width - 1
+                } else {
+                    0
+                };
+                let env = [
+                    ("col", col),
+                    ("width", width),
+                    ("_4", i128::from(col < width)),
+                    ("_5", i128::from(width > 0)),
+                    ("_6.0", if width > 0 { width - 1 } else { 0 }),
+                    ("_6.1", 0),
+                    // `_7.0`'s value AT THE JOIN — the clobbered one, which is
+                    // exactly what makes the inlined spelling false.
+                    ("_7.0", 0),
+                ];
+                assert_eq!(
+                    eval_ground(rhs, &env),
+                    Some(clamped),
+                    "merge equality is false at col={col} width={width}: {rhs:?}"
+                );
+            }
+        }
+
+        let Formula::Ite(outer_guard, ..) = rhs.as_ref() else {
+            panic!("expected an Ite, got {rhs:?}");
+        };
+        assert_eq!(
+            outer_guard.as_ref(),
+            &Formula::Not(Box::new(Formula::Var("_4".into(), Sort::Bool))),
+            "the switch block staled its own comparison; the opaque temp is the only \
+             sound spelling, got {outer_guard:?}"
+        );
+    }
+
+    /// Same staleness, reached through the `BitAnd` recursion rather than the top
+    /// comparison: `_1 = col < _7.0; _2 = width > 0; _4 = _1 & _2; _7.0 = 0;`.
+    /// The resolved definition is `And(Lt(col, _7.0), Gt(width, 0))`, so the
+    /// disturbed symbol appears only in a LEAF — which is why the check is stated
+    /// over the resolved formula's free variables rather than over the operands
+    /// of the single statement that defines the discriminant.
+    #[test]
+    fn cross_block_bitand_leaf_is_refused_even_when_the_switch_block_is_clean() {
+        // THE SHAPE THAT LEAKED PAST THE PREVIOUS TWO REPAIRS (adversarial review
+        // reproduced it). The switch block writes nothing the guard reads, so
+        // `switch_block_preserves_inlined_guard` is satisfied — but a BitAnd leaf is
+        // defined in ANOTHER block and its operand is staled in between:
+        //   bb0: _7.0 = width; _8 = col < _7.0;   Goto bb1
+        //   bb1: _7.0 = 0;                        Goto bb2
+        //   bb2: _9 = width > 0; _4 = _8 & _9;    SwitchInt(_4)
+        // `_8` resolves cross-block (unique definition, forward Goto), so the stale
+        // `col < _7.0` would be inlined at bb2 and the emitted Ite would be a FALSE
+        // equality. `bool_definition_is_switch_block_local` refuses it at the resolver.
+        let stmt = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let mut switch_block = BasicBlock {
+            id: trust_types::BlockId(2),
+            stmts: vec![
+                stmt(
+                    Place::local(9),
+                    Rvalue::BinaryOp(
+                        BinOp::Gt,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Uint(0, 32)),
+                    ),
+                ),
+                stmt(
+                    Place::local(4),
+                    Rvalue::BinaryOp(
+                        BinOp::BitAnd,
+                        Operand::Copy(Place::local(8)),
+                        Operand::Copy(Place::local(9)),
+                    ),
+                ),
+            ],
+            terminator: Terminator::Return,
+        };
+        let func = nested_clamp_func();
+        assert!(
+            !bool_definition_is_switch_block_local(&func, &switch_block, 4, 8),
+            "a BitAnd leaf defined OUTSIDE the switch block must refuse inlining — its \
+             operands can be staled on the path in between"
+        );
+
+        // Control: define the leaf in the switch block too, and it is admitted.
+        switch_block.stmts.insert(
+            0,
+            stmt(
+                Place::local(8),
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Copy(Place::local(2)),
+                ),
+            ),
+        );
+        assert!(
+            bool_definition_is_switch_block_local(&func, &switch_block, 4, 8),
+            "control: every leaf same-block must be admitted"
+        );
+    }
+
+    #[test]
+    fn nested_switch_merge_refuses_a_staled_bitand_leaf_operand() {
+        let mut func = nested_clamp_func();
+        func.body.locals.push(LocalDecl {
+            index: 7,
+            ty: Ty::Tuple(vec![Ty::u32(), Ty::u32()]),
+            name: None,
+        });
+        func.body.locals.push(LocalDecl { index: 8, ty: Ty::Bool, name: None });
+        func.body.locals.push(LocalDecl { index: 9, ty: Ty::Bool, name: None });
+        let field0 = || Place { local: 7, projections: vec![trust_types::Projection::Field(0)] };
+        let stmt = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        func.body.blocks[0].stmts = vec![
+            stmt(field0(), Rvalue::Use(Operand::Copy(Place::local(2)))),
+            stmt(
+                Place::local(8),
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Copy(field0()),
+                ),
+            ),
+            stmt(
+                Place::local(9),
+                Rvalue::BinaryOp(
+                    BinOp::Gt,
+                    Operand::Copy(Place::local(2)),
+                    Operand::Constant(ConstValue::Uint(0, 32)),
+                ),
+            ),
+            stmt(
+                Place::local(4),
+                Rvalue::BinaryOp(
+                    BinOp::BitAnd,
+                    Operand::Copy(Place::local(8)),
+                    Operand::Copy(Place::local(9)),
+                ),
+            ),
+            // Clobbers a symbol read by the FIRST leaf only.
+            stmt(field0(), Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32)))),
+        ];
+        let merged = branch_merge_definitions(&func, trust_types::BlockId(6), &Default::default());
+        assert_eq!(merged.len(), 1, "expected exactly the `clamped` merge, got {merged:?}");
+        let Formula::Eq(_, rhs) = &merged[0] else {
+            panic!("expected an equality, got {:?}", merged[0]);
+        };
+        let Formula::Ite(outer_guard, ..) = rhs.as_ref() else {
+            panic!("expected an Ite, got {rhs:?}");
+        };
+        assert_eq!(
+            outer_guard.as_ref(),
+            &Formula::Not(Box::new(Formula::Var("_4".into(), Sort::Bool))),
+            "a staled BitAnd LEAF must refuse the inlining just like a staled top-level \
+             comparison, got {outer_guard:?}"
+        );
+    }
+
+    // ── split_path_feasibility_disjuncts ────────────────────────────────────
+
+    #[test]
+    fn split_distributes_shared_conjuncts_over_every_path() {
+        let def =
+            Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(1)));
+        let p0 =
+            Formula::Lt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(0)));
+        let p1 =
+            Formula::Gt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(9)));
+        let combined = Formula::And(vec![def.clone(), Formula::Or(vec![p0.clone(), p1.clone()])]);
+        assert_eq!(
+            split_path_feasibility_disjuncts(&combined),
+            vec![Formula::And(vec![def.clone(), p0]), Formula::And(vec![def, p1])],
+            "every part must keep the shared definitional conjuncts"
+        );
+    }
+
+    #[test]
+    fn split_reaches_an_or_nested_under_an_and_spine() {
+        let range =
+            Formula::Ge(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(0)));
+        let p0 = Formula::Bool(true);
+        let p1 = Formula::Bool(false);
+        let inner = Formula::And(vec![range.clone(), Formula::Or(vec![p0.clone(), p1.clone()])]);
+        let outer = Formula::And(vec![range.clone(), inner]);
+        assert_eq!(
+            split_path_feasibility_disjuncts(&outer),
+            vec![
+                Formula::And(vec![range.clone(), Formula::And(vec![range.clone(), p0])]),
+                Formula::And(vec![range.clone(), Formula::And(vec![range, p1])]),
+            ],
+            "the And spine is descended; every other node stays byte-identical"
+        );
+    }
+
+    #[test]
+    fn split_declines_shapes_it_must_not_touch() {
+        let x = Formula::Var("x".into(), Sort::Int);
+        // No top-level Or at all.
+        let plain = Formula::And(vec![Formula::Ge(Box::new(x.clone()), Box::new(Formula::Int(0)))]);
+        assert_eq!(split_path_feasibility_disjuncts(&plain), vec![plain.clone()]);
+        // Distributivity does not apply under `Not` / `Ite` / an `Or` arm.
+        let under_not = Formula::And(vec![Formula::Not(Box::new(Formula::Or(vec![
+            Formula::Bool(true),
+            Formula::Bool(false),
+        ])))]);
+        assert_eq!(split_path_feasibility_disjuncts(&under_not), vec![under_not.clone()]);
+        // Over the cap: keep ONE obligation (the pre-split behaviour).
+        let many = Formula::Or(
+            (0..=MAX_SPLIT_PATHS as i128)
+                .map(|k| Formula::Eq(Box::new(x.clone()), Box::new(Formula::Int(k))))
+                .collect(),
+        );
+        assert_eq!(split_path_feasibility_disjuncts(&many), vec![many.clone()]);
+    }
+
+    /// EXACTNESS, checked by exhaustive ground evaluation: the disjunction of the
+    /// parts and the original formula agree on every assignment. This is the whole
+    /// soundness argument of the split — UNSAT iff every part is UNSAT, and any
+    /// part's model is verbatim a model of the original.
+    #[test]
+    fn split_is_ground_equivalent_to_the_formula_it_replaces() {
+        let x = || Formula::Var("x".into(), Sort::Int);
+        let y = || Formula::Var("y".into(), Sort::Int);
+        let combined = Formula::And(vec![
+            Formula::And(vec![
+                Formula::Ge(Box::new(x()), Box::new(Formula::Int(0))),
+                Formula::Le(Box::new(x()), Box::new(Formula::Int(6))),
+            ]),
+            Formula::Eq(
+                Box::new(y()),
+                Box::new(Formula::Ite(
+                    Box::new(Formula::Lt(Box::new(x()), Box::new(Formula::Int(3)))),
+                    Box::new(x()),
+                    Box::new(Formula::Int(3)),
+                )),
+            ),
+            Formula::Or(vec![
+                Formula::And(vec![
+                    Formula::Lt(Box::new(x()), Box::new(Formula::Int(3))),
+                    Formula::Gt(Box::new(y()), Box::new(Formula::Int(2))),
+                ]),
+                Formula::And(vec![
+                    Formula::Ge(Box::new(x()), Box::new(Formula::Int(3))),
+                    Formula::Not(Box::new(Formula::Eq(Box::new(y()), Box::new(Formula::Int(3))))),
+                ]),
+            ]),
+        ]);
+        let parts = split_path_feasibility_disjuncts(&combined);
+        assert_eq!(parts.len(), 2);
+        for xv in -2i128..=8 {
+            for yv in -2i128..=8 {
+                let env = [("x", xv), ("y", yv)];
+                let whole = eval_ground(&combined, &env).expect("in fragment");
+                let any = parts
+                    .iter()
+                    .map(|p| eval_ground(p, &env).expect("in fragment"))
+                    .fold(0, |a, b| a | b);
+                assert_eq!(whole, any, "split disagrees with the original at x={xv} y={yv}");
+            }
+        }
     }
 
     #[test]

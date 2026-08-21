@@ -416,28 +416,34 @@ fn constant_expr(ty: &Ty, value: &Constant, path: &str) -> Result<String, Litera
     }
 }
 
-fn binop_expr(op: BinOp) -> &'static str {
+/// `None` for operators EvalIR's `IRBinOp` does not model. The boolean
+/// 0/1-carrier connectives are deliberately NOT mapped onto
+/// `IRBinOp.and_`/`or_`/`xor_`: `semIntBinOp` denotes those through the opaque
+/// integer carrier, which is exactly the misdenotation `trust_ir::BinOp::BAnd`
+/// exists to rule out.
+fn binop_expr(op: BinOp) -> Option<&'static str> {
     match op {
-        BinOp::Add => "IRBinOp.add",
-        BinOp::Sub => "IRBinOp.sub",
-        BinOp::Mul => "IRBinOp.mul",
-        BinOp::UDiv => "IRBinOp.udiv",
-        BinOp::SDiv => "IRBinOp.sdiv",
-        BinOp::URem => "IRBinOp.urem",
-        BinOp::SRem => "IRBinOp.srem",
-        BinOp::FAdd => "IRBinOp.fadd",
-        BinOp::FSub => "IRBinOp.fsub",
-        BinOp::FMul => "IRBinOp.fmul",
-        BinOp::FDiv => "IRBinOp.fdiv",
-        BinOp::FRem => "IRBinOp.frem",
-        BinOp::FMin => "IRBinOp.fmin",
-        BinOp::FMax => "IRBinOp.fmax",
-        BinOp::And => "IRBinOp.and_",
-        BinOp::Or => "IRBinOp.or_",
-        BinOp::Xor => "IRBinOp.xor_",
-        BinOp::Shl => "IRBinOp.shl",
-        BinOp::LShr => "IRBinOp.lshr",
-        BinOp::AShr => "IRBinOp.ashr",
+        BinOp::BAnd | BinOp::BOr | BinOp::BXor => return None,
+        BinOp::Add => Some("IRBinOp.add"),
+        BinOp::Sub => Some("IRBinOp.sub"),
+        BinOp::Mul => Some("IRBinOp.mul"),
+        BinOp::UDiv => Some("IRBinOp.udiv"),
+        BinOp::SDiv => Some("IRBinOp.sdiv"),
+        BinOp::URem => Some("IRBinOp.urem"),
+        BinOp::SRem => Some("IRBinOp.srem"),
+        BinOp::FAdd => Some("IRBinOp.fadd"),
+        BinOp::FSub => Some("IRBinOp.fsub"),
+        BinOp::FMul => Some("IRBinOp.fmul"),
+        BinOp::FDiv => Some("IRBinOp.fdiv"),
+        BinOp::FRem => Some("IRBinOp.frem"),
+        BinOp::FMin => Some("IRBinOp.fmin"),
+        BinOp::FMax => Some("IRBinOp.fmax"),
+        BinOp::And => Some("IRBinOp.and_"),
+        BinOp::Or => Some("IRBinOp.or_"),
+        BinOp::Xor => Some("IRBinOp.xor_"),
+        BinOp::Shl => Some("IRBinOp.shl"),
+        BinOp::LShr => Some("IRBinOp.lshr"),
+        BinOp::AShr => Some("IRBinOp.ashr"),
     }
 }
 
@@ -512,9 +518,16 @@ fn inst_expr(_module: &Module, inst: &Inst, path: &str) -> Result<String, Litera
                     "supply a checked floating-point adequacy theorem before admitting this operation",
                 ));
             }
+            let Some(op_expr) = binop_expr(*op) else {
+                return Err(unsupported(
+                    path,
+                    format!("boolean-carrier binary operation {op:?} with no EvalIR model"),
+                    "extend EvalIR's IRBinOp with band/bor/bxor and their 0/1-carrier semantics (with refinement lemmas), or lower the connective to ICmp/Select before this pass",
+                ));
+            };
             format!(
                 "IRInst.binop {} ({}) {} {}",
-                binop_expr(*op),
+                op_expr,
                 ty(value_ty, "ty")?,
                 lhs.index(),
                 rhs.index()

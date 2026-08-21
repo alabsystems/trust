@@ -1049,6 +1049,8 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
         "agg-field-order",
         "marker-arm",
         "payload-tramp",
+        "dr-tramp",
+        "dr-retire",
     ] {
         let mut valid_class = burn_in.clone();
         valid_class.unstable_opts.trust_sat_perturb = Some(class.to_string());
@@ -1062,8 +1064,8 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
         Some(
             "invalid -Ztrust-sat-perturb value: expected enum-reshape, \
              enum-case-value, enum-ctor, enum-disc-index, switch-map, enum-payload, \
-             marker-order, marker-drop, agg-field-order, marker-arm, or \
-             payload-tramp"
+             marker-order, marker-drop, agg-field-order, marker-arm, payload-tramp, \
+             dr-tramp, or dr-retire"
         )
     );
 }

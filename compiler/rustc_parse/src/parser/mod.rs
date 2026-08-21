@@ -22,7 +22,11 @@ use attr_wrapper::{AttrWrapper, UsePreAttrPos};
 pub use diagnostics::AttemptLocalParseRecovery;
 // Public to use it for custom `if` expressions in rustfmt forks like https://github.com/tucant/rustfmt
 pub use expr::LetChainsPolicy;
-pub(crate) use item::{FnContext, FnParseMode};
+// Trust (I8): `trust_clean_decls_from_text` is re-exported one level so
+// `crate::trust_parse_clean_unit_decls` (the out-of-line `.clean` unit parse,
+// called from `rustc_expand`'s loader) can reach it without widening
+// `mod item` itself.
+pub(crate) use item::{FnContext, FnParseMode, trust_clean_decls_from_text};
 pub use pat::{CommaRecoveryMode, RecoverColon, RecoverComma};
 pub use path::PathStyle;
 use rustc_ast::token::{

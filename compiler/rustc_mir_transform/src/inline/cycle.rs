@@ -194,6 +194,23 @@ pub(crate) fn mir_inliner_callees<'tcx>(
     let steal;
     let guard;
     let body = match (instance, instance.def_id().as_local()) {
+        // Trust (#65, 2026-08-20): the FOURTH enumeration that walked a
+        // Clean-origin minted def into the HIR pipeline. `mir_promoted` on a
+        // HIR-less def dead-ends in typeck ("can't type-check body of
+        // DefId(…::m::f)") — reached HERE the moment ordinary Rust CALLS a
+        // minted def under `-O`: `optimized_mir(caller)` runs Inline →
+        // `mir_callgraph_cyclic` → this query on the callee. Serve from
+        // `optimized_mir`, the same cached, gate-fronted authority the
+        // drops-elaborated arm uses (Trust I5, "the mir_keys dead-end family"):
+        // phase is ahead of what callers here expect, which is sound for this
+        // reader — it only enumerates `TerminatorKind::Call`, and a
+        // Clean-origin body's call set is identical at every phase (the
+        // Projection fragment emits none, and the gate pins the body).
+        (InstanceKind::Item(_), Some(def_id))
+            if crate::clean_origin_mir::is_clean_origin(tcx, def_id) =>
+        {
+            tcx.optimized_mir(def_id.to_def_id())
+        }
         (InstanceKind::Item(_), Some(def_id)) => {
             steal = tcx.mir_promoted(def_id).0;
             guard = steal.borrow();

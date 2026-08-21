@@ -849,6 +849,23 @@ fn certify_with_identity_uncached(
         return Some(evidence);
     }
 
+    // LAST-RESORT, ONE INDIRECTION DEEPER: the same case split after resolving a
+    // REIFIED-`Bool` guard (`Ite(Not(Var("_3", Bool)), ..)` against a present
+    // `Eq(_3, Lt(i, 8))`) and after collapsing a complementary implication PAIR
+    // into the `Ite` definition it already entails. Both are the clamp-then-guard
+    // panic-freedom residual of `contract_panic_annotated`, which the lane above
+    // declines before any rung runs because its guard has no `ite_split_order_
+    // nonneg` arm. Takes the UNFILTERED view as well: `view()` deletes the
+    // reification that decides the guard. Placed after every other lane, and
+    // inert unless a derivation fires, so no certificate this producer already
+    // mints changes shape or bytes. See the section banner for the two
+    // entailments and why a satisfiable violation still fails closed.
+    if let Some(evidence) =
+        certify_reified_bool_guard_case_split(&conjuncts, &propositional, identity)
+    {
+        return Some(evidence);
+    }
+
     None
 }
 
@@ -8725,6 +8742,345 @@ fn certify_ite_case_split_contradiction(
     IteCaseSplitPlan::build(conjuncts)?.certify(identity)
 }
 
+// ===========================================================================
+// REIFIED-BOOL GUARD RESOLUTION — the `Ite` case split, one indirection deeper.
+//
+// The clamp-then-guard body
+//
+//     let k = if i < 8 { i } else { 7 };
+//     if k >= 8 { panic!(..) }
+//
+// (`tests/trust-falsification/proved/contract_panic_annotated.rs`) reaches this
+// crate with its branch condition REIFIED into a `Bool`-sorted temporary. Its
+// GROUNDED whole-function panic-freedom residual — the `Or` of the two per-path
+// candidates `refute_full_assert_obligations` proved, installed on the catch-all
+// row by the grounding rewrite — carries, in each disjunct,
+//
+//     Eq(k, Ite(Not(Var("_3", Bool)), 7, i))        -- the clamp
+//     Eq(Var("_3", Bool), Lt(i, 8))                 -- the reification
+//     Eq(_5, k)  ∧  Ge(_5, 8)                       -- the panic guard
+//
+// while the second `certify_vc` call of the same run states the clamp as an
+// IMPLICATION PAIR instead:
+//
+//     Implies(Not(_3),      Eq(k, 7))               -- the else value
+//     Implies(Not(Not(_3)), Eq(k, i))               -- the then value
+//
+// Both are UNSAT, ay proves both, and NEITHER certifies. The block is a
+// FRAGMENT gap, not a search gap — precisely the shape of the `collect_term_vars`
+// `Ite` hole, one indirection further in:
+//
+//   * [`flatten_ite_branches`] asks [`ite_split_order_nonneg`] for both
+//     polarities of the guard. `Not(Var("_3", Bool))` has no arm there, so
+//     [`IteCaseSplitPlan::parse_ite_definition`] returns `None`, the definition
+//     is DROPPED, `ite_definitions` stays 0 and `build` declines before any rung
+//     runs. The reification that would decide the guard is not merely unused —
+//     [`NormalizedConjuncts::view`] deletes it as a spent `Bool` reification.
+//   * The implication PAIR reaches no REFUTATION lane here. Stated precisely,
+//     because an earlier draft of this banner said "nothing reads
+//     `Formula::Implies` at all" and adversarial review measured that FALSE:
+//     the crate has two readers — [`discharge_entailed_implications`]
+//     (`NORMALIZATION_STEPS` entry 5, so it runs on EVERY violation this lane
+//     sees) and `collect_int_vars_deep`. The conclusion survives for a narrower
+//     reason: `discharge_entailed_implications` emits a consequent only when the
+//     antecedent is a `Ge`/`Le` bound entailed by bounds already present, and
+//     `Not(Var("_3", Bool))` is never such a bound, so this fixture's pair is
+//     genuinely unconsumed. Do not restate the stronger claim — it would send the
+//     next auditor looking for a consumer that exists.
+//
+// WHAT THIS LANE ADDS. Two purely SYNTACTIC derivations, then the EXISTING case
+// split. Nothing here reasons; the refutation is still `Or.rec` + Farkas +
+// [`finish_certificate`]'s ay cross-check and clean-kernel re-check.
+//
+//   (1) `Eq(v, Ite(G, T, E))`, `G` mentioning reified `Bool` variables
+//         ⊢ `Eq(v, Ite(G[b := A], T, E))`     for every present `Eq(b, A)`
+//       Congruence for `⟺`: the definition `Eq(Var(b, Bool), A)` is a conjunct
+//       of the violation, so `b` and `A` have the same truth value in EVERY
+//       model of it, and substituting one for the other inside a guard (under
+//       any stack of `Not`s) preserves the `Ite`'s value.
+//
+//   (2) `Implies(P, Eq(v, T))` ∧ `Implies(Not(P), Eq(v, E))`
+//         ⊢ `Eq(v, Ite(P[b := A], T, E))`
+//       Classical case analysis on `P`: if `P` then the first implication gives
+//       `v = T` and the resolved guard makes the `Ite` take `T`; if `¬P` then
+//       the second gives `v = E` and the `Ite` takes `E`. `Not(P)` is required
+//       SYNTACTICALLY, so the two antecedents are exhaustive by construction and
+//       the derivation never needs to know anything else about `P`.
+//
+// Both emitted formulas are CONSEQUENCES of conjuncts the violation already
+// contains, so the augmented pool has exactly the models of the original: a
+// SATISFIABLE violation stays satisfiable and fails closed at ay's cross-check
+// or at the missing Farkas witness. Nothing is dropped, no atom is asserted that
+// the violation does not entail, and no solver verdict is granted authority.
+//
+// PURE LAST-RUNG INSERTION. This runs only after `certify_ite_case_split_
+// contradiction` has DECLINED, and it declines itself unless a derivation
+// actually fired, so every certificate the producer already mints keeps
+// byte-identical shape (the [`shifted_single_var_interval_refutation`]
+// precedent).
+// ===========================================================================
+
+/// Structural budget for the reified-`Bool` derivations, checked before any
+/// solver or kernel work. `MAX_DEFS` bounds the definition map, `MAX_SYNTH` the
+/// number of derived `Ite` definitions handed on to the case-split plan.
+const BOOL_GUARD_MAX_DEFS: usize = 32;
+const BOOL_GUARD_MAX_SYNTH: usize = 4;
+
+/// `Some(f)` when `f` is an INT ORDER ATOM whose two operands both parse as
+/// linear forms — the only right-hand side a reified-`Bool` definition may
+/// carry, and the only guard [`ite_split_order_nonneg`] can case-split.
+fn int_order_atom(f: &Formula) -> Option<&Formula> {
+    match f {
+        Formula::Lt(a, b) | Formula::Le(a, b) | Formula::Gt(a, b) | Formula::Ge(a, b) => {
+            ite_split_linform(a)?;
+            ite_split_linform(b)?;
+            Some(f)
+        }
+        _ => None,
+    }
+}
+
+/// The `b ⟺ A` map harvested from the conjuncts: every `Eq(Var(b, Bool), A)`
+/// (either operand order) whose `A` is an [`int_order_atom`].
+///
+/// Fail-closed on ambiguity: a name bound to two DIFFERENT atoms is removed
+/// outright rather than resolved by first-wins, so a violation that constrains
+/// the same temporary twice can never be read through the wrong one. Over the
+/// cap the whole map is abandoned.
+fn reified_bool_definitions<'a>(conjuncts: &[&'a Formula]) -> BTreeMap<String, &'a Formula> {
+    let mut defs: BTreeMap<String, &'a Formula> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    for &c in conjuncts {
+        let Formula::Eq(a, b) = c else { continue };
+        let named = match (a.as_ref(), b.as_ref()) {
+            (Formula::Var(name, Sort::Bool), other) | (other, Formula::Var(name, Sort::Bool)) => {
+                int_order_atom(other).map(|atom| (name, atom))
+            }
+            _ => None,
+        };
+        let Some((name, atom)) = named else { continue };
+        match defs.get(name.as_str()) {
+            Some(existing) if *existing != atom => {
+                ambiguous.insert(name.clone());
+            }
+            Some(_) => {}
+            None => {
+                if defs.len() >= BOOL_GUARD_MAX_DEFS {
+                    return BTreeMap::new();
+                }
+                defs.insert(name.clone(), atom);
+            }
+        }
+    }
+    for name in &ambiguous {
+        defs.remove(name);
+    }
+    defs
+}
+
+/// `g` with every reified-`Bool` variable replaced by its defining int order
+/// atom, or `None` when some leaf is outside the fragment.
+///
+/// The accepted grammar is exactly `Not*` over (`Var(_, Bool)` | int order
+/// atom); anything else — a `Bool` variable with no definition, an `And`/`Or`
+/// guard, a `BitVec` comparison — declines, so an unresolved guard can never
+/// reach the case split.
+fn resolve_bool_guard(
+    g: &Formula,
+    defs: &BTreeMap<String, &Formula>,
+    depth: usize,
+) -> Option<Formula> {
+    if depth > ITE_SPLIT_MAX_ITE_DEPTH {
+        return None;
+    }
+    match g {
+        Formula::Var(name, Sort::Bool) => defs.get(name.as_str()).map(|atom| (*atom).clone()),
+        Formula::Not(inner) => {
+            Some(Formula::Not(Box::new(resolve_bool_guard(inner, defs, depth + 1)?)))
+        }
+        other => int_order_atom(other).cloned(),
+    }
+}
+
+/// [`resolve_bool_guard`] plus the USABILITY gate: the resolved guard must be
+/// case-splittable in BOTH polarities, which is exactly what
+/// [`flatten_ite_branches`] will ask of it. Declining here keeps the derived
+/// definition out of the pool rather than letting the plan drop it silently.
+fn resolved_case_split_guard(g: &Formula, defs: &BTreeMap<String, &Formula>) -> Option<Formula> {
+    let resolved = resolve_bool_guard(g, defs, 0)?;
+    ite_split_order_nonneg(&resolved, false)?;
+    ite_split_order_nonneg(&resolved, true)?;
+    Some(resolved)
+}
+
+/// True when `cond` is ALREADY a guard [`flatten_ite_branches`] accepts, so the
+/// existing lane sees the definition unchanged and this one must not touch it.
+fn guard_already_splittable(cond: &Formula) -> bool {
+    ite_split_order_nonneg(cond, false).is_some() && ite_split_order_nonneg(cond, true).is_some()
+}
+
+/// Rebuild an `Ite` VALUE with every guard resolved through `defs`, setting
+/// `changed` when a guard actually needed resolving. A guard the existing lane
+/// already accepts is copied verbatim.
+fn resolve_ite_value(
+    f: &Formula,
+    defs: &BTreeMap<String, &Formula>,
+    depth: usize,
+    changed: &mut bool,
+) -> Option<Formula> {
+    if depth > ITE_SPLIT_MAX_ITE_DEPTH {
+        return None;
+    }
+    match f {
+        Formula::Ite(cond, then_f, else_f) => {
+            let guard = if guard_already_splittable(cond) {
+                (**cond).clone()
+            } else {
+                *changed = true;
+                resolved_case_split_guard(cond, defs)?
+            };
+            Some(Formula::Ite(
+                Box::new(guard),
+                Box::new(resolve_ite_value(then_f, defs, depth + 1, changed)?),
+                Box::new(resolve_ite_value(else_f, defs, depth + 1, changed)?),
+            ))
+        }
+        other => {
+            ite_split_linform(other)?;
+            Some(other.clone())
+        }
+    }
+}
+
+/// `Implies(ante, Eq(..))` → the antecedent plus every reading of the
+/// consequent as `subject = value` with an `Int`-VARIABLE subject, left operand
+/// first. Two readings are possible only for a var/var equality; taking them in
+/// a fixed order keeps the derived definition deterministic, which
+/// [`recheck_cleancic`]'s byte-equality replay depends on.
+fn implication_var_definition(c: &Formula) -> Option<(&Formula, Vec<(&str, &Formula)>)> {
+    let Formula::Implies(ante, cons) = c else { return None };
+    let Formula::Eq(a, b) = cons.as_ref() else { return None };
+    let mut readings: Vec<(&str, &Formula)> = Vec::new();
+    if let Formula::Var(name, Sort::Int) = a.as_ref()
+        && ite_split_linform(b).is_some()
+    {
+        readings.push((name.as_str(), b.as_ref()));
+    }
+    if let Formula::Var(name, Sort::Int) = b.as_ref()
+        && ite_split_linform(a).is_some()
+    {
+        readings.push((name.as_str(), a.as_ref()));
+    }
+    (!readings.is_empty()).then_some((ante.as_ref(), readings))
+}
+
+/// The `Ite` definitions ENTAILED by the conjuncts under reified-`Bool`
+/// resolution — derivations (1) and (2) of the section banner. Empty when
+/// nothing fires, which is how this lane stays inert.
+fn reified_bool_guard_definitions(conjuncts: &[&Formula]) -> Vec<Formula> {
+    let defs = reified_bool_definitions(conjuncts);
+    if defs.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Formula> = Vec::new();
+    let push = |out: &mut Vec<Formula>, f: Formula| {
+        if out.len() < BOOL_GUARD_MAX_SYNTH && !out.contains(&f) {
+            out.push(f);
+        }
+    };
+
+    // (1) An `Ite` DEFINITION whose guard mentions a reified `Bool`.
+    for &c in conjuncts {
+        let Formula::Eq(a, b) = c else { continue };
+        let pair = match (a.as_ref(), b.as_ref()) {
+            (Formula::Ite(..), Formula::Ite(..)) => None,
+            (ite @ Formula::Ite(..), subject) | (subject, ite @ Formula::Ite(..)) => {
+                Some((subject, ite))
+            }
+            _ => None,
+        };
+        let Some((subject, ite)) = pair else { continue };
+        if ite_split_linform(subject).is_none() {
+            continue;
+        }
+        let mut changed = false;
+        let Some(resolved) = resolve_ite_value(ite, &defs, 0, &mut changed) else { continue };
+        if !changed {
+            continue;
+        }
+        push(&mut out, Formula::Eq(Box::new(subject.clone()), Box::new(resolved)));
+    }
+
+    // (2) A complementary implication PAIR over one subject.
+    for (index, &c) in conjuncts.iter().enumerate() {
+        let Some((c_ante, c_readings)) = implication_var_definition(c) else { continue };
+        for &d in conjuncts.iter().skip(index + 1) {
+            let Some((d_ante, d_readings)) = implication_var_definition(d) else { continue };
+            // ORIENTATION. Whichever antecedent is the SYNTACTIC negation of the
+            // other selects the `else` branch, so the OTHER implication's value
+            // is the `then` branch. At most one arm can match: `c == Not(d)` and
+            // `d == Not(c)` together would need `c == Not(Not(c))`.
+            let (guard_src, then_side, else_side) = match (c_ante, d_ante) {
+                (_, Formula::Not(inner)) if inner.as_ref() == c_ante => {
+                    (c_ante, &c_readings, &d_readings)
+                }
+                (Formula::Not(inner), _) if inner.as_ref() == d_ante => {
+                    (d_ante, &d_readings, &c_readings)
+                }
+                _ => continue,
+            };
+            // One subject must be readable on BOTH sides; readings are ordered
+            // left-operand-first and the first match wins, so the derived
+            // definition is deterministic.
+            let Some((subject, then_value, else_value)) =
+                then_side.iter().find_map(|(subject, then_value)| {
+                    else_side
+                        .iter()
+                        .find(|(name, _)| name == subject)
+                        .map(|(_, else_value)| (*subject, *then_value, *else_value))
+                })
+            else {
+                continue;
+            };
+            let Some(guard) = resolved_case_split_guard(guard_src, &defs) else { continue };
+            push(
+                &mut out,
+                Formula::Eq(
+                    Box::new(Formula::Var(subject.to_string(), Sort::Int)),
+                    Box::new(Formula::Ite(
+                        Box::new(guard),
+                        Box::new(then_value.clone()),
+                        Box::new(else_value.clone()),
+                    )),
+                ),
+            );
+        }
+    }
+    out
+}
+
+/// See the section banner: derive the `Ite` definitions a reified-`Bool` guard
+/// hides, append them to the pool, and hand the result to the EXISTING case
+/// split.
+///
+/// `propositional` is the UNFILTERED conjunct view: [`NormalizedConjuncts::view`]
+/// deletes `Eq(Var(_, Bool), _)` as a spent reification, which is exactly the
+/// definition this lane needs. The refuted pool is still built from `conjuncts`,
+/// so the atoms the plan asserts are the same ones every other lane sees plus
+/// the derived definitions.
+fn certify_reified_bool_guard_case_split(
+    conjuncts: &[&Formula],
+    propositional: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    let derived = reified_bool_guard_definitions(propositional);
+    if derived.is_empty() {
+        return None;
+    }
+    let augmented: Vec<&Formula> = conjuncts.iter().copied().chain(derived.iter()).collect();
+    IteCaseSplitPlan::build(&augmented)?.certify(identity)
+}
+
 /// What an ay answer is allowed to decide about a certificate.
 ///
 /// The tail below runs TWO independent refutations of the same hypotheses: ay's,
@@ -14988,6 +15344,249 @@ mod tests {
                 certify_violation(&viol).is_some(),
                 "{name}: the mutant's proved rows must keep their pre-existing disposition"
             );
+        }
+    }
+
+    // -- reified-`Bool` guard resolution ------------------------------------
+
+    fn iv(name: &str) -> Formula {
+        Formula::Var(name.to_string(), Sort::Int)
+    }
+    fn bvar(name: &str) -> Formula {
+        Formula::Var(name.to_string(), Sort::Bool)
+    }
+    fn lt_f(a: Formula, b: Formula) -> Formula {
+        Formula::Lt(Box::new(a), Box::new(b))
+    }
+    fn eq_f(a: Formula, b: Formula) -> Formula {
+        Formula::Eq(Box::new(a), Box::new(b))
+    }
+    fn not_f(a: Formula) -> Formula {
+        Formula::Not(Box::new(a))
+    }
+    fn imp_f(a: Formula, b: Formula) -> Formula {
+        Formula::Implies(Box::new(a), Box::new(b))
+    }
+    fn ite_f(c: Formula, t: Formula, e: Formula) -> Formula {
+        Formula::Ite(Box::new(c), Box::new(t), Box::new(e))
+    }
+
+    /// Derivation (2) of the section banner, on `slot_index`'s own conjuncts:
+    /// the complementary implication PAIR collapses to the `Ite` definition it
+    /// entails, with the reified guard resolved through `Eq(_3, i < 8)`.
+    #[test]
+    fn implication_pair_derives_the_resolved_ite_definition() {
+        let definition = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let then_case = imp_f(not_f(bvar("_3")), eq_f(iv("k"), Formula::Int(7)));
+        let else_case = imp_f(not_f(not_f(bvar("_3"))), eq_f(iv("k"), iv("i")));
+        let conjuncts: Vec<&Formula> = vec![&definition, &then_case, &else_case];
+        let derived = reified_bool_guard_definitions(&conjuncts);
+        assert_eq!(
+            derived,
+            vec![eq_f(
+                iv("k"),
+                ite_f(not_f(lt_f(iv("i"), Formula::Int(8))), Formula::Int(7), iv("i")),
+            )],
+            "the implication pair must derive exactly the resolved Ite definition"
+        );
+    }
+
+    /// The SAME pair with the two implications swapped: the orientation is read
+    /// off which antecedent is the syntactic negation of the other, never off
+    /// conjunct order, so the derived definition is identical.
+    #[test]
+    fn implication_pair_orientation_is_order_independent() {
+        let definition = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let else_case = imp_f(not_f(not_f(bvar("_3"))), eq_f(iv("k"), iv("i")));
+        let then_case = imp_f(not_f(bvar("_3")), eq_f(iv("k"), Formula::Int(7)));
+        let conjuncts: Vec<&Formula> = vec![&definition, &else_case, &then_case];
+        assert_eq!(
+            reified_bool_guard_definitions(&conjuncts),
+            vec![eq_f(
+                iv("k"),
+                ite_f(not_f(lt_f(iv("i"), Formula::Int(8))), Formula::Int(7), iv("i")),
+            )],
+        );
+    }
+
+    /// Derivation (1): a present `Ite` definition whose guard is a reified
+    /// `Bool` is re-emitted with the guard resolved.
+    #[test]
+    fn bool_guarded_ite_definition_is_resolved() {
+        let definition = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let clamp = eq_f(iv("k"), ite_f(not_f(bvar("_3")), Formula::Int(7), iv("i")));
+        let conjuncts: Vec<&Formula> = vec![&definition, &clamp];
+        assert_eq!(
+            reified_bool_guard_definitions(&conjuncts),
+            vec![eq_f(
+                iv("k"),
+                ite_f(not_f(lt_f(iv("i"), Formula::Int(8))), Formula::Int(7), iv("i")),
+            )],
+        );
+    }
+
+    /// INERT without a definition to resolve: an `Ite` whose guard is already an
+    /// int order atom is left to the lane above, so its certificate keeps its
+    /// existing shape and bytes.
+    #[test]
+    fn already_splittable_guard_derives_nothing() {
+        let definition = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let clamp = eq_f(iv("k"), ite_f(lt_f(iv("i"), Formula::Int(8)), iv("i"), Formula::Int(7)));
+        let conjuncts: Vec<&Formula> = vec![&definition, &clamp];
+        assert!(reified_bool_guard_definitions(&conjuncts).is_empty());
+    }
+
+    /// FAIL-CLOSED: an unreified `Bool` guard has no definition to resolve, so
+    /// nothing is derived and the lane declines.
+    #[test]
+    fn undefined_bool_guard_derives_nothing() {
+        let other = eq_f(bvar("_9"), lt_f(iv("i"), Formula::Int(8)));
+        let clamp = eq_f(iv("k"), ite_f(not_f(bvar("_3")), Formula::Int(7), iv("i")));
+        let conjuncts: Vec<&Formula> = vec![&other, &clamp];
+        assert!(reified_bool_guard_definitions(&conjuncts).is_empty());
+    }
+
+    /// FAIL-CLOSED: two DIFFERENT reifications of one name drop it from the map
+    /// rather than resolving by first-wins.
+    #[test]
+    fn ambiguous_reification_drops_the_name() {
+        let first = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let second = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(16)));
+        let clamp = eq_f(iv("k"), ite_f(not_f(bvar("_3")), Formula::Int(7), iv("i")));
+        let conjuncts: Vec<&Formula> = vec![&first, &second, &clamp];
+        assert!(reified_bool_guard_definitions(&conjuncts).is_empty());
+    }
+
+    /// FAIL-CLOSED: antecedents that are not syntactic complements are NOT an
+    /// exhaustive case split, so no `Ite` definition may be derived from them.
+    #[test]
+    fn non_complementary_implications_derive_nothing() {
+        let definition = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let one = imp_f(not_f(bvar("_3")), eq_f(iv("k"), Formula::Int(7)));
+        let two = imp_f(bvar("_4"), eq_f(iv("k"), iv("i")));
+        let conjuncts: Vec<&Formula> = vec![&definition, &one, &two];
+        assert!(reified_bool_guard_definitions(&conjuncts).is_empty());
+    }
+
+    /// FAIL-CLOSED: a complementary pair over DIFFERENT subjects is not a
+    /// definition of either of them.
+    #[test]
+    fn implication_pair_over_different_subjects_derives_nothing() {
+        let definition = eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8)));
+        let one = imp_f(not_f(bvar("_3")), eq_f(iv("k"), Formula::Int(7)));
+        let two = imp_f(not_f(not_f(bvar("_3"))), eq_f(iv("m"), iv("i")));
+        let conjuncts: Vec<&Formula> = vec![&definition, &one, &two];
+        assert!(reified_bool_guard_definitions(&conjuncts).is_empty());
+    }
+
+    /// THE LEMMA INVENTORY of the reified-`Bool` guard certificate, read off the
+    /// SERIALIZED term the producer emits for `slot_index`'s grounded residual.
+    ///
+    /// Every constant is one the `Ite` case split (`b76453697c`) and the Farkas
+    /// fold already used — this lane adds NO kernel lemma, extends no
+    /// environment, and introduces no axiom. `kernel_checks_false` independently
+    /// enforces the second half of that claim (any `ConstantKind::Axiom` outside
+    /// `FOUNDATIONAL_AXIOMS` and the per-variable `Int` skolems fails the
+    /// check); this test pins the first, so a future edit that reaches for a new
+    /// lemma has to say so here.
+    #[test]
+    fn certificate_names_only_preexisting_kernel_lemmas() {
+        let u64_max = Formula::Int(18446744073709551615);
+        let k = || iv("k#s1_0_s2_0");
+        let range = || {
+            Formula::And(vec![
+                Formula::Ge(Box::new(iv("i")), Box::new(Formula::Int(0))),
+                Formula::Le(Box::new(iv("i")), Box::new(u64_max.clone())),
+            ])
+        };
+        let context = || {
+            Formula::And(vec![
+                eq_f(bvar("_3"), lt_f(iv("i"), Formula::Int(8))),
+                Formula::And(vec![
+                    imp_f(not_f(bvar("_3")), eq_f(k(), Formula::Int(7))),
+                    imp_f(not_f(not_f(bvar("_3"))), eq_f(k(), iv("i"))),
+                ]),
+                eq_f(iv("_5"), k()),
+                eq_f(bvar("_4"), Formula::Ge(Box::new(iv("_5")), Box::new(Formula::Int(8)))),
+                Formula::Bool(true),
+            ])
+        };
+        let arm = |path: Formula| {
+            Formula::And(vec![
+                path,
+                Formula::Ge(Box::new(iv("_5")), Box::new(Formula::Int(8))),
+                range(),
+                context(),
+            ])
+        };
+        let violation = Formula::And(vec![
+            range(),
+            Formula::And(vec![
+                Formula::Bool(true),
+                Formula::Or(vec![
+                    arm(not_f(lt_f(iv("i"), Formula::Int(8)))),
+                    arm(lt_f(iv("i"), Formula::Int(8))),
+                ]),
+            ]),
+        ]);
+
+        let Some(ProofEvidence::CleanCic { term, .. }) = certify_violation(&violation) else {
+            panic!("the grounded residual must certify");
+        };
+        let term = deserialize_term(&term).expect("the producer's own serialization");
+        let mut names = Vec::new();
+        assert!(collect_const_names(&term, &mut names), "every node must be auditable");
+        let used: BTreeSet<String> = names.iter().map(|n| n.to_string()).collect();
+        let expected: BTreeSet<String> = [
+            // Case tree over the derived `Ite` definition — the `Or.rec` /
+            // `And.left` / `And.right` shape `b76453697c` introduced.
+            "Or",
+            "Or.rec",
+            "And",
+            "And.left",
+            "And.right",
+            "False",
+            // Farkas fold of each leaf and its closing false atom.
+            "Int",
+            "Int.zero",
+            "Int.add",
+            "Int.mul",
+            "Int.ofNat",
+            "Int.negSucc",
+            "Int.NonNeg.mk",
+            "Int.zero_add",
+            "Int.mul_zero",
+            "Int.add_assoc",
+            "Int.add_comm",
+            "Int.left_distrib",
+            "Int.add_le_add_left",
+            "Int.add_le_add_right",
+            "Int.le_trans",
+            "Int.lt_of_lt_of_le",
+            "Int.lt_irrefl",
+            "Eq",
+            "Eq.refl",
+            "Eq.subst",
+            "Eq.symm",
+            "LE.le",
+            "instLEInt",
+            // The obligation's own free integer variables (`encoded_var_name`).
+            "i",
+            "trust_var_6b2373315f305f73325f30",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert!(
+            used.is_subset(&expected),
+            "certificate names constants outside the pre-existing inventory: {:?}",
+            used.difference(&expected).collect::<Vec<_>>()
+        );
+        // The case split and the Farkas fold must both actually be present, so
+        // this test cannot pass by the certificate degenerating into something
+        // simpler than the lane it is pinning.
+        for required in ["Or.rec", "And.left", "Int.add_le_add_left", "Int.lt_irrefl"] {
+            assert!(used.contains(required), "certificate does not use {required}");
         }
     }
 }

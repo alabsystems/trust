@@ -361,6 +361,32 @@ fn authorize_trust_execution(
         return Ok(TrustExecutionAuthorization::InheritedExplicitUnverified);
     }
 
+    // A REFUSAL MUST BE ABLE TO STEER. When `cmd` has a verified counterpart, refusing is
+    // the whole point: it puts `targo trust <lane>` in front of someone who was about to
+    // produce an unverified artifact, and the message names both lanes and their claims.
+    //
+    // When there is NO verified counterpart the refusal cannot steer anyone. `run` has no
+    // `targo trust run`, so the message's own text — "This is the only lane for `run`" —
+    // concedes that the only way forward is to retype the command with `--unverified`. A
+    // prompt with one button is not a decision; it is a toll. And it is a HARMFUL toll: the
+    // habit it builds is exactly the reflex this authorization exists to prevent, because
+    // someone who types `--unverified` daily to run a tool will type it without reading on
+    // the day they are building something whose proof status is a real choice.
+    //
+    // Worse, it makes the flag say something false about the command. "Verified" and
+    // "unverified" describe whether an ARTIFACT carries a proof claim. Applied to
+    // `ship provision` — mint this machine's publishing identity — there is no artifact
+    // whose proof status is in question, so the flag answers a question nobody asked.
+    //
+    // So: proceed, and SAY the lane instead of demanding it be typed. The awareness the
+    // refusal exists to create is preserved by `ExplicitUnverified`'s own notice ("runs
+    // with the proof pipeline off"), which prints either way. Nothing about what gets
+    // built changes — this is the same lane the flag would have selected, chosen for the
+    // user because it is the only one on offer.
+    if verified_trust_lane_for(cmd).is_none() && !is_manifest_command {
+        return Ok(TrustExecutionAuthorization::ExplicitUnverified);
+    }
+
     anyhow::bail!(unauthorized_lane_message(cmd, is_manifest_command))
 }
 
@@ -830,16 +856,120 @@ impl ProtectedPathSnapshot {
     fn same_stable_identity(&self, other: &Self) -> bool {
         self == other
     }
+
+    /// Whether two snapshots of an ANCESTOR directory carry the same
+    /// authority over the selected path. Ordinary entry churn changes a
+    /// directory's length, link count, and timestamps, so none of those are
+    /// authority. Replacing the directory changes its identity; changing who
+    /// can rewrite it changes its mode/owner (or Windows attributes).
+    fn same_directory_authority(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device
+                && self.inode == other.inode
+                && self.mode == other.mode
+                && self.uid == other.uid
+                && self.gid == other.gid
+        }
+        #[cfg(windows)]
+        {
+            self.file_attributes == other.file_attributes
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
+    /// Whether the LATER ancestor snapshot `other` has the rename-shaped
+    /// metadata signature: ctime advanced while mtime did not. Entry churn
+    /// advances both; rename/restore advances ctime alone. Windows directory
+    /// handles are retained without delete sharing, so rename is prevented by
+    /// the kernel there rather than inferred from timestamps.
+    fn metadata_tampered_since(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            let ctime_advanced = (other.changed_seconds, other.changed_nanoseconds)
+                > (self.changed_seconds, self.changed_nanoseconds);
+            let mtime_advanced = (other.modified_seconds, other.modified_nanoseconds)
+                > (self.modified_seconds, self.modified_nanoseconds);
+            ctime_advanced && !mtime_advanced
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            false
+        }
+    }
 }
 
 struct ProtectedSubcommandGuard {
     executable: ProtectedPathGuard,
     directories: Vec<ProtectedDirectoryGuard>,
+    /// Trust: every symlink traversed while resolving the launch path to its
+    /// canonical toolchain, in resolution order. Always empty when the launch
+    /// path is already canonical, and always empty on Windows, where reparse
+    /// points are held by `open_protected_path`'s share mode instead.
+    symlink_hops: Vec<ProtectedSymlinkHop>,
+}
+
+/// Trust: one symlink on the launch path, pinned by its own exact metadata and
+/// by the target it names.
+///
+/// A symlink has no interior to churn, so — unlike a directory — it is held to
+/// full snapshot equality with no slack at all, and a replacement (new inode) or
+/// a rename-and-restore (`ctime` moves, `mtime` does not) is refused.
+struct ProtectedSymlinkHop {
+    path: PathBuf,
+    target: PathBuf,
+    snapshot: ProtectedPathSnapshot,
+    parent: PathBuf,
+    parent_snapshot: ProtectedPathSnapshot,
 }
 
 struct ProtectedDirectoryGuard {
     path: PathBuf,
     selected: ProtectedPathGuard,
+    role: ProtectedDirectoryRole,
+}
+
+/// What a directory in the selected path is trusted for, and therefore how
+/// strictly it is rechecked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectedDirectoryRole {
+    /// The selected toolchain `bin` itself: any content change is relevant.
+    Selected,
+    /// A directory that merely contains the selected one: identity and rewrite
+    /// authority matter, unrelated entries do not.
+    Ancestor,
+}
+
+impl ProtectedDirectoryGuard {
+    fn still_authentic(&self, observed: &Self) -> bool {
+        if self.path != observed.path || self.role != observed.role {
+            return false;
+        }
+        match self.role {
+            ProtectedDirectoryRole::Selected => {
+                self.selected.identity == observed.selected.identity
+                    && self.selected.snapshot == observed.selected.snapshot
+            }
+            ProtectedDirectoryRole::Ancestor => {
+                self.selected
+                    .identity
+                    .same_file(&observed.selected.identity)
+                    && self
+                        .selected
+                        .snapshot
+                        .same_directory_authority(&observed.selected.snapshot)
+                    && !self
+                        .selected
+                        .snapshot
+                        .metadata_tampered_since(&observed.selected.snapshot)
+            }
+        }
+    }
 }
 
 struct ProtectedPathGuard {
@@ -865,23 +995,35 @@ impl ProtectedSubcommandGuard {
                 directory_path.display()
             )
         })?;
-        #[cfg(unix)]
-        if canonical_directory != directory_path {
-            return Err(format!(
-                "protected Trust toolchain directory `{}` traverses a symlink or non-canonical path to `{}`",
-                directory_path.display(),
-                canonical_directory.display()
-            ));
-        }
+        // Trust: a non-canonical launch path is AUTHENTICATED, not refused.
+        // `rustup toolchain link` can only install a custom toolchain as a
+        // symlink, so refusing every non-canonical spelling did not defend the
+        // toolchain — it made every protected subcommand unreachable through the
+        // only entry point users have, and pushed fmt/clippy gates onto a stock
+        // compiler instead.
+        //
+        // What replaces it is the substitution quantifier this codebase already
+        // states for pathname-backed execution (`cargo::util::process_authority`):
+        // no principal other than root or the invoking identity may be able to
+        // swap the object. Replacing a symlink needs write access to the same
+        // containing directory that replacing a directory needs, and both are
+        // caught the same way, by pinned device/inode identity — so a hop is
+        // admitted, then held to MORE than a directory ancestor is: exact
+        // metadata plus its target, an owner that is root or us, and a holding
+        // directory no other principal may write.
+        let symlink_hops = capture_protected_symlink_hops(directory_path, &canonical_directory)?;
 
         // The protected child is launched through a pathname. Retain the full
         // launch and canonical ancestor chains so rename -> redirect -> restore
         // of any selected directory changes the nearest unchanged parent even
         // when the original directory object itself is restored.
-        let paths = protected_directory_ancestors(directory_path, &canonical_directory);
-        let directories = capture_protected_directories(&paths)?;
-        let executable = capture_protected_path(path, true)?;
-        let confirmed_directories = capture_protected_directories(&paths)?;
+        let paths =
+            protected_directory_ancestors(directory_path, &canonical_directory, &symlink_hops);
+        let directories =
+            capture_protected_directories(&paths, directory_path, &canonical_directory)?;
+        let executable = capture_protected_path(path, true, None)?;
+        let confirmed_directories =
+            capture_protected_directories(&paths, directory_path, &canonical_directory)?;
         let confirmed_canonical_directory = directory_path.canonicalize().map_err(|error| {
             format!(
                 "cannot re-canonicalize protected Trust toolchain directory `{}`: {error}",
@@ -902,9 +1044,17 @@ impl ProtectedSubcommandGuard {
                 directory_path.display()
             ));
         }
+        let confirmed_hops = capture_protected_symlink_hops(directory_path, &canonical_directory)?;
+        if !same_protected_symlink_hops(&symlink_hops, &confirmed_hops) {
+            return Err(format!(
+                "protected Trust toolchain launch path `{}` changed a symlink while subcommand identity was captured",
+                directory_path.display()
+            ));
+        }
         Ok(Self {
             executable,
             directories,
+            symlink_hops,
         })
     }
 
@@ -912,12 +1062,26 @@ impl ProtectedSubcommandGuard {
         self.executable.identity == other.executable.identity
             && self.executable.snapshot.same_stable_identity(&other.executable.snapshot)
             && same_protected_directories(&self.directories, &other.directories)
+            && same_protected_symlink_hops(&self.symlink_hops, &other.symlink_hops)
     }
 }
 
-fn protected_directory_ancestors(launch: &Path, canonical: &Path) -> Vec<PathBuf> {
+/// Trust: every DIRECTORY on the launch and canonical paths, with the symlink
+/// hops removed — those are authenticated separately, to a stricter standard.
+///
+/// A launch ancestor reached THROUGH a hop stays in this list: it is a real
+/// directory, and pinning that spelling is what makes a retargeted hop change
+/// the identity of the launch path's own toolchain directory.
+fn protected_directory_ancestors(
+    launch: &Path,
+    canonical: &Path,
+    hops: &[ProtectedSymlinkHop],
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for ancestor in launch.ancestors().chain(canonical.ancestors()) {
+        if hops.iter().any(|hop| hop.path == ancestor) {
+            continue;
+        }
         if !paths.iter().any(|path| path == ancestor) {
             paths.push(ancestor.to_owned());
         }
@@ -925,16 +1089,265 @@ fn protected_directory_ancestors(launch: &Path, canonical: &Path) -> Vec<PathBuf
     paths
 }
 
+/// Trust: the two halves of a hop are re-checked at DIFFERENT strictnesses, for
+/// the same reason `ProtectedDirectoryGuard::still_authentic` splits Selected
+/// from Ancestor.
+///
+/// The symlink itself is held to exact metadata plus its target: a symlink has
+/// no interior, so nothing about it churns for unrelated reasons, and a
+/// replacement (new inode) or a rename-and-restore (`ctime` moves, `mtime` does
+/// not) has to be refused.
+///
+/// The directory HOLDING it is an ancestor and is held to authority only. It is
+/// a real directory — `~/.rustup/toolchains`, `~/toolchains` — whose `len`,
+/// `mtime` and `ctime` move whenever any unrelated entry is created or removed
+/// inside it. Comparing those would make an unrelated file appearing beside the
+/// toolchain link abort an in-flight protected subcommand, which is exactly the
+/// defect `fix(targo): tolerate unrelated protected-ancestor churn` removed from
+/// the directory chain. The rename-shaped signature is still not tolerated.
+fn same_protected_symlink_hops(left: &[ProtectedSymlinkHop], right: &[ProtectedSymlinkHop]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.path == right.path
+                && left.target == right.target
+                && left.snapshot == right.snapshot
+                && left.parent == right.parent
+                && left
+                    .parent_snapshot
+                    .same_directory_authority(&right.parent_snapshot)
+                && !left
+                    .parent_snapshot
+                    .metadata_tampered_since(&right.parent_snapshot)
+        })
+}
+
+/// Trust: resolve the launch path one component at a time, authenticating every
+/// symlink it goes through, and prove the walk lands exactly where
+/// `canonicalize` said it would.
+///
+/// The walk is what finds hops `Path::ancestors` cannot see — a hop introduced
+/// by a previous hop's target, which on this machine is the promotion symlink
+/// (`~/.rustup/toolchains/trust -> ~/toolchains/trust-current -> trust-<rev>`)
+/// and therefore the one object most likely to be rewritten under a live run.
+/// The cross-check against `canonical` is what makes the resulting list safe to
+/// rely on: a hop rewritten mid-walk makes the two disagree and the capture is
+/// refused.
+#[cfg(unix)]
+fn capture_protected_symlink_hops(
+    directory: &Path,
+    canonical: &Path,
+) -> Result<Vec<ProtectedSymlinkHop>, String> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    /// A resolution needing more hops than this is a loop or an attack, not a
+    /// toolchain layout; Linux's own limit is 40.
+    const MAX_LAUNCH_SYMLINK_HOPS: usize = 64;
+
+    let mut remaining = VecDeque::new();
+    push_protected_path_components(directory, &mut remaining)?;
+    let mut resolved = PathBuf::from("/");
+    let mut hops: Vec<ProtectedSymlinkHop> = Vec::new();
+    while let Some(name) = remaining.pop_front() {
+        if name == OsString::from(Component::CurDir.as_os_str()) {
+            continue;
+        }
+        if name == OsString::from(Component::ParentDir.as_os_str()) {
+            // `resolved` is fully resolved at every step, so a lexical pop is
+            // what the kernel does too, and `/..` is `/`.
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+            format!(
+                "cannot inspect protected Trust launch path component `{}`: {error}",
+                candidate.display()
+            )
+        })?;
+        if !metadata.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        if hops.len() >= MAX_LAUNCH_SYMLINK_HOPS {
+            return Err(format!(
+                "protected Trust toolchain directory `{}` resolves through more than {MAX_LAUNCH_SYMLINK_HOPS} symlinks",
+                directory.display()
+            ));
+        }
+        let hop = capture_protected_symlink_hop(&candidate, &resolved)?;
+        if hop.target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        let mut expansion = VecDeque::new();
+        push_protected_path_components(&hop.target, &mut expansion)?;
+        if expansion.is_empty() {
+            return Err(format!(
+                "protected Trust launch path symlink `{}` has an empty target",
+                candidate.display()
+            ));
+        }
+        while let Some(component) = expansion.pop_back() {
+            remaining.push_front(component);
+        }
+        hops.push(hop);
+    }
+    if resolved != canonical {
+        return Err(format!(
+            "protected Trust toolchain directory `{}` resolves to `{}`, but its authenticated symlink chain resolves to `{}`",
+            directory.display(),
+            canonical.display(),
+            resolved.display()
+        ));
+    }
+    Ok(hops)
+}
+
+#[cfg(not(unix))]
+fn capture_protected_symlink_hops(
+    _directory: &Path,
+    _canonical: &Path,
+) -> Result<Vec<ProtectedSymlinkHop>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn push_protected_path_components(
+    path: &Path,
+    out: &mut std::collections::VecDeque<std::ffi::OsString>,
+) -> Result<(), String> {
+    use std::path::Component;
+
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir | Component::ParentDir | Component::Normal(_) => {
+                out.push_back(component.as_os_str().to_owned());
+            }
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "protected Trust launch path `{}` carries a platform prefix component",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Trust: the substitution check for one symlink hop, the same quantifier
+/// `cargo::util::process_authority` applies to a pathname-backed execution
+/// object — no principal other than root or the invoking identity may be able to
+/// replace it. Two things decide that for a symlink:
+///
+/// * who owns the LINK — with a sticky holding directory, only its owner (or the
+///   directory's owner, or root) may remove or rename it; and
+/// * who may write the DIRECTORY that holds it. That, not the link, is the
+///   substitution primitive: a symlink's target is immutable, so the only way to
+///   retarget one is to replace the directory entry.
+///
+/// The link's OWN mode bits are deliberately not examined. Linux reports every
+/// symlink as `0o777` and ignores the bits entirely, so testing them would refuse
+/// every symlink on Linux while proving nothing on any platform.
+#[cfg(unix)]
+fn capture_protected_symlink_hop(path: &Path, parent: &Path) -> Result<ProtectedSymlinkHop, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let invoking_uid = unsafe { libc::geteuid() };
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect protected Trust launch path symlink `{}`: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Err(format!(
+            "protected Trust launch path component `{}` is no longer a symlink",
+            path.display()
+        ));
+    }
+    if metadata.uid() != 0 && metadata.uid() != invoking_uid {
+        return Err(format!(
+            "protected Trust launch path symlink `{}` is owned by uid={}, which is neither root nor the invoking identity (uid={invoking_uid}); a redirection a foreign principal owns can be repointed at another toolchain",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    let target = fs::read_link(path).map_err(|error| {
+        format!(
+            "cannot read protected Trust launch path symlink `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let snapshot = ProtectedPathSnapshot::from_metadata(&metadata, path)?;
+
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+        format!(
+            "cannot inspect the directory `{}` holding protected Trust launch path symlink `{}`: {error}",
+            parent.display(),
+            path.display()
+        )
+    })?;
+    if !protected_path_type_is_valid(&parent_metadata, false) {
+        return Err(format!(
+            "the directory `{}` holding protected Trust launch path symlink `{}` is not a plain directory",
+            parent.display(),
+            path.display()
+        ));
+    }
+    if parent_metadata.uid() != 0 && parent_metadata.uid() != invoking_uid {
+        return Err(format!(
+            "the directory `{}` holding protected Trust launch path symlink `{}` is owned by uid={}, which is neither root nor the invoking identity (uid={invoking_uid}); its owner can repoint the symlink at another toolchain",
+            parent.display(),
+            path.display(),
+            parent_metadata.uid()
+        ));
+    }
+    // Sticky (`0o1000`) is the exemption POSIX defines for exactly this: in a
+    // sticky directory only the entry's own owner, the directory's owner, or root
+    // may remove or rename an entry, and both owners were just proven to be root
+    // or the invoking identity. Without sticky, a group- or world-writable
+    // directory hands any local principal the ability to replace the link.
+    if parent_metadata.mode() & 0o022 != 0 && parent_metadata.mode() & 0o1000 == 0 {
+        return Err(format!(
+            "the directory `{}` holding protected Trust launch path symlink `{}` is group- or world-writable without the sticky bit (mode={:#o}); any local principal could repoint the symlink at another toolchain",
+            parent.display(),
+            path.display(),
+            parent_metadata.mode() & 0o7777
+        ));
+    }
+    let parent_snapshot = ProtectedPathSnapshot::from_metadata(&parent_metadata, parent)?;
+
+    Ok(ProtectedSymlinkHop {
+        path: path.to_owned(),
+        target,
+        snapshot,
+        parent: parent.to_owned(),
+        parent_snapshot,
+    })
+}
+
 fn capture_protected_directories(
     paths: &[PathBuf],
+    selected_directory: &Path,
+    canonical_selected_directory: &Path,
 ) -> Result<Vec<ProtectedDirectoryGuard>, String> {
     paths
         .iter()
         .map(|path| {
-            let selected = capture_protected_path(path, false)?;
+            // Both spellings name the selected directory. On Unix capture has
+            // already proven them equal; Windows canonical spelling can differ.
+            let role = if path == selected_directory || path == canonical_selected_directory {
+                ProtectedDirectoryRole::Selected
+            } else {
+                ProtectedDirectoryRole::Ancestor
+            };
+            let selected = capture_protected_path(path, false, Some(role))?;
             Ok(ProtectedDirectoryGuard {
                 path: path.clone(),
                 selected,
+                role,
             })
         })
         .collect()
@@ -945,20 +1358,10 @@ fn same_protected_directories(
     right: &[ProtectedDirectoryGuard],
 ) -> bool {
     left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.path == right.path
-                && left.selected.identity == right.selected.identity
-                // Trust: directories keep FULL snapshot equality, timestamps
-                // included. A rename -> redirect -> restore of an ancestor
-                // preserves that directory's own inode, so the changed
-                // modification/change time is the only signal that reveals the
-                // race — and executing a binary never mutates a parent
-                // directory's timestamps, so the provenance-xattr false
-                // positive that motivates `same_stable_identity` cannot arise
-                // here. Only the executable file needs the timestamp-tolerant
-                // comparison.
-                && left.selected.snapshot == right.selected.snapshot
-        })
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.still_authentic(right))
 }
 
 struct AuthenticatedProtectedSubcommand {
@@ -982,8 +1385,8 @@ impl AuthenticatedProtectedSubcommand {
     /// its result if the executable or full launch/canonical directory chain
     /// no longer has the selected identity. This is not stable-handle execution:
     /// the process abstraction still launches a pathname, so a raced child's
-    /// side effects can occur before the post-check rejects its result. Unrelated
-    /// direct-entry churn in a recorded shared ancestor can also fail closed.
+    /// side effects can occur before the post-check rejects its result. Ancestor
+    /// entry churn is deliberately ignored; selected-directory churn is not.
     fn run_guarded<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
         let guard = self.revalidate().map_err(|error| {
             format!("protected Trust subcommand authentication failed before launch: {error}")
@@ -1014,6 +1417,7 @@ impl AuthenticatedProtectedSubcommand {
 fn capture_protected_path(
     path: &Path,
     require_executable: bool,
+    directory_role: Option<ProtectedDirectoryRole>,
 ) -> Result<ProtectedPathGuard, String> {
     let before = fs::symlink_metadata(path).map_err(|error| {
         format!(
@@ -1086,10 +1490,25 @@ fn capture_protected_path(
             path.display()
         )
     })?;
-    if before_snapshot != opened_snapshot
-        || opened_snapshot != after_snapshot
-        || after_snapshot != path_snapshot
-        || identity != path_identity
+    let snapshots_agree =
+        |earlier: &ProtectedPathSnapshot, later: &ProtectedPathSnapshot| match directory_role {
+            Some(ProtectedDirectoryRole::Ancestor) => {
+                earlier.same_directory_authority(later) && !earlier.metadata_tampered_since(later)
+            }
+            Some(ProtectedDirectoryRole::Selected) | None => earlier == later,
+        };
+    // Stable opened-file identity excludes Windows change-time/link-count
+    // churn while retaining the full volume + 128-bit file id. The retained
+    // Windows directory handle additionally denies delete/rename sharing for
+    // the guard's lifetime.
+    let opened_identities_agree = match directory_role {
+        Some(ProtectedDirectoryRole::Ancestor) => identity.same_file(&path_identity),
+        Some(ProtectedDirectoryRole::Selected) | None => identity == path_identity,
+    };
+    if !snapshots_agree(&before_snapshot, &opened_snapshot)
+        || !snapshots_agree(&opened_snapshot, &after_snapshot)
+        || !snapshots_agree(&after_snapshot, &path_snapshot)
+        || !opened_identities_agree
     {
         return Err(format!(
             "protected Trust path `{}` changed while its identity was captured",
@@ -1413,7 +1832,7 @@ mod trust_tests {
     use cargo::CargoResult;
     use std::ffi::{OsStr, OsString};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus};
     use std::sync::Mutex;
 
@@ -1450,6 +1869,42 @@ mod trust_tests {
         let error = authorize_trust_execution(true, "build", false, false, false, false, false)
             .expect_err("implicit unverified Targo must fail");
         assert!(error.to_string().contains("implicitly unverified artifact"));
+    }
+
+    /// A REFUSAL MUST BE ABLE TO STEER SOMEWHERE.
+    ///
+    /// `build`/`check`/`test` have a `targo trust` counterpart, so refusing puts a real
+    /// alternative in front of the user and must keep happening. `run` has none — the
+    /// refusal's own text conceded "This is the only lane for `run`" — so demanding the
+    /// flag could only make the user retype the identical command. That toll builds the
+    /// `--unverified` reflex this authorization exists to prevent, and spends it on a verb
+    /// where the choice is real.
+    ///
+    /// This pins the DISTINCTION, not either half alone: a change that starts refusing
+    /// `run` again, or stops refusing `build`, fails here.
+    #[test]
+    fn a_verb_with_no_verified_counterpart_proceeds_instead_of_demanding_the_flag() {
+        for lane_less in ["run", "ship", "install", "publish"] {
+            let got = authorize_trust_execution(true, lane_less, false, false, false, false, false)
+                .unwrap_or_else(|e| panic!("`targo {lane_less}` must not refuse: {e}"));
+            assert!(
+                matches!(got, TrustExecutionAuthorization::ExplicitUnverified),
+                "`{lane_less}` must take the only lane it has, got {got:?}"
+            );
+            assert!(
+                verified_trust_lane_for(lane_less).is_none(),
+                "precondition: `{lane_less}` has no verified counterpart"
+            );
+        }
+        // …and the verbs that DO have a counterpart still refuse, for the same reason.
+        for steerable in ["build", "check", "test"] {
+            assert!(
+                verified_trust_lane_for(steerable).is_some(),
+                "precondition: `{steerable}` has a verified counterpart"
+            );
+            authorize_trust_execution(true, steerable, false, false, false, false, false)
+                .expect_err("`{steerable}` must still refuse — the refusal can steer");
+        }
     }
 
     #[test]
@@ -1753,6 +2208,144 @@ mod trust_tests {
         fs::remove_dir_all(root).expect("remove protected Windows fixture");
     }
 
+    /// `<temp>/<unique>/ancestor/bin/targo-trust`: a private chain whose
+    /// selected directory and ancestor can be mutated independently.
+    #[cfg(unix)]
+    fn protected_ancestor_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let root = temp.join(format!(
+            "targo-protected-ancestor-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let ancestor = root.join("ancestor");
+        let selected_bin = ancestor.join("bin");
+        fs::create_dir_all(&selected_bin).expect("create protected ancestor fixture");
+        let command = selected_bin.join("targo-trust");
+        fs::write(&command, b"#!/bin/sh\nexit 0\n").expect("write protected fixture command");
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+            .expect("make protected fixture command executable");
+        (root, ancestor, selected_bin, command)
+    }
+
+    /// THE FALSE POSITIVE THIS POLICY CLOSES: a protected compile must not be
+    /// invalidated because an unrelated process creates or removes an entry in
+    /// an ancestor such as `$HOME` or `/private/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn protected_subcommand_guard_allows_unrelated_ancestor_entry_churn() {
+        let _lock = PROTECTED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (root, ancestor, _selected_bin, command) = protected_ancestor_fixture("churn");
+        let authenticated = AuthenticatedProtectedSubcommand::capture(command)
+            .expect("authenticate protected ancestor fixture");
+
+        fs::write(ancestor.join("unrelated.tmp"), b"noise").expect("create unrelated entry");
+        authenticated
+            .revalidate()
+            .expect("ancestor entry creation must preserve authentication");
+        fs::remove_file(ancestor.join("unrelated.tmp")).expect("remove unrelated entry");
+        authenticated
+            .revalidate()
+            .expect("ancestor entry removal must preserve authentication");
+        fs::create_dir(ancestor.join("unrelated-dir")).expect("create unrelated directory");
+        authenticated
+            .revalidate()
+            .expect("ancestor link-count churn must preserve authentication");
+
+        drop(authenticated);
+        fs::remove_dir_all(root).expect("remove protected ancestor fixture");
+    }
+
+    /// The selected toolchain directory remains strict: a new sibling binary
+    /// is toolchain churn, not unrelated ancestor churn.
+    #[cfg(unix)]
+    #[test]
+    fn protected_subcommand_guard_still_rejects_selected_directory_churn() {
+        let _lock = PROTECTED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (root, _ancestor, selected_bin, command) = protected_ancestor_fixture("selected-churn");
+        let authenticated = AuthenticatedProtectedSubcommand::capture(command)
+            .expect("authenticate protected selected directory");
+
+        fs::write(selected_bin.join("new-tool"), b"replacement candidate")
+            .expect("create selected-directory sibling");
+        assert!(
+            authenticated.revalidate().is_err(),
+            "selected toolchain directory churn escaped authentication"
+        );
+
+        drop(authenticated);
+        fs::remove_dir_all(root).expect("remove protected selected-directory fixture");
+    }
+
+    /// Renaming an ancestor aside and restoring the same inode leaves a ctime
+    /// signature even though identity and permissions match again.
+    #[cfg(unix)]
+    #[test]
+    fn protected_subcommand_guard_still_rejects_renamed_and_restored_ancestor() {
+        let _lock = PROTECTED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (root, ancestor, _selected_bin, command) = protected_ancestor_fixture("rename");
+        let parked = root.join("ancestor-parked");
+        let authenticated = AuthenticatedProtectedSubcommand::capture(command)
+            .expect("authenticate protected ancestor before rename");
+
+        fs::rename(&ancestor, &parked).expect("rename protected ancestor aside");
+        fs::rename(&parked, &ancestor).expect("restore protected ancestor");
+        assert!(
+            authenticated.revalidate().is_err(),
+            "rename-and-restore escaped ancestor authentication"
+        );
+
+        drop(authenticated);
+        fs::remove_dir_all(root).expect("remove protected rename fixture");
+    }
+
+    /// Ancestor content is irrelevant, but ancestor rewrite authority is not.
+    #[cfg(unix)]
+    #[test]
+    fn protected_subcommand_guard_still_rejects_widened_ancestor_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = PROTECTED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (root, ancestor, _selected_bin, command) = protected_ancestor_fixture("permissions");
+        let authenticated = AuthenticatedProtectedSubcommand::capture(command)
+            .expect("authenticate protected ancestor before permission change");
+        let original = fs::metadata(&ancestor)
+            .expect("inspect ancestor permissions")
+            .permissions();
+        let mut widened = original.clone();
+        widened.set_mode(original.mode() | 0o022);
+        assert_ne!(
+            widened.mode(),
+            original.mode(),
+            "fixture ancestor was already writable"
+        );
+        fs::set_permissions(&ancestor, widened).expect("widen ancestor permissions");
+
+        assert!(
+            authenticated.revalidate().is_err(),
+            "widened ancestor authority escaped authentication"
+        );
+
+        fs::set_permissions(&ancestor, original).expect("restore ancestor permissions");
+        drop(authenticated);
+        fs::remove_dir_all(root).expect("remove protected permission fixture");
+    }
+
     #[cfg(unix)]
     #[test]
     fn protected_subcommand_guard_rejects_rewrite_and_swap_restore() {
@@ -1823,6 +2416,13 @@ mod trust_tests {
         fs::remove_dir_all(root).expect("remove protected-command identity fixture");
     }
 
+    /// Trust: THE NEGATIVE THAT DEFINES THE RULE. What makes an ancestor symlink
+    /// inadmissible is not that it is a symlink — `rustup toolchain link` can
+    /// only ever produce one — it is that some principal other than root or the
+    /// invoking identity can replace it. A world-writable holding directory is
+    /// exactly that primitive and is refused at capture; the SAME symlink is
+    /// admitted once the directory is closed again, which is what proves the
+    /// refusal is caused by the writability rather than by the redirection.
     #[cfg(unix)]
     #[test]
     fn protected_subcommand_guard_rejects_mutable_ancestor_symlink() {
@@ -1848,19 +2448,151 @@ mod trust_tests {
         fs::write(&command, b"selected protected command").expect("write selected command");
         fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
             .expect("make selected command executable");
-        let redirected_root = root.join("redirected");
+        let holder = root.join("holder");
+        fs::create_dir(&holder).expect("create the directory that holds the hop");
+        let redirected_root = holder.join("redirected");
         symlink(root.join("real"), &redirected_root).expect("create mutable ancestor symlink");
-
         let redirected_command = redirected_root.join("bin/targo-trust");
-        let error = AuthenticatedProtectedSubcommand::capture(redirected_command)
+
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o777))
+            .expect("make the holding directory world-writable");
+        let error = AuthenticatedProtectedSubcommand::capture(redirected_command.clone())
             .err()
-            .expect("an ancestor-symlink toolchain spelling must be rejected");
+            .expect("an ancestor symlink any local principal can replace must be rejected");
         assert!(
-            error.contains("traverses a symlink or non-canonical path"),
-            "{error}"
+            error.contains("group- or world-writable"),
+            "the refusal must name the substitution primitive, got: {error}"
         );
 
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o755))
+            .expect("close the holding directory again");
+        AuthenticatedProtectedSubcommand::capture(redirected_command)
+            .expect("the same ancestor symlink must authenticate once no other principal can replace it");
+
         fs::remove_dir_all(root).expect("remove protected-command symlink fixture");
+    }
+
+    /// Trust: the hop's HOLDING DIRECTORY is an ancestor, so it gets the
+    /// ancestor contract `fix(targo): tolerate unrelated protected-ancestor
+    /// churn` established for the directory chain — unrelated entries appearing
+    /// beside the toolchain symlink must not abort an in-flight subcommand,
+    /// because on a real machine that directory is `~/.rustup/toolchains` and
+    /// anything may write there. The SYMLINK itself keeps exact metadata: it has
+    /// no interior, so it has nothing to churn.
+    #[cfg(unix)]
+    #[test]
+    fn protected_subcommand_guard_allows_churn_beside_a_launch_symlink() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let _lock = PROTECTED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let root = temp.join(format!(
+            "targo-protected-hop-churn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let sealed_bin = root.join("sealed/bin");
+        fs::create_dir_all(&sealed_bin).expect("create sealed toolchain");
+        let command = sealed_bin.join("targo-trust");
+        fs::write(&command, b"#!/bin/sh\nexit 0\n").expect("write command");
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+            .expect("make command executable");
+        // `holder` stands in for `~/.rustup/toolchains`: it holds the toolchain
+        // symlink AND whatever else the user happens to install.
+        let holder = root.join("holder");
+        fs::create_dir(&holder).expect("create the directory holding the hop");
+        let linked = holder.join("trust");
+        symlink(root.join("sealed"), &linked).expect("create rustup-style symlink");
+
+        let authenticated =
+            AuthenticatedProtectedSubcommand::capture(linked.join("bin/targo-trust"))
+                .expect("a rustup-style symlinked toolchain must authenticate");
+
+        // Exactly what installing an unrelated toolchain beside this one does.
+        let churned = authenticated.run_guarded(|| {
+            fs::create_dir(holder.join("unrelated-toolchain")).expect("install a neighbour");
+            fs::write(holder.join("unrelated.tmp"), b"noise").expect("write an unrelated entry");
+            fs::remove_file(holder.join("unrelated.tmp")).expect("remove it again");
+        });
+        assert!(
+            churned.is_ok(),
+            "unrelated churn beside a launch symlink must not break authentication: {churned:?}"
+        );
+
+        drop(authenticated);
+        fs::remove_dir_all(root).expect("remove hop-churn fixture");
+    }
+
+    /// Trust: the rustup shape end to end. A linked custom toolchain is always
+    /// reached through a symlink, and this machine adds a second, INTERMEDIATE
+    /// hop that an atomic promotion rewrites
+    /// (`~/.rustup/toolchains/trust -> ~/toolchains/trust-current -> trust-<rev>`).
+    /// `Path::ancestors` cannot see that second hop at all, so this test is what
+    /// proves the component-by-component resolution walk is load-bearing:
+    /// capture succeeds, and flipping the intermediate hop under the guard is
+    /// refused.
+    #[cfg(unix)]
+    #[test]
+    fn protected_subcommand_guard_authenticates_a_rustup_style_symlink_chain() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let _lock = PROTECTED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let root = temp.join(format!(
+            "targo-protected-rustup-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let sealed_bin = root.join("sealed/bin");
+        let decoy_bin = root.join("decoy/bin");
+        fs::create_dir_all(&sealed_bin).expect("create sealed toolchain");
+        fs::create_dir_all(&decoy_bin).expect("create decoy toolchain");
+        for bin in [&sealed_bin, &decoy_bin] {
+            let command = bin.join("targo-trust");
+            fs::write(&command, b"#!/bin/sh\nexit 0\n").expect("write command");
+            fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+                .expect("make command executable");
+        }
+        let current = root.join("trust-current");
+        let linked = root.join("linked");
+        symlink(root.join("sealed"), &current).expect("create promotion symlink");
+        symlink(&current, &linked).expect("create rustup-style symlink");
+
+        let launched = linked.join("bin/targo-trust");
+        let authenticated = AuthenticatedProtectedSubcommand::capture(launched)
+            .expect("a rustup-style symlinked toolchain must authenticate");
+        assert_eq!(
+            authenticated.selected.symlink_hops.len(),
+            2,
+            "both hops must be pinned, including the intermediate one `Path::ancestors` cannot see"
+        );
+
+        let flipped = authenticated.run_guarded(|| {
+            let staged = root.join("trust-staged");
+            symlink(root.join("decoy"), &staged).expect("stage the replacement");
+            fs::rename(&staged, &current).expect("flip the promotion symlink");
+        });
+        assert!(
+            flipped.is_err(),
+            "flipping the intermediate promotion symlink under the guard must be refused"
+        );
+
+        drop(authenticated);
+        fs::remove_dir_all(root).expect("remove rustup-style symlink fixture");
     }
 
     #[cfg(unix)]

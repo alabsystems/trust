@@ -4345,31 +4345,19 @@ fn publish_body_verification_outcome<'tcx>(
 ) {
     let output_mode = TrustOutputMode::parse(tcx.sess);
 
-    // Trust: Report results via rustc diagnostics when human-readable output is enabled.
-    if output_mode.emit_human() {
-        if !artifacts.results.is_empty() {
-            report_results(
-                tcx,
-                body,
-                &artifacts.results,
-                &artifacts.result_bindings,
-                &artifacts.proof_authorities,
-                artifacts.proof_results.summary.certified as usize,
-            );
-        } else if !artifacts.transport_results.is_empty() {
-            report_transport_results(
-                tcx,
-                body,
-                &artifacts.transport_results,
-                artifacts.proof_results.summary.cached,
-            );
-        }
-    }
-
     // Compute the policy-visible rows once, independently of rendering.
     // They are both the JSON payload and the compiler's memory-safe fatality
     // boundary; tying enforcement to `emit_json()` would let a human-output
     // invocation bypass a failure that Targo correctly rejects.
+    //
+    // Trust (D2, part C): this block is computed BEFORE human reporting on
+    // purpose. `report_results` renders its denominator from the VC-level
+    // `artifacts.results`, which does NOT contain the additive policy rows
+    // minted here — so the human line used to read "… out of 2 obligation(s)"
+    // for the very body whose JSON said `skipped: 1, total: 3`. A summary that
+    // silently drops a skipped row is how the D2 false PROVE stayed invisible;
+    // the count is now handed to the renderer. Nothing here emits a
+    // diagnostic, so hoisting it leaves stderr ORDER byte-identical.
     let demoted_rows = (artifacts.proof_results.summary.total != 0)
         .then(|| demote_transport_rows_for_default_lane(tcx, body, &policy, artifacts.as_ref()))
         .flatten();
@@ -4377,6 +4365,11 @@ fn publish_body_verification_outcome<'tcx>(
     let contract_rows = rewrite_contract_panic_transport_rows(&policy, rows_after_demotion);
     let rows_before_coroutine_assumption =
         contract_rows.as_deref().unwrap_or(rows_after_demotion);
+    // The fail-closed lanes, needed BEFORE the disposition: publishing a
+    // coroutine contract row is an explicit-advisory-only capability (see
+    // `coroutine_protocol_publish_decision`).
+    let strict = policy.fail_closed();
+    let memory_safe = memory_safe_demotion_applies(tcx, body);
     // Coroutine resume bodies remain fully analyzed: their real arithmetic,
     // bounds, and panic obligations must never disappear behind a whole-body
     // skip. The three compiler-inserted ResumedAfter* sentinels are instead
@@ -4392,6 +4385,7 @@ fn publish_body_verification_outcome<'tcx>(
         rows_before_coroutine_assumption,
         artifacts.as_ref(),
         &func_path,
+        policy.is_explicit_advisory(),
     );
     let effective_rows = match &coroutine_protocol_rows {
         Some(
@@ -4400,6 +4394,43 @@ fn publish_body_verification_outcome<'tcx>(
         ) => rows.as_slice(),
         None => rows_before_coroutine_assumption,
     };
+    // Trust (D2, part C): the additive policy rows the VC-level renderer cannot
+    // see. `saturating_sub` because the disposition also STRIPS any stale row
+    // claiming a published kind, so the delta is not unconditionally positive.
+    let additional_policy_rows = effective_rows
+        .len()
+        .saturating_sub(rows_before_coroutine_assumption.len());
+    // Trust (D2, part C): whether this body's discharges are conditional on the
+    // coroutine executor-protocol premise. A published disposition means the
+    // bridge injected the entry `Assume`, which DOMINATES every block — so no
+    // discharge in this body is unconditional, and the human summary must not
+    // advertise a kernel-certified UNCONDITIONAL proof over it. Derived from the
+    // disposition itself rather than from the row delta, which a strip can zero.
+    let conditional_on_coroutine_premise = coroutine_protocol_rows.is_some();
+
+    // Trust: Report results via rustc diagnostics when human-readable output is enabled.
+    if output_mode.emit_human() {
+        if !artifacts.results.is_empty() {
+            report_results(
+                tcx,
+                body,
+                &artifacts.results,
+                &artifacts.result_bindings,
+                &artifacts.proof_authorities,
+                artifacts.proof_results.summary.certified as usize,
+                additional_policy_rows,
+                conditional_on_coroutine_premise,
+            );
+        } else if !artifacts.transport_results.is_empty() {
+            report_transport_results(
+                tcx,
+                body,
+                &artifacts.transport_results,
+                artifacts.proof_results.summary.cached,
+            );
+        }
+    }
+
     if output_mode.emit_human() {
         match &coroutine_protocol_rows {
             Some(CoroutineProtocolDisposition::UnprovedAssumption(_)) => eprintln!(
@@ -4504,8 +4535,9 @@ fn publish_body_verification_outcome<'tcx>(
     // Batteries-on verification uses the native typed route. Strict scopes
     // fail closed; the explicit memory-safe policy relaxes only rows the
     // compiler reclassified with its authenticated no-unsafe marker.
-    let strict = policy.fail_closed();
-    let memory_safe = memory_safe_demotion_applies(tcx, body);
+    // (`strict` / `memory_safe` are bound above the disposition — the contract
+    // upgrade is explicit-advisory-only and must consult them first.)
+    //
     // Trust #3: `artifacts` is now an `Arc<VerificationArtifacts>`; borrow the
     // shared payload (`as_ref`) for the `&VerificationArtifacts` consumers.
     // Pass the policy so diagnostics distinguish strict, survey, and
@@ -4513,7 +4545,9 @@ fn publish_body_verification_outcome<'tcx>(
     report_strict_l0_verification_failure(tcx, body, &func_path, artifacts.as_ref(), &policy);
     // A PUBLISHED contract (sentinels solver-proved under the exported
     // precondition) is verified-modulo-callers and does not abort; only the
-    // UNPROVED premise keeps the fail-closed strict rejection.
+    // UNPROVED premise keeps the fail-closed strict rejection. Since D2 the
+    // contract cannot publish in a fail-closed lane at all, so this abort is
+    // reachable for EVERY strict coroutine resume body again.
     if strict
         && matches!(
             &coroutine_protocol_rows,
@@ -8066,6 +8100,27 @@ impl FullVerificationFailure {
     }
 }
 
+/// Trust: whether the strict-verification diagnostic may truthfully recommend
+/// the nonfatal advisory policy for this failure.
+///
+/// The recommendation is intentionally narrower than "the build failed". A
+/// concrete refutation is not a coverage gap, and structurally invalid native
+/// evidence is not safe to interpret well enough to recommend a policy change.
+/// At least one actual gap category must also be present so an empty failure can
+/// never grow misleading guidance if a caller changes.
+fn advisory_policy_help_applies(
+    failure: FullVerificationFailure,
+    has_unproved_assumption_panic: bool,
+    native_structurally_sound: bool,
+) -> bool {
+    native_structurally_sound
+        && failure.failed == 0
+        && (has_unproved_assumption_panic
+            || failure.unknown > 0
+            || failure.runtime_checked > 0
+            || failure.skipped > 0)
+}
+
 /// Is this L0 failure fatal to the build?
 ///
 /// `require_full_discharge` (i.e. `targo trust certify`) keeps the historical
@@ -10000,6 +10055,19 @@ fn def_uses_unsafe_source<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
         return true;
     }
     let Some(local) = did.as_local() else { return true };
+    // Trust (I5): a Clean-origin def has no HIR body to walk, and needs none —
+    // every emittable shape (projection / wrapping binop / composed tree) is
+    // moves plus calls to safe, total, marker-authenticated core primitives;
+    // `unsafe` is unrepresentable in the emission, so `false` is the honest
+    // answer, not a concession. The conservative `true` would falsely poison
+    // every caller's UB-free classification the moment the emitted body is
+    // inlined. NINTH member of the synthetic-HIR family — reached through a
+    // CALLER's inlined-scope scan once `cross_crate_inlinable` copies the
+    // emitted body into it (measured under compiletest; the `hir_body_owned_by`
+    // walk below `span_bug!`s on the synthetic owner).
+    if crate::clean_origin_mir::is_clean_origin(tcx, local) {
+        return false;
+    }
     // Only fn/closure owners have a walkable HIR body; otherwise be conservative.
     if !tcx.hir_body_owner_kind(local).is_fn_or_closure() {
         return true;
@@ -10327,6 +10395,21 @@ fn abort_on_full_verification_failure<'tcx>(
     // warning (coverage gap) diagnostic — the two `Diag` levels are distinct
     // types and cannot share a binding, so the notes are level-agnostic here.
     let mut notes: Vec<String> = Vec::new();
+    // Trust (diagnostic legibility): the native verifier's own reporting —
+    // status line, per-request digests, per-obligation evidence and skip
+    // reasons — is SEPARATED from the notes a person can act on, and emitted
+    // after them.
+    //
+    // It used to be interleaved, and it is bounded at 1 + 8 + 24 + 8 = 41 notes
+    // against a handful of human ones. On the smallest possible failing program
+    // — `fn main() { println!("…"); }`, whose only unproved row is panic-freedom
+    // for an absent std callee — that put roughly a dozen lines of bundle
+    // digests, CHC/PDR strength requirements and TrustIr validation dumps
+    // between the reader and the one sentence naming the fix. A first contact
+    // with the toolchain that fails on correct code should lead with what to do
+    // about it; the engine's internals are for whoever is debugging the engine,
+    // and they keep their every byte, just below.
+    let mut engine_notes: Vec<String> = Vec::new();
     notes.push(format!(
         "summary: {} trusted, {} certified, {} failed, {} unknown, {} runtime-checked, {} skipped out of {}",
         summary.trusted,
@@ -10371,14 +10454,44 @@ fn abort_on_full_verification_failure<'tcx>(
         }
     }
     if has_unproved_assumption_panic {
-        notes.push(
-            "an unproven panic-freedom obligation for a call to an absent callee (a std/extern \
-             function whose body is not in the lowered bundle), or for drop glue with unproven \
-             panic-freedom, could not be established — its panic path stays reachable, so under \
-             the fail-closed default this is a build error (model the call/drop as total, or \
-             rewrite it to a verifiable form); `-Z trust-policy=advisory` downgrades it to a warning"
-                .to_string(),
-        );
+        // Trust (I5, ruling v7/D3 — a refusal must carry the fix, with
+        // options): the generic note below truthfully describes the std/extern
+        // absent-callee class, but it used to be emitted for EVERY absent
+        // callee — including a LOCAL Clean-origin function, kernel-defined in
+        // this very crate, for which "a std/extern function" is false (the
+        // recorded defect on `tests/ui/trust/clean_origin_verify_on.rs`). Name
+        // each such callee for what it is, say why its call was still refused,
+        // and give the options; keep the generic note exactly for the rows it
+        // still truthfully describes.
+        let (clean_origin_absent, other_assumption_rows) =
+            clean_origin_absent_callees_in_artifacts(tcx, artifacts);
+        for (callee, decl) in &clean_origin_absent {
+            notes.push(format!(
+                "the call to `{callee}` is not a std/extern call: `{callee}` is a local \
+                 Clean-origin function, kernel-checked and emitted from the Clean declaration \
+                 `{decl}` in this crate's `clean {{ … }}` island. Its call-site semantics are \
+                 modeled only for emission-plan shapes the cross-authority summary lane \
+                 implements (today: parameter projections, `def f (a : T) (b : T) : T := a`, \
+                 and single wrapping `+`/`-`/`*` binary ops over parameters and in-range \
+                 numerals at one unsigned machine width, \
+                 `def g (a : UInt64) (b : UInt64) : UInt64 := a + b`); \
+                 this declaration's shape is not yet modeled, so the call fails closed rather \
+                 than guessing. Options: (1) restate the Clean `def` in a modeled shape; \
+                 (2) wrap the call in a Rust `fn` carrying an explicit `ensures` contract and \
+                 prove that contract; (3) build with `-Z trust-policy=advisory` to record this \
+                 gap as a warning until the summary lane models this shape"
+            ));
+        }
+        if clean_origin_absent.is_empty() || other_assumption_rows {
+            notes.push(
+                "an unproven panic-freedom obligation for a call to an absent callee (a std/extern \
+                 function whose body is not in the lowered bundle), or for drop glue with unproven \
+                 panic-freedom, could not be established — its panic path stays reachable, so under \
+                 the fail-closed default this is a build error (model the call/drop as total, or \
+                 rewrite it to a verifiable form); `-Z trust-policy=advisory` downgrades it to a warning"
+                    .to_string(),
+            );
+        }
     }
     if failure.unknown > 0 {
         notes.push("unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification".to_string());
@@ -10390,7 +10503,7 @@ fn abort_on_full_verification_failure<'tcx>(
         notes.push("skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification".to_string());
     }
     if let Some(result) = &artifacts.full_verification {
-        notes.push(format!(
+        engine_notes.push(format!(
             "native full verifier status: {:?}; requested={}, proved={}, failed={}, unknown={}, timed_out={}, unsupported={}, skipped={}, insufficient_strength={}",
             result.status,
             result.summary.requested_obligations,
@@ -10403,23 +10516,44 @@ fn abort_on_full_verification_failure<'tcx>(
             result.summary.insufficient_strength,
         ));
         for diagnostic in result.diagnostics.iter().take(8) {
-            notes.push(format!("native full verifier diagnostic: {diagnostic}"));
+            engine_notes.push(format!("native full verifier diagnostic: {diagnostic}"));
         }
         for evidence in result.evidence.iter().take(8) {
             for diagnostic in evidence.diagnostics.iter().take(3) {
-                notes.push(format!(
+                engine_notes.push(format!(
                     "native full verifier evidence `{}`: {diagnostic}",
                     evidence.obligation_id
                 ));
             }
         }
         for skipped in result.skipped.iter().take(8) {
-            notes.push(format!(
+            engine_notes.push(format!(
                 "native full verifier skipped `{}`: {:?}",
                 skipped.obligation_id, skipped.reason
             ));
         }
     }
+    // Trust: one line saying what the following block IS, so a reader who does
+    // not work on the verifier knows they can stop here rather than reading
+    // forty notes looking for an instruction that is not in them.
+    if !engine_notes.is_empty() {
+        engine_notes.insert(
+            0,
+            format!(
+                "--- native verifier detail ({} line(s) below; engine internals, not required to act on this error) ---",
+                engine_notes.len()
+            ),
+        );
+    }
+    // Trust: relaxing the policy is a truthful suggestion only for a coverage
+    // gap backed by structurally valid native state. A refutation is not a gap,
+    // and malformed or row-misaligned evidence must remain fail-closed without
+    // suggesting a policy bypass.
+    let advisory_would_help = advisory_policy_help_applies(
+        failure,
+        has_unproved_assumption_panic,
+        native_structurally_sound,
+    );
     // Trust (completeness-gap ruling B): report the gap without failing the build
     // when every obligation keeps its runtime check or is the exact defined-IEEE
     // advisory. The LABEL is unchanged — the rows are still reported unproved and
@@ -10439,6 +10573,9 @@ fn abort_on_full_verification_failure<'tcx>(
         for note in notes {
             diag.note(note);
         }
+        for note in engine_notes {
+            diag.note(note);
+        }
         diag.emit();
     } else {
         let mut diag = tcx.dcx().struct_span_err(body.span, header);
@@ -10450,6 +10587,21 @@ fn abort_on_full_verification_failure<'tcx>(
                 "the default policy reports rather than fails a gap whose obligations all keep \
                  their runtime checks; that did not apply here because {reason}"
             ));
+        }
+        // Trust: the ONE actionable line, as `help:` and ahead of the engine
+        // dump. rustc renders `help:` distinctly from `note:` and readers are
+        // trained to look for it; the same sentence buried mid-way through a
+        // note list is not findable, which is how a build error whose remedy
+        // WAS printed still read as a dead end.
+        if advisory_would_help {
+            diag.help(
+                "this build failed on unproved coverage, not on a refutation: to record these \
+                 rows as warnings and continue only in non-proof survey mode, build with `-Z \
+                 trust-policy=advisory`",
+            );
+        }
+        for note in engine_notes {
+            diag.note(note);
         }
         diag.emit();
     }
@@ -12064,6 +12216,49 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
         }
         eligible_bodies.insert(local);
     }
+    // Trust (I5 cross-authority call modeling): register MODELED Clean-origin
+    // defs in the panic-free callee registry BEFORE the demand-order walk. The
+    // walk below only covers ELIGIBLE bodies, and a Clean-origin def is
+    // outside the VC pipeline's coverage universe by construction (see
+    // `trust_coverage_eligible_body`) — no walk order can ever register one.
+    // The claim itself needs no VC run: panic-freedom holds BY CONSTRUCTION of
+    // the emitter, on the same plan of record the kernel gate checked (the
+    // gate fatally refuses compilation if the emitted body disagrees with that
+    // plan; see `clean_origin_plan_of_record` for the chain), shape by shape:
+    //   * `Projection`: `_0 = move _{i+1}; return` — one statement, no calls,
+    //     no asserts, no unwind edge.
+    //   * `WrappingBinOp`: `bb0: _0 = Call(u{w}::wrapping_{op}, [l, r]) ->
+    //     bb1: Return` — this body CONTAINS a call, so the Projection
+    //     rationale extends honestly rather than silently: the ONE callee is
+    //     core's inherent `u{w}::wrapping_{add,sub,mul}`, selected by the
+    //     EMITTER itself (never by user code) through
+    //     `clean_origin_mir::resolve_core_wrapping_method`, which refuses any
+    //     resolution failing
+    //     `trust_mir_extract::tcx_is_authenticated_core_integer_wrapping_method`
+    //     — the same marker authentication the extractor's own wrapping lane
+    //     trusts. Those primitives are TOTAL (defined on every input, no
+    //     panic path; wrapping is their semantics, not an error), and the
+    //     call's unwind edge is `UnwindAction::Unreachable`.
+    // `register_proven_panic_free` is deliberately NOT used: its axiom-census
+    // gate reads census absence as "unanswered" — the right fail-closed
+    // default for verdicts produced by a bundle run that can spend
+    // assumptions — but these bodies have no real HIR and no attribute
+    // surface on which a user axiom could be spent (`Projection` has no calls
+    // at all; `WrappingBinOp`'s one call is emitter-chosen, marker-
+    // authenticated core code, not a user-nameable site), and their authority
+    // is the kernel gate, not a census-taking verification.
+    // Only modeled shapes register; every other shape (and any plan/env
+    // refusal) keeps its callers fail-closed (`clean_origin_call_model_of_record`).
+    for local in crate::clean_origin_mir::clean_origin_defs(tcx) {
+        if clean_origin_call_model_of_record(tcx, local.to_def_id()).is_none() {
+            continue;
+        }
+        let def_path = trust_mir_extract::safe_def_path_str(tcx, local.to_def_id());
+        debug!("Trust (I5): registering modeled Clean-origin def `{def_path}` as panic-free");
+        with_crate_verification_state(tcx.sess, |state| {
+            state.panic_free_proven_funcs.insert(def_path.clone());
+        });
+    }
     // The panic-free callee registry is consumed while a caller's one-shot
     // verdict is built, so populate it in callee-first order. This is only a
     // permutation of the same eligible body set; cycles cannot bootstrap a proof
@@ -12366,15 +12561,22 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
 /// This hook deliberately runs after the coverage row and crate summary. It is
 /// unavailable when the front end already has errors or the invocation has no
 /// codegen output, so forcing the codegen mono graph cannot suppress the honest
-/// fail-closed summary. Local instances are excluded until their authored
-/// contract bundles can be instantiated and bound to the concrete body; dumping
-/// them with `None` would silently erase specification identity.
+/// fail-closed summary. LOCAL instances are admitted since 2026-08-19 for the
+/// contract-free generic case only (fn/assoc-fn requiring monomorphization; the
+/// native-store contract guard declines any `def_may_have_contracts` local, and
+/// non-generic locals plus all closures stay excluded — the ordinary lane owns
+/// them). One recorded softness: a local whose spec arrives via the LEGACY
+/// HIR-attribute channel is not declined here — no spec is ERASED (the ordinary
+/// lane's extraction recovers those attributes into its own dumped row, and
+/// downstream consumers fail closed on `requires != Some([])`), but such a mono
+/// row is spec-carrying-by-attribute; extend the guard to that channel before
+/// relying on "mono rows are spec-free" as an invariant.
 ///
-/// Every admission check declines rather than approximates: only real foreign
-/// item bodies are considered, the instance arguments and the entire
-/// instantiated `Body` must contain no non-region parameter, inference, or
-/// placeholder, and collection must not enlarge the already-complete local
-/// verification inventory.
+/// Every admission check declines rather than approximates: only real function
+/// bodies are considered (foreign, or the narrowed local class above), the
+/// instance arguments and the entire instantiated `Body` must contain no
+/// non-region parameter, inference, or placeholder, and collection must not
+/// enlarge the already-complete local verification inventory.
 #[allow(rustc::potential_query_instability)]
 fn trust_dump_monomorphic_instances(tcx: TyCtxt<'_>) {
     let Some(dump_path) = tcx.sess.opts.unstable_opts.trust_dump.mir.as_deref() else {
@@ -12420,9 +12622,36 @@ fn trust_dump_monomorphic_instances(tcx: TyCtxt<'_>) {
         for (item, _data) in cgu.items() {
             let rustc_middle::mono::MonoItem::Fn(instance) = item else { continue };
             // Shims, intrinsics, and virtual dispatch have no ordinary user MIR.
-            // Local items are withheld until exact instantiated contract bundles
-            // are available; the W16 target is foreign generic library bodies.
             let ty::InstanceKind::Item(def) = instance.def else { continue };
+            // Trust (LOCAL MONO INSTANCES, 2026-08-19): a CONTRACT-FREE local
+            // generic's concrete instance is admitted — the bytesize intake's
+            // `<ByteSize as AddAssign<u64>>::add_assign` class, which NOTHING
+            // else can dump concretely (the ordinary local-`DefId` extractor
+            // sees the generic body with `TyKind::Param` locals). The recorded
+            // withholding rationale — "dumping a local instance with `None`
+            // would silently erase specification identity" — is preserved by
+            // the SHARED contract guard below: `trust_contracts_if_any` reads
+            // local bundles too (`def_may_have_contracts`), so any
+            // contract-carrying local body still declines, and only bodies
+            // with NO authored spec flow through. NON-generic local bodies
+            // stay excluded: the ordinary extractor already dumps them, and
+            // this lane would only duplicate that row under a mono path.
+            if def.is_local()
+                && (!tcx.generics_of(def).requires_monomorphization(tcx)
+                    // Every closure carries synthetic own Type params, so
+                    // `requires_monomorphization` is unconditionally TRUE for
+                    // closures — without this exclusion every reachable local
+                    // closure would dump here AND in the ordinary lane,
+                    // double-counting rows and aliasing the identity key for
+                    // non-generic parents (round finding, 2026-08-19). A local
+                    // closure of a GENERIC parent is dumped generically by the
+                    // ordinary lane; its concrete instances wait for a
+                    // dedicated identity treatment rather than an ambiguous
+                    // one-string-two-bodies row.
+                    || matches!(tcx.def_kind(def), DefKind::Closure))
+            {
+                continue;
+            }
             // Trust (W16 breadth, wave-2): admit a CONCRETE foreign instance too.
             // The prior `!requires_monomorphization => continue` disqualifier
             // silently dropped every reachable NON-generic foreign body
@@ -12441,8 +12670,7 @@ fn trust_dump_monomorphic_instances(tcx: TyCtxt<'_>) {
             // are all retained verbatim. Still DOUBLE-GATED behind
             // `-Ztrust-dump=mir:` + `TRUST_DUMP_MONO` (checked at the top): no
             // default-behavior change.
-            if def.is_local()
-                || !matches!(tcx.def_kind(def), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
+            if !matches!(tcx.def_kind(def), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
                 || !tcx.is_mir_available(def)
                 || trust_contracts_if_any(tcx, def).is_some_and(|bundle| {
                     // A nonzero summary with empty decoded vectors is malformed
@@ -12518,6 +12746,23 @@ fn trust_dump_monomorphic_instances(tcx: TyCtxt<'_>) {
 pub(crate) fn trust_coverage_eligible_body(tcx: TyCtxt<'_>, local: LocalDefId) -> bool {
     if !matches!(tcx.def_kind(local.to_def_id()), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
     {
+        return false;
+    }
+    // Trust (I5): a Clean-origin def is OUTSIDE the VC pipeline's coverage
+    // universe by construction — its `optimized_mir` is the kernel-gated
+    // emission, served BEFORE the pass manager, so `TrustVerify::run_pass`
+    // never observes it, and its correctness authority is the faithfulness
+    // gate (`clean_origin_mir`), not a VC verdict. Counting it in the
+    // denominator would make coverage name a body the verifier CORRECTLY
+    // never processes — the same shape as the dead-contract-closure exclusion
+    // below, and the FIFTH site the mir_keys seeding of Clean-origin defs
+    // reached (predicted from this reconciliation's own `processed ==
+    // eligible` assertion, not discovered as an ICE). Nothing goes silent:
+    // the island lane separately reports the kernel check of every
+    // declaration, and the gate refuses emission outright on disagreement.
+    // This check also sits BEFORE the `hir_body_const_context` read at the
+    // bottom, which is not written for a synthetic HIR owner.
+    if crate::clean_origin_mir::is_clean_origin(tcx, local) {
         return false;
     }
     // Runtime contract checks are disabled by default. Their compiler-generated
@@ -13330,6 +13575,28 @@ fn try_harvest_flip<'tcx>(
         CallerCoverage, CallerDischargeProof, StrengthenedProof, classify_coverage,
         mint_caller_propagation_certificate,
     };
+
+    // Trust (I5): a Clean-origin def has no ordinary MIR pipeline — step (1)'s
+    // `mir_drops_elaborated_and_const_checked` walks `mir_borrowck` ->
+    // `mir_promoted` -> `mir_built` -> `check_match` -> `typeck`, and `typeck`
+    // `span_bug!`s on a def with a synthetic HIR owner and no body. MEASURED:
+    // this is the FOURTH such site (`can't type-check body of
+    // DefId(..::m::pick)` on `tests/ui/trust/clean_origin_verify_on.rs`), after
+    // the backing inventory, the R1 call-graph scan, and the MIR pipeline —
+    // it fires because Clean-origin defs are seeded into `mir_keys`, which is
+    // exactly the loop `trust_init_r1_attributions` harvests from.
+    //
+    // Unlike the R1 SCAN (which must stay COMPLETE and therefore reads the
+    // gated emission out of `optimized_mir`), the flip HARVEST is opportunistic
+    // strengthening of an unproved RUST obligation by charging a precondition
+    // to callers. A Clean-origin body's meaning is owned by the kernel
+    // faithfulness gate, not by Rust contracts — minting a caller-propagation
+    // flip against it would mix two proof authorities — and the emitted
+    // projection generates no failing VC to strengthen anyway. Returning `None`
+    // mints nothing: fail-closed, strictly fewer claims.
+    if crate::clean_origin_mir::is_clean_origin(tcx, f_local) {
+        return None;
+    }
 
     // (0) Coverage MUST be provably Total. The signals carry recursive/address-taken/
     //     public/hidden (recursion folded into is_public, so the recursive set passed to
@@ -14824,6 +15091,33 @@ pub fn trust_init_backing_certificates(tcx: TyCtxt<'_>) {
             | DefKind::SyntheticCoroutineBody) => {
                 let fn_like = matches!(kind, DefKind::Fn | DefKind::AssocFn);
                 if !fn_like && !need_backing {
+                    continue;
+                }
+                // Trust (I5): a Clean-origin def is in `mir_keys` but has no
+                // ordinary MIR pipeline behind it. Asking for
+                // `mir_drops_elaborated_and_const_checked` walks
+                // `mir_borrowck` -> `mir_promoted` -> `mir_built` ->
+                // `check_match` -> `typeck`, and `typeck`'s first act is
+                // `node.body_id().unwrap_or_else(|| span_bug!(...))` on a def
+                // that has a synthetic HIR owner and no body — a hard ICE,
+                // measured on `m::pick` (2026-08-19).
+                //
+                // The body is taken from `optimized_mir` instead, which for
+                // these defs IS the gated emission — so the backing inventory
+                // stays COMPLETE (it is not skipped, which would silently drop
+                // a body from an inventory whose completeness gates
+                // certification) and the function summary is extracted from
+                // exactly the body that will be codegened.
+                if crate::clean_origin_mir::is_clean_origin(tcx, local_def_id) {
+                    let body = tcx.optimized_mir(local_def_id);
+                    let func =
+                        trust_mir_extract::extract_function_with_contract_bundle(tcx, body, None);
+                    if need_backing {
+                        backing_funcs.push(func.clone());
+                    }
+                    if fn_like {
+                        funcs.push(func);
+                    }
                     continue;
                 }
                 let steal = tcx.mir_drops_elaborated_and_const_checked(local_def_id);
@@ -16486,6 +16780,242 @@ fn extracted_callee_body_for_tracing<'tcx>(
     })
 }
 
+/// Trust (I5 cross-authority call modeling): the plan of record for a LOCAL
+/// Clean-origin def — the SAME decision the sole body emitter acts on.
+///
+/// # The authority chain, and why this function may exist at all
+///
+/// `clean_origin_mir::build_gated_body` derives a `CleanOriginPlan` via
+/// `clean_crate_environment` (the kernel-checked island environment) plus
+/// `trust_clean_origin::plan_clean_origin_body` (which re-checks the
+/// declaration's `FullKernelCheck` provenance and its total carrier
+/// signature), emits MIR from the plan's shape, and the faithfulness gate
+/// (`check_faithful`) then FATALLY refuses compilation unless the emitted body
+/// kernel-identifies with the declaration. So for any Clean-origin def that
+/// COMPILES, the plan returned here describes the emitted body exactly — not
+/// because anyone re-read MIR bytes, but because the emitter cannot produce a
+/// body that disagrees with this plan and live.
+///
+/// This function re-runs that SAME derivation (`clean_crate_environment` →
+/// `plan_clean_origin_body`, both deterministic over the same island bytes;
+/// the registry lookup keys the same `clean_origin_defs` row the emitter
+/// keys). It NEVER reads the emitted MIR and NEVER parses Clean text itself.
+///
+/// `None` on ANY refusal — not a Clean-origin def, tainted/unrecoverable
+/// island session, plan refused. Every consumer must treat `None` as "no
+/// knowledge": the call stays havocked/absent and fails closed exactly as it
+/// did before this lane existed. Never a default, never a guess.
+///
+/// COST: the registry lookup comes first and is empty in every crate without
+/// a `clean { … }` island, so ordinary crates never elaborate anything here.
+/// For a registry hit this re-elaborates the crate's islands (the same
+/// deliberately-uncached cost profile as `clean_origin_mir` itself — see the
+/// cost note on `clean_crate_environment`).
+fn clean_origin_plan_of_record(
+    tcx: TyCtxt<'_>,
+    callee_def_id: DefId,
+) -> Option<trust_clean_origin::CleanOriginPlan> {
+    let local = callee_def_id.as_local()?;
+    let (name, _span) = crate::clean_origin_mir::clean_origin_registry_entry(tcx, local)?;
+    let session = crate::clean_origin_mir::clean_crate_environment(tcx)?;
+    let env = session.environment()?;
+    trust_clean_origin::plan_clean_origin_body(env, &name).ok()
+}
+
+/// Trust (I5 cross-authority call modeling): the validated call model for a
+/// LOCAL Clean-origin def whose plan-of-record shape this lane models —
+/// everything the caller-side consumers (panic-free registry, compiler-total
+/// classification, definitional summary) need, re-checked against the plan
+/// rather than trusted from it.
+enum CleanOriginCallModel {
+    /// `fun x0 … x_{n-1} => x_i`: the emitted body is `_0 = move _{i+1};
+    /// return` — call-free, total, complete value semantics `_0 == arg_i`.
+    Projection { projected: usize, arity: usize },
+    /// A single wrapping `+`/`-`/`*` over parameters / in-range numerals at
+    /// ONE unsigned machine width: the emitted body is `bb0: _0 =
+    /// Call(u{width}::wrapping_{op}, [l, r]) -> bb1: Return`, with the callee
+    /// emitter-selected and marker-authenticated
+    /// (`clean_origin_mir::resolve_core_wrapping_method` refuses anything
+    /// failing `tcx_is_authenticated_core_integer_wrapping_method`) and the
+    /// unwind edge `UnwindAction::Unreachable` — total by construction for
+    /// ALL THREE ops. Value semantics are expressible for `Add`/`Sub` only
+    /// (`trust_vcgen::clean_origin_wrapping_binop_postconditions`, which
+    /// refuses `Mul` — that boundary is recorded at its definition).
+    WrappingBinOp {
+        op: trust_types::admissible_body::ArithBinOp,
+        left: trust_types::admissible_body::ArithOperand,
+        right: trust_types::admissible_body::ArithOperand,
+        width: u32,
+        arity: usize,
+    },
+}
+
+/// Trust (I5 cross-authority call modeling): the [`CleanOriginCallModel`] for
+/// a LOCAL Clean-origin def; `None` for every other def, every unmodeled
+/// shape, and any plan invariant violation (fail-closed, never a guess).
+///
+/// The match is deliberately EXHAUSTIVE over `CleanOriginShape` with no `_`
+/// arm: this lane models exactly `Projection` and `WrappingBinOp`. Any future
+/// variant fails compilation here by design and gets its own explicit arm (a
+/// modeling arm or a fail-closed `None` arm), never a fall-through —
+/// `Composed`, which landed while this lane was being extended, starts
+/// exactly that way below: fail-closed `None` (no summary, no panic-freedom,
+/// no totality claim; its callers keep the fatal absent-callee arm and the
+/// v7/D3 note) until a summary lane for it exists.
+fn clean_origin_call_model_of_record(
+    tcx: TyCtxt<'_>,
+    callee_def_id: DefId,
+) -> Option<CleanOriginCallModel> {
+    use trust_types::admissible_body::ArithOperand;
+    let plan = clean_origin_plan_of_record(tcx, callee_def_id)?;
+    let arity = plan.param_tys().len();
+    match plan.shape() {
+        trust_clean_origin::CleanOriginShape::Projection { projected } => {
+            // The planner guarantees `projected < arity`; if that invariant is
+            // ever violated, refuse the summary rather than trust it.
+            (*projected < arity).then_some(CleanOriginCallModel::Projection {
+                projected: *projected,
+                arity,
+            })
+        }
+        trust_clean_origin::CleanOriginShape::WrappingBinOp { op, left, right } => {
+            // The planner guarantees a single unsigned machine width across
+            // EVERY signature position and in-range operands
+            // (`recognise_wrapping_binop` / `recognise_arith_operand`).
+            // Re-validate all of it here — same refuse-not-trust discipline
+            // as the `projected < arity` check above: any violation refuses
+            // the model instead of minting a wrong summary or a wrong
+            // totality claim.
+            let trust_types::Ty::Int { width, signed: false } = plan.return_ty() else {
+                return None;
+            };
+            let width = *width;
+            if !matches!(width, 8 | 16 | 32 | 64) {
+                return None;
+            }
+            if plan.param_tys().iter().any(|ty| {
+                !matches!(ty, trust_types::Ty::Int { width: w, signed: false } if *w == width)
+            }) {
+                return None;
+            }
+            let operand_valid = |operand: &ArithOperand| match operand {
+                ArithOperand::Param(i) => *i < arity,
+                // width <= 64 (checked above), so the shift cannot overflow.
+                ArithOperand::Const(v) => *v < (1u128 << width),
+            };
+            (operand_valid(left) && operand_valid(right)).then_some(
+                CleanOriginCallModel::WrappingBinOp {
+                    op: *op,
+                    left: *left,
+                    right: *right,
+                    width,
+                    arity,
+                },
+            )
+        }
+        // NOT MODELED by this increment: no summary, no panic-freedom claim,
+        // no compiler-total classification — callers of a `Composed` def stay
+        // fail-closed (havocked result, fatal absent-callee arm, the v7/D3
+        // note naming the callee as Clean-origin) until this lane grows a
+        // per-node composition of the same extractor-pinned encoding.
+        trust_clean_origin::CleanOriginShape::Composed { .. } => None,
+        // Trust (R2/C5a): likewise fail-closed — a Select call stays havocked
+        // until a summary lane for the shape lands (its natural clause is the
+        // definitional `ite` equality, same pattern as the projection's).
+        trust_clean_origin::CleanOriginShape::Select { .. } => None,
+    }
+}
+
+/// Trust (I5 cross-authority call modeling): the caller-side summary for a
+/// call to a Clean-origin function whose shape the summary lane models,
+/// derived from the plan of record (`clean_origin_call_model_of_record` —
+/// kernel gate → plan → this summary; see `clean_origin_plan_of_record` for
+/// the full chain).
+///
+/// # The exact semantics injected
+///
+/// * `Projection`: `result == arg_{projected}`, spelled `_0 ==
+///   <formal_{projected}>` over synthetic formals. For the emitted body
+///   `_0 = move _{projected+1}; return` this is the body's COMPLETE value
+///   semantics.
+/// * `WrappingBinOp` at `Add`/`Sub`: `_0 == (l op r) mod 2^width`, spelled as
+///   the single-`Ite` modular reduction in Int/LIA — THE EXTRACTOR'S OWN
+///   wrapping encoding (`trust-vcgen`'s `wrapping_call_assert_model` mints
+///   the identical formula when it models the same `u{w}::wrapping_{op}`
+///   primitive inside an ordinary extracted body; the constructor
+///   `trust_vcgen::clean_origin_wrapping_binop_postconditions` owns the
+///   encoding and its unit tests pin the two together, because a summary that
+///   encoded wrapping differently from the extractor would be a soundness
+///   bug). Operand range facts ride alongside, exactly as the extractor's do.
+/// * `WrappingBinOp` at `Mul`: NO summary (`None` — the constructor's
+///   recorded boundary: the Int/LIA lane that consumes these clauses has no
+///   faithful nonlinear-mod encoding, matching the extractor's own refusal).
+///   The call's PANIC-FREEDOM is still discharged (the op is total either
+///   way); only its result stays havocked, fail-closed.
+///
+/// trust-vcgen rebinds each clause at each call site (formals → actual
+/// operands, `_0` → the caller's dest) and version-pins it to the dest's
+/// post-call SSA token, so the definition fact is an EQUALITY that refutes a
+/// wrong caller claim (`assert!(s == 1)` after `wsum(u64::MAX, 1)`) exactly
+/// as it discharges a right one (`assert!(s == 0)` — the WRAPPED value; an
+/// unwrapped integer summary would refute it) — the summary states what the
+/// callee returns, it does not bless what the caller asserts.
+///
+/// The formal names are synthetic (`__trust_clean_origin_arg{i}`): the plan
+/// does not carry source parameter names, and none are needed — the clauses
+/// are constructed over these names and they are substituted away wholesale
+/// at rebinding, so they never reach a solver namespace. They exist only to
+/// satisfy the arity/rebindability gates that make injection sound
+/// (`callee_postcondition_is_injectable`).
+///
+/// The summary deliberately carries NO preconditions (the plan's existence IS
+/// the total-carrier evidence for the whole signature) and NO extracted body,
+/// contract, or float range: its clauses are the facts the plan authorizes.
+/// `with_definitional_postcondition` is the trust-vcgen authority carrier
+/// whose contract this producer satisfies — see its doc.
+fn clean_origin_callee_summary(
+    tcx: TyCtxt<'_>,
+    callee_def_id: DefId,
+    callee_name: &str,
+) -> Option<trust_vcgen::FunctionSummary> {
+    let model = clean_origin_call_model_of_record(tcx, callee_def_id)?;
+    let synthetic_formals = |arity: usize| -> Vec<String> {
+        (0..arity).map(|i| format!("__trust_clean_origin_arg{i}")).collect()
+    };
+    match model {
+        CleanOriginCallModel::Projection { projected, arity } => {
+            let param_names: Vec<String> = synthetic_formals(arity);
+            let post = Formula::Eq(
+                Box::new(Formula::var("_0", Sort::Int)),
+                Box::new(Formula::var(&param_names[projected], Sort::Int)),
+            );
+            Some(
+                trust_vcgen::FunctionSummary::new(callee_name)
+                    .with_param_names(param_names)
+                    .with_definitional_postcondition(post),
+            )
+        }
+        CleanOriginCallModel::WrappingBinOp { op, left, right, width, arity } => {
+            let param_names: Vec<String> = synthetic_formals(arity);
+            // `None` for `Mul` (and any invalid instance): inject nothing —
+            // the call stays havocked while its totality travels separately.
+            let posts = trust_vcgen::clean_origin_wrapping_binop_postconditions(
+                op,
+                left,
+                right,
+                width,
+                &param_names,
+            )?;
+            let mut summary =
+                trust_vcgen::FunctionSummary::new(callee_name).with_param_names(param_names);
+            for post in posts {
+                summary = summary.with_definitional_postcondition(post);
+            }
+            Some(summary)
+        }
+    }
+}
+
 /// Trust: cheap scan for whether `body` contains any `Call` terminator.
 ///
 /// The callee-contract DB is built ENTIRELY from `Call` terminators (both the
@@ -16597,6 +17127,23 @@ fn add_direct_call_contract_summaries<'tcx>(
         // contract extraction cheap (replacing the old def-id `seen` set).
         let callee_name = trust_mir_extract::func_operand_name(tcx, callee_op);
         if db.get(&callee_name).is_some() {
+            continue;
+        }
+
+        // Trust (I5 cross-authority call modeling): a LOCAL Clean-origin callee
+        // whose plan-of-record shape this increment models gets a DEFINITIONAL
+        // summary here — kernel gate → plan → summary; the clause restates the
+        // emitted body's complete value semantics, so it both discharges a
+        // right caller claim and refutes a wrong one. Keyed by the SAME
+        // `func_operand_name` spelling the extracted `Terminator::Call`
+        // carries, like every other entry in this DB. Short-circuits the
+        // contract/tracing path below on purpose: a Clean-origin def's meaning
+        // is owned by the kernel faithfulness gate, not by Rust contracts, and
+        // its (fed, empty) HIR surface has nothing for those lanes anyway. A
+        // `None` (unmodeled shape, plan/env refusal) falls through unchanged —
+        // fail-closed, exactly the pre-lane behavior.
+        if let Some(summary) = clean_origin_callee_summary(tcx, callee_def_id, &callee_name) {
+            db.insert(summary);
             continue;
         }
 
@@ -17170,12 +17717,23 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
     // regression versus pre-composition behaviour. `effective_max_level` itself
     // bumps a CONTRACTED caller to >= L1, so a caller that declares its own
     // contracts still gets composition at the default level.
-    let empty_summaries = trust_vcgen::SummaryDatabase::new();
+    // Trust (I5 cross-authority call modeling): below L1Functional the general
+    // summary DB must still not apply — that is the R3 #1 rule above, verbatim.
+    // But a DEFINITIONAL, precondition-free summary (the Clean-origin lane,
+    // `clean_origin_callee_summary`) has no conditional half: there is no
+    // precondition VC for the level filter to strip, and its clause is true of
+    // every execution of the emitted callee body by construction. Exactly that
+    // subset — both properties enforced inside trust-vcgen, where the authority
+    // bit is crate-private — rides the L0 lane, so a plain L0 caller of a
+    // Clean-origin projection or wrapping `+`/`-` binop can discharge (or be
+    // refuted on) its own assertions about the call's result. Empty when no
+    // such callee exists: byte-identical to the old empty-DB behavior.
+    let l0_definitional_summaries = callee_summaries.definitional_precondition_free_subset();
     let vc_summaries: &trust_vcgen::SummaryDatabase =
         if effective_max_level(tcx.sess, &func) >= trust_types::ProofLevel::L1Functional {
             &callee_summaries
         } else {
-            &empty_summaries
+            &l0_definitional_summaries
         };
 
     // Trust #941: Dump extracted VerifiableFunction as JSON for test fixture generation.
@@ -17730,7 +18288,8 @@ fn record_verdict_axiom_freedom(sess: &Session, def_id: DefId, axiom_free: bool)
 ///
 /// Deliberately NOT refused here: `abi_total_panic_free` (bodyless foreign
 /// non-unwinding), `type_total_std` (type-verified std iterator advance),
-/// `compiler_total` (the `?` desugar, rung-1 Φ) and the reliance lanes' own
+/// `compiler_total` (the `?` desugar, rung-1 Φ; the Clean-origin modeled-call
+/// lane, `clean_origin_call_model_of_record`) and the reliance lanes' own
 /// `dyn_contract_total`. Those are facts this compiler derived and they emit no
 /// assumption row in any mode; only USER declarations are axioms here.
 fn verdict_rests_on_user_axiom(sess: &Session, def_id: DefId) -> Option<&'static str> {
@@ -18130,8 +18689,22 @@ fn refute_full_assert_obligations(
     // assert/panic block of its own (e.g. a `fn main` whose only statement is a call)
     // still reaches the interprocedural panic-freedom discharge below, which proves
     // its catch-all when every callee is already proven panic-free.
-    let refutable =
+    let mut refutable =
         trust_vcgen::generate_full_assert_refutation_vcs_with_context(func, vcgen_context);
+    // Trust (coroutine resume-state contract): that generator walks only
+    // `Terminator::Call` panic sites, so rustc's compiler-inserted
+    // `ResumedAfter{Return,Panic,Drop}` sentinels — which are
+    // `Terminator::Assert`s, never calls — produced ZERO candidates and the
+    // solver was never asked about them. Append one real candidate per
+    // sentinel: exact path feasibility ∧ the recognized entry precondition
+    // `selector ∈ live_states`. UNSAT here is a genuine proof about the BODY
+    // (no execution honoring that precondition reaches the sentinel) and
+    // NOTHING more — the precondition itself is the caller's obligation, is
+    // published as the `contract:coroutine-resume-state` row, and is charged to
+    // every in-bundle poll/resume site; it is not discharged anywhere by this
+    // call. Fail-closed: the generator declines (empty) on any shape it cannot
+    // exactly constrain.
+    refutable.extend(trust_vcgen::coroutine_sentinel_refutation_vcs(func));
     let debug = env_flag_enabled("TRUST_ASSERT_DEBUG");
     let mut proved_vcs: Vec<(VerificationCondition, VerificationResult)> = Vec::new();
     let mut refuted_vcs: Vec<(VerificationCondition, VerificationResult)> = Vec::new();
@@ -18300,6 +18873,30 @@ fn refute_full_assert_obligations(
     };
     let deadline_has_remaining = || !deadline.is_some_and(|at| std::time::Instant::now() >= at);
 
+    // Trust (coroutine resume-state contract): the coroutine-sentinel proofs
+    // must ALSO surface as their OWN rows, not only be folded into the
+    // catch-all. The contract-publish seam's anti-silent-drop belt
+    // (`rows_exhibit_coroutine_sentinel_proof`) accepts nothing but a PROVED
+    // row per sentinel carrying the bridge marker and the exact live-state set:
+    // "the catch-all is proved" is precisely the vacuous stand-in that belt
+    // exists to refuse. Identified ONLY by the marker description, which
+    // `coroutine_sentinel_refutation_vcs` mints exclusively from the pure
+    // recognizer plus a compiler-generated `AssertMessage` — never from user
+    // text — so no ordinary assert candidate can enter this set. Additive: real
+    // ay `Proved` rows for real solved VCs; a sentinel that did NOT prove is
+    // simply absent here, the count-equality gate then fails, and the
+    // fail-closed `assumption:coroutine` row + strict abort stands.
+    let sentinel_proof_rows: Vec<(VerificationCondition, VerificationResult)> = proved_vcs
+        .iter()
+        .filter(|(vc, _)| {
+            matches!(&vc.kind, VcKind::Assertion { message }
+                if trust_types::assumption::
+                    parse_coroutine_resume_contract_obligation_description(message).is_some())
+        })
+        .cloned()
+        .collect();
+    let mut sentinel_published = sentinel_proof_rows.is_empty();
+
     let mut proved = 0u32;
     if all_assert_panics_unreachable && deadline_has_remaining() {
         // Include an ALREADY-Proved-but-uncertified catch-all (e.g. one the
@@ -18432,10 +19029,26 @@ fn refute_full_assert_obligations(
                 results.push(entry);
                 proved += 1;
             }
+            // Already surfaced above (this branch pushes every proved
+            // candidate, sentinels included); nothing left to publish.
+            sentinel_published = true;
         }
         // else: some other obligation is still open — leave the catch-all Unknown
         // (the function stays inconclusive on that other gap) and do not inflate the
         // set with subsumed per-block duplicates.
+    }
+    // Trust (coroutine resume-state contract): publish the sentinel proofs as
+    // their own rows (see `sentinel_proof_rows`). Deliberately OUTSIDE the
+    // catch-all gate: the sentinel proof must be visible even when some OTHER
+    // obligation of the body is still open, because the publish seam's
+    // `coroutine_contract_rows_all_statically_proved` gate independently
+    // refuses the contract row in exactly that case — so this can never
+    // substitute for it.
+    if !sentinel_published {
+        for entry in sentinel_proof_rows {
+            results.push(entry);
+            proved += 1;
+        }
     }
 
     // INTERPROCEDURAL panic-freedom discharge. A function whose own assert/panic
@@ -18455,7 +19068,26 @@ fn refute_full_assert_obligations(
     // is surfaced as a failure above) nor when any obligation is left open. The
     // callee facts come from this Session's panic-free registry, populated as
     // each function fully verifies and matched by exact `def_path`.
-    if proved == 0 && refuted == 0 && deadline_has_remaining() {
+    //
+    // Trust (coroutine resume-state contract) — THE SITE-ENUMERATION HOLE. That
+    // soundness argument is a claim that (a) ∪ (b) COVERS every panic site, and
+    // for a coroutine resume body it does not: rustc's `ResumedAfter*` sentinel
+    // is a `Terminator::Assert` with no obligation of its own (`trust_vcgen`'s
+    // safety lane deliberately emits none for those three messages), so it is
+    // neither (a) nor (b). For a zero-await resume body — which has no calls at
+    // all — `all_calls_target_proven_panic_free` is VACUOUSLY true, and this
+    // rule stamped the whole-function catch-all `Proved` without anything ever
+    // having looked at the sentinel or at the resume-state precondition it
+    // depends on. DECLINE for any body carrying such a sentinel: its panic
+    // surface is exactly what this rule cannot enumerate. The sentinel
+    // candidates appended above are the honest route — if they prove, the
+    // catch-all is discharged by the (non-vacuous) block above; if they do not,
+    // the catch-all stays open.
+    if proved == 0
+        && refuted == 0
+        && deadline_has_remaining()
+        && !trust_vcgen::body_has_coroutine_protocol_sentinel(func)
+    {
         let pf_idxs: Vec<usize> = results
             .iter()
             .enumerate()
@@ -20261,17 +20893,22 @@ fn collect_full_verification_artifacts_once<'tcx>(
 
     let mut all_vcs = solver_vcs.to_vec();
     all_vcs.extend(discharged.iter().map(|(vc, _)| vc.clone()));
-    let (bundle, mut native_trust_ir_bundle, mut body_bound_carriers, definition_entry_markers) =
-        build_full_verification_input(
-            tcx,
-            body,
-            func,
-            compiler_contracts,
-            &all_vcs,
-            loop_feedback,
-            policy,
-            context.deadline,
-        );
+    let (
+        bundle,
+        mut native_trust_ir_bundle,
+        mut body_bound_carriers,
+        definition_entry_markers,
+        mut coroutine_resume_contract,
+    ) = build_full_verification_input(
+        tcx,
+        body,
+        func,
+        compiler_contracts,
+        &all_vcs,
+        loop_feedback,
+        policy,
+        context.deadline,
+    );
     // This is the one audited semantic-TCB issuer in the root constellation:
     // the native bundle has just returned from the final live MIR lowering and
     // all compiler-owned rewrites are complete. A mint failure poisons the
@@ -20283,24 +20920,26 @@ fn collect_full_verification_artifacts_once<'tcx>(
         Ok(authority) => authority,
         Err(reason) => {
             body_bound_carriers.clear();
+            coroutine_resume_contract = None;
             native_trust_ir_bundle = Err(reason);
             None
         }
     };
-    // Trust (coroutine resume-state contract): extract the bridge's
-    // authenticated sentinel-conversion evidence from the LIVE native bundle's
-    // module, before any verification consumes it. `None` whenever the bundle
-    // failed to build or the contract lane did not (fully) engage — the
-    // publish seam then keeps the fail-closed `assumption:coroutine` + strict
-    // abort. Belt: the evidence must be about THIS function (the extractor
-    // recomputes the recognizer decision from `func`'s own body).
-    let coroutine_resume_contract = match &native_trust_ir_bundle {
-        Ok(Some(native_bundle)) => trust_ir_bridge::coroutine_resume_contract_module_evidence(
-            func,
-            &native_bundle.module,
-        ),
-        _ => None,
-    };
+    // Trust (coroutine resume-state contract): the bridge's authenticated
+    // sentinel-conversion evidence was minted INSIDE the bundle builder, from
+    // the live module while it still carried the bridge's private proof
+    // inventory (see the extraction site in
+    // `build_native_trust_ir_bundle_from_verifiable_functions`). Extracting it
+    // HERE — the previous shape — could only ever answer `None`: by this point
+    // `append_verifier_api_obligations_to_native_trust_ir` has reset the module
+    // inventory to the public bundle and the marker-stamped obligations the
+    // extractor authenticates against are gone. `None` whenever the bundle
+    // failed to build, the authority mint failed, or the contract lane did not
+    // (fully) engage — the publish seam then keeps the fail-closed
+    // `assumption:coroutine` + strict abort. Belt: the evidence is about THIS
+    // function (the extractor recomputes the recognizer decision from `func`'s
+    // own body) and is re-filtered on `function_def_path` at the publish seam.
+    //
     // A definition-site `requires(P)` is the callee's modular entry
     // assumption, not a proposition to prove for arbitrary inputs. Keep its
     // exact compiler-authored row in `bundle` for catalog/transport reporting,
@@ -22104,6 +22743,11 @@ fn build_full_verification_input<'tcx>(
     Result<Option<trust_ir_bridge::NativeVerificationBundle>, String>,
     Vec<CompilerFinalizedBodyBoundCarrier>,
     ExactDefinitionEntryMarkerSet,
+    // Trust (coroutine resume-state contract): the bridge's authenticated
+    // sentinel-conversion evidence, minted from the live PRE-RESET module (see
+    // the extraction site). `None` whenever the bundle failed to build or the
+    // contract lane did not fully engage.
+    Option<trust_ir_bridge::CoroutineResumeContractModuleEvidence>,
 ) {
     // verifier-perf: degrade over-budget fat recursive `Ty::Adt` declared types ONCE, up
     // front, so BOTH the verifier-api bundle AND the native trust-ir bundle builders
@@ -22165,6 +22809,7 @@ fn build_full_verification_input<'tcx>(
         ExactDefinitionEntryMarkerSet::freeze_from_compiler_reference(&monitor_reference, &bundle);
     stamp_certified_monitor_metadata(tcx, body, &monitor_reference, &mut bundle);
     let mut body_bound_carriers = Vec::new();
+    let mut coroutine_resume_contract = None;
     // Trust (assumption-root gate): this early-out skips
     // `build_native_trust_ir_bundle_for_verifier_api`, which is where the user-axiom
     // census is written — so a body that times out HERE gets no census record and
@@ -22188,9 +22833,11 @@ fn build_full_verification_input<'tcx>(
             policy,
             &mut body_bound_carriers,
             all_vcs,
+            &mut coroutine_resume_contract,
         );
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             body_bound_carriers.clear();
+            coroutine_resume_contract = None;
             Err("per-function verification budget expired during native trust-ir bundle construction"
                 .to_string())
         } else {
@@ -22199,9 +22846,18 @@ fn build_full_verification_input<'tcx>(
     };
     if !matches!(&native_trust_ir_bundle, Ok(Some(_))) {
         body_bound_carriers.clear();
+        // Same fail-closed rule as the carriers: evidence about a module that
+        // did not survive to become the solved bundle must never publish.
+        coroutine_resume_contract = None;
     }
     let definition_entry_markers = definition_entry_markers.seal_final_bundle(&bundle);
-    (bundle, native_trust_ir_bundle, body_bound_carriers, definition_entry_markers)
+    (
+        bundle,
+        native_trust_ir_bundle,
+        body_bound_carriers,
+        definition_entry_markers,
+        coroutine_resume_contract,
+    )
 }
 
 /// Mint source-generation authority only for the exact live native bundle
@@ -23747,8 +24403,14 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
     // attaching an unreplayable imported certificate. See
     // `append_verifier_api_obligations_to_native_trust_ir`.
     all_vcs: &[VerificationCondition],
+    // Trust (coroutine resume-state contract): see the same-named parameter on
+    // `build_native_trust_ir_bundle_from_verifiable_functions`.
+    coroutine_resume_contract: &mut Option<
+        trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+    >,
 ) -> Result<Option<trust_ir_bridge::NativeVerificationBundle>, String> {
     body_bound_carriers.clear();
+    *coroutine_resume_contract = None;
     ensure_default_trust_mc_function_obligation(func, bundle)?;
 
     let any_routable = bundle
@@ -24069,6 +24731,7 @@ fn build_native_trust_ir_bundle_for_verifier_api<'tcx>(
         body_bound_carriers,
         all_vcs,
         native_target_info,
+        coroutine_resume_contract,
     )?;
     if let Some(native_bundle) = native.as_ref()
         && let Some(dump_dir) = tcx.sess.opts.unstable_opts.trust_dump.native_bundle.as_deref()
@@ -25380,6 +26043,31 @@ fn collect_expected_absent_callees<'tcx>(
         if trust_mir_extract::trust_try_total_marker(tcx, callee_def_id, gen_args) {
             insert_exact_absent_call_identity(compiler_total_out, &call_key);
         }
+        // Trust (I5 cross-authority call modeling): a call to a LOCAL
+        // Clean-origin function of a MODELED shape is total by construction of
+        // the gated emission, on the SAME plan of record the emitter used
+        // (`clean_origin_call_model_of_record`; the faithfulness gate fatally
+        // refuses compilation if the emitted body disagrees with that plan):
+        // `Projection` is `_0 = move _{i+1}; return` (no panic path, no
+        // unwind edge), and `WrappingBinOp` is one call to core's
+        // emitter-selected, marker-authenticated `u{w}::wrapping_{op}` with
+        // `UnwindAction::Unreachable` (the primitive is total for all three
+        // ops — see the panic-free registration for the full rationale).
+        // Ride the authenticated COMPILER-TOTAL set — the arm that emits no
+        // obligation and no `Assert(false)` marker — never a user-axiom lane:
+        // no user declaration is involved, so the assumption-root census is
+        // untouched. This discharges the call's PANIC-FREEDOM only; the
+        // callee's result stays havocked in the bridge (its value semantics
+        // travel separately, as the definitional callee summary consumed by
+        // the vcgen lane — `clean_origin_callee_summary`, which models the
+        // VALUE of `Projection` and of `WrappingBinOp` at `Add`/`Sub`; a
+        // `Mul` result stays havocked there while its totality still holds
+        // here). Any other shape, and any plan/env refusal, inserts nothing:
+        // the call keeps the fatal absent-callee arm, fail-closed exactly as
+        // before this lane existed.
+        if clean_origin_call_model_of_record(tcx, callee_def_id).is_some() {
+            insert_exact_absent_call_identity(compiler_total_out, &call_key);
+        }
         // ROBUST FOREIGN / extern-"C" absent-callee classification. A bodyless
         // extern-block fn often does not resolve to `Ok(Some)`, so decide on the
         // syntactic def-id up front while recording the exact call-site key.
@@ -25543,6 +26231,9 @@ fn build_native_trust_ir_bundle_for_test_verifier_api_with_carriers(
         // Test harness: no Session in scope; a target-independent module keeps
         // every pre-existing test expectation (target_info stays None).
         None,
+        // Test harness: the coroutine contract evidence is only consumed by the
+        // compiler's publish seam, which this seam does not reach.
+        &mut None,
     )
 }
 
@@ -25580,8 +26271,21 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
     // stable_digest, lineage, replay) commits to it. `None` (tests) keeps the
     // module target-independent.
     target_info: Option<trust_ir::TargetInfo>,
+    // Trust (coroutine resume-state contract): OUT-param for the bridge's
+    // authenticated sentinel-conversion evidence, minted from the LIVE lowered
+    // module while it still carries the bridge's private proof inventory.
+    // MUST be read here and not at the caller: the next step
+    // (`append_verifier_api_obligations_to_native_trust_ir`) RESETS that
+    // inventory to the public bundle, after which the marker obligations the
+    // extractor authenticates against are gone and the extraction can only ever
+    // answer `None`. Threaded like `body_bound_carriers`, and cleared on every
+    // failure path for the same reason.
+    coroutine_resume_contract: &mut Option<
+        trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+    >,
 ) -> Result<Option<trust_ir_bridge::NativeVerificationBundle>, String> {
     body_bound_carriers.clear();
+    *coroutine_resume_contract = None;
     let panic_source_function_paths: FxHashSet<String> =
         trust_ir_functions.iter().map(|function| function.def_path.clone()).collect();
     // FAIL-SOFT BUNDLING: one unloweable CALLEE must not push every obligation
@@ -25895,6 +26599,25 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
         })?
         .name
         .clone();
+    // Trust (coroutine resume-state contract): extract the bridge's
+    // authenticated sentinel-conversion evidence HERE — the last point at which
+    // `module` still carries the bridge's private proof inventory. The very next
+    // call resets that inventory to the public verifier-api bundle, and the
+    // extractor authenticates against exactly the marker-stamped bridge
+    // obligations the reset removes; running it afterwards (which is what the
+    // consumer used to do) could only ever answer `None`, so the contract lane
+    // could never engage no matter how the body lowered.
+    //
+    // This is PLUMBING, NOT A DISCHARGE. `coroutine_resume_contract_module_evidence`
+    // is unchanged and stays fully fail-closed: it re-runs the pure recognizer on
+    // `func`'s own body, requires every marker-prefixed obligation of THIS
+    // function to parse to exactly the recognized state set with kind
+    // `PanicFreedom`, and requires at least one. The evidence still asserts only
+    // "the bridge lowered N sentinels as refutable obligations under live set L"
+    // — the compiler independently requires every published row PROVED and the
+    // per-sentinel marker rows VISIBLE before it will publish the contract row.
+    *coroutine_resume_contract =
+        trust_ir_bridge::coroutine_resume_contract_module_evidence(func, &module);
     let bindings = append_verifier_api_obligations_to_native_trust_ir(
         &mut module,
         func,
@@ -25903,6 +26626,7 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
         all_vcs,
     )?;
     if bindings.is_empty() {
+        *coroutine_resume_contract = None;
         return Ok(None);
     }
 
@@ -27414,6 +28138,26 @@ pub(crate) fn trust_mir_mutually_recursive_functions<'tcx>(
                     tcx.hir_body_const_context(def_id),
                     None | Some(rustc_hir::ConstContext::ConstFn)
                 )
+                // Trust (I5): a Clean-origin def cannot participate in an
+                // `optimized_mir` query cycle — its `optimized_mir` is the
+                // kernel-gated emission, served by an early return BEFORE the
+                // pass pipeline, and it is produced from the Clean declaration
+                // alone: it never reads another local body's MIR, so no local
+                // cycle can close through it. Excluding it here skips a
+                // pointless adjacency query whose answer is a discarded
+                // singleton.
+                //
+                // History, kept because it explains the root fix: this
+                // exclusion was first REQUIRED, not elective — the adjacency
+                // provider's unguarded elaborated-MIR borrow dead-ended in
+                // `typeck`'s synthetic-HIR-owner `span_bug!` (measured: the
+                // SIXTH such consumer, via `main` -> `optimized_mir` -> this
+                // oracle -> the adjacency of `pick`). That family is now
+                // closed at the seam instead: `mir_drops_elaborated_and_const_
+                // checked` itself serves the gated emission for Clean-origin
+                // defs, so this filter is no longer load-bearing for the
+                // borrow's legality.
+                && !crate::clean_origin_mir::is_clean_origin(tcx, def_id)
         })
         .collect();
     nodes.sort_unstable_by_key(|def_id| def_id.local_def_index.as_u32());
@@ -39336,6 +40080,16 @@ fn effective_max_level(
 /// `report_results`.
 const MAX_REPORTED_REASONS: usize = 5;
 
+/// `additional_policy_rows` — D2 part C. `results` is the VC-level inventory and
+/// does NOT contain the additive policy rows the transport layer mints later
+/// (`assumption:coroutine`, `contract:coroutine-resume-state`). Rendering the
+/// denominator from `results.len()` alone made the human line disagree with the
+/// JSON for the SAME body: "0 unknown … out of 2 obligation(s)" against
+/// `unknown: 1, skipped: 1, total: 3`. The missing row was precisely the one
+/// carrying the executor-protocol premise, so the human surface — the one a
+/// developer actually reads — showed a complete, unconditional proof of a body
+/// whose conditionality lived only in a row it had dropped. A summary that
+/// hides a skipped row is how the D2 false PROVE stayed invisible.
 fn report_results(
     tcx: TyCtxt<'_>,
     body: &Body<'_>,
@@ -39343,6 +40097,8 @@ fn report_results(
     result_bindings: &[Option<ResultObligationBinding>],
     proof_authorities: &[Option<ResultProofAuthority>],
     certified: usize,
+    additional_policy_rows: usize,
+    conditional_on_coroutine_premise: bool,
 ) {
     if results.is_empty() {
         return;
@@ -39494,14 +40250,30 @@ fn report_results(
         }
     }
 
+    // D2 part C: in a contract-engaged coroutine body the entry `Assume`
+    // dominates every block, so NOTHING here was proved unconditionally.
+    // Calling those rows "proved" on the line a developer actually reads is the
+    // human-surface half of the same defect the transport stamp closes; name
+    // the conditionality in the counter itself rather than only in a note.
+    let discharge_label =
+        if conditional_on_coroutine_premise { "conditionally discharged (NOT proved)" } else { "proved" };
     let mut summary = format!(
-        "Trust verification: {proved} proved, {failed} failed, {unknown} unknown, \
+        "Trust verification: {proved} {discharge_label}, {failed} failed, {unknown} unknown, \
          {timeout} timed out, {runtime_checked} runtime-checked",
     );
     if other > 0 {
         summary.push_str(&format!(", {other} other"));
     }
-    summary.push_str(&format!(" out of {} obligation(s)", results.len()));
+    // D2 part C: the additive policy rows are SKIPPED, and they count toward the
+    // denominator. Reporting them keeps the human line reconcilable with the
+    // JSON transport for the same body.
+    if additional_policy_rows > 0 {
+        summary.push_str(&format!(", {additional_policy_rows} skipped"));
+    }
+    summary.push_str(&format!(
+        " out of {} obligation(s)",
+        results.len() + additional_policy_rows
+    ));
 
     // Trust: All results are notes — verification is additive and must NEVER
     // break builds.
@@ -39513,7 +40285,24 @@ fn report_results(
     // (solver-trusted), so we report it explicitly when present. Runtime-check
     // elision remains disabled until this proof also carries exact MIR-Assert
     // identity.
-    if certified > 0 {
+    // Trust (D2 part C): a coroutine resume body's discharges all sit under the
+    // bridge's entry `Assume(resume_state ∈ live_states)`, which dominates every
+    // block. Advertising them as kernel-certified states a stronger fact than
+    // the kernel established: on the exhibit the certified term was an EX FALSO
+    // derivation from `resume_state = 0 ∧ resume_state = 1`, whose
+    // `axiom_closure: Empty` is literally true of the term (ex falso needs no
+    // axiom) and materially misleading about the obligation, because the premise
+    // was baked into the hypothesis CONTEXT rather than presented as an axiom.
+    // Name the premise instead of the tier.
+    if conditional_on_coroutine_premise {
+        if certified > 0 {
+            diag.note(format!(
+                "{certified} obligation(s) were discharged CONDITIONALLY, under the coroutine \
+                 resume-state entry assumption injected at function entry — not as unconditional \
+                 proof; see the accompanying coroutine executor-protocol row"
+            ));
+        }
+    } else if certified > 0 {
         diag.note(format!(
             "of which {certified} kernel-certified by the clean CIC kernel \
              (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)"
@@ -41123,9 +41912,11 @@ enum CoroutineProtocolPublishDecision {
     /// engagement: not a coroutine resume body — publish nothing (nothing was
     /// assumed).
     NotACoroutineResumeBody,
-    /// The authenticated evidence accounts for every MIR sentinel and every
-    /// published row is statically proved with the sentinel proof visible:
-    /// publish the `contract:coroutine-resume-state` row.
+    /// The authenticated evidence accounts for every MIR sentinel, every
+    /// published row is statically proved with the sentinel proof visible, no
+    /// UNMARKED row claims proof over the entry `Assume` (D2 part B), and the
+    /// lane is the explicit ADVISORY one (D2 part A): publish the
+    /// `contract:coroutine-resume-state` row.
     PublishContractRow,
     /// Every other engaged state: publish the fail-closed
     /// `assumption:coroutine` row (strict / memory-safe lanes then reject the
@@ -41133,25 +41924,158 @@ enum CoroutineProtocolPublishDecision {
     PublishAssumptionRow,
 }
 
+/// `contract_publication_permitted` is [`TrustVerifyPolicy::is_explicit_advisory`]
+/// — the D2 gate (part A).
+///
+/// THE D2 DEFECT, and why the gate is a POLICY gate rather than a stronger
+/// evidence check. There is NO caller-side discharge lane for the exported
+/// resume-state precondition: `crates/trust-ir-bridge/src/lower.rs` says so in
+/// the obligation text it mints ("no caller-side discharge lane exists yet"),
+/// and the callsite charge fires only for an in-bundle `Call` terminator whose
+/// callee signature carries `coroutine_resume_contract`. The REAL caller of an
+/// `async fn` body is the generated `Future::poll` shim plus an executor that
+/// lives in another crate — and Targo compiles every dependency unit with
+/// `-Ztrust-verify=off`. Measured: a cross-crate consumer under strict
+/// verification receives NO resume-precondition obligation, and neither does an
+/// in-crate `async fn` caller. So in a fail-closed lane, publishing a contract
+/// row converts an UNDISCHARGED premise into SILENCE: the build goes green with
+/// nothing, anywhere, obliged to establish the premise.
+///
+/// `pub async fn tick(x: u32) -> u32 { x }` under default strict policy
+/// therefore reported "2 proved … of which 2 kernel-certified", exit 0, while a
+/// two-poll driver panicked `` `async fn` resumed after completion `` at the
+/// exact span of the row certified "panic freedom: no assertion,
+/// `unreachable!`, or panic is reachable".
+///
+/// Fail-closed lanes get the assumption row and
+/// `abort_on_coroutine_protocol_assumption` back. `ContractPublished` survives
+/// for the explicit advisory lane, which makes no proof claim and exists to
+/// report conditional evidence — the feature is GATED, not deleted.
 fn coroutine_protocol_publish_decision(
     sentinel_count: usize,
     evidence: Option<&trust_ir_bridge::CoroutineResumeContractModuleEvidence>,
     rows_all_statically_proved: bool,
     sentinel_proof_visible: bool,
+    contract_publication_permitted: bool,
+    no_unmarked_conditional_proof: bool,
 ) -> CoroutineProtocolPublishDecision {
     match evidence {
         None if sentinel_count == 0 => CoroutineProtocolPublishDecision::NotACoroutineResumeBody,
         Some(evidence)
             if evidence.sentinel_obligation_count == sentinel_count
                 && rows_all_statically_proved
-                && sentinel_proof_visible =>
+                && sentinel_proof_visible
+                // D2 part A: a fail-closed lane may not publish a contract
+                // whose premise no caller is obliged to discharge.
+                && contract_publication_permitted
+                // D2 part B: and no row may have silently consumed the entry
+                // `Assume` while still claiming bare `Proved`.
+                && no_unmarked_conditional_proof =>
         {
             CoroutineProtocolPublishDecision::PublishContractRow
         }
         // Sentinels with no (or mismatched) evidence, unproved rows, invisible
-        // sentinel proofs — and the D1 arm: evidence with zero MIR sentinels.
+        // sentinel proofs, a fail-closed lane, an unmarked conditional proof —
+        // and the D1 arm: evidence with zero MIR sentinels.
         _ => CoroutineProtocolPublishDecision::PublishAssumptionRow,
     }
+}
+
+/// D2 part B — the structural half. The bridge injects
+/// `Assume(resume_state ∈ live_states)` at the coroutine body's ENTRY
+/// (`crates/trust-ir-bridge/src/lower.rs`), and entry DOMINATES every block, so
+/// EVERY obligation discharged in that body is conditional on the
+/// executor-protocol premise — not merely the sentinels.
+///
+/// The bridge marks the sentinel rows it mints
+/// (`COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX`), and those are conditional BY
+/// DESIGN: describing them is what the contract row is FOR. Any OTHER row
+/// claiming `Outcome::Proved` in such a body is a proof that consumed the entry
+/// `Assume` without saying so — measured on the exhibit, the whole-function
+/// panic-freedom aggregate carried a CIC term and context BYTE-IDENTICAL to the
+/// sentinel row's, i.e. the same ex-falso derivation from
+/// `resume_state = 0 ∧ resume_state = 1`, and still reported `proved` /
+/// `Certified` / `KernelRechecked` / `axiom_closure: Empty`.
+///
+/// `axiom_closure: Empty` is LITERALLY TRUE of that term — ex falso quodlibet
+/// needs no axiom — and MATERIALLY MISLEADING about the obligation, because the
+/// premise was not an axiom the kernel could see: it had been baked into the
+/// hypothesis CONTEXT the kernel was handed. The kernel did its job faithfully.
+///
+/// So this predicate refuses the contract upgrade whenever an unmarked row
+/// claims proof, and `stamp_coroutine_conditional_rows` puts the marker on the
+/// row itself so the leak cannot recur through a different lane.
+fn coroutine_rows_free_of_unmarked_conditional_proof(
+    rows: &[TransportObligationResult],
+    evidence: &trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+) -> bool {
+    rows.iter().all(|row| {
+        row.outcome != Outcome::Proved
+            || row.design_mandate
+            || row_is_marked_coroutine_sentinel(row, evidence)
+    })
+}
+
+/// Whether `row` is one of the bridge-marked sentinel rows for `evidence` — the
+/// rows whose conditionality the contract row exists to state. Matched against
+/// the rendered description, stripping exactly the `VcKind::Assertion` renderer
+/// prefix and no other (same convention as
+/// `rows_exhibit_coroutine_sentinel_proof`).
+fn row_is_marked_coroutine_sentinel(
+    row: &TransportObligationResult,
+    evidence: &trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+) -> bool {
+    trust_types::assumption::parse_coroutine_resume_contract_obligation_description(
+        row.description.strip_prefix("assertion: ").unwrap_or(&row.description),
+    )
+    .is_some_and(|(states, _)| states == evidence.live_states)
+}
+
+/// D2 part B — put the marker ON THE ROW THAT CONSUMED THE ASSUME.
+///
+/// Every `Proved` row in a contract-engaged coroutine body is conditional on the
+/// entry `Assume` (see [`coroutine_rows_free_of_unmarked_conditional_proof`]).
+/// The bridge-marked sentinel rows already say so in their description; this
+/// rewrites every OTHER proved row so it can no longer be mistaken — by a
+/// consumer, a report, or a future lane — for an unconditional proof:
+///
+///  * `kind` gains [`COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX`], keeping the
+///    original kind after the prefix so the row keeps its diagnostic identity;
+///  * `outcome` drops from `Proved` to `Skipped` — targo's
+///    `partition_outcome_counts` buckets the row as `assumed` and grants it no
+///    proof credit, which is the link that was missing (the aggregate's `kind`
+///    was `assert`, its `outcome` was `proved`, and NOTHING tied it to the
+///    sibling `contract:coroutine-resume-state` row that carried the
+///    conditionality);
+///  * `proof_evidence` is STRIPPED. The `Certified` / `KernelRechecked` grade
+///    described an unconditional discharge of a formula whose hypothesis context
+///    already contained the premise; retaining it next to a conditional outcome
+///    would reproduce the exact ambiguity this closes.
+///
+/// Design-mandate rows are inventory, never discharge targets, and are left
+/// alone.
+fn stamp_coroutine_conditional_rows(
+    rows: &[TransportObligationResult],
+    evidence: &trust_ir_bridge::CoroutineResumeContractModuleEvidence,
+) -> Vec<TransportObligationResult> {
+    rows.iter()
+        .map(|row| {
+            if row.outcome != Outcome::Proved
+                || row.design_mandate
+                || row_is_marked_coroutine_sentinel(row, evidence)
+            {
+                return row.clone();
+            }
+            let mut out = row.clone();
+            out.kind = trust_types::assumption::coroutine_resume_conditional_row_kind(&row.kind);
+            out.outcome = Outcome::Skipped;
+            out.proof_evidence = None;
+            out.reason = Some(
+                trust_types::assumption::COROUTINE_RESUME_CONDITIONAL_ROW_REASON.to_string(),
+            );
+            out
+        })
+        .collect()
 }
 
 /// How a coroutine body's executor-protocol premise publishes.
@@ -41159,7 +42083,14 @@ enum CoroutineProtocolDisposition {
     /// The bridge converted EVERY sentinel to a refutable obligation under the
     /// recognized resume-state contract AND every published row is statically
     /// proved: the premise publishes as a `contract:coroutine-resume-state`
-    /// row (verified-modulo-callers) and strict does NOT abort.
+    /// row (verified-modulo-callers).
+    ///
+    /// CORRECTED 2026-08-20 (D2): this variant no longer means "and strict does
+    /// NOT abort", because it is no longer REACHABLE from a fail-closed lane —
+    /// it is explicit-advisory-only. Publishing a conditional row in a lane that
+    /// makes a proof claim, while no caller anywhere is obliged to discharge the
+    /// premise, is what produced the false `Certified` verdict on
+    /// `pub async fn tick(x: u32) -> u32 { x }`.
     ContractPublished(Vec<TransportObligationResult>),
     /// Today's fail-closed path: exactly one additive `assumption:coroutine`
     /// skipped row; strict and memory-safe lanes reject the unproved premise.
@@ -41183,17 +42114,23 @@ enum CoroutineProtocolDisposition {
 ///  3. every published row statically PROVED (post-demotion `Outcome::Proved`;
 ///     design-mandate inventory rows excepted) — the sentinel obligations are
 ///     real refutable rows now, so an unproved/refuted sentinel blocks here;
-///  4. the sentinel proof VISIBLE among the rows (per-sentinel marker rows
-///     matching the evidence count, or the whole-function panic-freedom
-///     aggregate row proved) — the anti-silent-drop belt: "all rows proved"
-///     must never be vacuously true because the solver never saw the
-///     sentinels (the R3 counted-carrier fail-open class).
+///  4. the sentinel proof VISIBLE among the rows as per-sentinel marker rows
+///     matching the evidence count and state set — the anti-silent-drop belt:
+///     "all rows proved" must never be vacuously true because the solver never
+///     saw the sentinels (the R3 counted-carrier fail-open class);
+///  5. `contract_publication_permitted` — the explicit ADVISORY lane only (D2
+///     part A): no caller-side discharge lane exists, so a fail-closed lane
+///     publishing this row would turn an undischarged premise into silence;
+///  6. no UNMARKED row claiming `Proved` (D2 part B): every proof in this body
+///     consumed the entry `Assume`, and only the bridge-marked sentinel rows
+///     are allowed to be conditional without saying so on the row.
 fn coroutine_protocol_disposition(
     tcx: TyCtxt<'_>,
     body: &Body<'_>,
     rows: &[TransportObligationResult],
     artifacts: &VerificationArtifacts,
     func_path: &str,
+    contract_publication_permitted: bool,
 ) -> Option<CoroutineProtocolDisposition> {
     let sentinel_count = count_coroutine_protocol_asserts(body);
     // Evidence is only ever consulted for THIS function; another bundled
@@ -41206,8 +42143,11 @@ fn coroutine_protocol_disposition(
         sentinel_count,
         evidence,
         coroutine_contract_rows_all_statically_proved(rows),
-        evidence
-            .is_some_and(|evidence| rows_exhibit_coroutine_sentinel_proof(rows, evidence, func_path)),
+        evidence.is_some_and(|evidence| rows_exhibit_coroutine_sentinel_proof(rows, evidence)),
+        contract_publication_permitted,
+        evidence.is_none_or(|evidence| {
+            coroutine_rows_free_of_unmarked_conditional_proof(rows, evidence)
+        }),
     );
     match decision {
         CoroutineProtocolPublishDecision::NotACoroutineResumeBody => None,
@@ -41227,8 +42167,16 @@ fn coroutine_protocol_disposition(
             Some(CoroutineProtocolDisposition::ContractPublished(out))
         }
         CoroutineProtocolPublishDecision::PublishAssumptionRow => {
+            // D2 part B: stamp before adding the assumption row, so a row that
+            // consumed the entry `Assume` cannot ship as bare `Proved` /
+            // `Certified` even in the lane that merely RECORDS the premise.
+            // Without evidence the bridge injected no `Assume` and there is
+            // nothing conditional to mark.
+            let stamped = evidence
+                .map(|evidence| stamp_coroutine_conditional_rows(rows, evidence))
+                .unwrap_or_else(|| rows.to_vec());
             Some(CoroutineProtocolDisposition::UnprovedAssumption(
-                rows_with_coroutine_protocol_assumption(tcx, body, rows),
+                rows_with_coroutine_protocol_assumption(tcx, body, &stamped),
             ))
         }
     }
@@ -41246,39 +42194,44 @@ fn coroutine_contract_rows_all_statically_proved(rows: &[TransportObligationResu
 }
 
 /// The anti-silent-drop belt for the contract upgrade: the sentinel proof must
-/// be VISIBLE in the published rows, in one of the two shapes the counted
-/// carrier machinery can surface it as — (a) every bridge-marked sentinel
-/// obligation as its own PROVED row (count must equal the evidence's), or
-/// (b) the whole-function panic-freedom AGGREGATE row proved (identified by
-/// its exact compiler-minted obligation id — it subsumes the per-site
-/// sentinel asserts, which the evidence certifies are refutable `Inst::Assert`s
-/// in the very module that aggregate was solved over).
+/// be VISIBLE in the published rows as every bridge-marked sentinel obligation
+/// carrying its own PROVED row, with the count equal to the evidence's and the
+/// marker's live-state set equal to the evidence's.
+///
+/// THE AGGREGATE FALLBACK IS DELETED, NOT REPAIRED. It accepted "the
+/// whole-function panic-freedom AGGREGATE row is proved" as a stand-in, on the
+/// theory that the aggregate subsumes the per-site sentinel asserts. It does
+/// not: measured on the real fixture, that row's `Proved` came from the
+/// INTERPROCEDURAL panic-freedom rule, whose site enumeration (obligations +
+/// `Terminator::Call`) cannot see a sentinel `Terminator::Assert` at all and is
+/// vacuously satisfied by a call-free resume body. Accepting it would make the
+/// contract vacuous — exactly the R3 counted-carrier fail-open this belt exists
+/// to prevent. The per-sentinel marker rows are the only accepted evidence.
+///
+/// The marker is matched against the row's rendered description, which carries
+/// `VcKind::Assertion`'s `"assertion: "` renderer prefix
+/// (`trust_types::formula::vc_kind`); strip exactly that one prefix before
+/// parsing, and no other.
 fn rows_exhibit_coroutine_sentinel_proof(
     rows: &[TransportObligationResult],
     evidence: &trust_ir_bridge::CoroutineResumeContractModuleEvidence,
-    func_path: &str,
 ) -> bool {
+    // An evidence set that accounts for no sentinel cannot be witnessed by
+    // "zero marker rows found": fail closed rather than let 0 == 0 pass.
+    if evidence.sentinel_obligation_count == 0 {
+        return false;
+    }
     let marked_proved = rows
         .iter()
         .filter(|row| {
             row.outcome == Outcome::Proved
                 && trust_types::assumption::parse_coroutine_resume_contract_obligation_description(
-                    &row.description,
+                    row.description.strip_prefix("assertion: ").unwrap_or(&row.description),
                 )
                 .is_some_and(|(states, _)| states == evidence.live_states)
         })
         .count();
-    if marked_proved == evidence.sentinel_obligation_count {
-        return true;
-    }
-    let aggregate_id = format!(
-        "vc:{}:assertion:panic-freedom:0",
-        trust_types::canonical_artifact_id_component(func_path)
-    );
-    rows.iter().any(|row| {
-        row.outcome == Outcome::Proved
-            && row.obligation_id.as_deref() == Some(aggregate_id.as_str())
-    })
+    marked_proved == evidence.sentinel_obligation_count
 }
 
 /// The published `contract:coroutine-resume-state` row. `Outcome::Skipped` on
@@ -41554,6 +42507,68 @@ fn transport_rows_have_unproved_assumption_panic(rows: &[TransportObligationResu
 
 fn artifacts_have_unproved_assumption_panic(artifacts: &VerificationArtifacts) -> bool {
     artifacts.transport_results.iter().any(transport_row_is_unproved_assumption_panic)
+}
+
+/// Trust (I5 cross-authority call modeling, ruling v7/D3): split this
+/// function's unproved assumption-panic rows into the LOCAL Clean-origin
+/// absent callees — returned as `(callee_def_path, clean_declaration_name)`,
+/// deduplicated — and a flag for whether any OTHER unproved assumption-panic
+/// row remains (a genuine std/extern absent callee, drop glue, or an extern
+/// dispatch row: anything whose text does not parse to a registry member).
+///
+/// The recorded defect this serves: the strict-summary note described EVERY
+/// absent callee as "a std/extern function whose body is not in the lowered
+/// bundle", which is FALSE for a Clean-origin callee — it is local and
+/// kernel-defined in the very crate being compiled
+/// (`tests/ui/trust/clean_origin_verify_on.rs` pinned this). The caller uses
+/// the split to name such a callee truthfully, with options, and to keep the
+/// generic note only for rows it still truthfully describes.
+///
+/// Matching is by the exact `safe_def_path_str` spelling of each registry def
+/// against the name inside the bridge's fatal absent-callee marker text (the
+/// same `ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX` parse the adversarial-witness
+/// predicate uses). A name that does not parse or does not match keeps the
+/// generic note — fail-safe: this helper can only make the diagnostic MORE
+/// specific, never suppress it. Crates with no `clean { … }` island skip the
+/// row scan entirely.
+fn clean_origin_absent_callees_in_artifacts(
+    tcx: TyCtxt<'_>,
+    artifacts: &VerificationArtifacts,
+) -> (Vec<(String, String)>, bool) {
+    let mut registry: Vec<(String, String)> = Vec::new();
+    for local in crate::clean_origin_mir::clean_origin_defs(tcx) {
+        if let Some((decl, _span)) = crate::clean_origin_mir::clean_origin_registry_entry(tcx, local)
+        {
+            registry.push((trust_mir_extract::safe_def_path_str(tcx, local.to_def_id()), decl));
+        }
+    }
+    let mut clean_origin_hits: Vec<(String, String)> = Vec::new();
+    let mut other_rows = false;
+    if registry.is_empty() {
+        return (clean_origin_hits, artifacts_have_unproved_assumption_panic(artifacts));
+    }
+    for row in artifacts
+        .transport_results
+        .iter()
+        .filter(|row| transport_row_is_unproved_assumption_panic(row))
+    {
+        let parsed_callee = row
+            .description
+            .split(ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX)
+            .nth(1)
+            .and_then(|rest| rest.split('`').next());
+        match parsed_callee
+            .and_then(|name| registry.iter().find(|(def_path, _)| def_path == name))
+        {
+            Some((def_path, decl)) => {
+                if !clean_origin_hits.iter().any(|(existing, _)| existing == def_path) {
+                    clean_origin_hits.push((def_path.clone(), decl.clone()));
+                }
+            }
+            None => other_rows = true,
+        }
+    }
+    (clean_origin_hits, other_rows)
 }
 
 /// Trust (assumption-root gate), IN-BAND half: does this body's own ledger show a

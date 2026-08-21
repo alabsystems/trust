@@ -526,6 +526,73 @@ pub(super) fn v2_build_overflow_vc_for_operands(
             // And render a REMAINDER bound (`r < C` for `r = x % C`) so the range-clamping
             // idiom `(a % 100) * (b % 50)` PROVES. See `v2_bv_rem_constraints`.
             terms.extend(v2_bv_rem_constraints(func, lhs, rhs, width, signed));
+            // Trust: UMUL RECORD, RE-LANDED (2026-08-20) — the UNSIGNED var*var
+            // mul VC carries an AUTHENTICATED obligation again: the Int-reading
+            // out-of-range core `Or([Lt(a*b,0), Gt(a*b,MAX)])` becomes the record
+            // BODY and the formula's final conjunct, with the BV rendering and
+            // the guard bounds demoted to a `ConjoinFactsLast` wrapper — so
+            // `reconstruct(record) == formula` bit-for-bit (the authentication
+            // invariant) and the trust-ir/mirsem umul arms can ground the core.
+            //
+            // THIS WAS RETRACTED ONCE, on 2026-08-20, and the reason it is safe
+            // NOW is a change in a different crate. The Int core makes the query
+            // a mixed QF_BV + NIA problem that ay answers with `internal-error`,
+            // so an unguarded overflowing `a*b` degraded from `Failed` WITH A
+            // VERIFIED COUNTEREXAMPLE to `Unknown` — under the prime directive,
+            // from a build error to a runtime check. `trust-router`'s
+            // DISJOINT-COMPONENT REFUTATION lane now refutes such a query
+            // component-wise (the BV predicate and the Int core are over disjoint
+            // variable sets), so that verdict is `Failed` with a composed witness
+            // again — MEASURED both ways before re-landing. Do not re-land this
+            // conjunct into a build where that lane is absent or narrowed: the
+            // pins `trust_router::in_process_ay_backend::tests::
+            // umul_bare_bv_unguarded_refutes_with_counterexample` and
+            // `disjoint_split_refutes_the_mixed_bv_nia_mul_query` are what hold
+            // the pair together.
+            //
+            // SOUNDNESS of the conjoin itself (unchanged from the first landing):
+            // for unsigned width-w operands the BV overflow predicate and the Int
+            // out-of-range reading are the SAME machine predicate in two
+            // renderings. PROVE direction — conjoining can only SHRINK the
+            // violation's SAT set, so every previously-proved row stays proved.
+            // REFUTE direction — the only conjuncts over the core's REAL operand
+            // vars are drop-only facts true on every reaching execution, so a
+            // genuinely overflowing execution models the whole conjunction; the
+            // core goes UNSAT only when those facts bound `a*b` into range, i.e.
+            // exactly when no real overflow exists. The SIGNED var*var path is
+            // UNCHANGED (its Int reading needs the two-sided signed core and its
+            // own spec treatment).
+            if !signed {
+                let lhs_f = operand_to_formula(func, lhs);
+                let rhs_f = operand_to_formula(func, rhs);
+                let result = Formula::Mul(Box::new(lhs_f), Box::new(rhs_f));
+                let out_of_range = Formula::Or(vec![
+                    Formula::Lt(
+                        Box::new(result.clone()),
+                        Box::new(crate::range::type_min_formula(width, false)),
+                    ),
+                    Formula::Gt(
+                        Box::new(result),
+                        Box::new(crate::range::type_max_formula(width, false)),
+                    ),
+                ]);
+                terms.push(bv_formula);
+                let mut conjuncts = terms.clone();
+                conjuncts.push(out_of_range.clone());
+                return Some(VerificationCondition {
+                    kind: VcKind::ArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) },
+                    function: func.name.clone().into(),
+                    location: span.clone(),
+                    formula: Formula::And(conjuncts),
+                    contract_metadata: None,
+                    obligation: Some(ObligationRecord {
+                        body: out_of_range,
+                        wrappers: vec![ObligationWrapper::ConjoinFactsLast { facts: terms }],
+                        subject: None,
+                        width: Some(width),
+                    }),
+                });
+            }
             let formula = if terms.is_empty() {
                 bv_formula
             } else {

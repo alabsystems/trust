@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-clean-carrier — increment I4 of
+# docs/design/2026-08-04-two-language-compiler-architecture.md.
+#
+# Clean type -> Rust carrier. PARTIAL, TOTAL ON ITS DOMAIN, NEVER APPROXIMATING.
+#
+# WHY THIS CRATE EXISTS AND WHY IT LANDS BEFORE I5.
+# Every other gate in Trust is refutation-shaped: it can only decline to prove
+# something, so a disagreement costs a failed build. This direction can PRODUCE
+# A VALUE, so a disagreement is a WRONG BINARY. Kernel definitional equality
+# does NOT subsume representation faithfulness: a `Nat -> u64` extraction
+# composed with a `u64 -> Nat` admission is defeq-equal *while the binary
+# wraps*. `tests/defeq_insufficiency.rs` demonstrates exactly that against the
+# real `clean_kernel::TypeChecker`, which is why the carrier obligation is a
+# SEPARATE obligation discharged BEFORE the kernel gate.
+#
+# THE DEPENDENCY LIST IS PART OF THE ARGUMENT.
+# `clean-kernel` is here because the input is a kernel `Expr` and because the
+# defeq-insufficiency control must run the REAL definitional-equality checker,
+# not a Rust imitation of one. `trust-symbols` is here because this crate owns
+# the only sound route to `CarrierEvidence::Total`. `trust-types` is here
+# because the output is a Rust `Ty`. There is no elaborator, no parser, and no
+# solver: this crate decides representability, it never decides a proposition.
+
+[package]
+name = "trust-clean-carrier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Clean type -> Rust carrier (I4): partial, total on its domain, never approximating; the only sound producer of CarrierEvidence::Total."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Exactly three. See the header before adding a fourth.
+clean-kernel = { workspace = true }
+trust-symbols = { path = "../trust-symbols" }
+trust-types = { path = "../trust-types", default-features = false }

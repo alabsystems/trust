@@ -9,6 +9,15 @@
 #                        expirations (scripts/pr_gate.sh)
 #   fast.pin-coherence   every submodule at its recorded pin
 #   fast.bridge-pin      the vendored Lean semantics match the trust-ir pin
+#   fast.measurement-provenance  no commit this push introduces publishes a test
+#                          count naming a tree it does not carry
+#   fast.revert-rationale  no commit this push introduces reverts something
+#                        without saying WHY (scripts/check_revert_rationale.sh).
+#                        Added 2026-08-20 after `31814afa35` reverted the
+#                        wave-SG struct-interior offset gate — a confirmed
+#                        miscompile mechanism — with an empty body, leaving the
+#                        class ungated on main for 2h10m until another lane
+#                        re-derived the evidence from scratch.
 #
 # and one SCOPED lane, which is not in the under-a-minute budget and does not
 # pretend to be:
@@ -65,6 +74,11 @@ for git_local_var in $(git rev-parse --local-env-vars); do
   unset "$git_local_var"
 done
 cd "$REPO_ROOT"
+
+# pre-push is fed "<local-ref> <local-sha> <remote-ref> <remote-sha>" lines on
+# stdin. Read them all so git never sees EPIPE, and keep them:
+# fast.revert-rationale judges exactly the commits this push would introduce.
+PUSHED_REFS="$(cat 2>/dev/null || true)"
 
 PYTHON_BIN=""
 for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
@@ -152,6 +166,19 @@ run_lane() {
 
 echo "Trust pre-push gate (no stage2 build required)"
 
+revert_rationale_lane() {
+  printf '%s\n' "$PUSHED_REFS" | bash scripts/check_revert_rationale.sh --pre-push
+}
+
+# Judges exactly the commits this push would introduce: a `Measured-on:` trailer
+# must name a blob the commit actually carries, and a soundness-gate commit that
+# quotes a test count must carry one. See reports/reporting-integrity-2026-08-20.md.
+measurement_provenance_lane() {
+  printf '%s\n' "$PUSHED_REFS" | bash scripts/check_measurement_provenance.sh --pre-push
+}
+
+run_lane fast.revert-rationale revert_rationale_lane
+run_lane fast.measurement-provenance measurement_provenance_lane
 run_lane fast.pr-gate bash scripts/pr_gate.sh
 run_lane fast.pin-coherence bash scripts/check_pin_coherence.sh
 run_lane fast.bridge-pin bash scripts/check_bridge_pin.sh --check

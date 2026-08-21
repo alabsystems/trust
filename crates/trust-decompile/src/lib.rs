@@ -17,9 +17,10 @@ use thiserror::Error;
 use trust_binary_parse::{BinaryArtifactIdentity, parse_binary_with_identity};
 #[cfg(feature = "trust-cg")]
 use trust_cg_bridge::{
-    BinaryTrustCgConversion, BinaryTrustCgConversionError, BinaryTrustCgProofConsumerEvidence,
+    BinaryEntryBindings, BinaryEntryParam, BinaryTrustCgConversion,
+    BinaryTrustCgConversionError, BinaryTrustCgProofConsumerEvidence,
     BinaryTrustCgProofConsumerStatus, BinaryTrustCgSymbolicFormula, BinaryTrustCgValidationBlocker,
-    lower_binary_decompiled_function_to_lir,
+    BindingArch, lower_binary_decompiled_function_to_lir_with_entry_bindings,
 };
 use trust_ir_bridge::{
     BridgeError as TrustIrBridgeError, TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_FEATURE,
@@ -7175,17 +7176,38 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                     &conversion.unsupported,
                     &conversion.validation_records,
                 ));
-                let preserved_symbolic_formulas = if conversion
-                    .preserved_symbolic_formulas
-                    .is_empty()
-                {
-                    preserved_symbolic_formulas_for_target(DecompileTarget::TrustCg, functions)
-                } else {
-                    merge_preserved_symbolic_formulas(
-                        conversion.preserved_symbolic_formulas,
-                        preserved_symbolic_formulas_for_target(DecompileTarget::TrustCg, functions),
+                // The body scan is conversion-blind: it re-lists every
+                // symbolic formula in the lifted body, including statements
+                // whose formulas the trust-cg conversion already bridge-owned
+                // CONSUMED (the entry-register-binding load lowering). Those
+                // statements are no longer awaiting target semantics —
+                // re-listing them would resurrect the exact blocker their
+                // consumption discharged — so they are subtracted here; their
+                // disclosure lives in the conversion evidence rows.
+                let body_scan = preserved_symbolic_formulas_for_target(
+                    DecompileTarget::TrustCg,
+                    functions,
+                )
+                .into_iter()
+                .filter(|formula| {
+                    !conversion.consumed_symbolic_statements.iter().any(
+                        |(function, block, statement_index)| {
+                            formula.function.as_deref() == Some(function.as_str())
+                                && formula.block == Some(*block)
+                                && formula.statement_index == Some(*statement_index)
+                        },
                     )
-                };
+                })
+                .collect::<Vec<_>>();
+                let preserved_symbolic_formulas =
+                    if conversion.preserved_symbolic_formulas.is_empty() {
+                        body_scan
+                    } else {
+                        merge_preserved_symbolic_formulas(
+                            conversion.preserved_symbolic_formulas,
+                            body_scan,
+                        )
+                    };
                 target_validation_blockers.extend(
                     symbolic_formula_target_validation_blockers_unless_consumed(
                         DecompileTarget::TrustCg,
@@ -7291,6 +7313,12 @@ struct TrustCgTextConversion {
     validation_records: Vec<ReconstructionValidationRecord>,
     target_validation_blockers: Vec<TargetValidationBlocker>,
     preserved_symbolic_formulas: Vec<PreservedSymbolicFormula>,
+    /// Statements — keyed (function, block, statement index) — whose symbolic
+    /// formulas were ALL bridge-owned consumed by trust-cg target semantics
+    /// (e.g. the entry-register-binding load lowering). The render layer's
+    /// conversion-blind body scan must not re-list these as still awaiting
+    /// consumption; their disclosure lives in the conversion evidence rows.
+    consumed_symbolic_statements: Vec<(String, usize, usize)>,
     target_proof_consumer_accepted: bool,
     unsupported: UnsupportedLedger,
     diagnostics: Vec<String>,
@@ -7417,6 +7445,45 @@ fn conversion_record_diagnostics(
     }
 }
 
+/// Entry-register binding candidates for one decompiled function, handed to
+/// the trust-cg bridge.
+///
+/// The candidate set is the ABI argument-register PREFIX sized by the
+/// function's recorded parameter facts — the entry-block read-before-write
+/// OBSERVATION (`BinaryParameter.index` is the ABI slot), which is evidence
+/// for candidacy only, never authority: the bridge cross-checks every
+/// candidate against the body's own `LocalDecl`s and justifies every
+/// individual use with its per-block write-freedom analysis over the lifted
+/// body, refusing anything unproven. A prefix — not the raw observed set — so
+/// LIR param position always equals ABI slot.
+#[cfg(feature = "trust-cg")]
+fn entry_bindings_for_function(
+    metadata: &BinaryArtifactMetadata,
+    function: &DecompiledFunction,
+) -> Option<BinaryEntryBindings> {
+    let arch = lift_arch_from_name(&metadata.architecture)?;
+    let max_abi_index =
+        function.signature.parameters.iter().map(|parameter| parameter.index).max()?;
+    let candidates = trust_lift::entry_register_binding_prefix(arch, max_abi_index);
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(BinaryEntryBindings {
+        arch: match arch {
+            LiftArch::Aarch64 => BindingArch::Aarch64,
+            LiftArch::X86_64 => BindingArch::X86_64,
+        },
+        params: candidates
+            .into_iter()
+            .map(|candidate| BinaryEntryParam {
+                var_name: candidate.var_name,
+                reg_name: candidate.reg_name,
+                local_index: candidate.local_index,
+            })
+            .collect(),
+    })
+}
+
 #[cfg(feature = "trust-cg")]
 fn trust_cg_conversion_for_functions(
     metadata: &BinaryArtifactMetadata,
@@ -7431,6 +7498,8 @@ fn trust_cg_conversion_for_functions(
     let mut records = Vec::with_capacity(functions.len());
     let mut target_validation_blockers = Vec::new();
     let mut preserved_symbolic_formulas = Vec::new();
+    let mut consumed_symbolic_statements: Vec<(String, usize, usize)> = Vec::new();
+    use std::collections::BTreeMap;
     let mut target_proof_consumer_artifact_digest = None;
     let mut target_proof_consumer_accepted = true;
     let mut target_proof_consumer_seen = false;
@@ -7462,7 +7531,11 @@ fn trust_cg_conversion_for_functions(
             diagnostics.push(feature);
         }
 
-        match lower_binary_decompiled_function_to_lir(function) {
+        let entry_bindings = entry_bindings_for_function(metadata, function);
+        match lower_binary_decompiled_function_to_lir_with_entry_bindings(
+            function,
+            entry_bindings.as_ref(),
+        ) {
             Ok(conversion) => {
                 let proof_consumer = conversion.target_proof_consumer_evidence();
                 if !conversion.symbolic_formula_evidence.is_empty()
@@ -7487,6 +7560,26 @@ fn trust_cg_conversion_for_functions(
                 ));
                 preserved_symbolic_formulas
                     .extend(trust_cg_preserved_symbolic_formulas(&conversion.symbolic_formulas));
+                // A statement whose evidence rows were ALL bridge-owned
+                // consumed is no longer awaiting target semantics; record it
+                // so the render layer's body scan cannot re-list it.
+                {
+                    let mut per_statement: BTreeMap<(String, usize, usize), bool> =
+                        BTreeMap::new();
+                    for row in &conversion.symbolic_formula_evidence {
+                        let key =
+                            (row.function.clone(), row.block, row.statement_index);
+                        let all_consumed =
+                            per_statement.entry(key).or_insert(true);
+                        *all_consumed &= row.target_semantics_consumed;
+                    }
+                    consumed_symbolic_statements.extend(
+                        per_statement
+                            .into_iter()
+                            .filter(|(_, all_consumed)| *all_consumed)
+                            .map(|(key, _)| key),
+                    );
+                }
                 diagnostics.extend(conversion.diagnostics.iter().cloned());
                 if target_proof_consumer_artifact_digest.is_none() {
                     let artifact = trust_cg_target_proof_consumer_artifact_digest(
@@ -7535,6 +7628,7 @@ fn trust_cg_conversion_for_functions(
                     validation_records: records,
                     target_validation_blockers,
                     preserved_symbolic_formulas,
+                    consumed_symbolic_statements: Vec::new(),
                     target_proof_consumer_accepted: false,
                     unsupported,
                     diagnostics,
@@ -7565,6 +7659,7 @@ fn trust_cg_conversion_for_functions(
         validation_records: records,
         target_validation_blockers,
         preserved_symbolic_formulas,
+        consumed_symbolic_statements,
         target_proof_consumer_accepted: target_proof_consumer_seen
             && target_proof_consumer_accepted,
         unsupported: UnsupportedLedger::default(),
@@ -7636,6 +7731,7 @@ fn rejected_trust_cg_conversion_with_blocker(
             feature,
         ),
         preserved_symbolic_formulas: Vec::new(),
+        consumed_symbolic_statements: Vec::new(),
         target_proof_consumer_accepted: false,
         unsupported,
         diagnostics: rejected_conversion_diagnostics(TRUST_CG_VALIDATION_SUBSET)

@@ -15,7 +15,7 @@ use trust_types::{
 };
 
 use crate::validation::{ValidationError, validate_lir};
-use crate::{BridgeError, lower_to_lir};
+use crate::BridgeError;
 
 const DIAGNOSTIC_TARGET: &str = "target=trust_cg-lir";
 const DIAGNOSTIC_SOURCE: &str = "source=binary-derived-trust_ir";
@@ -68,6 +68,11 @@ const TRUST_CG_REFINEMENT_METADATA_CONSUMER: &str =
     "trust-cg-bridge::bidirectional-refinement-consumption-gate";
 const TRUST_CG_BOUNDED_EMPTY_TARGET_CONSUMED_CODE: &str = "bounded-empty-trust_cg-target-consumed";
 const TRUST_CG_SCALAR_TARGET_CONSUMED_CODE: &str = "scalar-bool-true-trust_cg-target-consumed";
+// Trust: the entry-register-binding lowering consumed this formula with real
+// target semantics (an Opcode::Load / param reference emitted for it, each use
+// justified by the per-block write-freedom certificate over the lifted body).
+const TRUST_CG_ENTRY_BINDING_TARGET_CONSUMED_CODE: &str =
+    "entry-register-binding-trust_cg-target-consumed";
 const SCALAR_BOOL_TRUE_REFINEMENT_FORWARD: &str =
     "lifted TrustIr local0 = Symbolic(Bool(true)) refines trust_cg Iconst(B1, 1)";
 const SCALAR_BOOL_TRUE_REFINEMENT_REVERSE: &str =
@@ -593,10 +598,20 @@ pub enum BinaryTrustCgConversionError {
 pub fn lower_binary_decompiled_function_to_lir(
     function: &DecompiledFunction,
 ) -> Result<BinaryTrustCgConversion, BinaryTrustCgConversionError> {
+    lower_binary_decompiled_function_to_lir_with_entry_bindings(function, None)
+}
+
+/// Like [`lower_binary_decompiled_function_to_lir`], with an entry-register
+/// binding table (see `crate::entry_binding`) that lets justified
+/// function-entry register uses lower to real LIR parameters and loads.
+pub fn lower_binary_decompiled_function_to_lir_with_entry_bindings(
+    function: &DecompiledFunction,
+    entry_bindings: Option<&crate::entry_binding::BinaryEntryBindings>,
+) -> Result<BinaryTrustCgConversion, BinaryTrustCgConversionError> {
     let lifted = function.lifted.as_ref().ok_or_else(|| {
         BinaryTrustCgConversionError::MissingLiftedTrustIr { function: function.name.clone() }
     })?;
-    let mut conversion = lower_binary_trust_ir_to_lir(lifted)?;
+    let mut conversion = lower_binary_trust_ir_to_lir_with_entry_bindings(lifted, entry_bindings)?;
     attach_checked_certificate_evidence(&mut conversion, function);
     Ok(conversion)
 }
@@ -609,10 +624,66 @@ pub fn lower_binary_decompiled_function_to_lir(
 pub fn lower_binary_trust_ir_to_lir(
     lifted_trust_ir: &VerifiableFunction,
 ) -> Result<BinaryTrustCgConversion, BinaryTrustCgConversionError> {
-    let lir = lower_to_lir(lifted_trust_ir)?;
+    lower_binary_trust_ir_to_lir_with_entry_bindings(lifted_trust_ir, None)
+}
+
+/// Like [`lower_binary_trust_ir_to_lir`], with an entry-register binding
+/// table. Formulas the lowering consumed with real target semantics (the
+/// 8-byte little-endian load emitted as `Opcode::Load`, bare bound register
+/// `Var`s emitted as parameter references) have their evidence rows marked
+/// bridge-owned-consumed, so the symbolic-formula proof blocker reports only
+/// the formulas that genuinely remain unconsumed. The AGGREGATE proof state
+/// is deliberately unchanged: consuming one formula does not consume the
+/// artifact, and nothing here provides checked-certificate or replay
+/// evidence, so the conversion stays `InspectableRejected` at
+/// `TrustLevel::Rejected`.
+pub fn lower_binary_trust_ir_to_lir_with_entry_bindings(
+    lifted_trust_ir: &VerifiableFunction,
+    entry_bindings: Option<&crate::entry_binding::BinaryEntryBindings>,
+) -> Result<BinaryTrustCgConversion, BinaryTrustCgConversionError> {
+    let options = crate::lower::LoweringOptions {
+        entry_bindings: entry_bindings.cloned(),
+        ..crate::lower::LoweringOptions::default()
+    };
+    let (lir, consumed_symbolic) = crate::lower::lower_body_to_lir_with_options_and_consumptions(
+        &lifted_trust_ir.name,
+        &lifted_trust_ir.body,
+        &options,
+    )?;
     validate_lir(&lir).map_err(BinaryTrustCgConversionError::Validation)?;
-    let symbolic_formula_evidence = collect_symbolic_formula_evidence(lifted_trust_ir);
-    let symbolic_formulas = symbolic_formulas_from_evidence(&symbolic_formula_evidence);
+    let mut symbolic_formula_evidence = collect_symbolic_formula_evidence(lifted_trust_ir);
+    for consumption in &consumed_symbolic {
+        for entry in symbolic_formula_evidence.iter_mut().filter(|entry| {
+            entry.block == consumption.block
+                && entry.statement_index == consumption.statement_index
+                && entry.formula.as_ref() == Some(&consumption.formula)
+        }) {
+            entry.target_semantics_consumed = true;
+            entry.target_semantic_consumption = BinaryTrustCgTargetSemanticConsumptionEvidence {
+                consumer: TRUST_CG_TARGET_SEMANTIC_CONSUMER.to_string(),
+                target_semantics_consumed: true,
+                input_claimed_target_semantics_consumed: None,
+                code: TRUST_CG_ENTRY_BINDING_TARGET_CONSUMED_CODE.to_string(),
+                detail: consumption.detail.clone(),
+            };
+        }
+    }
+    // `symbolic_formulas` is the STILL-AWAITING-CONSUMPTION list — the set the
+    // preserved-formula blockers and the downstream release gates quantify
+    // over. A bridge-owned consumed formula leaves it (its target semantics
+    // exist now); its full disclosure stays in `symbolic_formula_evidence`
+    // (marked consumed, with the consuming LIR named) and in the proof-consumer
+    // records, which grade it accepted.
+    let awaiting_consumption: Vec<BinaryTrustCgSymbolicFormulaEvidence> = symbolic_formula_evidence
+        .iter()
+        .filter(|entry| {
+            !trust_cg_target_semantic_consumption_is_bridge_owned(
+                &entry.target_semantic_consumption,
+            )
+        })
+        .cloned()
+        .collect();
+    let symbolic_formulas = symbolic_formulas_from_evidence(&awaiting_consumption);
     let provenance_evidence = collect_function_provenance_evidence(lifted_trust_ir);
     let unsupported_ledger_evidence = Vec::new();
     let refinement_metadata_evidence = collect_binary_scalar_refinement_metadata(
@@ -1636,7 +1707,9 @@ fn trust_cg_target_semantic_consumption_is_bridge_owned(
         && evidence.consumer == TRUST_CG_TARGET_SEMANTIC_CONSUMER
         && matches!(
             evidence.code.as_str(),
-            TRUST_CG_BOUNDED_EMPTY_TARGET_CONSUMED_CODE | TRUST_CG_SCALAR_TARGET_CONSUMED_CODE
+            TRUST_CG_BOUNDED_EMPTY_TARGET_CONSUMED_CODE
+                | TRUST_CG_SCALAR_TARGET_CONSUMED_CODE
+                | TRUST_CG_ENTRY_BINDING_TARGET_CONSUMED_CODE
         )
 }
 
@@ -4936,6 +5009,158 @@ mod tests {
 
         let error = lower_binary_trust_ir_to_lir(&trust_ir)
             .expect_err("non-ground symbolic TrustIr must not produce executable LIR");
+        assert!(matches!(
+            error,
+            BinaryTrustCgConversionError::Lowering(BridgeError::UnsupportedOp(message))
+                if message.contains("symbolic operand requires target-semantic lowering")
+        ));
+    }
+
+    /// A lifted body shaped like `trust_fixture_x86_load` after frame
+    /// reconstruction: one surviving statement, the 8-byte little-endian load
+    /// of [RDI] into RAX, over an arg_count-0 machine-register body.
+    fn x86_load_lifted_function() -> VerifiableFunction {
+        let mem = Formula::Var(
+            "MEM".to_string(),
+            Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))),
+        );
+        let root = Formula::Var("X7".to_string(), Sort::BitVec(64));
+        let mut load = Formula::BitVec { value: 0, width: 64 };
+        for i in 0..8u32 {
+            let addr = if i == 0 {
+                root.clone()
+            } else {
+                Formula::BvAdd(
+                    Box::new(root.clone()),
+                    Box::new(Formula::BitVec { value: i128::from(i), width: 64 }),
+                    64,
+                )
+            };
+            let byte = Formula::Select(Box::new(mem.clone()), Box::new(addr));
+            let extended = Formula::BvZeroExt(Box::new(byte), 56);
+            load = if i == 0 {
+                extended
+            } else {
+                Formula::BvOr(
+                    Box::new(load),
+                    Box::new(Formula::BvShl(
+                        Box::new(extended),
+                        Box::new(Formula::BitVec { value: i128::from(i * 8), width: 64 }),
+                        64,
+                    )),
+                    64,
+                )
+            };
+        }
+        let u64_ty = Ty::Int { width: 64, signed: false };
+        VerifiableFunction {
+            name: "trust_fixture_x86_load".to_string(),
+            def_path: "binary::trust_fixture_x86_load".to_string(),
+            span: SourceSpan::binary_address(0x400000),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: u64_ty.clone(), name: Some("_lifted_result".into()) },
+                    LocalDecl { index: 1, ty: u64_ty.clone(), name: Some("RAX".into()) },
+                    LocalDecl { index: 8, ty: u64_ty, name: Some("RDI".into()) },
+                ],
+                blocks: vec![TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(1),
+                        rvalue: Rvalue::Use(Operand::Symbolic(load)),
+                        span: SourceSpan::binary_address(0x400000),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    fn rdi_entry_bindings() -> crate::entry_binding::BinaryEntryBindings {
+        crate::entry_binding::BinaryEntryBindings {
+            arch: crate::entry_binding::BindingArch::X86_64,
+            params: vec![crate::entry_binding::BinaryEntryParam {
+                var_name: "X7".to_string(),
+                reg_name: "RDI".to_string(),
+                local_index: 8,
+            }],
+        }
+    }
+
+    /// The load fixture converts with real target semantics under a justified
+    /// entry binding: the LIR is emitted (Load of the RDI param), the load's
+    /// evidence row is bridge-owned consumed so the symbolic-formula proof
+    /// blocker disappears — while the AGGREGATE conversion stays
+    /// InspectableRejected at TrustLevel::Rejected with the certificate and
+    /// replay blockers intact (consuming one formula does not consume the
+    /// artifact).
+    #[test]
+    fn justified_load_converts_and_consumes_exactly_its_own_evidence_row() {
+        let lifted = x86_load_lifted_function();
+        let conversion =
+            lower_binary_trust_ir_to_lir_with_entry_bindings(&lifted, Some(&rdi_entry_bindings()))
+                .expect("the justified load must convert");
+
+        assert_eq!(conversion.lir.signature.params.len(), 1, "one entry-register param");
+        let entry_instructions = &conversion.lir.blocks[&Block(0)].instructions;
+        assert!(
+            entry_instructions
+                .iter()
+                .any(|instruction| matches!(instruction.opcode, Opcode::Load { .. })),
+            "a real Load must be emitted: {entry_instructions:?}"
+        );
+
+        assert_eq!(conversion.symbolic_formula_evidence.len(), 1);
+        let row = &conversion.symbolic_formula_evidence[0];
+        assert!(row.target_semantics_consumed, "the load row must be marked consumed");
+        assert_eq!(
+            row.target_semantic_consumption.code,
+            TRUST_CG_ENTRY_BINDING_TARGET_CONSUMED_CODE
+        );
+        assert!(row.target_semantic_consumption.detail.contains("Opcode::Load"));
+
+        let proof_consumer = conversion.target_proof_consumer_evidence();
+        assert!(
+            !proof_consumer
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "symbolic-formula-not-consumed-by-target-semantics"),
+            "a consumed formula must not report the unconsumed blocker: {:?}",
+            proof_consumer.blockers
+        );
+        assert!(
+            proof_consumer
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "checked-certificate-not-consumed-by-target-semantics"
+                    || blocker.code == "missing-checked-proof-certificate"),
+            "certificate evidence stays unconsumed: {:?}",
+            proof_consumer.blockers
+        );
+        assert!(
+            !proof_consumer.target_semantics_consumed,
+            "consuming one formula must not consume the artifact"
+        );
+
+        assert_eq!(conversion.trust_cg_validation, BinaryTrustCgValidationStatus::InspectableRejected);
+        assert_eq!(conversion.trust_level, TrustLevel::Rejected);
+    }
+
+    /// The converse control: the SAME body without bindings still refuses the
+    /// whole conversion — the capability is gated on the justification, not on
+    /// the shape alone.
+    #[test]
+    fn load_without_bindings_still_refuses() {
+        let lifted = x86_load_lifted_function();
+        let error = lower_binary_trust_ir_to_lir(&lifted)
+            .expect_err("the load must refuse without a justified binding");
         assert!(matches!(
             error,
             BinaryTrustCgConversionError::Lowering(BridgeError::UnsupportedOp(message))

@@ -1,0 +1,121 @@
+{
+  "name": "into",
+  "def_path": "<u64 as core::convert::Into<u64>>::into",
+  "span": {
+    "file": "core/src/convert/mod.rs",
+    "line_start": 779,
+    "col_start": 4,
+    "line_end": 781,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<u64 as core::convert::From<u64>>::from",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "core/src/convert/mod.rs",
+              "line_start": 780,
+              "col_start": 8,
+              "line_end": 780,
+              "col_end": 21
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "self",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "self",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

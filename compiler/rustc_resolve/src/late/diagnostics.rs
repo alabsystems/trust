@@ -643,6 +643,11 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         let mut err = self.r.dcx().struct_span_err(base_error.span, base_error.msg.clone());
         err.code(code);
 
+        // Trust (I5, ruling v7/D3): a name the user can see in a `clean { … }`
+        // island, which was refused a `DefId`, must say WHY and give options —
+        // not a bare "cannot find function".
+        self.r.trust_note_clean_origin_refusal(&mut err, path);
+
         // Try to get the span of the identifier within the path's syntax context
         // (if that's different).
         if let Some(within_macro_span) =

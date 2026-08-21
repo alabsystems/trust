@@ -32,13 +32,37 @@ const PANICKING: &[&str] = &[
     "alloc::vec::Vec::<u32>::remove",          // panics on OOB index
     "alloc::vec::Vec::<u32>::insert",          // panics on OOB index
     "alloc::vec::Vec::<u32>::swap_remove",     // panics on OOB index
+    // `push` is NOT total: growing the vector calls `RawVec::grow_one`, whose
+    // capacity computation ends in `raw_vec::capacity_overflow()` — a real
+    // `panic!`, documented by std as "Panics if the new capacity exceeds
+    // `isize::MAX` bytes". It sat in SHOULD_BE_TOTAL, which asserts "cannot
+    // panic", so the oracle was demanding a summary that would have been FALSE.
+    // The element type does not rescue it: the overflow path is in the
+    // allocator, not in element code, so the primitive spelling panics too.
+    "alloc::vec::Vec::<u32>::push",            // capacity overflow -> capacity_overflow()
     "<alloc::vec::Vec<u32> as core::ops::index::Index<usize>>::index", // Vec[i] OOB panic
     "<[u32] as core::ops::index::Index<usize>>::index", // slice[i] OOB panic
     "core::option::Option::<u32>::map",        // runs a user closure
     "core::option::Option::<u32>::unwrap_or_else", // runs a user closure
     "alloc::string::ToString::to_string",      // dispatches to Display::fmt (user)
     "std::collections::hash::map::HashMap::<u32, u32>::get", // Hash+Eq on key (user)
-    "core::slice::<impl [u32]>::contains",     // Eq on elements (user)
+    // `<[T]>::contains` is total or not DEPENDING ON THE ELEMENT TYPE, so the pin has
+    // to name a USER element — the same convention this list already uses for
+    // `Vec::<ElemT>::dedup` ("PartialEq on elements (user)") and
+    // `BTreeMap::<UserOrdK, u32>::get` ("Ord on the KEY").
+    //
+    // CORRECTED 2026-08-20: this entry used to be spelled `<impl [u32]>` while giving
+    // "Eq on elements (user)" as its reason. For a PRIMITIVE element the reason does
+    // not hold — `PartialEq for u32` is core's built-in and coherence forbids a user
+    // impl, so `<[u32]>::contains` runs no user code at all (its `SliceContains`
+    // impls in `library/core/src/slice/cmp.rs` are memchr / a constant-lane
+    // `chunks_exact` SIMD scan / `iter().any`, none of which panics). The entry was
+    // pinning the right HAZARD with the wrong WITNESS. It now names a user element,
+    // and the primitive spelling is pinned in the opposite direction in
+    // SHOULD_BE_TOTAL below — so the oracle constrains BOTH sides of the element
+    // distinction instead of only forbidding the union.
+    "core::slice::<impl [ElemT]>::contains", // Eq on elements (user)
+    "core::slice::<impl [mycrate::Widget]>::contains", // ditto, spelled-out user path
     "core::num::<impl i32>::saturating_div",   // hunt-9: still panics on div-by-zero
     "core::num::<impl i32>::saturating_rem",   // hunt-9: still panics on rem-by-zero
     "core::num::<impl i32>::wrapping_div",     // wraps only MIN/-1; panics on div-by-zero
@@ -100,7 +124,6 @@ const ADVERSARIAL: &[&str] = &[
 /// unrecognized — the precision rung-1 must reclaim.
 const SHOULD_BE_TOTAL: &[&str] = &[
     "alloc::vec::Vec::<u32>::new",
-    "alloc::vec::Vec::<u32>::push",
     "alloc::vec::Vec::<u32>::len",
     "alloc::vec::Vec::<u32>::is_empty",
     "alloc::vec::Vec::<u32>::capacity",
@@ -111,6 +134,23 @@ const SHOULD_BE_TOTAL: &[&str] = &[
     "core::option::Option::<u32>::is_none",
     "core::slice::<impl [u32]>::get",
     "core::slice::<impl [u32]>::len",
+    // B2 (2026-08-20): `<[PRIM]>::contains`. One call to `cmp::SliceContains::
+    // slice_contains`, whose impls for primitives are memchr (`u8`/`i8`), a
+    // constant-lane `chunks_exact` SIMD scan, or `iter().any` — all over the BUILT-IN
+    // `PartialEq`, which coherence forbids a user crate from replacing. No user code,
+    // no allocation, no panic path. Its USER-element twin is pinned in PANICKING
+    // above, so this pair is what keeps the element distinction honest in both
+    // directions.
+    "core::slice::<impl [u32]>::contains",
+    "core::slice::<impl [i32]>::contains",
+    "core::slice::<impl [u8]>::contains",
+    "core::slice::<impl [char]>::contains",
+    // B3 (2026-08-20): `BufReader::new` — `Box::new_uninit_slice(DEFAULT_BUF_SIZE)`
+    // plus two struct constructions; `R` is only moved. Constant-size raw uninit
+    // allocation, so no layout arithmetic and no user code. The CALLER-SUPPLIED
+    // `with_capacity` sibling is deliberately not here and is pinned as a near-miss
+    // in the bridge's own fail-closed test.
+    "std::io::buffered::bufreader::BufReader::<std::fs::File>::new",
     "alloc::string::String::new",
     "alloc::string::String::len",
     // rung-1 recovery: the UTF-16 total pair. `str::encode_utf16` is a lazy iterator

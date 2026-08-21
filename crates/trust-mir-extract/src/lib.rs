@@ -1675,6 +1675,302 @@ pub fn faithful_vtable_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> trus
     crate::ty_convert::convert_ty_in_env(tcx, ty::TypingEnv::fully_monomorphized(), ty)
 }
 
+/// Trust (vtable slice 18): the bound on how deep [`faithful_key_skeleton`] will recurse.
+///
+/// A rustc type is a finite tree, so the walk terminates without this — the bound exists
+/// so a pathologically nested type produces a REFUSAL (fail-closed, its own tag) instead
+/// of a multi-kilobyte identity string in every consumer that carries it.
+const MAX_KEY_NESTING_DEPTH: u32 = 16;
+
+/// Trust (vtable slice 18): the `tcx`-level walk that turns ONE rustc type into the
+/// renderable skeleton `trust_types::VtableKeyTy`.
+///
+/// # Why this is the half that needs a `tcx`
+///
+/// Slice 17 rendered principal arguments and binding terms through
+/// `trust_types::Ty::vtable_source_type_key_in_body`, whose closed grammar must refuse
+/// `Ty::Adt`: that type's `name` is a GENERICS-ERASED def path, so `Vec<i32>` and
+/// `Vec<u64>` share one name and admitting it would re-open the merge slice 17 closed.
+/// The def path PLUS recursively rendered generic arguments is injective where the erased
+/// name is not — and only a `tcx` holder can walk to the arguments at all. This function
+/// supplies the facts; `trust_types::VtableKeyTy::render_in_body` owns the rendering and
+/// its injectivity obligation, because this crate is workspace-EXCLUDED (`rustc_private`)
+/// and cannot run a unit test.
+///
+/// # ZERO CHURN, by construction
+///
+/// The pre-slice-18 renderer is tried FIRST at every node, and anything it spells is
+/// wrapped VERBATIM as `VtableKeyTy::Closed`. So every key admitted before this slice is
+/// not merely equal to what it was — it is produced by the same unchanged code. Only a
+/// type that renderer REFUSES can reach the arms below.
+///
+/// # Regions
+///
+/// Lifetime arguments are skipped at EVERY depth, matching slice 17's top-level rule.
+/// Regions are erased everywhere else in this pipeline; counting them would manufacture
+/// divergences between two spellings of one type.
+///
+/// # What still refuses
+///
+/// The `_` arm hands back `closed_grammar_refusal_shape` of the SAME converted type slice
+/// 17 classified, so every residual census row (`opaque/param`, `unsized`, `fn-like`)
+/// keeps its exact tag and stays countable across the slice boundary. In particular the
+/// merged `PRE_MONO_ALIAS` sentinel — one string stamped on EVERY param-bearing
+/// projection — is still refused, at every depth: admitting it would key `<T as A>::X`
+/// and `<U as B>::Y` to one string, which is the same merge in another costume.
+fn faithful_key_skeleton<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    owner: &str,
+    depth: u32,
+) -> Result<trust_types::VtableKeyTy, trust_types::RefusalShape> {
+    use trust_types::{RefusalShape, VtableKeyTy as K};
+
+    let closed = faithful_vtable_key_ty(tcx, ty);
+    if closed.vtable_source_type_key_in_body(owner).is_some() {
+        return Ok(K::Closed(closed));
+    }
+    if depth >= MAX_KEY_NESTING_DEPTH {
+        return Err(RefusalShape::TooDeep);
+    }
+    let child = |t: ty::Ty<'tcx>| faithful_key_skeleton(tcx, t, owner, depth + 1);
+    match ty.kind() {
+        ty::Adt(def, args) => {
+            let mut rendered = Vec::new();
+            for arg in args.iter() {
+                if arg.as_region().is_some() {
+                    continue;
+                }
+                // A const argument has no canonical spelling in this grammar. REFUSE
+                // rather than drop it: dropping would merge `Foo<3>` with `Foo<4>` —
+                // the principal's own const args already have this disposition.
+                let arg_ty = arg.as_type().ok_or(RefusalShape::NominalConstArg)?;
+                rendered.push(child(arg_ty)?);
+            }
+            Ok(K::Nominal {
+                path: sysroot_authenticated_def_path_str(tcx, def.did()),
+                args: rendered,
+            })
+        }
+        ty::Tuple(elems) => {
+            let mut parts = Vec::with_capacity(elems.len());
+            for e in elems.iter() {
+                parts.push(child(e)?);
+            }
+            Ok(K::Tuple(parts))
+        }
+        ty::Array(elem, len) => {
+            let n = len.try_to_target_usize(tcx).ok_or(RefusalShape::SymbolicArrayLen)?;
+            Ok(K::Array { elem: Box::new(child(*elem)?), len: u128::from(n) })
+        }
+        ty::Ref(_, inner, mutability) => {
+            Ok(K::Ref { mutable: mutability.is_mut(), inner: Box::new(child(*inner)?) })
+        }
+        ty::RawPtr(pointee, mutability) => {
+            Ok(K::RawPtr { mutable: mutability.is_mut(), pointee: Box::new(child(*pointee)?) })
+        }
+        _ => Err(trust_types::closed_grammar_refusal_shape(&closed)),
+    }
+}
+
+/// Trust (vtable slice 18): render ONE type of a trait object's key, faithfully.
+///
+/// The single entry point for both halves of the key (principal arguments and
+/// associated-type binding terms); the caller supplies only the tag PREFIX so the two
+/// populations stay separately countable in the reason-tag histogram.
+fn faithful_key_component<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    owner: &str,
+    tag_for: fn(trust_types::RefusalShape) -> &'static str,
+) -> Result<String, &'static str> {
+    faithful_key_skeleton(tcx, ty, owner, 0)
+        .and_then(|skeleton| skeleton.render_in_body(owner))
+        .map_err(tag_for)
+}
+
+/// Trust (vtable slice 17, SOUNDNESS): the ONE renderer of a trait object's FAITHFUL,
+/// INJECTIVE principal key — the string EVERY shared trait-object identity must be
+/// derived from.
+///
+/// # The defect this closes
+///
+/// `Ty::Dynamic { trait_name }` records the principal trait's def path and nothing
+/// else, so `dyn Convert<u32>` and `dyn Convert<u64>` render ONE string. Two consumers
+/// keyed identities on it:
+///   * `trust_ir::stable_vtable_global_name` — one global NAME for two vtables, i.e. an
+///     asserted `Load`-equality of two DIFFERENT vtables.
+///   * `trust_ir::stable_trait_object_id` -> `FatPtrKind::TraitObject { trait_id }`,
+///     which IS the trait object's TYPE IDENTITY. `differential.rs`'s `tys_agree`
+///     compares those ids with `Ok(x == y)`, so it returned TRUE for two genuinely
+///     different types — a path to a FALSE AGREED, strictly worse than the name merge
+///     (a wrong global name is a wrong load; a wrong type identity corrupts the
+///     comparison itself).
+///
+/// The per-body collision tripwire in `trait_object_id` could not catch this **by
+/// construction**: it guards two DISTINCT def paths hashing to ONE id (an FNV
+/// collision), and erasure is the OPPOSITE direction — two distinct trait objects
+/// rendering the SAME def path, which lands in its approve arm. That tripwire is
+/// retained (it still guards genuine collisions, which faithful rendering does not
+/// eliminate); this function supplies its missing twin.
+///
+/// # Why FAITHFUL rather than a blanket refusal
+///
+/// The two designs fail in opposite directions. Erasure fails OPEN and invisibly (two
+/// types -> one id -> a false agreement). A rendering drift between the two sides fails
+/// VISIBLY (one type -> two ids -> the bodies simply do not agree), costing measurement
+/// and never soundness. So the precise option is also the safe one, and a blanket
+/// refusal would pay real capability — `dyn Fn(A) -> B` desugars to `Fn<(A,)>`, so every
+/// `dyn Fn`/`FnMut`/`FnOnce` would refuse — for a defect that has zero corpus
+/// population. See CLAUDE.md v7/D2.
+///
+/// # Drift is impossible by construction, not by discipline
+///
+/// This is the SINGLE renderer. Both `tcx`-holding callers — the THIR producer's
+/// `trait_object_id` and the extractor's `TyKind::Dynamic` arm — call it; neither
+/// re-derives it. The extractor stamps the result into `Ty::Dynamic { principal_key }`,
+/// and the MIR-side bridge (which has no `tcx` and must never acquire one) only ever
+/// HASHES the string it was handed. `trait_object_id`'s own comment records that a
+/// hand-copied second producer of one identity drifted once already; this is that lesson
+/// applied one level up.
+///
+/// # The rendering, and its injectivity obligation
+///
+/// The obligation is over the TYPE, not the string: two distinct trait objects must
+/// never render to one string. So the WHOLE existential predicate list participates —
+/// principal path, non-lifetime principal args, associated-type bindings, and auto
+/// traits — each through the closed, canonical grammar `vtable_source_type_key`, whose
+/// admitted spellings are canonical for the rustc type they came from (so equal
+/// renderings imply equal types, which is the soundness direction).
+///
+/// LIFETIMES ARE EXCLUDED, deliberately: regions are erased everywhere else in this
+/// pipeline, so admitting them would manufacture divergences between two spellings of
+/// one type — and would refuse `&'a V -> &'a dyn T`, a real shape.
+///
+/// # Fail-closed BACKSTOP
+///
+/// The policy is *render faithfully; if it cannot be rendered injectively, refuse*.
+/// `None` whenever any component escapes the closed grammar (a param/placeholder/opaque
+/// or nominal argument, a const term, a binding whose term is unrenderable) or any
+/// rendered component contains `$` (the vtable mint splits at the LAST `$`; asserted
+/// here rather than assumed). Falling back to the erased spelling IS the bug.
+///
+/// # Zero churn on already-minted identities
+///
+/// An args-free, binding-free, auto-trait-free principal returns `safe_def_path_str`
+/// VERBATIM — the function literally returns that string rather than reconstructing it —
+/// so every existing `trait_id` and the three shipped slice-3 vtable globals are
+/// byte-identical BY CONSTRUCTION.
+pub fn faithful_principal_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    preds: &ty::List<ty::PolyExistentialPredicate<'tcx>>,
+    owner: &str,
+) -> Result<String, &'static str> {
+    fn dollar_free(s: String) -> Result<String, &'static str> {
+        if s.is_empty() || s.contains('$') {
+            Err("Ty(dyn key: '$' or empty in rendered component)")
+        } else {
+            Ok(s)
+        }
+    }
+
+    // SYSROOT-AUTHENTICATED, deliberately. The stamp is identity for a real sysroot
+    // crate and non-identity only for one IMPERSONATING it, so an impersonating
+    // `core::fmt::Debug` can never share an identity with the real one. This is also the
+    // spelling the extractor already stamps into `trait_name` and the vtable mint already
+    // uses on BOTH sides — so the three shipped slice-3 globals are byte-identical — and
+    // adopting it here additionally closes a pre-existing asymmetry: the producer's
+    // `trait_object_id` hashed the UNSTAMPED `safe_def_path_str` while the oracle hashed
+    // the stamped one. Identity in this corpus, divergent under impersonation.
+    let principal = preds.principal().ok_or("Ty(dyn no principal)")?;
+    let tr = principal.skip_binder();
+    let base = dollar_free(sysroot_authenticated_def_path_str(tcx, tr.def_id))?;
+
+    // Principal arguments — NON-LIFETIME only.
+    let mut args = Vec::new();
+    for arg in tr.args.iter() {
+        if arg.as_region().is_some() {
+            continue;
+        }
+        // A const argument has no canonical spelling in the closed grammar yet: refuse
+        // rather than drop it (dropping would merge `dyn Foo<3>` with `dyn Foo<4>`).
+        let arg_ty = arg.as_type().ok_or("Ty(dyn principal arg: const-generic)")?;
+        // BODY-SCOPED: a bare `ty::Param` argument (`dyn A<T>`) is renderable — `T` is a
+        // single fixed type within one body — but it is NOT body-independent, so the key
+        // names the owner. Rendering it with the owner-less renderer would refuse
+        // `dyn A<T>` outright; rendering it WITHOUT the owner would merge two bodies'
+        // `dyn A<T>` into one `trait_id` for two distinct types. Concrete arguments are
+        // body-independent and delegate, so `dyn A<i32>` keeps its exact spelling.
+        // Trust (vtable slice 18): a NOMINAL argument now renders too — def path plus
+        // recursively rendered arguments, which is injective where `Ty::Adt`'s erased
+        // `name` was not. The closed grammar still runs first at every node, so every
+        // spelling admitted before this slice is byte-identical.
+        let rendered = faithful_key_component(
+            tcx,
+            arg_ty,
+            owner,
+            trust_types::principal_arg_refusal_tag_for,
+        )?;
+        args.push(dollar_free(rendered)?);
+    }
+
+    // Associated-type bindings: `dyn Iterator<Item = u32>` and `<Item = u64>` are
+    // DIFFERENT TYPES sharing one principal path, so omitting them would leave exactly
+    // the merge this function exists to prevent.
+    let mut bindings = Vec::new();
+    for proj in preds.projection_bounds() {
+        let p = proj.skip_binder();
+        let name = dollar_free(sysroot_authenticated_def_path_str(tcx, p.def_id))?;
+        let term = p.term.as_type().ok_or("Ty(dyn assoc binding: const term)")?;
+        // Trust (vtable slice 18): the binding term takes the same faithful nominal
+        // rendering as a principal argument — `Item = Vec<i32>` and `Item = Vec<u64>` are
+        // different types sharing one principal path AND one binding name, so the term is
+        // the only thing that can separate them.
+        let term_key = faithful_key_component(
+            tcx,
+            term,
+            owner,
+            trust_types::assoc_binding_refusal_tag_for,
+        )?;
+        bindings.push(format!("{name}={}", dollar_free(term_key)?));
+    }
+    bindings.sort();
+
+    // Auto traits: `dyn Debug` and `dyn Debug + Send` are different types. Their VTABLES
+    // coincide (an auto trait adds no entries), so merging them was harmless for the
+    // vtable name — but not for the type identity `tys_agree` compares.
+    let mut autos = Vec::new();
+    for did in preds.auto_traits() {
+        autos.push(dollar_free(sysroot_authenticated_def_path_str(tcx, did))?);
+    }
+    autos.sort();
+
+    if args.is_empty() && bindings.is_empty() && autos.is_empty() {
+        // The overwhelmingly common `dyn Trait` — returned VERBATIM, so no existing
+        // identity can churn.
+        return Ok(base);
+    }
+
+    let mut out = base;
+    if !args.is_empty() {
+        out.push('<');
+        out.push_str(&args.join(", "));
+        out.push('>');
+    }
+    for b in &bindings {
+        out.push_str("+[");
+        out.push_str(b);
+        out.push(']');
+    }
+    for a in &autos {
+        out.push('+');
+        out.push_str(a);
+    }
+    Ok(out)
+}
+
+
+
 pub fn extract_function<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) -> VerifiableFunction {
     extract_function_with_contract_bundle(tcx, body, None)
 }
@@ -1722,6 +2018,10 @@ fn extract_function_with_purpose<'tcx>(
     let _datatype_defs = ty_convert::DatatypeDefScope::begin();
     let def_id = body.source.def_id();
     let def_path = safe_def_path_str(tcx, def_id);
+    // Trust (vtable slice 17): open the BODY-SCOPED owner scope BEFORE any type is
+    // converted (metadata/signature types included), so every `Ty::Dynamic` this
+    // extraction produces carries the same owner the THIR producer will use.
+    let _owner_scope = ty_convert::OwnerDefPathScope::begin(&def_path);
     let metadata = extract_metadata_with_contract_bundle(tcx, body, compiler_contracts);
     // Trust: Use opt_item_name to avoid panic on closures/synthetic items
     // (e.g. `fmt::builders::{closure#0}`). Fall back to last segment of def_path.
@@ -3872,7 +4172,7 @@ fn codegen_ty_issue(ty: &Ty, context: &str) -> Option<String> {
         Ty::Adt { name, .. } => Some(format!("{context} uses layout-erased ADT `{name}`")),
         Ty::Datatype { name, .. } => Some(format!("{context} uses proof-only datatype `{name}`")),
         Ty::Closure { name, .. } => Some(format!("{context} uses layout-erased closure `{name}`")),
-        Ty::Dynamic { trait_name } => Some(format!(
+        Ty::Dynamic { trait_name, .. } => Some(format!(
             "{context} uses trait object `{trait_name}` without exact vtable metadata"
         )),
         Ty::Coroutine { name, .. } => {
@@ -8338,7 +8638,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 function.body.return_ty
             );
         };
-        let Ty::Dynamic { trait_name } = ret_inner.as_ref() else {
+        let Ty::Dynamic { trait_name, .. } = ret_inner.as_ref() else {
             panic!("expected dyn_debug_ref return pointee to be Dynamic, got {ret_inner:?}");
         };
         assert_eq!(trait_name, "trust_mir_extract_call_target_fixture::LocalDebug");

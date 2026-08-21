@@ -248,8 +248,25 @@ pub fn island_definition_arity(env: &KernelEnvironment, name: &str) -> Option<us
     Some(arity)
 }
 
+/// The compiler's reserved namespace for E6 kernel-imported program functions
+/// — the constants [`mangle_kernel_const`] mints and I2 records as
+/// `trust_symbols::KernelStatus::Reflected`.
+///
+/// It is reserved in both directions: an island may not declare into it
+/// (`strict_leaf_policy_error`), and a constant inside it may not be admitted
+/// as a kernel-checked Clean declaration
+/// ([`admit_certified_island_definition`]). One spelling, so the two halves
+/// cannot drift apart.
+pub const KERNEL_IMPORT_PREFIX: &str = "trust_import_";
+
 /// Authenticate an island [`ConstantKind::Definition`] and install the exact
 /// facet/admission pair needed to elaborate calls to it.
+///
+/// **I2 (decision of record §7).** This is a "`KernelChecked` is required"
+/// position. It refuses a reflected Rust carrier — see the two checks at the
+/// top of the body — and on success it mints an [`trust_spec_elab::Admission`]
+/// carrying `KernelStatus::KernelChecked`, so downstream can tell the two
+/// apart by type rather than by inspecting the constant's spelling.
 ///
 /// This is deliberately stronger than calling [`trust_spec_elab::FacetTable::admit`]:
 /// an admission is usable only alongside four certified facets. A strict Clean
@@ -265,6 +282,45 @@ pub fn admit_certified_island_definition(
     name: &str,
     facets: &mut trust_spec_elab::FacetTable,
 ) -> Result<trust_spec_elab::Admission, String> {
+    // ------------------------------------------------------------------
+    // I2 — a REFLECTED Rust carrier may not be admitted here.
+    // ------------------------------------------------------------------
+    // This function is the compiler's "`KernelChecked` is required" site: it
+    // exists to authenticate a Clean declaration the CIC kernel re-checked, and
+    // on success it stamps four `FacetStatus::Certified { evidence:
+    // "clean-island-kernel-definition" }` facets. A `trust_import_*` constant is
+    // not that. It is a Rust `fn` projected into the environment by
+    // `admit_function_into`: the kernel checked that the carrier's body inhabits
+    // its type, and never checked that the constant DENOTES that `fn`. The
+    // compiler asserts the correspondence, and it is TCB.
+    //
+    // Before I2 this call SUCCEEDED on a reflected carrier — the reflexive
+    // `name = name` audit passes for it, because the declaration really is a
+    // well-formed kernel Definition — and the environment then carried a row
+    // claiming `clean-island-kernel-definition` evidence for a reflection, a
+    // claim the kernel never made. Two independent checks close it:
+    //
+    //  1. the TYPED one: ask the admission record what status the constant was
+    //     minted under. The real caller (`trust_verify.rs`'s in-walk discharge)
+    //     reaches here with the very table the program-function mints were
+    //     recorded in, so the provenance is present and does not have to be
+    //     guessed from the spelling;
+    //  2. the STRUCTURAL backstop: `trust_import_*` is a reserved namespace —
+    //     `strict_leaf_policy_error` refuses any island that declares into it —
+    //     so a constant there is a reflected carrier by construction, even when
+    //     the caller hands us a table that never saw the mint. Fail-closed: an
+    //     admitter that cannot tell Reflected from KernelChecked must refuse.
+    if let Some(status) = facets.kernel_const_status(name)
+        && let Err(refusal) = status.require_kernel_check(name)
+    {
+        return Err(refusal.to_string());
+    }
+    if name.starts_with(KERNEL_IMPORT_PREFIX) {
+        return Err(trust_symbols::KernelStatus::Reflected
+            .require_kernel_check(name)
+            .expect_err("Reflected never satisfies a kernel-check requirement")
+            .to_string());
+    }
     if facets.get(name).is_some() {
         // Re-admitting THE SAME island definition is idempotent, not a
         // collision. A clause may call one definition more than once
@@ -280,8 +336,14 @@ pub fn admit_certified_island_definition(
         // facet key still fails closed here — only the identical re-admission
         // is allowed through, and it returns the admission already recorded
         // rather than minting a second one.
+        //
+        // I2 strengthens this from a string comparison to a status question:
+        // the identical re-admission is the one whose recorded status says the
+        // kernel re-checked it. The name equality is kept as well, so this is
+        // strictly narrower than before, never wider.
         if let Some(existing) = facets.admitted(name)
             && existing.kernel_const == name
+            && existing.require_kernel_check().is_ok()
         {
             return Ok(existing.clone());
         }
@@ -364,7 +426,54 @@ pub fn admit_certified_island_definition(
             no_panic: certified(),
         },
     );
-    let admission = trust_spec_elab::Admission { kernel_const: name.to_string(), arity };
+    // ------------------------------------------------------------------
+    // I2 — mint the status through the sealed seam.
+    // ------------------------------------------------------------------
+    // `trust_symbols::CicKernelRecheck::held_by_kernel_recheck` is an
+    // ASSERTION, and this is the review it exists to concentrate. Its three
+    // clauses, against what just happened above:
+    //
+    //  1. "the kernel re-checked the declaration's own obligation — not a
+    //     sibling's, not a synthetic `name = name`, not a parse". The goal here
+    //     IS syntactically `name = name`, and that caveat is the reason this
+    //     paragraph exists rather than a one-line call. It holds anyway, and
+    //     for a checked reason: `cert_meter::grade` delegates to
+    //     `Environment::audit_certification`, which collects the const refs of
+    //     goal AND term — `name` among them — and then runs
+    //     `check_decl_readonly_strict` on the RECONSTRUCTED declaration of
+    //     every reachable constant
+    //     (`first-party/clean/crates/clean-kernel/src/env/axiom_audit.rs:1242`,
+    //     `:1284`). That call re-checks this definition's own `value : type`
+    //     obligation. The reflexivity is the vehicle that puts the declaration
+    //     into the audited closure, not a substitute for checking it — which is
+    //     what the caveat forbids.
+    //  2. "the caller can produce the exact term that was checked". The digest
+    //     below is taken over this declaration's own type and value, the two
+    //     halves of the obligation `check_decl_readonly_strict` re-checked.
+    //  3. "the caller ran the full certification audit, so the AxiomClosure
+    //     distinguishes audited-empty from not audited". `cert_meter::grade`
+    //     returned `Certified`, which is exactly `audit.is_certified()` — an
+    //     EMPTY issue list over the unfiltered transitive closure. `Trusted`
+    //     (a non-empty closure) and `Rejected` both returned `Err` above and
+    //     never reach here, so `audited([])` is the honest closure and not an
+    //     `unrecorded()` one.
+    //
+    // A reflected Rust carrier deliberately does not come through here: it gets
+    // `Reflected`, which needs no token, because its correspondence to the Rust
+    // item is TCB.
+    use trust_symbols::KernelAuthority as _;
+    let digest = trust_symbols::TermDigest::of_bytes(
+        format!(
+            "clean-island-definition\n{name}\ntype={}\nvalue={}",
+            info.type_,
+            info.value.as_ref().expect("checked non-None above"),
+        )
+        .as_bytes(),
+    );
+    let status = trust_symbols::CicKernelRecheck::held_by_kernel_recheck()
+        .kernel_checked(digest, trust_symbols::AxiomClosure::audited([]));
+    debug_assert!(status.is_certified(), "a Certified grade must project to a Certified status");
+    let admission = trust_spec_elab::Admission::kernel_checked(name, arity, status);
     facets.admit(name, admission.clone());
     Ok(admission)
 }
@@ -501,6 +610,20 @@ pub fn kernel_prove_ensures_by_defeq(
 /// sorry/axiom-closure + proof-checks-goal audit). `Certified` is the ONLY
 /// dischargeable verdict; `Trusted` (axiom/marker-tainted) and `Rejected` are
 /// not.
+///
+/// **I3 disposition, recorded so the next reader does not have to re-derive
+/// it.** This lookup is the second of the two name→symbol sites (the other is
+/// `trust_spec_elab`'s call arm, which is where the firewall is enforced), and
+/// it deliberately consults NO capability. Citing a theorem is a PROOF position
+/// — §4.1.1 gives PROOF total observer capability over every declaration
+/// including private internals, with zero annotations — so a capability check
+/// here could only ever refuse something the ratified semantics permits. The
+/// `TheoremNotFound` below is therefore not the forbidden "not found": it fires
+/// only when the constant is genuinely absent from the environment, never when
+/// a visible declaration is merely unexecutable. A CALL-position consumer of
+/// this machinery does not exist and must not be added here; it belongs on
+/// `trust_spec_elab::elaborate_goal_typed_in`, which takes the use site's
+/// capability and answers with `ProofOnlyRefusal`.
 fn grade_cited_theorem_against_goal(
     env: &Environment,
     theorem: &str,
@@ -542,6 +665,147 @@ fn grade_cited_theorem_against_goal(
 /// function (not a session method) so the E9 in-walk discharge can mint a LEAF
 /// self-function into a per-body CLONE of the island env without owning a
 /// session.
+///
+/// **I2 (decision of record §7): every admission this mints is
+/// `trust_symbols::KernelStatus::Reflected`, never `KernelChecked`.** The
+/// kernel really did check the minted declaration — `Environment::add_decl`
+/// verifies that the value inhabits the type, and a mistaken term is rejected
+/// rather than admitted. What the kernel did *not* check, and cannot, is that
+/// the constant DENOTES `func`: that correspondence is asserted by this
+/// function, from the MIR body, and is TCB (`docs/TCB.md`). A theorem proved
+/// about the carrier is therefore only as good as the reflection, which is
+/// exactly why the status has to say `Reflected`. The four
+/// `trust_spec_elab::admit_*_function` minters below are where the status is
+/// attached; this function never upgrades it, and holds no token that could.
+/// Trust (#63, R3) — THE FAITHFULNESS GATE for island-def-originated carriers.
+///
+/// R2 (island `def` -> executable Rust) is the ONE direction in this system that
+/// can PRODUCE a value: a divergence there is a **wrong binary**, not a refused
+/// proof. Every other gate can only decline to certify. The plan
+/// (`docs/plans/2026-08-02-v7-island-parse-and-produce.md` §4, sequencing §6)
+/// therefore lands this gate BEFORE R2 is reachable from user code, and its
+/// acceptance criterion is the RED case: a generated body that does not match its
+/// Clean definition must FAIL THE BUILD.
+///
+/// MECHANISM — item 10 phase 2 run backwards, zero new kernel machinery:
+///  1. the island `def` is admitted for citation
+///     ([`admit_certified_island_definition`]);
+///  2. the GENERATED carrier body is E6-admitted as its `trust_import_*`
+///     constant ([`admit_function_into`] — kernel-checked defining equation,
+///     `Reflected` status per I2);
+///  3. the goal `∀ params, carrier(params) = def(params)` elaborates through the
+///     SAME `elaborate_ensures` path every citation uses, and the kernel judges
+///     it by DEFINITIONAL EQUALITY ([`kernel_prove_ensures_by_defeq`]) —
+///     unfolding the carrier constant on one side and the island definition on
+///     the other. No hand-rolled equality; the kernel is the only judge.
+///
+/// FAIL-CLOSED at every step, and each rejection names its repair (v7/D3): a
+/// carrier body outside the E6 fragment is REFUSED (R2 may only originate bodies
+/// this gate can check — that bounds the generator, deliberately), an
+/// unmappable parameter type is refused naming the type, and a defeq refusal
+/// reports the elaborated goal so the divergence is inspectable.
+#[derive(Debug)]
+pub enum CarrierFaithfulnessRejection {
+    /// The island definition could not be admitted for citation.
+    IslandDefinitionNotAdmissible { def_name: String, detail: String },
+    /// A carrier parameter (or return) type has no elaborable Rust spelling.
+    /// R2's own acceptance says this fails the build naming the type.
+    UnrepresentableType { def_name: String, ty: String },
+    /// The generated body is outside the E6-recognizable fragment, so the gate
+    /// CANNOT check it — which means R2 must not emit it. Extending the
+    /// generator requires extending the E6 fragment first, never skipping the
+    /// check (v7/D2: extending capability extends the CHECK, never trust).
+    CarrierOutsideCheckedFragment { carrier: String },
+    /// The kernel refused `carrier ≡ def` — THE red case. The generated binary
+    /// would compute something other than the Clean definition.
+    NotDefinitionallyEqual { def_name: String, carrier: String, detail: String },
+}
+
+/// Trust (#63, R3): kernel-verify that a GENERATED carrier body IS its Clean
+/// island definition, by definitional equality. `Ok(())` is the ONLY green;
+/// every other outcome must fail the build at the caller.
+pub fn check_generated_carrier_faithfulness(
+    env: &mut Environment,
+    island_def: &str,
+    carrier: &trust_types::VerifiableFunction,
+    facets: &mut trust_spec_elab::FacetTable,
+) -> Result<(), CarrierFaithfulnessRejection> {
+    use CarrierFaithfulnessRejection as R;
+    // 1. The island definition, admitted for citation.
+    let admission =
+        admit_certified_island_definition(env, island_def, facets).map_err(|detail| {
+            R::IslandDefinitionNotAdmissible { def_name: island_def.to_string(), detail }
+        })?;
+    // 2. Parameter spellings, from the CARRIER's own signature (what the binary
+    //    will actually use). Synthetic names — the goal quantifies over them, so
+    //    the source-level names are irrelevant to the proposition.
+    let rust_ty = |ty: &trust_types::Ty| -> Option<&'static str> {
+        match ty {
+            trust_types::Ty::Int { width: 64, signed: false } => Some("u64"),
+            trust_types::Ty::Int { width: 64, signed: true } => Some("i64"),
+            trust_types::Ty::Int { width: 32, signed: false } => Some("u32"),
+            trust_types::Ty::Int { width: 32, signed: true } => Some("i32"),
+            trust_types::Ty::Bool => Some("bool"),
+            _ => None,
+        }
+    };
+    if carrier.body.arg_count != admission.arity {
+        return Err(R::NotDefinitionallyEqual {
+            def_name: island_def.to_string(),
+            carrier: carrier.def_path.clone(),
+            detail: format!(
+                "arity mismatch: carrier takes {}, definition takes {}",
+                carrier.body.arg_count, admission.arity
+            ),
+        });
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut params: Vec<(&str, &str)> = Vec::new();
+    for i in 1..=carrier.body.arg_count {
+        names.push(format!("x{}", i - 1));
+    }
+    for (i, local) in (1..=carrier.body.arg_count).zip(names.iter()) {
+        let decl = carrier.body.locals.iter().find(|d| d.index == i).ok_or_else(|| {
+            R::UnrepresentableType {
+                def_name: island_def.to_string(),
+                ty: format!("<missing local decl for parameter {i}>"),
+            }
+        })?;
+        let spelled = rust_ty(&decl.ty).ok_or_else(|| R::UnrepresentableType {
+            def_name: island_def.to_string(),
+            ty: format!("{:?}", decl.ty),
+        })?;
+        params.push((local.as_str(), spelled));
+    }
+    // 3. E6-admit the generated body, and RECORD the admission — the ensures
+    //    elaborator consults the facet table for it, and an unrecorded mint
+    //    fails elaboration with "not E6-admitted" (caught by this gate's own
+    //    GREEN control the first time around). A decline means the gate cannot
+    //    check this carrier, so the build must refuse it.
+    let Some((_kernel_name, carrier_admission)) = admit_function_into(env, carrier, facets)
+    else {
+        return Err(R::CarrierOutsideCheckedFragment { carrier: carrier.def_path.clone() });
+    };
+    facets.admit(carrier.def_path.clone(), carrier_admission);
+    // 4. The goal: result == island_def(x0, .., xN) over the carrier — the SAME
+    //    defeq route every uncited ensures clause takes; the kernel unfolds both
+    //    constants and judges.
+    let clause = format!("result == {island_def}({})", names.join(", "));
+    match kernel_prove_ensures_by_defeq(env, &clause, &params, &carrier.def_path, facets) {
+        CitationVerdict::KernelStatementMatchCertified => Ok(()),
+        CitationVerdict::ClauseOutsideFragment { reason } => Err(R::NotDefinitionallyEqual {
+            def_name: island_def.to_string(),
+            carrier: carrier.def_path.clone(),
+            detail: format!("goal did not elaborate: {reason}"),
+        }),
+        other => Err(R::NotDefinitionallyEqual {
+            def_name: island_def.to_string(),
+            carrier: carrier.def_path.clone(),
+            detail: format!("kernel refused definitional equality: {other:?}"),
+        }),
+    }
+}
+
 #[must_use]
 pub fn admit_function_into(
     env: &mut Environment,
@@ -886,12 +1150,12 @@ fn leaf_declaration_names(result: &ElabResult) -> Vec<&clean_kernel::Name> {
 
 /// A fresh, valid kernel constant name for a program function imported under E6.
 /// Non-identifier characters of the def-path (`::`, `<`, `>`, spaces, …) become
-/// `_`, under a `trust_import_` prefix that namespaces these constants away from
-/// prelude and island declarations.
+/// `_`, under a [`KERNEL_IMPORT_PREFIX`] prefix that namespaces these constants
+/// away from prelude and island declarations.
 fn mangle_kernel_const(def_path: &str) -> String {
     let sanitized: String =
         def_path.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-    format!("trust_import_{sanitized}")
+    format!("{KERNEL_IMPORT_PREFIX}{sanitized}")
 }
 
 /// The machine-integer width for a bit count, or `None` outside the supported
@@ -967,7 +1231,7 @@ pub(crate) fn strict_leaf_policy_error(env: &Environment, leaf: &ElabResult) -> 
         // declaration, where the diagnostic names the actual mistake, and stops
         // the environment from ever holding a constant that lies about which
         // Rust function it came from.
-        if name.to_string().starts_with("trust_import_") {
+        if name.to_string().starts_with(KERNEL_IMPORT_PREFIX) {
             return Some(format!(
                 "Clean island declaration `{name}` declares into the compiler's kernel-import \
                  namespace (`trust_import_*`); that namespace is reserved for E6 program-function \
@@ -1332,6 +1596,172 @@ pub fn clause_monitor_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// Trust (#63, R3) — THE RED CASE, written before the green one per the
+    /// plan's own acceptance: a generated carrier whose body does NOT match its
+    /// Clean definition must be REJECTED, with the kernel as the only judge.
+    ///
+    /// The carrier here is an E6-recognizable IDENTITY body, so admission
+    /// succeeds and the refusal comes from the DEFEQ GATE itself — the test
+    /// exercises the gate, not the admission filter in front of it.
+    #[test]
+    fn r3_diverging_generated_carrier_is_rejected() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let identity_carrier = |def_path: &str| VerifiableFunction {
+            name: "gen".into(),
+            def_path: def_path.into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl {
+                        index: 0,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: None,
+                    },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("x0".into()),
+                    },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Int { width: 64, signed: false },
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+
+        let mut env = Environment::with_prelude();
+        let outcome = check_clean_island_into(
+            "def r3_same (x : UInt64) : UInt64 := x
+
+\
+             def r3_diff (x : UInt64) : UInt64 := UInt64.add x 1",
+            &mut env,
+        );
+        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+
+        let mut facets = trust_spec_elab::FacetTable::from_structural_facets([
+            ("gen::same_carrier", true, true, true, true),
+            ("gen::diff_carrier", true, true, true, true),
+        ]);
+
+        // RED: the identity carrier does NOT compute `x + 1`. The kernel must
+        // refuse, and the refusal must be the defeq gate (not admission).
+        let carrier = identity_carrier("gen::diff_carrier");
+        let verdict =
+            check_generated_carrier_faithfulness(&mut env, "r3_diff", &carrier, &mut facets);
+        match &verdict {
+            Err(CarrierFaithfulnessRejection::NotDefinitionallyEqual { detail, .. }) => {
+                // The refusal must come from the KERNEL's defeq judgment, not
+                // from a failed elaboration in front of it — the gate's first
+                // draft passed this test for the wrong reason (an unrecorded
+                // admission failed elaboration, which also maps to this
+                // variant), and the GREEN control below is what exposed it.
+                assert!(
+                    detail.contains("kernel refused definitional equality"),
+                    "the RED case must be the kernel's judgment, not a gate in \
+                     front of it: {detail}"
+                );
+            }
+            other => panic!(
+                "a diverging generated carrier MUST be rejected by the kernel's \
+                 defeq judgment — a green here is a miscompiler: {other:?}"
+            ),
+        }
+
+        // GREEN CONTROL: the SAME carrier against the definition it faithfully
+        // implements passes — so the red above is discrimination, not a gate
+        // that refuses everything.
+        let carrier = identity_carrier("gen::same_carrier");
+        let verdict =
+            check_generated_carrier_faithfulness(&mut env, "r3_same", &carrier, &mut facets);
+        assert!(verdict.is_ok(), "the faithful carrier must pass: {verdict:?}");
+    }
+
+    /// Trust (#63, R3) — fail-closed controls on the gates IN FRONT of the
+    /// kernel: a carrier outside the E6 fragment is REFUSED (R2 may only emit
+    /// what this gate can check), and an arity mismatch never reaches defeq.
+    #[test]
+    fn r3_gate_refuses_what_it_cannot_check() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let mut env = Environment::with_prelude();
+        let outcome =
+            check_clean_island_into("def r3_tgt (x : UInt64) : UInt64 := x", &mut env);
+        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+        let mut facets = trust_spec_elab::FacetTable::from_structural_facets([(
+            "gen::opaque",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        // A body the E6 recognizer cannot elaborate (raw pointer cast shape):
+        // the gate must refuse rather than skip the check.
+        let opaque = VerifiableFunction {
+            name: "gen".into(),
+            def_path: "gen::opaque".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("x0".into()),
+                    },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Cast(
+                            Operand::Copy(Place::local(1)),
+                            Ty::Int { width: 32, signed: false },
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Int { width: 64, signed: false },
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+        let verdict =
+            check_generated_carrier_faithfulness(&mut env, "r3_tgt", &opaque, &mut facets);
+        assert!(
+            matches!(
+                verdict,
+                Err(CarrierFaithfulnessRejection::CarrierOutsideCheckedFragment { .. })
+                    | Err(CarrierFaithfulnessRejection::NotDefinitionallyEqual { .. })
+            ),
+            "an uncheckable carrier must be refused, never skipped: {verdict:?}"
+        );
+    }
 
     #[test]
     fn admit_program_functions_mints_only_admissible_recognized_bodies() {
@@ -2103,7 +2533,7 @@ mod tests {
         );
         shadowed.admit(
             "ident_isl",
-            Admission { kernel_const: "trust_import_ident_isl".to_string(), arity: 1 },
+            Admission::reflected("trust_import_ident_isl", 1),
         );
         assert!(
             admit_certified_island_definition(&env, "ident_isl", &mut shadowed).is_err(),
@@ -2152,6 +2582,116 @@ mod tests {
             "a name that merely contains the prefix must not be refused, got {:?}",
             ok.errors
         );
+    }
+
+    /// **I2's control, from the decision of record
+    /// (`docs/design/2026-08-04-two-language-compiler-architecture.md` §7):**
+    /// *"a `Reflected` symbol cited where `KernelChecked` is required must be
+    /// REFUSED, not silently accepted."*
+    ///
+    /// `admit_certified_island_definition` is the compiler's one
+    /// "`KernelChecked` required" site: it exists to authenticate a Clean
+    /// declaration the CIC kernel re-checked, and on success it stamps four
+    /// `FacetStatus::Certified { evidence: "clean-island-kernel-definition" }`
+    /// facets. A `trust_import_*` constant is NOT that: it is a **reflected**
+    /// Rust carrier, minted by `admit_function_into`, whose correspondence to
+    /// the Rust `fn` is asserted by the compiler and taken on trust by the
+    /// kernel (TCB). The kernel checked that the body inhabits the type; it
+    /// never checked that the constant denotes `crate::min2`.
+    ///
+    /// So handing that constant to the island admitter must fail closed. If it
+    /// succeeds, the environment carries a row claiming
+    /// `clean-island-kernel-definition` evidence for a reflection — a claim the
+    /// kernel never made.
+    #[test]
+    fn a_reflected_rust_carrier_is_refused_where_a_kernel_checked_declaration_is_required() {
+        use trust_spec_elab::FacetTable;
+
+        // 1. Reflect a Rust program function into the Clean environment. This
+        //    is the I2 direction: `crate::min2` enters as `trust_import_crate__min2`.
+        let min2 = min2_verifiable_function();
+        let mut table =
+            FacetTable::from_structural_facets([("crate::min2", true, true, true, true)]);
+        let mut env = Environment::with_prelude();
+        let (path, admission) = admit_function_into(&mut env, &min2, &table)
+            .expect("the reflected carrier must mint — this test is about what happens next");
+        assert_eq!(admission.kernel_const, "trust_import_crate__min2");
+        assert!(
+            admission.status().is_reflected(),
+            "a Rust program function enters the Clean environment as Reflected, got {:?}",
+            admission.status()
+        );
+        assert!(
+            admission.require_kernel_check().is_err(),
+            "and it never satisfies a kernel-check requirement"
+        );
+        table.admit(path, admission);
+
+        // 2. Cite it where a kernel-CHECKED declaration is required. The real
+        //    compiler path (`trust_verify.rs:19970-20013`) reaches this with the
+        //    very same table the mints were recorded in, so the refusal has the
+        //    provenance available to it and does not have to guess.
+        let refusal = admit_certified_island_definition(
+            &env,
+            "trust_import_crate__min2",
+            &mut table,
+        );
+
+        let error = refusal.expect_err(
+            "a Reflected Rust carrier must be REFUSED where a KernelChecked Clean \
+             declaration is required — the reflection is TCB and the kernel never \
+             re-checked that `trust_import_crate__min2` denotes `crate::min2`",
+        );
+        assert!(
+            error.contains("reflected"),
+            "the refusal must NAME the status that caused it, got: {error}"
+        );
+        // v7/D3: a refusal carries the fix, with options.
+        assert!(
+            error.contains("options:"),
+            "the refusal must name the fix with options (v7/D3), got: {error}"
+        );
+
+        // And it must not have stamped island evidence on the way out.
+        assert!(
+            table.admitted("trust_import_crate__min2").is_none(),
+            "the refused carrier must not acquire an island admission"
+        );
+
+        // 3. The STRUCTURAL backstop: a caller that hands us a table which
+        //    never saw the mint still cannot get the carrier through, because
+        //    `trust_import_*` is a reserved namespace no island may declare
+        //    into. Fail-closed — an admitter that cannot tell Reflected from
+        //    KernelChecked refuses rather than assumes.
+        let mut blind = FacetTable::new();
+        let blind_error =
+            admit_certified_island_definition(&env, "trust_import_crate__min2", &mut blind)
+                .expect_err("the reserved-namespace backstop must refuse too");
+        assert_eq!(blind_error, error, "both routes must give the same refusal");
+
+        // 4. The POSITIVE direction, so this test cannot pass by the admitter
+        //    having simply stopped working: a genuine Clean island `def` is
+        //    still admitted, and its admission SATISFIES the kernel-check
+        //    requirement the reflected carrier failed.
+        let mut island_env = Environment::with_prelude();
+        let outcome =
+            check_clean_island_into("def isl_min (x : UInt64) : UInt64 := x", &mut island_env);
+        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+        let mut island_facets = FacetTable::new();
+        let admitted = admit_certified_island_definition(
+            &island_env,
+            "isl_min",
+            &mut island_facets,
+        )
+        .expect("a kernel-re-checked island definition must still be admitted");
+        let verdict = admitted
+            .require_kernel_check()
+            .expect("an island definition the kernel re-checked carries KernelChecked");
+        assert!(
+            verdict.closure().is_audited_empty(),
+            "a Certified grade means an AUDITED-empty closure, not an unrecorded one"
+        );
+        assert!(admitted.status().is_certified());
     }
 
     #[test]
@@ -2562,7 +3102,11 @@ mod tests {
             FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
         let mut facets = FacetTable::new();
         facets.insert("identity", admissible);
-        facets.admit("identity", Admission { kernel_const: "identity".to_string(), arity: 1 });
+        // A hand-built island-shaped admission for an elaboration test: it is
+        // not minted by the kernel-recheck path, so it is `reflected` — the
+        // weaker, fail-closed status. The elaborator does not require a kernel
+        // re-check, so this still exercises what it is meant to exercise.
+        facets.admit("identity", Admission::reflected("identity", 1));
         let params: &[(&str, &str)] = &[("x", "u64")];
 
         // DISCHARGE: the u64 reflexivity theorem proves `ensures x >= x`.

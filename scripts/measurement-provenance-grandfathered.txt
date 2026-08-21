@@ -1,0 +1,39 @@
+# Commits that fall AFTER the R2 epoch (2026-08-20) but were authored BEFORE
+# `scripts/check_measurement_provenance.sh` existed. Each quotes a test count,
+# touches a soundness-gate path, and names no tree — through no fault of its
+# author, because at the moment it was written there was nothing to name it
+# with.
+#
+# THIS LIST MAY ONLY EVER SHRINK. Adding a row for a NEW commit is the same act
+# as deleting the gate, and there is no situation in which it is the right one:
+# the fix for a commit that cannot stamp is to stamp it (`git commit --amend`,
+# paste the `--- trailer` lines from scripts/lib/measure_stamp.sh), not to
+# record that it did not. `scripts/tests/check_measurement_provenance_test.sh`
+# asserts the count never grows.
+#
+# One full 40-hex sha per line. A short sha, a ref name or a prefix is INERT
+# here by construction: the sweep matches /^[0-9a-f]{40}$/ and silently ignores
+# anything else, so a typo cannot widen the waiver — it can only fail to apply.
+#
+# Measured 2026-08-20 by `scripts/check_measurement_provenance.sh --history`
+# over 7,112 commits: exactly these five, and R1 found nothing at all
+# (0 trailers in the whole history, which is what makes R1 safe to apply with
+# no epoch and no waiver).
+
+# 2026-08-20T00:40  feat(thir-lower): wave-SG — the STRUCT-INTERIOR offset class is GATED
+# THE INCIDENT ITSELF (lane copy of 8e214e90d5). Quotes "599 passed, 0 failed"
+# measured on blob d08476acf3, committed with blob 0a2fd94a8d. This gate exists
+# because of this commit; it is grandfathered only because the rule postdates it.
+68d8001117b7e83032a14d136a6188ab42f17c9e
+
+# 2026-08-20T03:44  feat(thir-lower): wave-SG re-land, quotes "600 passed, 1 failed"
+52cf9c47db68c47a38a19bb9c11922e339a2a104
+
+# 2026-08-20T04:22  gate(revert): the RCA + revert-rationale gate; quotes the 599
+a84866de8dcc862958b490c449f85c130a30529d
+
+# 2026-08-20T05:08  fix(markers): quotes "test result: FAILED. 625 passed; 2 failed"
+16e98a2a8f43714e8664d91107e6ce525fc010f2
+
+# 2026-08-20T05:12  feat(thir-lower): wave-COV; quotes "base 620 passed / 1 failed"
+fc53c1cd8819f39e0c9e2a23d2876f877db08aae

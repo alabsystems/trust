@@ -64,7 +64,37 @@ fn frontend_command_for_invocation(raw_argv0: Option<&str>, current_exe: Option<
 }
 
 fn clippy_version_info_for_display() -> String {
-    rustc_tools_util::get_version_info!().to_string()
+    // `get_version_info!` yields `tippy <CARGO_PKG_VERSION> (<hash> <date>)`, where
+    // CARGO_PKG_VERSION is clippy's `0.1.<rustc-minor>` convention inherited wholesale
+    // — a number whose entire upstream purpose is binding clippy to a rustc RELEASE.
+    // Trust has no such release to bind to, and the inherited number already disagreed
+    // with the compat line it appeared to track (0.1.98 beside a 1.99 toolchain).
+    //
+    // UNLIKE `trustc`'s and `targo`'s leading tokens, this one carries NO compatibility
+    // obligation: the crate is `publish = false` and nothing in the tree depends on it
+    // by version, so `0.1.98` is read by nobody. A number no consumer reads and no rule
+    // maintains is not a version, it is decoration — so the banner leads with the
+    // PRODUCT version instead, and Trust's toolchain answers "which Trust is this?" the
+    // same way from every tool.
+    //
+    // The crate version stays where it is in Cargo.toml. It is the build system's
+    // business, and rewriting it to carry meaning it does not have is the move that
+    // produced the drift in the first place.
+    let info = rustc_tools_util::get_version_info!();
+    let Some(trust_version) = option_env!("CFG_TRUST_VERSION") else {
+        // A standalone build has no binding to report; fall back to the inherited
+        // rendering rather than invent one, the same posture targo takes for an absent
+        // provenance binding.
+        return info.to_string();
+    };
+    let hash = info.commit_hash.unwrap_or_default();
+    let date = info.commit_date.unwrap_or_default();
+    let (hash, date) = (hash.trim(), date.trim());
+    if hash.is_empty() && date.is_empty() {
+        format!("{} {trust_version}", info.crate_name)
+    } else {
+        format!("{} {trust_version} ({hash} {date})", info.crate_name)
+    }
 }
 
 pub fn main() {

@@ -35,6 +35,8 @@ LL | fn not_pure(x: u64) -> u64 { x + 1 }
    = note: summary: 0 trusted, 0 certified, 1 failed, 0 unknown, 0 runtime-checked, 0 skipped out of 1
    = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
+   = note: --- native verifier detail (11 line(s) below; engine internals, not required to act on this error) ---
    = note: native full verifier status: Inconclusive; requested=1, proved=0, failed=0, unknown=1, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=2
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
@@ -46,7 +48,6 @@ LL | fn not_pure(x: u64) -> u64 { x + 1 }
    = note: native full verifier evidence `vc:e6_kernel_import_admits__not_pure:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__not_pure:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__not_pure:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e6_kernel_import_admits.rs:74:1
@@ -91,6 +92,9 @@ LL | | { x }
    = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
@@ -100,7 +104,6 @@ LL | | { x }
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_const:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e6_kernel_import_admits.rs:81:1
@@ -145,6 +148,9 @@ LL | | { x }
    = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
@@ -154,7 +160,6 @@ LL | | { x }
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_proj:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e6_kernel_import_admits.rs:88:1
@@ -199,6 +204,9 @@ LL | | { if x < y { x } else { y } }
    = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
@@ -208,7 +216,6 @@ LL | | { if x < y { x } else { y } }
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_select:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e6_kernel_import_admits.rs:95:1
@@ -253,6 +260,9 @@ LL | | { x }
    = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
@@ -262,7 +272,6 @@ LL | | { x }
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_arith:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e6_kernel_import_admits.rs:102:1
@@ -307,6 +316,9 @@ LL | | { y }
    = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
    = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
    = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:$DIGEST requests=1
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
@@ -316,7 +328,6 @@ LL | | { y }
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e6_kernel_import_admits__c_not_pure:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
 
 error: citation `triv` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), Const(Name { depth: 1, suffix: [\"trust_import_e6_kernel_import_ad\"…], lean4_hash: 659d77b52c253a02 }, []))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(0)))), inferred: Const(Name { depth: 1, suffix: [\"True\"], lean4_hash: a4bb0d768367154e }, []), location: None }" }]
   --> $DIR/e6_kernel_import_admits.rs:77:30

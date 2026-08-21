@@ -35,6 +35,22 @@ pub struct VcResultRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub evidence: Option<trust_types::ProofEvidence>,
+    /// R-U §7 grade-record carrier (ADDITIVE, 2026-08-20 increment): the typed
+    /// multi-axis record standing behind `evidence`, carried ALONGSIDE the
+    /// legacy `AssuranceLevel` in it — never replacing it. Populated where the
+    /// evidence is capped (`cap_unvalidated_certificate_assurance_carrying`),
+    /// and its `to_legacy()` always equals the row's legacy assurance.
+    ///
+    /// `None` on records generated before this increment; `skip_serializing_if`
+    /// keeps a `None` row BYTE-IDENTICAL to the pre-increment JSON, so old
+    /// records still digest-validate and old readers see an unchanged wire.
+    /// (This type is serde_json-only — it is not on the bincode envelope path —
+    /// which is what makes the optional field additive; see
+    /// `cap_unchecked_record_strength` for the site where that does NOT hold.)
+    /// Like `evidence`, this is packaging metadata, never proof authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub grade: Option<trust_types::grade::GradeRecord>,
 }
 
 /// Assumptions under which the certificate was generated.
@@ -185,8 +201,17 @@ pub fn generate_certificate_record_with_env(
     for (vc, result) in results {
         let vc_snapshot = VcSnapshot::from_vc(vc)?;
         let (solver, reported_strength, time_ms, reported_proved) = extract_result_info(result);
-        let evidence =
-            result.evidence().map(crate::evidence::cap_unvalidated_certificate_assurance);
+        // 2026-08-20 carrier increment: the cap returns the GradeRecord it
+        // minted (or losslessly imported) and the row carries it, alongside —
+        // never instead of — the legacy assurance inside `evidence`.
+        let (evidence, grade) = match result.evidence() {
+            Some(raw) => {
+                let (capped, record) =
+                    crate::evidence::cap_unvalidated_certificate_assurance_carrying(raw);
+                (Some(capped), Some(record))
+            }
+            None => (None, None),
+        };
         vc_entries.push(VcResultRecord {
             vc_snapshot,
             solver,
@@ -194,6 +219,7 @@ pub fn generate_certificate_record_with_env(
             time_ms,
             reported_proved,
             evidence,
+            grade,
         });
     }
 
@@ -334,6 +360,19 @@ fn cap_unchecked_record_strength(
     // R-U Phase C: the downgrade is expressed through the grade record's
     // named constructors and projected back to the carried legacy level
     // (projection pinned by named_constructor_projects_to_its_legacy_level).
+    //
+    // COLLAPSE RETAINED (2026-08-20 carrier increment). This record lands in
+    // `SolverInfo::strength`, and `SolverInfo` cannot carry a `GradeRecord`
+    // additively today: it rides the bincode POSITIONAL wire (cert.rs
+    // documents that its fields deliberately take no `skip_serializing_if`
+    // for exactly that reason), so an added optional field would change the
+    // bytes of every existing row; and it is constructed by struct literal in
+    // crates outside this one (trust-clean, trust-router tests). A record the
+    // binary deserializers would drop or misparse is worse than this honest
+    // collapse. The carried form for this packaging path lives on
+    // `VcResultRecord::grade`; threading here waits on a SolverInfo schema
+    // rev (or the ProofStrength write-only derived-grade lane in trust-types
+    // result.rs becoming a stored carrier).
     if strength.grade().is_certified() {
         strength.assurance = trust_types::grade::GradeRecord::smt_backed().to_legacy();
     }
@@ -1008,6 +1047,115 @@ mod tests {
             trust_types::AssuranceLevel::SmtBacked
         );
         assert!(record.vc_entries[0].reported_proved);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-08-20 carrier increment: VcResultRecord::grade
+    // -----------------------------------------------------------------------
+
+    /// The additive typed grade survives serialize/deserialize, alongside the
+    /// legacy evidence it projects to (round-trip acceptance control).
+    #[test]
+    fn carried_grade_survives_json_roundtrip_alongside_legacy_assurance() {
+        use trust_types::grade::GradeRecord;
+
+        let func = sample_function();
+        let results = vec![(sample_vc("carried-grade"), proved_result())];
+        let cert = generate_certificate_record(&func, &results).unwrap();
+
+        let grade = cert.vc_entries[0].grade.as_ref().expect("proved row must carry a grade");
+        // smt_unsat() arrives as (Smt, SmtBacked) evidence; the carried record
+        // is its lossless import — exactly GradeRecord::smt_backed().
+        assert_eq!(grade, &GradeRecord::smt_backed());
+        // Carried ALONGSIDE the legacy assurance, and coherent with it.
+        let legacy = &cert.vc_entries[0].evidence.as_ref().unwrap().assurance;
+        assert_eq!(&grade.to_legacy(), legacy);
+
+        let json = cert.to_json().expect("serialize");
+        let restored = GeneratedCertificateRecord::from_json(&json).expect("deserialize");
+        assert_eq!(
+            restored.vc_entries[0].grade, cert.vc_entries[0].grade,
+            "the additive grade field must survive the JSON round-trip"
+        );
+        assert_eq!(
+            restored.vc_entries[0].evidence, cert.vc_entries[0].evidence,
+            "the legacy evidence must ride along unchanged"
+        );
+    }
+
+    /// NEGATIVE acceptance control: an smt-backed row's carried grade must not
+    /// claim a kernel-theorem citation — no `CitedKernelTheorem` validation, no
+    /// `cites:`/`residual:` closure entries. Only the trust-cg-bridge citation
+    /// mint site may produce that record shape.
+    #[test]
+    fn smt_backed_row_grade_never_claims_cited_kernel_theorem() {
+        use trust_types::grade::{AxiomClosure, ProofValidation};
+
+        let func = sample_function();
+        // Both an honest smt-backed row and a capped over-claiming row.
+        let certified_claim = VerificationResult::Proved {
+            solver: "caller-controlled".into(),
+            time_ms: 1,
+            strength: ProofStrength::smt_unsat_certified(),
+            proof_certificate: None,
+            solver_warnings: None,
+            native_proof_envelope: None,
+        };
+        let results =
+            vec![(sample_vc("honest"), proved_result()), (sample_vc("claim"), certified_claim)];
+        let cert = generate_certificate_record(&func, &results).unwrap();
+
+        for entry in &cert.vc_entries {
+            let grade = entry.grade.as_ref().expect("proved rows carry a grade");
+            assert!(
+                !matches!(grade.validation, ProofValidation::CitedKernelTheorem),
+                "an smt-backed packaging row must never claim a kernel-theorem citation"
+            );
+            assert!(!grade.is_certified(), "no-replay packaging never carries Certified");
+            if let AxiomClosure::Named(names) = &grade.axiom_closure {
+                assert!(
+                    !names.iter().any(|n| n.starts_with("cites:") || n.starts_with("residual:")),
+                    "citation closure entries may only be minted by the citation constructor"
+                );
+            }
+        }
+    }
+
+    /// Serialization-compat evidence: a row WITHOUT the new field keeps the
+    /// exact pre-increment wire (no `grade` key at all), and a simulated
+    /// pre-increment record — evidence present, no grade — still passes the
+    /// new reader's digest validation. Old records neither change bytes nor
+    /// get rejected.
+    #[test]
+    fn rows_without_grade_keep_pre_increment_bytes_and_still_validate() {
+        let func = sample_function();
+        let results = vec![(sample_vc("compat"), proved_result())];
+        let mut cert = generate_certificate_record(&func, &results).unwrap();
+
+        // Simulate a record generated before this increment: strip the grade
+        // and recompute the digest the OLD writer would have written. If the
+        // None row serialized any differently from the old two-optional shape,
+        // this digest would not match what the old code produced.
+        cert.vc_entries[0].grade = None;
+        cert.record_digest = compute_record_digest(&cert).unwrap();
+
+        let json = cert.to_json().expect("serialize the pre-increment shape");
+        // Precision matters here: `ProofStrength`'s write-only DERIVED `grade`
+        // (human-readable serialization only; trust-types result.rs) appears
+        // elsewhere in the record, so assert on the ROW's own keys, not on the
+        // whole document.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let row = value["vc_entries"][0]
+            .as_object()
+            .expect("vc_entries[0] must serialize as an object");
+        assert!(
+            !row.contains_key("grade"),
+            "a None grade must serialize to NOTHING — byte-identical to the old wire; got {row:?}"
+        );
+        let restored = GeneratedCertificateRecord::from_json(&json)
+            .expect("a pre-increment record must still deserialize and digest-validate");
+        assert_eq!(restored.vc_entries[0].grade, None, "absent field defaults to None");
+        assert!(restored.vc_entries[0].evidence.is_some(), "legacy evidence untouched");
     }
 
     #[test]

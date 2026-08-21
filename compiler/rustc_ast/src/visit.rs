@@ -855,9 +855,25 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, nm),
                     ItemKind::GlobalAsm(asm) =>
                         visit_visitable!($($mut)? vis, asm),
-                    // Trust: a Clean island is span-only verifier vocabulary —
-                    // nothing for AST visitors to walk.
-                    ItemKind::CleanIsland(_) => {}
+                    // Trust (I5): the island body itself is Clean source, not
+                    // Rust AST, so there is nothing here for a visitor to
+                    // descend into — but each recognised declaration carries a
+                    // `NodeId`, and walking it is what gets that id renumbered
+                    // by `InvocationCollector::visit_id` during expansion.
+                    // Without this arm the ids stay `DUMMY_NODE_ID` and no
+                    // declaration can be given a findable `DefId`.
+                    ItemKind::CleanIsland(island) => {
+                        // Trust (I8): the pending out-of-line unit name is an
+                        // `Ident` like `Mod`'s; visiting it keeps span/hygiene
+                        // maintenance identical to every other item name. It
+                        // is `None` for inline islands and for units once the
+                        // expansion-time load has replaced the payload, so
+                        // this is a no-op everywhere but the pending window.
+                        visit_visitable!($($mut)? vis, &$($mut)? island.unloaded_unit);
+                        for decl in &$($mut)? island.decls {
+                            visit_visitable!($($mut)? vis, &$($mut)? decl.node_id);
+                        }
+                    }
                     ItemKind::TyAlias(ty_alias) =>
                         visit_visitable!($($mut)? vis, ty_alias),
                     ItemKind::Enum(ident, generics, enum_definition) =>

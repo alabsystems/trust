@@ -1291,6 +1291,37 @@ pub(super) fn opaque_guard_newtype_u64(ty: &trust_types::Ty) -> bool {
                     [(_, trust_types::Ty::Int { width: 64, signed: false })]))
 }
 
+/// Trust: TRANSPARENT-UNWRAP call-arg widening (2026-08-19) — the width- and
+/// depth-parametric sibling of [`opaque_guard_newtype_u64`]: a variantless
+/// SINGLE-FIELD struct chain, **G-STRUCT-KIND stamped at every hop**, terminating
+/// at ANY `Int`. Scoped to CALL arguments exactly as the u64 form: the call model
+/// needs only a deterministic opaque token for the value (`SemOperand::Field` —
+/// no scalar-value claim), so the exact-u64 restriction carried no soundness
+/// content — it was the measured population of its day. The live population here
+/// is `NonMaxU8::get`'s argument `(*self).0 : NonZero<u8>` = `Adt(Adt(Int8))`,
+/// the transparent-chain shape the 2026-08-18 unwrap leg certifies on the callee
+/// side. The stamp requirement is why this is a SIBLING rather than a
+/// replacement: the legacy u64 consumers' dumps may predate `adt_kind`, and the
+/// old predicate's scope must not silently move.
+pub(super) fn opaque_guard_newtype_chain(ty: &trust_types::Ty) -> bool {
+    let mut cur = ty;
+    for _ in 0..8usize {
+        match cur {
+            trust_types::Ty::Int { .. } => return true,
+            trust_types::Ty::Adt {
+                fields, variants, faithful_enum_repr: None, adt_kind, ..
+            } if variants.is_empty()
+                && *adt_kind == Some(trust_types::AdtKind::Struct)
+                && fields.len() == 1 =>
+            {
+                cur = &fields[0].1;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Recognize the OPAQUE-CHAIN ADT-RETURN shape (section comment above). ALL
 /// of the following must hold — anything else fails closed (`None`):
 ///

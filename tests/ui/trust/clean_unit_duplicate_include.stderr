@@ -1,0 +1,16 @@
+error: the Clean unit `$DIR/clean_unit_dup_shared.clean` is included twice in this crate
+  --> $DIR/clean_unit_duplicate_include.rs:18:1
+   |
+LL | clean mod clean_unit_dup_other;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: first included here
+  --> $DIR/clean_unit_duplicate_include.rs:15:1
+   |
+LL | clean mod clean_unit_dup_shared;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: a `.clean` unit registers its declarations in the crate's single Clean environment, so a second inclusion would declare every name a second time
+   = help: options: include the unit once — its declarations are citable from every `clean { … }` island in the crate and callable through the module that includes it; or split the text into two files if two units were intended
+
+error: aborting due to 1 previous error
+

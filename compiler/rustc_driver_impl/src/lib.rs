@@ -440,12 +440,14 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
                 | "agg-field-order"
                 | "marker-arm"
                 | "payload-tramp"
+                | "dr-tramp"
+                | "dr-retire"
         ) {
             return Some(
                 "invalid -Ztrust-sat-perturb value: expected enum-reshape, \
                  enum-case-value, enum-ctor, enum-disc-index, switch-map, enum-payload, \
-                 marker-order, marker-drop, agg-field-order, marker-arm, or \
-                 payload-tramp",
+                 marker-order, marker-drop, agg-field-order, marker-arm, payload-tramp, \
+                 dr-tramp, or dr-retire",
             );
         }
         // A perturbation deliberately corrupts one lowering class so the
@@ -2310,6 +2312,29 @@ fn version_at_macro_invocation_with_frontend_policy(
     // version with `(<commit> <date>)`. The `binary:` field below still reports the real
     // invoked binary (`trustc`) for human/identity use; parsers key off the leading line and
     // `release:`, both of which are now drop-in.
+    //
+    // VERIFIED 2026-08-19, and the two halves have DIFFERENT standing — do not read the
+    // paragraph above as uniformly proven:
+    //
+    //   * PROVEN: this arrangement works. A probe crate depending on libc, autocfg and
+    //     rustc_version was compiled from real crates.io sources by this stage2. libc
+    //     0.2.189 built; `autocfg::probe_rustc_version(1, 70)` answered true;
+    //     `rustc_version::version_meta()` (the CRATES.IO copy, not the patched vendored
+    //     one) parsed `semver=1.99.0-dev channel=Dev`. `let`-else and inline `const` then
+    //     compiled and ran, so the Rust surface this release string promises is real.
+    //
+    //   * NOT PROVEN: that branding the leading token BREAKS libc. libc is not vendored
+    //     here, so the counterfactual was never re-run; the "asserts `\"rustc 1\"`" detail
+    //     is an unverified recollection from whoever hit it. Treat it as a reason to be
+    //     careful, not as a measurement. Anyone tempted to brand the leading token should
+    //     re-run the probe with the change applied rather than trusting this sentence.
+    //
+    // One thing the probe DID settle: the `-dev` suffix is load-bearing. The vendored
+    // rustc_version accepts `"dev" | "trust"`, but the crates.io copy accepts only
+    // `"" | "dev" | "beta" | "nightly"` — so a `1.99.0-trust` release string would fail
+    // `UnknownPreReleaseTag` on every user's machine. `bootstrap`'s
+    // `"trust" => format!("{num}-dev")` must NOT be "tidied" to match the `-trust` package
+    // naming, however inconsistent the two look side by side.
     //
     // The number here is deliberately NOT Trust's version. It comes from
     // `src/rust-compat-version` and says which Rust this toolchain is

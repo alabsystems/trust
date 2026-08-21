@@ -1,0 +1,4 @@
+-- Trust I8: deliberately broken Clean — the same shape the v7/D1 write-up
+-- uses for the inline island's parse-time failure. The error must be spanned
+-- INTO THIS FILE at the `:=` below.
+theorem bad : :=

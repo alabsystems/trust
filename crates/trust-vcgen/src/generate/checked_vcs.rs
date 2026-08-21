@@ -667,6 +667,12 @@ pub(super) fn v2_build_cast_vc(
         // array's static N); it carries no arithmetic/bounds obligation, so it is
         // modeled with no VC, mirroring the primary cast-relation gate.
         || crate::is_array_to_slice_ref_cast(&from_ty, to_ty)
+        // `&T -> &dyn Trait` (trait-object pointer unsize) is likewise a
+        // metadata-only coercion — an infallible vtable attach with no
+        // arithmetic/range obligation. `convert.rs` began spelling it
+        // `Rvalue::Cast` in d806992cd4 (it was `Use(OpaqueConst)` before); without
+        // this arm the coercion mints a spurious `unsupported cast` here.
+        || crate::cast_target_is_trait_object_pointer(to_ty)
     {
         return None;
     }

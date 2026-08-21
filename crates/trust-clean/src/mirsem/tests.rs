@@ -9999,6 +9999,46 @@ fn transparent_unwrap_multihop_field_return_certifies() {
     }
 }
 
+/// Trust: STABLE CALLEE IDS (2026-08-19) — the registry id is a content key of
+/// the resolved def-path, not a BTreeMap position: the SAME callee gets the SAME
+/// id at EVERY registry size (the audits' growth-instability hazard, closed
+/// structurally), and the forced high bit keeps the space disjoint from the
+/// synthetic intrinsic ids (0..7) by construction.
+#[test]
+fn stable_callee_ids_are_membership_independent() {
+    let fact = || CalleeFact {
+        arg_count: 1,
+        param_tys: vec![u8_ty()],
+        return_ty: trust_types::Ty::Bool,
+        requires: Some(vec![]),
+        param_names: vec![Some("self".into())],
+    };
+    let resolve = super::call_lift::resolve_certified_callee;
+    let mut small = std::collections::BTreeMap::new();
+    small.insert("z::target".to_string(), fact());
+    let (_, _, id_small) = resolve(&small, "z::target").expect("resolves");
+    // Grow the registry with keys that SORT BEFORE the target — the old
+    // position-based id would shift; the stable id must not.
+    let mut grown = small.clone();
+    for k in ["a::one", "b::two", "c::three"] {
+        grown.insert(k.to_string(), fact());
+    }
+    let (_, _, id_grown) = resolve(&grown, "z::target").expect("resolves");
+    assert_eq!(id_small, id_grown, "the id must be membership-independent");
+    assert!(id_small >= (1 << 63), "the id space is disjoint from the synthetic 0..7 range");
+    // CROSS-PATH agreement: the ::-suffix path and the compose lane's
+    // exact-only resolver must mint the SAME id for the same key — a
+    // single-path revert to positional ids fails here.
+    let (_, _, id_suffix) = resolve(&grown, "target").expect("resolves via unique suffix");
+    assert_eq!(id_small, id_suffix, "suffix path must agree with the exact path");
+    let (_, _, id_exact) = super::adt_compose::resolve_certified_callee_exact(&grown, "z::target")
+        .expect("resolves on the compose lane");
+    assert_eq!(id_small, id_exact, "the compose lane's resolver must mint the same id");
+    // Distinct callees get distinct ids (at this scale, deterministically).
+    let (_, _, id_other) = resolve(&grown, "a::one").expect("resolves");
+    assert_ne!(id_small, id_other);
+}
+
 #[test]
 fn overflowing_add_whole_pair_return_declines_fail_closed() {
     let dir = format!(
@@ -13561,7 +13601,7 @@ fn umul_overflow_vc_modeled_classifies_unsigned_mul_only() {
 }
 
 #[test]
-fn unsigned_var_mul_fails_closed_deferred_gap() {
+fn unsigned_var_mul_record_certifies_adequacy_discharge_still_refuses() {
     // FORGERY PROBE (a) at the ADEQUACY axis: a full-range `fn umul(a:u8,b:u8){a*b}`
     // (the `var*var` shape — `wrapping_mul`'s body class) raises an
     // ArithmeticOverflow{op:Mul,(u8,u8)} VC that the emitter models with BITVECTOR
@@ -13619,16 +13659,21 @@ fn unsigned_var_mul_fails_closed_deferred_gap() {
         !function_emits_unmodeled_safety_vc(&func),
         "unsigned-mul is a kind-modeled ArithmeticOverflow (umul_overflow_vc_modeled)"
     );
-    // … but the LOAD-BEARING formula-aware bridge DECLINES the BITVECTOR shape, so the
-    // adequacy builder AND the whole-function witness both fail closed. No false cert.
+    // … and the VC carries its authenticated Or-range record (the UMUL RECORD,
+    // retracted 2026-08-20 and re-landed the same day once trust-router could
+    // refute the mixed query component-wise), so the formula-aware bridge GROUNDS
+    // it — the ADEQUACY axis certifies from the record…
     assert!(
-        function_safety_vcs_faithful(&func).is_none(),
-        "a var*var unsigned-mul function must fail closed — the formula-aware bridge \
-         declines its bitvector overflow VC"
+        function_safety_vcs_faithful(&func).is_some(),
+        "the recorded var*var unsigned-mul VC grounds against umulOverflows — \
+         adequacy holds"
     );
+    // …while the DISCHARGE axis is untouched: a full-range `a * b` genuinely can
+    // overflow, so the violation stays SAT and the COUNTED fully-faithful bar
+    // still refuses. Adequacy is not discharge — no false green.
     assert!(
-        function_fully_faithful_witness(&func).is_none(),
-        "a var*var unsigned-mul function is NOT fully faithful (bridge declines)"
+        !crate::prove::function_safety_vcs_all_discharged(&func),
+        "a full-range a*b stays UNDISCHARGED — adequacy is not discharge"
     );
 }
 
@@ -18368,6 +18413,18 @@ fn call_callee_projects_the_callee_id() {
     assert!(
         tc.is_def_eq(&lhs, &Expr::nat_lit(7)),
         "call_callee (Call.mk 7 _ _) must ι-reduce to 7"
+    );
+    // The 2^63-scale ids the stable content keys mint project identically —
+    // magnitude is free (a `BigNat::Small` literal is already WHNF and the
+    // ι-reduction extracts it whole, never reducing it digit-wise).
+    let big = super::call_lift::stable_callee_id("z::target");
+    let call_big = Expr::apps(
+        cst(MIRSEM_CALL_MK),
+        [Expr::nat_lit(big), Expr::app(cst(MIRSEM_OPERAND_CONST), int_lit(3)), int_lit(42)],
+    );
+    assert!(
+        tc.is_def_eq(&call_callee_app(call_big), &Expr::nat_lit(big)),
+        "call_callee must ι-reduce a 2^63-scale id identically"
     );
 }
 

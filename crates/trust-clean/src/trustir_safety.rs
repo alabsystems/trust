@@ -703,9 +703,16 @@ fn formula_var_name(f: &trust_types::Formula) -> Option<&str> {
 //
 // MEASURED over the 2326 committed fixture functions, comparing the OLD first match
 // against the emitter's own violation BY VALUE. The corpus emits 772 safety VCs; the
-// 85 `ArithmeticOverflow` VCs whose op/signedness combination this tier does not model
-// (`arith-other`: the BV `var*var` mul lane and the mixed-signedness forms) decline
-// before the locator and are excluded from the table, so its denominator is 687:
+// 85 `ArithmeticOverflow` VCs whose op/signedness combination this tier did not model
+// at measurement time (`arith-other`: the BV `var*var` mul lane and the
+// mixed-signedness forms) declined before the locator and are excluded from the
+// table, so its denominator is 687. (The UMUL RECORD moved the UNSIGNED var*var
+// mul subset OUT of that class — it now carries an authenticated record and
+// certifies via the umul arm — so the counts here describe the 2026-07-29
+// measurement, not current coverage. That conjunct was retracted on 2026-08-20
+// and re-landed the same day atop `trust-router`'s disjoint-component refutation
+// lane; see `trust_vcgen::generate::bv_rem_mul_tests::
+// unsigned_var_var_mul_vc_carries_authenticated_record`.)
 //
 //   kind    VCs   old == emitted   old DIFFERS   emitted absent, old supplied one
 //   bounds   68        13              20                   34
@@ -2267,6 +2274,18 @@ fn trustir_safety_vc_adequate_kind(
                     if !matches!(&**under_t, F::Mul(..)) {
                         return declined(
                             "umul VC: the recorded core's operator is not `Mul` — an \
+                             op-desynchronised record",
+                        );
+                    }
+                    // Round hardening (2026-08-19): pin BOTH disjuncts' operators.
+                    // `binop_operands` is op-blind, so without this an
+                    // `Or([Lt(Mul(a,b),0), Gt(Add(a,b),MAX)])` decoy passed the
+                    // structural gates and was stopped only by kernel def-eq,
+                    // which admits it at two-literal coincidence points (2+2=2·2).
+                    // Unreachable from the emitter; belt for hand-fed records.
+                    if !matches!(&**over_t, F::Mul(..)) {
+                        return declined(
+                            "umul VC: the over-disjunct's operator is not `Mul` — an \
                              op-desynchronised record",
                         );
                     }

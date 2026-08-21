@@ -1,0 +1,3 @@
+-- Trust I8: the unit-authored `def f` that must collide (E0428) with a
+-- same-module Rust `fn f` in `clean_unit_rust_collision.rs`.
+def f (a : UInt64) : UInt64 := a

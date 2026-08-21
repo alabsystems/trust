@@ -107,6 +107,16 @@ fn as_send(x: &u32) -> &dyn Send {
 fn through(d: &dyn Speak) -> u32 {
     d.speak()
 }
+// ALSO THE ICE REGRESSION PIN (2026-08-20). `call_through` is the only body here with a
+// DIRECT `FnDef` callee whose signature takes `&dyn Trait`, which is what makes it the
+// trigger: the comparator's argument-borrow classifier reads the callee sig via
+// `fn_sig(..).instantiate(..).skip_binder()`, and `skip_binder` leaves the late-bound `'a`
+// of `&'a (dyn Speak + 'a)` in the POINTEE as an escaping bound var. Feeding that to
+// `Ty::is_freeze` reached `ty::Binder::dummy`'s `!has_escaping_bound_vars` assertion and
+// ABORTED THE COMPILER at `rustc_middle/src/ty/predicate.rs:492`. `through` alone cannot
+// catch it — its `d.speak()` is a virtual call, not a `FnDef`. Keep this pair: if the
+// classifier ever queries an unguarded pointee again, this file ICEs instead of going quietly
+// wrong. See `mir_differential::arg_borrow_kind_of`.
 fn call_through(d: &dyn Speak) -> u32 {
     through(d)
 }

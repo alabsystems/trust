@@ -1,0 +1,199 @@
+# trust-ir producer scorecard — `tests/ui/trust/` classification manifest
+#
+# READ THIS BEFORE ADDING A FILE. Every campaign slice adds a regression test
+# under tests/ui/trust/. The scorecard samples a SEEDED 2000-file subset of
+# tests/ui, and `random.sample` is a function of the population LENGTH, so
+# adding ONE file to the eligible population reshuffles the whole sample:
+# measured, one addition moved 179 of 2000 files, and a slice-16 sweep was
+# discarded outright after 233 shifted. Two sweeps are then not comparable and
+# every delta measured across them is noise.
+#
+# The historical workaround was to hand-move the campaign's own pins out of
+# tests/ui before each sweep. That count went 8 -> 9 -> 13 -> 14 -> 15 -> 16 and
+# lived in nobody's head; getting it wrong silently measures a different corpus.
+# This file replaces it. `scripts/trust_ir_producer_scorecard.py` reads it and
+# removes the [excluded] paths from the sampling population BEFORE sampling, so
+# the pins may stay in the tree and the sample is unchanged by their presence.
+#
+# THE RULE. Every ELIGIBLE .rs file under tests/ui/trust/ (eligible = survives
+# the UI_CONTENT_FILTERS in the scorecard: no //~ annotation, no aux-build, no
+# ignore- directive) must be listed in exactly one section. The scorecard HARD
+# FAILS on an unclassified one, naming the file — that is the whole point: the
+# next slice cannot forget. A file that is not eligible needs no entry, because
+# the content filters already keep it out of the population; if it later becomes
+# eligible the check fires then, which is exactly when it starts to matter.
+#
+#   [excluded]  A campaign pin minted AFTER the 2026-07-01 baseline. It is not
+#               part of the corpus the ratchet is measured over, and admitting
+#               it would move the sample. THIS IS THE DEFAULT for a new slice
+#               regression test.
+#   [in-pool]   Genuinely part of the measured corpus — it predates the campaign
+#               and every recorded sweep has swept it. Do not add here to make
+#               an error go away; adding a new pin here changes the sample and
+#               invalidates comparison with every prior sweep.
+#
+# VERIFY WITHOUT SWEEPING:  python3 scripts/trust_ir_producer_scorecard.py --check-ui-pins
+#
+# IDENTITY, MEASURED (2026-08-19). With this manifest applied and all 16 pins of
+# that wave IN TREE, the sampler reproduced a sampling population of 6983 and a
+# file-list-IDENTICAL 2000-file sample against the recorded postbuild-vtable18
+# sweep (data.json `corpora.ui_sample`), which was produced by the hand-move
+# procedure. 14 of the 16 were in the eligible population; the other two
+# (clean_origin_call_parity, clean_origin_const_ctfe) carry //~ annotations and
+# were already filtered out.
+#
+# THE INVARIANT THAT MATTERS is the POST-EXCLUSION SAMPLING POPULATION, not the
+# pin count: 6983 is what seeds the sample, so a later pin holds the sweep
+# comparable exactly when it keeps that number fixed. The raw `eligible` total
+# DOES move as tests land (7005 today), which is why the number to read off
+# `--check-ui-pins` is its last line.
+#
+# UPDATED 2026-08-20 (merge of origin/main @ ebb831628f). The excluded list is
+# now 28 entries, 22 of them in the eligible population. Seven arrived with the
+# I5 Clean-origin / clean-unit wave (clean_origin_nat_projection,
+# clean_origin_verify_on, clean_origin_wrapping_binop, clean_unit_call_parity,
+# clean_unit_cfg_off, clean_unit_inline_duplicate, clean_unit_island_equivalence)
+# and one with the D2 coroutine fix (async_exhibit_does_not_certify). All eight
+# are campaign pins minted after the baseline, so [excluded] is the default
+# classification; with them listed the sampling population is 6983 again —
+# re-measured, not assumed. The 2000-file sample identity itself was NOT
+# re-measured on this merge; it follows from the population being unchanged.
+
+[excluded]
+tests/ui/trust/assumption-rows/async_exhibit_does_not_certify.rs
+tests/ui/trust/clean_origin_call_parity.rs
+tests/ui/trust/clean_origin_const_ctfe.rs
+tests/ui/trust/clean_origin_nat_projection.rs
+tests/ui/trust/clean_origin_parity_collision.rs
+tests/ui/trust/clean_origin_parity_no_collision.rs
+tests/ui/trust/clean_origin_verify_on.rs
+tests/ui/trust/clean_origin_wrapping_binop.rs
+tests/ui/trust/clean_unit_call_parity.rs
+tests/ui/trust/clean_unit_cfg_off.rs
+tests/ui/trust/clean_unit_inline_duplicate.rs
+tests/ui/trust/clean_unit_island_equivalence.rs
+tests/ui/trust/dyn_dispatch_reliance_field_held_dyn_root_stays_closed.rs
+tests/ui/trust/dyn_dispatch_reliance_field_held_dyn_variant_carrier_stays_closed.rs
+tests/ui/trust/dyn_dispatch_reliance_open_sink_poison_direction.rs
+tests/ui/trust/dyn_dispatch_reliance_recursive_field_carrier_discharges.rs
+tests/ui/trust/trust_ir_array_first_class_spelling.rs
+tests/ui/trust/trust_ir_array_slot_value_model.rs
+tests/ui/trust/trust_ir_const_param_column.rs
+tests/ui/trust/trust_ir_enum_oracle_first_class_alignment.rs
+tests/ui/trust/trust_ir_fat_bytes_const_marshalling.rs
+tests/ui/trust/trust_ir_fat_reborrow_passthrough.rs
+tests/ui/trust/trust_ir_linked_call_width_and_admission.rs
+tests/ui/trust/trust_ir_overwritten_lane_zero.rs
+tests/ui/trust/trust_ir_promoted_global_paired_admission.rs
+tests/ui/trust/trust_ir_unsize_dyn_data_lane.rs
+tests/ui/trust/trust_ir_vtable_faithful_principal_key.rs
+tests/ui/trust/trust_ir_vtable_nominal_principal_key.rs
+
+[in-pool]
+tests/ui/trust/assoc_const_projection_no_ice.rs
+tests/ui/trust/assumed_total_key_alias_write_fmt_recovery.rs
+tests/ui/trust/certified_monitor_e5_extended_carriers.rs
+tests/ui/trust/certified_monitor_early_returns.rs
+tests/ui/trust/certified_monitor_entry_snapshot.rs
+tests/ui/trust/certified_monitor_extended_carriers.rs
+tests/ui/trust/certified_monitor_extended_wrapping.rs
+tests/ui/trust/certified_monitor_loop_invariant.rs
+tests/ui/trust/certified_monitor_multi_clause_runtime.rs
+tests/ui/trust/certified_monitor_operator_runtime.rs
+tests/ui/trust/certified_monitor_recursive_decreases.rs
+tests/ui/trust/certified_monitor_rejects_native_link.rs
+tests/ui/trust/certified_monitor_rejects_startup_controls.rs
+tests/ui/trust/certified_monitor_requires_entry.rs
+tests/ui/trust/certified_monitor_resolved_types_runtime.rs
+tests/ui/trust/certified_monitor_skip_violation.rs
+tests/ui/trust/certified_monitor_tail_call.rs
+tests/ui/trust/certified_monitor_targo_scoped_out.rs
+tests/ui/trust/certified_monitor_u8_wrapping.rs
+tests/ui/trust/certified_monitor_violation.rs
+tests/ui/trust/certified_monitor_wide_wrapping.rs
+tests/ui/trust/clean_island_grammar.rs
+tests/ui/trust/clean_island_lexical_string.rs
+tests/ui/trust/clean_symbol_graph_forward_reference.rs
+tests/ui/trust/compiletest_default_isolation.rs
+tests/ui/trust/contract_projection_named_params_verify.rs
+tests/ui/trust/contract_reserved_return_place_param.rs
+tests/ui/trust/contract_synthetic_namespace_collision.rs
+tests/ui/trust/contract_verify_off_no_ice.rs
+tests/ui/trust/drop_glue_proved_destructor_credits.rs
+tests/ui/trust/dyn_coercion_bundle_stays_well_typed.rs
+tests/ui/trust/dyn_dispatch_reliance_cflow_concrete_sink.rs
+tests/ui/trust/dyn_dispatch_reliance_contract_discharges.rs
+tests/ui/trust/e2_by_value_prime_discharge.rs
+tests/ui/trust/e9_arbitrary_body_result_free_discharge.rs
+tests/ui/trust/e9_definitional_call_discharge.rs
+tests/ui/trust/e9_island_defeq_discharge.rs
+tests/ui/trust/e9_min2_case_split_discharge.rs
+tests/ui/trust/e9_multi_clause_discharge.rs
+tests/ui/trust/e9_one_program_two_languages.rs
+tests/ui/trust/e9_postcondition_citation_discharge.rs
+tests/ui/trust/e9_release_mode_discharge.rs
+tests/ui/trust/e9_result_binding_discharge.rs
+tests/ui/trust/e9_subset_binding_discharge.rs
+tests/ui/trust/functional_contracts.rs
+tests/ui/trust/native_bundle_foreign_body_local_impl_callee.rs
+tests/ui/trust/native_bundle_std_body_proved.rs
+tests/ui/trust/native_bundle_std_instance_identity.rs
+tests/ui/trust/native_bundle_std_trait_impl_body_proved.rs
+tests/ui/trust/native_bundle_std_trait_impl_keeps_existing_model.rs
+tests/ui/trust/native_clause_grammar.rs
+tests/ui/trust/native_clause_prime_char_adjacency.rs
+tests/ui/trust/native_contract_liveness.rs
+tests/ui/trust/native_loop_clause_semantics.rs
+tests/ui/trust/native_loop_clauses.rs
+tests/ui/trust/native_loop_collection_semantics.rs
+tests/ui/trust/native_loop_feedback_semantics.rs
+tests/ui/trust/native_loop_lint_preservation.rs
+tests/ui/trust/native_recursive_decreases_semantics.rs
+tests/ui/trust/native_recursive_requires_fresh_context.rs
+tests/ui/trust/native_requires_shadow_not_assumed.rs
+tests/ui/trust/paired_condvar_dark_init_no_crate_hash_ice.rs
+tests/ui/trust/perf/generic_struct_two_instantiations.rs
+tests/ui/trust/perf/symbolic_assoc_const_lowering.rs
+tests/ui/trust/postcondition_entry_hypothesis_survives_synthetic_ret.rs
+tests/ui/trust/quantifier_binder_shadow_no_ice.rs
+tests/ui/trust/r1/flip_caller_covered.rs
+tests/ui/trust/r1/flip_comptime_stolen_body_recovered.rs
+tests/ui/trust/r1/flip_private_reachable.rs
+tests/ui/trust/r1/flip_with_island_present.rs
+tests/ui/trust/return_if_value_union_arms_no_ice.rs
+tests/ui/trust/s1c_arith_true_ensures_proves.rs
+tests/ui/trust/s1c_body_bound_bool_identity_receipt.rs
+tests/ui/trust/s1c_body_bound_ge_refl.rs
+tests/ui/trust/s1c_branch_abs_proves.rs
+tests/ui/trust/s1c_requires_bearing_stays_closed.rs
+tests/ui/trust/scalar_safety_flawed.rs
+tests/ui/trust/scalar_safety_good.rs
+tests/ui/trust/static_byte_array_ref_does_not_ice.rs
+tests/ui/trust/static_byte_table_ref_no_ice.rs
+tests/ui/trust/thir_opaque_result_layout_no_cycle.rs
+tests/ui/trust/thir_param_projection_normalize_no_ice.rs
+tests/ui/trust/trait_panic_free_impl_discharges.rs
+tests/ui/trust/trust_ir_ambiguous_callee_keeps_unanimous_return.rs
+tests/ui/trust/trust_ir_const_index_oob_fails_closed.rs
+tests/ui/trust/trust_ir_dynamic_array_index_fails_closed.rs
+tests/ui/trust/trust_ir_flip_literal_loop_source_provenance.rs
+tests/ui/trust/trust_ir_flip_loop_source_provenance.rs
+tests/ui/trust/trust_ir_flip_loop_source_provenance_false_proof.rs
+tests/ui/trust/trust_ir_flip_loop_source_provenance_proof.rs
+tests/ui/trust/trust_ir_link_sig_instantiation_invariance.rs
+tests/ui/trust/trust_ir_loop_without_break_has_no_exit_block.rs
+tests/ui/trust/trust_ir_lower_fat_pointee_spelling.rs
+tests/ui/trust/trust_ir_lower_logical_op_env_merge.rs
+tests/ui/trust/trust_ir_lower_loop_break_carries_writes.rs
+tests/ui/trust/trust_ir_lower_recursive_pointer_payload_enum.rs
+tests/ui/trust/trust_ir_lower_rpit_no_cycle.rs
+tests/ui/trust/trust_ir_lower_self_ctor_zst.rs
+tests/ui/trust/trust_ir_lower_self_referential_static_no_cycle.rs
+tests/ui/trust/trust_ir_lower_str_payload_enum.rs
+tests/ui/trust/trust_ir_lower_struct_payload_enum.rs
+tests/ui/trust/trust_ir_pre_mono_alias_is_an_opaque_sort.rs
+tests/ui/trust/trust_ir_raw_dyn_fat_pointer.rs
+tests/ui/trust/trust_ir_untagged_enum_layout_descriptor.rs
+tests/ui/trust/twp29_arith_free_bare_claim_unchanged.rs
+tests/ui/trust/vanilla_off_note.rs
+tests/ui/trust/wrapping_refutation_release_identity.rs

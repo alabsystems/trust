@@ -401,7 +401,9 @@ fn extract_operand_places(rvalue: &Rvalue) -> Vec<&Place> {
         Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
             extract_operand_place(op).into_iter().collect()
         }
-        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+        Rvalue::BinaryOp(_, a, b)
+        | Rvalue::CheckedBinaryOp(_, a, b)
+        | Rvalue::UncheckedBinaryOp(_, a, b) => {
             let mut places = Vec::new();
             places.extend(extract_operand_place(a));
             places.extend(extract_operand_place(b));

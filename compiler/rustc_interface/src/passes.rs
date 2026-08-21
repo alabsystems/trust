@@ -1536,6 +1536,18 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) {
         rustc_mir_build::trust_ir_crate_finalize(tcx);
     }
 
+    // Trust (lane CTFE, `-Ztrust-ctfe-trivial-probe`, default OFF): MEASUREMENT
+    // ONLY. Here, and not at the seam, because for a trivial const there IS no
+    // seam: `mir_built` fast-paths it, so `mir_for_ctfe` — and with it
+    // `try_flip_ctfe` — is never demanded. Every `mir_built` in the crate has
+    // executed by now (borrow-checking forced it, and `is_trivial_const` forces
+    // it for the rest), so the flip registry is fully populated and no trivial
+    // const's built body has been stolen. AFTER `trust_ir_crate_finalize`, so
+    // that the probe's registry `take`s cannot perturb the published coverage
+    // artifact even in principle — the control arm then has nothing left to
+    // catch. The probe installs no body and changes no emitted code.
+    rustc_mir_transform::trust_probe_trivial_const_flips(tcx);
+
     // Trust (deferred-verification lane, Step 4): the `misc_checking_3` sweep is
     // DIAGNOSTIC-ONLY — effective visibilities, private-in-public, deathness,
     // clashing extern decls, privacy, lint expectations, diagnostic items. Nothing

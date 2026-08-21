@@ -546,6 +546,46 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
             // poison, fail-closed, with the gap naming WHICH body — a named crate-level gap
             // instead of the hard "read from stolen value" ICE
             // `trust_mir_direct_local_callees` carried.
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::SyntheticCoroutineBody
+                if crate::clean_origin_mir::is_clean_origin(tcx, local) =>
+            {
+                // Trust (I5): a Clean-origin def has no ordinary MIR pipeline.
+                // `mir_drops_elaborated_and_const_checked` walks `mir_borrowck`
+                // -> `mir_promoted` -> `mir_built` -> `check_match` ->
+                // `typeck`, and `typeck` `span_bug!`s on a def with a synthetic
+                // HIR owner and no body. MEASURED: this is the SECOND such
+                // site — `trust_verify.rs`'s backing inventory was the first —
+                // and the ICE it produced (`can't type-check body of
+                // DefId(..::m::pick)`) only appears once a Clean-origin
+                // function is CALLED at runtime with verification ON.
+                //
+                // The body is scanned out of `optimized_mir`, which for these
+                // defs IS the gated emission, so the R1 call graph stays
+                // COMPLETE — it is not skipped, which would be a silent gap in
+                // an oracle whose completeness is the thing it certifies.
+                let body = tcx.optimized_mir(local);
+                let mut scan = CallScan {
+                    tcx,
+                    owner: did,
+                    owner_typing_env: body.typing_env(tcx),
+                    address_taken: &mut address_taken,
+                    edges: &mut edges,
+                    direct_call_sites: &mut direct_call_sites,
+                    hidden: &mut hidden,
+                    mono_call_sites: &mut mono_call_sites,
+                    mono_unresolved: &mut mono_unresolved,
+                    // The emission is deterministic in the Clean declaration:
+                    // one block, `_0 = move _{i+1}; return`, with no
+                    // monomorphisation-dependent choice anywhere in it. So this
+                    // arm contributes nothing that could differ between two runs
+                    // over the same environment, and marking it otherwise would
+                    // poison the oracle's reproducibility for a body that is the
+                    // most reproducible thing it scans.
+                    reproducible: true,
+                };
+                scan.visit_body(body);
+                None
+            }
             DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::SyntheticCoroutineBody => {
                 let steal = tcx.mir_drops_elaborated_and_const_checked(local);
                 if steal.is_stolen() {

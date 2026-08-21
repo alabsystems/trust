@@ -89,6 +89,27 @@ pub(super) fn is_int_wrapping_neg_call(callee: &str) -> bool {
 /// user-defined `mymod::saturating_add` must NOT match (it would inject a false
 /// value-definition, a false-PROVE channel).
 pub(super) fn saturating_add_sub_method(callee: &str) -> Option<&'static str> {
+    // Trust (std-intrinsics lane): the METHOD spelling below is what a user crate
+    // calling `x.saturating_add(y)` produces. The METHOD BODY — and any code
+    // compiled with `#![feature(core_intrinsics)]` — instead calls the body-less
+    // rustc intrinsic, which the extractor stamps
+    // `@trust-rustc-intrinsic::core::intrinsics::saturating_add::<T>` (measured
+    // against the stage2 `-Ztrust-dump=mir:` output). That path fails the
+    // `core::`/`std::` prefix test below, so the intrinsic form was havoc'd while
+    // the identical method form was modeled exactly.
+    //
+    // Route BOTH spellings to the SAME clamp construction in
+    // `saturating_call_dest_value`: the MIN/MAX saturation boundary is then
+    // stated in exactly one place. Restating it for the intrinsic would be a
+    // second place to get the saturation edge wrong.
+    //
+    // The intrinsic lane admits ONLY add/sub — `library/core/src/intrinsics/mod.rs`
+    // declares no `saturating_mul` intrinsic, so a marked path spelling one is a
+    // misextraction or a forgery and must decline (the method arm below keeps
+    // `saturating_mul`, which IS a real library method).
+    if let Some(intrinsic) = marked_saturating_intrinsic(callee) {
+        return Some(intrinsic);
+    }
     let tail = callee.rsplit("::").next().unwrap_or(callee);
     let tail = tail.split('<').next().unwrap_or(tail).trim();
     let method = match tail {

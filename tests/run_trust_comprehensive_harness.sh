@@ -130,6 +130,11 @@ manifest.lane-coverage|all|harness|true|2026-07-25|python3 scripts/check_gate_la
 fast.ledger-expirations|fast|ledger|true|2026-07-25|python3 scripts/check_ledger_expirations.py --warn-days 14
 fast.pr-gate|fast|drift|true|2026-07-25|bash scripts/pr_gate.sh
 fast.pin-coherence|fast|supply-chain|true|2026-07-25|bash scripts/check_pin_coherence.sh
+fast.oracle-freeze|fast|soundness|true|2026-08-20|bash scripts/check_frozen_files.sh
+fast.oracle-freeze-selftest|fast|soundness|true|2026-08-20|bash scripts/check_frozen_files.sh --selftest
+fast.revert-rationale|fast|soundness|true|never|bash scripts/check_revert_rationale.sh --history
+fast.measurement-provenance|fast|soundness|true|2026-08-20|bash scripts/check_measurement_provenance.sh --history
+fast.measurement-provenance-selftest|fast|soundness|true|2026-08-20|bash scripts/check_measurement_provenance.sh --selftest
 fast.bridge-pin|fast|supply-chain|true|never|bash scripts/check_bridge_pin.sh --check
 scoped.compiler-check|all|supply-chain|true|never|bash scripts/check_compiler_targets_build.sh
 fast.tcb-panic-freedom|fast|soundness|true|2026-07-25|bash scripts/check_tcb_panic_freedom.sh

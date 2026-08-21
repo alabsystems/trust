@@ -2269,9 +2269,14 @@ fn dyn_passes_axiom_gate(env: &Environment, carrier: &reflect::DynCarrier) -> bo
 /// Collect the DISTINCT trait-object existentials ([`reflect::DynCarrier`]) reachable
 /// from a function's signature/locals — every `dyn Trait` (bare or behind a transparent
 /// reference) appearing as a parameter, return, or local type. The current extractor
-/// (`Ty::Dynamic { trait_name }`) supplies NO method signatures, so each carrier is the
-/// best-sound minimal existential (`Sigma Type Unit`); richer per-method modeling is
-/// deferred pending extractor support. Deduplicated by trait (existential) name.
+/// supplies NO method signatures, so each carrier is the best-sound minimal existential
+/// (`Sigma Type Unit`); richer per-method modeling is deferred pending extractor support.
+///
+/// Deduplicated by the FAITHFUL existential name, which is derived from
+/// `Ty::Dynamic::principal_key` and never from the generics-erased `trait_name`. A trait
+/// object with no faithful key contributes NO carrier (fail-closed). Note that the
+/// empty-`methods` shape is precisely what keeps the historical erased-name merge latent:
+/// see `reflect::dyn_const_name` for what arms it.
 #[must_use]
 pub fn reachable_dyn_carriers(func: &VerifiableFunction) -> Vec<reflect::DynCarrier> {
     let mut seen = std::collections::HashSet::new();
@@ -2279,23 +2284,21 @@ pub fn reachable_dyn_carriers(func: &VerifiableFunction) -> Vec<reflect::DynCarr
     // The MIR locals cover the function's parameters, return slot, and temporaries —
     // every `dyn Trait` reachable from the function's types appears here.
     for local in &func.body.locals {
-        for trait_name in dyn_trait_names_in(&local.ty) {
-            // TYPE-ZOO #2/#3 — PRODUCTION-WIRED dispatch by the extractor tag convention, so
-            // the REGISTERED existential matches the carrier `reflect::reflect_ty` now emits:
-            //   * `@impl::<trait>` → the `Trust.Impl.<trait>` existential ([`reflect_impl_trait`]);
-            //   * a `+`-joined multi-bound → the CONJOINED-vtable existential ([`reflect_multi_dyn`]);
-            //   * a single-bound `dyn Trait` → the base `Trust.Dyn.<trait>` ([`reflect_dyn`]).
-            // All three register through the identical `register_dyn_carriers` `Sigma` path
-            // (axiom_deps EMPTY — NO 4th axiom); the difference is only the existential NAME /
-            // conjoined vtable. With today's extractor (no method signatures) each is the
-            // best-sound minimal/conjoined existential.
-            let carrier = if let Some(bare) = trait_name.strip_prefix("@impl::") {
-                reflect::reflect_impl_trait(bare, &[])
-            } else if trait_name.contains('+') {
-                reflect::reflect_multi_dyn(&trait_name, &[])
-            } else {
-                reflect::reflect_dyn(&trait_name, &[])
-            };
+        for key in dyn_principal_keys_in(&local.ty) {
+            // FAIL CLOSED on an unkeyable trait object: mint NO carrier at all rather than
+            // one keyed on the erased `trait_name`. This is the INPUT side of the same merge
+            // `reflect::dyn_const_name` documents — a carrier registered under an erased name
+            // is exactly what a second, different trait object would then collide with.
+            // `reflect_ty` refuses the same type independently, so the body fails closed
+            // there; skipping here only declines to seed the environment.
+            let Some(key) = key else { continue };
+            // ONE registration path, keyed on the whole opaque key. The `@impl::` /
+            // `+`-joined dispatch that used to sit here is deleted: both spellings are
+            // unreachable from the extractor, and on the KEY the `+` branch would be wrong —
+            // `+` separates an associated-type binding or an auto trait, not a second
+            // principal bound to conjoin. With today's extractor (no method signatures) this
+            // is the best-sound minimal existential.
+            let carrier = reflect::reflect_dyn(&key, &[]);
             if seen.insert(carrier.name.clone()) {
                 out.push(carrier);
             }
@@ -2389,18 +2392,26 @@ fn ty_reaches_never(ty: &trust_types::Ty) -> bool {
     }
 }
 
-/// Every trait name appearing in a `dyn Trait` reachable through `ty` — transparently
-/// through references, and recursively through composites (tuples, slices/arrays,
-/// struct/enum fields). A bare `dyn Trait` contributes its `trait_name`.
-fn dyn_trait_names_in(ty: &trust_types::Ty) -> Vec<String> {
+/// Every trait-object IDENTITY appearing in a `dyn Trait` reachable through `ty` —
+/// transparently through references, and recursively through composites (tuples,
+/// slices/arrays, struct/enum fields).
+///
+/// A bare `dyn Trait` contributes its `principal_key`: the FAITHFUL, injective identity
+/// minted by the one renderer `trust_mir_extract::faithful_principal_key`. It used to
+/// contribute the generics-ERASED `trait_name`, which merged `dyn Convert<u32>` with
+/// `dyn Convert<u64>` — see `reflect::dyn_const_name` for the full argument.
+///
+/// `None` is preserved rather than dropped, so the caller must DECIDE what to do with an
+/// unkeyable trait object instead of silently receiving a shorter list.
+fn dyn_principal_keys_in(ty: &trust_types::Ty) -> Vec<Option<String>> {
     use trust_types::Ty;
     let mut out = Vec::new();
-    fn walk(ty: &Ty, out: &mut Vec<String>, depth: u32) {
+    fn walk(ty: &Ty, out: &mut Vec<Option<String>>, depth: u32) {
         if depth > 8 {
             return;
         }
         match ty {
-            Ty::Dynamic { trait_name } => out.push(trait_name.clone()),
+            Ty::Dynamic { principal_key, .. } => out.push(principal_key.clone()),
             Ty::Ref { inner, .. } => walk(inner, out, depth + 1),
             Ty::RawPtr { pointee, .. } => walk(pointee, out, depth + 1),
             Ty::Slice { elem } | Ty::Array { elem, .. } => walk(elem, out, depth + 1),
@@ -11320,37 +11331,41 @@ mod tests {
         assert!(!func_reaches_never(&plain), "a `!`-free function does not reach the never type");
     }
 
-    /// TYPE-ZOO #2/#3 — an `impl Trait` (RPIT/TAIT) existential and a MULTI-BOUND
-    /// `dyn A + B + Send` existential BOTH register modulo 3 through the same
-    /// `register_dyn_carriers` path (vtable record + recursor + existential definition
-    /// axiom_deps EMPTY — NO 4th axiom), under distinct stable names.
+    /// TYPE-ZOO #3 — two trait objects that differ ONLY in an AUTO TRAIT register as two
+    /// SEPARATE existentials, each modulo 3 (vtable record + recursor + existential
+    /// definition `axiom_deps` EMPTY — NO 4th axiom).
+    ///
+    /// This replaces a test over the deleted `Trust.Impl.*` / multi-bound machinery, whose
+    /// spellings the extractor cannot emit and one of which described a type Rust cannot
+    /// express. The shape below is the real one, and it is also the REGISTRATION-side
+    /// witness for the slice-19 identity split: under the erased `trait_name` both of these
+    /// hashed to one name, so the second carrier hit the already-registered branch and was
+    /// admitted into the registry against the FIRST one's vtable.
     #[test]
-    fn impl_trait_and_multi_bound_dyn_register_modulo_3_no_4th_axiom() {
-        // #2 impl Trait → existential under the Trust.Impl.* name.
-        let impl_c = reflect::reflect_impl_trait("core::iter::Iterator", &[]);
+    fn auto_trait_differing_dyns_register_as_separate_existentials_modulo_3() {
+        let bare = reflect::reflect_dyn("core::fmt::Debug", &[]);
+        let with_send = reflect::reflect_dyn("core::fmt::Debug+core::marker::Send", &[]);
+        assert_ne!(bare.name, with_send.name, "distinct existentials, not one merged carrier");
+
         let mut env = Environment::with_prelude();
-        let reg = register_dyn_carriers(&mut env, std::slice::from_ref(&impl_c));
-        assert!(reg.get(&impl_c.name).is_some(), "impl Trait existential registers modulo 3");
-        for n in [impl_c.vtable_name.as_str(), impl_c.name.as_str()] {
+        let reg = register_dyn_carriers(&mut env, &[bare.clone(), with_send.clone()]);
+        for carrier in [&bare, &with_send] {
             assert!(
-                env.axiom_deps(&Name::from_string(n)).expect("declared").is_empty(),
-                "{n} modulo 3"
+                reg.get(&carrier.name).is_some(),
+                "{} registers modulo 3",
+                carrier.name
             );
+            for n in [carrier.vtable_name.as_str(), carrier.name.as_str()] {
+                assert!(
+                    env.axiom_deps(&Name::from_string(n)).expect("declared").is_empty(),
+                    "{n} modulo 3"
+                );
+            }
         }
-        // #3 multi-bound dyn → CONJOINED existential (markers drop to empty obligation).
-        let multi_c =
-            reflect::reflect_multi_dyn("core::fmt::Debug + core::clone::Clone + Send", &[]);
-        let reg2 = register_dyn_carriers(&mut env, std::slice::from_ref(&multi_c));
-        assert!(reg2.get(&multi_c.name).is_some(), "multi-bound existential registers modulo 3");
-        for n in [multi_c.vtable_name.as_str(), multi_c.name.as_str()] {
-            assert!(
-                env.axiom_deps(&Name::from_string(n)).expect("declared").is_empty(),
-                "{n} modulo 3"
-            );
-        }
-        // The impl-Trait and dyn existentials over the SAME trait are distinct.
-        let dyn_c = reflect::reflect_dyn("core::iter::Iterator", &[]);
-        assert_ne!(impl_c.name, dyn_c.name);
+        // Both vtable records exist independently in the env — the merge would have left
+        // only one, with the second carrier silently pointing at it.
+        assert!(env.inductive_info(&Name::from_string(&bare.vtable_name)).is_some());
+        assert!(env.inductive_info(&Name::from_string(&with_send.vtable_name)).is_some());
     }
 
     /// TYPE-ZOO #5/#6 — a GAT type-level-function family and a COROUTINE state record
@@ -12757,7 +12772,7 @@ mod tests {
                         index: 1,
                         ty: Ty::Ref {
                             mutable: true,
-                            inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
+                            inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
                         },
                         name: Some("w".into()),
                     },
@@ -12784,7 +12799,7 @@ mod tests {
             ProofTerm::Pi { domain, .. } => {
                 assert_eq!(
                     **domain,
-                    ProofTerm::Const("Trust.Dyn.core_fmt_Write".into()),
+                    ProofTerm::Const(crate::reflect::dyn_const_name("core::fmt::Write").into()),
                     "the dyn parameter binds at the closed existential, not a Type variable"
                 );
             }
@@ -12814,8 +12829,8 @@ mod tests {
         use crate::kernel_check::KernelContext;
 
         let carrier = reflect::reflect_dyn("core::fmt::Write", &[]);
-        assert_eq!(carrier.name, "Trust.Dyn.core_fmt_Write");
-        assert_eq!(carrier.vtable_name, "Trust.Dyn.Vtable.core_fmt_Write");
+        assert_eq!(carrier.name, reflect::dyn_const_name("core::fmt::Write"));
+        assert_eq!(carrier.vtable_name, reflect::dyn_vtable_record_name("core::fmt::Write"));
 
         let mut env = Environment::with_prelude();
         let registry = register_dyn_carriers(&mut env, std::slice::from_ref(&carrier));
@@ -12854,6 +12869,7 @@ mod tests {
         // the registered `Definition`, NOT an opaque free const / per-trait axiom.
         let dyn_ty = reflect::reflect_ty(&trust_types::Ty::Dynamic {
             trait_name: "core::fmt::Write".into(),
+            principal_key: Some("core::fmt::Write".into()),
         })
         .expect("dyn reflects");
         let dyn_expr =
@@ -12922,7 +12938,7 @@ mod tests {
                 "inner".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
+                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
                 },
             )],
             disc_index_safe: false,
@@ -13512,7 +13528,7 @@ mod tests {
                     },
                     LocalDecl {
                         index: 1,
-                        ty: Ty::Dynamic { trait_name: "core::fmt::Write".into() },
+                        ty: Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) },
                         name: Some("w".into()),
                     },
                 ],
@@ -13560,7 +13576,7 @@ mod tests {
                 "inner".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "Write".into() }),
+                    inner: Box::new(Ty::Dynamic { trait_name: "Write".into(), principal_key: Some("Write".into()) }),
                 },
             )],
             disc_index_safe: false,
@@ -14051,7 +14067,7 @@ mod tests {
                 Ty::Slice {
                     elem: Box::new(Ty::Tuple(vec![
                         t_param(),
-                        Ty::Dynamic { trait_name: "Tr".into() },
+                        Ty::Dynamic { trait_name: "Tr".into(), principal_key: Some("Tr".into()) },
                     ])),
                 },
             )],
@@ -14826,7 +14842,7 @@ mod tests {
                     "sink".into(),
                     Ty::Ref {
                         mutable: true,
-                        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
+                        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: true }),
@@ -14860,7 +14876,7 @@ mod tests {
                 "buf".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
+                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
                 },
             )],
             disc_index_safe: false,

@@ -88,8 +88,10 @@ NOTES:
   - Tests run inside crates/ workspace, NOT the root rustc workspace.
   - Use --lib to skip doc tests for faster feedback.
   - CARGO_SKIP_CACHE=1 is set to avoid stale test cache results.
-  - Excluded crates (trust-mir-extract, trust-thir-lower, trust-witness)
-    require rustc_private and are not tested through this script.
+  - trust-mir-extract, trust-thir-lower and trust-witness require rustc_private
+    and are excluded from the crates/ workspace; this script dispatches them to
+    `x.py test --stage 1 crates/<name>` (bootstrap's per-crate test step), which
+    RUNS their tests rather than declaring them untestable.
 USAGE
     exit 0
 }
@@ -264,6 +266,64 @@ if [[ "$VERBOSE" == "1" ]]; then
 fi
 if [[ -n "$RELEASE" ]]; then
     CARGO_ARGS+=("$RELEASE")
+fi
+
+# Trust (#60, 2026-08-19): the three rustc_private crates are EXCLUDED from the
+# crates/ workspace (crates/Cargo.toml `exclude`), so the cargo path below cannot
+# reach them — it would answer "did not match any packages". They ARE reachable
+# through bootstrap's per-crate test step, so dispatch them there instead of
+# declaring them untestable (the NOTES block used to do exactly that).
+#
+# Deliberately `x.py test`, NOT `x.py check`: check compiles the test targets but
+# executes ZERO of them, so a check-dispatch would print green having run 0 of
+# trust-mir-extract's ~487 tests — the ladder's own named anti-pattern ("a rung
+# that misses the break is worse than no rung"), inside a test runner where no
+# caveat sits in front of the reader.
+#
+# trust-spec-temporal is intentionally NOT in this list: it is not a
+# rustc_private exclusion but a separate [workspace] root, and bootstrap has no
+# step for it.
+RUSTC_PRIVATE_CRATES=(trust-mir-extract trust-thir-lower trust-witness)
+if [[ ${#CRATES[@]} -eq 0 ]]; then
+    # An omitted crate list means *all* Trust crates, including the three
+    # rustc_private crates that are deliberately outside `crates/`' workspace.
+    # Keep CRATES empty so the Cargo invocation below still selects the full
+    # ordinary workspace, but explicitly feed every excluded crate through
+    # bootstrap first.
+    DISPATCH_CANDIDATES=("${RUSTC_PRIVATE_CRATES[@]}")
+else
+    # Explicit selection remains narrow: dispatch only requested excluded
+    # crates, and leave the other requested names for the Cargo invocation.
+    DISPATCH_CANDIDATES=("${CRATES[@]}")
+fi
+REMAINING=()
+XPY_RC=0
+for crate in "${DISPATCH_CANDIDATES[@]}"; do
+    dispatched=0
+    for rp in "${RUSTC_PRIVATE_CRATES[@]}"; do
+        if [[ "$crate" == "$rp" ]]; then
+            log "dispatching ${crate} to bootstrap (rustc_private; not in the crates/ workspace)"
+            if ! python3 "$REPO_ROOT/x.py" test --stage 1 "crates/${crate}"; then
+                XPY_RC=1
+            fi
+            dispatched=1
+            break
+        fi
+    done
+    if [[ "$dispatched" == "0" ]]; then
+        REMAINING+=("$crate")
+    fi
+done
+if [[ "$XPY_RC" != "0" ]]; then
+    echo "error: bootstrap-dispatched crate tests FAILED" >&2
+    exit 1
+fi
+if [[ ${#CRATES[@]} -gt 0 ]]; then
+    if [[ ${#REMAINING[@]} -eq 0 ]]; then
+        # Every explicitly requested crate was bootstrap-dispatched and passed.
+        exit 0
+    fi
+    CRATES=("${REMAINING[@]}")
 fi
 
 # Target selection: specific crates or full workspace

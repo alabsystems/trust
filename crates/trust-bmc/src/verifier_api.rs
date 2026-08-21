@@ -345,6 +345,7 @@ fn obligation_is_whole_function_panic_freedom(
                 | TRUST_MC_TYPED_CHC_LOWERING_STATUS_METADATA_KEY
                 | TRUST_MC_TYPED_CHC_UNSUPPORTED_REASON_METADATA_KEY
                 | TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY
+                | TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY
                 | TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY
                 | TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY
                 | TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY
@@ -15849,6 +15850,11 @@ mod tests {
             public_obligation.source = compiler_style_source(18, 13);
             add_typed_body_aware_vc_formula_value(&mut public_obligation, true);
             let mut bundle = bundle_with(vec![public_obligation]);
+            // The production compiler deliberately cannot mint this premise
+            // yet.  This synthetic fixture is testing the consumer's
+            // validated-refutation path, so state the positive producer edge
+            // explicitly instead of relying on absence as exactness.
+            attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
             let mut direct_contract =
                 typed_chc_contract("contract-exact-loop-formula", &obligation_id, true);
             direct_contract.source = compiler_style_source(18, 13);
@@ -15958,6 +15964,10 @@ mod tests {
         public_obligation.source = compiler_style_source(18, 13);
         add_typed_body_aware_vc_formula_value(&mut public_obligation, true);
         let mut bundle = bundle_with(vec![public_obligation]);
+        // See `certified_exact_e4_e5_refutation_is_terminal_before_native_transport`:
+        // a synthetic positive-control refutation must carry the exact
+        // producer-fidelity premise that production currently withholds.
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let mut direct_contract =
             typed_chc_contract("contract-exact-precondition-formula", &obligation_id, true);
         direct_contract.source = compiler_style_source(18, 13);
@@ -16188,7 +16198,11 @@ mod tests {
         let adapter = TrustMcVerifierApiAdapter::new(
             TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
         );
-        let bundle = compiler_style_panic_freedom_public_bundle();
+        let mut bundle = compiler_style_panic_freedom_public_bundle();
+        // Isolate witness validation from the separately tested producer
+        // fidelity gate.  Without this test-only premise, the sound result is
+        // Unknown and this test never reaches bounded-unroll replay.
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let native_bundle = bind_compiler_style_native_bundle_to_public(
             compiler_style_loop_overflow_tmir_bundle(),
             &bundle,

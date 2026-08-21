@@ -1844,7 +1844,7 @@ fn convert_rvalue<'tcx>(
             if matches!(bin_op, mir::BinOp::Offset) {
                 return Rvalue::PtrOffset { ptr: l, count: r };
             }
-            let Some((our_op, checked)) = convert_supported_binop(*bin_op) else {
+            let Some((our_op, form)) = convert_supported_binop(*bin_op) else {
                 return unsupported_rvalue(
                     format!("BinOp::{bin_op:?}"),
                     "operation requires explicit MIR semantics before proof".to_string(),
@@ -1852,10 +1852,13 @@ fn convert_rvalue<'tcx>(
                 );
             };
 
-            if checked {
-                Rvalue::CheckedBinaryOp(our_op, l, r)
-            } else {
-                Rvalue::BinaryOp(our_op, l, r)
+            match form {
+                BinopForm::Plain => Rvalue::BinaryOp(our_op, l, r),
+                BinopForm::Checked => Rvalue::CheckedBinaryOp(our_op, l, r),
+                // Trust: R2/C4 — the UB-on-overflow form stays distinguishable;
+                // collapsing it into `BinaryOp` would hand any binop-form
+                // definitional import UB arithmetic under the wrapping spelling.
+                BinopForm::Unchecked => Rvalue::UncheckedBinaryOp(our_op, l, r),
             }
         }
 
@@ -2443,34 +2446,56 @@ fn convert_ref_rvalue(borrow_kind: mir::BorrowKind, place: Place) -> Rvalue {
     }
 }
 
-fn convert_supported_binop(op: mir::BinOp) -> Option<(BinOp, bool)> {
+/// Which TrustIr `Rvalue` a supported MIR binop lowers to.
+///
+/// Trust (R2/C4): three-state, not two. `Unchecked` used to be collapsed into
+/// `Plain`, which was sound for the VC lane (vcgen demands an overflow VC for
+/// a direct binop either way, and under proved overflow-absence the unchecked,
+/// wrapping and mathematical results coincide) but destroys exactly the
+/// provenance a DEFINITIONAL import must see: MIR `Add` is defined WRAPPING,
+/// MIR `AddUnchecked` is UB on overflow, and a consumer that treats a bare
+/// `Rvalue::BinaryOp(Add, ..)` as unconditional wrapping semantics (any
+/// future binop-form definitional import) must never be handed the UB op
+/// under that spelling. See `trust_types::Rvalue::UncheckedBinaryOp`.
+enum BinopForm {
+    /// Plain MIR op — for integer `Add`/`Sub`/`Mul`, defined wrapping.
+    Plain,
+    /// `*WithOverflow` — returns `(result, overflowed)`.
+    Checked,
+    /// `*Unchecked` — UB on overflow; never conflate with `Plain`.
+    Unchecked,
+}
+
+fn convert_supported_binop(op: mir::BinOp) -> Option<(BinOp, BinopForm)> {
+    use BinopForm::{Checked, Plain, Unchecked};
     match op {
-        mir::BinOp::Add => Some((BinOp::Add, false)),
-        mir::BinOp::AddUnchecked => Some((BinOp::Add, false)),
-        mir::BinOp::AddWithOverflow => Some((BinOp::Add, true)),
-        mir::BinOp::Sub => Some((BinOp::Sub, false)),
-        mir::BinOp::SubUnchecked => Some((BinOp::Sub, false)),
-        mir::BinOp::SubWithOverflow => Some((BinOp::Sub, true)),
-        mir::BinOp::Mul => Some((BinOp::Mul, false)),
-        mir::BinOp::MulUnchecked => Some((BinOp::Mul, false)),
-        mir::BinOp::MulWithOverflow => Some((BinOp::Mul, true)),
-        mir::BinOp::Div => Some((BinOp::Div, false)),
-        mir::BinOp::Rem => Some((BinOp::Rem, false)),
-        mir::BinOp::BitXor => Some((BinOp::BitXor, false)),
-        mir::BinOp::BitAnd => Some((BinOp::BitAnd, false)),
-        mir::BinOp::BitOr => Some((BinOp::BitOr, false)),
-        mir::BinOp::Shl => Some((BinOp::Shl, false)),
+        mir::BinOp::Add => Some((BinOp::Add, Plain)),
+        // Trust: R2/C4 — arithmetic `*Unchecked` keeps its UB provenance.
+        mir::BinOp::AddUnchecked => Some((BinOp::Add, Unchecked)),
+        mir::BinOp::AddWithOverflow => Some((BinOp::Add, Checked)),
+        mir::BinOp::Sub => Some((BinOp::Sub, Plain)),
+        mir::BinOp::SubUnchecked => Some((BinOp::Sub, Unchecked)),
+        mir::BinOp::SubWithOverflow => Some((BinOp::Sub, Checked)),
+        mir::BinOp::Mul => Some((BinOp::Mul, Plain)),
+        mir::BinOp::MulUnchecked => Some((BinOp::Mul, Unchecked)),
+        mir::BinOp::MulWithOverflow => Some((BinOp::Mul, Checked)),
+        mir::BinOp::Div => Some((BinOp::Div, Plain)),
+        mir::BinOp::Rem => Some((BinOp::Rem, Plain)),
+        mir::BinOp::BitXor => Some((BinOp::BitXor, Plain)),
+        mir::BinOp::BitAnd => Some((BinOp::BitAnd, Plain)),
+        mir::BinOp::BitOr => Some((BinOp::BitOr, Plain)),
+        mir::BinOp::Shl => Some((BinOp::Shl, Plain)),
         mir::BinOp::ShlUnchecked => None,
-        mir::BinOp::Shr => Some((BinOp::Shr, false)),
+        mir::BinOp::Shr => Some((BinOp::Shr, Plain)),
         mir::BinOp::ShrUnchecked => None,
-        mir::BinOp::Eq => Some((BinOp::Eq, false)),
-        mir::BinOp::Lt => Some((BinOp::Lt, false)),
-        mir::BinOp::Le => Some((BinOp::Le, false)),
-        mir::BinOp::Ne => Some((BinOp::Ne, false)),
-        mir::BinOp::Ge => Some((BinOp::Ge, false)),
-        mir::BinOp::Gt => Some((BinOp::Gt, false)),
+        mir::BinOp::Eq => Some((BinOp::Eq, Plain)),
+        mir::BinOp::Lt => Some((BinOp::Lt, Plain)),
+        mir::BinOp::Le => Some((BinOp::Le, Plain)),
+        mir::BinOp::Ne => Some((BinOp::Ne, Plain)),
+        mir::BinOp::Ge => Some((BinOp::Ge, Plain)),
+        mir::BinOp::Gt => Some((BinOp::Gt, Plain)),
         // Three-way comparison returns -1/0/1, not a boolean.
-        mir::BinOp::Cmp => Some((BinOp::Cmp, false)),
+        mir::BinOp::Cmp => Some((BinOp::Cmp, Plain)),
         mir::BinOp::Offset => None,
     }
 }

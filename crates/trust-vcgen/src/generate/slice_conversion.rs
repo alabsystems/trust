@@ -766,6 +766,12 @@ pub(super) fn collect_cast_relation_unsupported(
         // stays opaque, so accepting it by target is sound (and stops it from
         // poisoning the function's other obligations into Unsupported).
         || crate::cast_target_is_slice_ref(target_ty)
+        // `&T -> &dyn Trait` / `*const T -> *const dyn Trait` (trait-object pointer
+        // unsize). `convert.rs` began spelling this `Rvalue::Cast` in d806992cd4
+        // (it was `Use(OpaqueConst)` before, reaching no cast predicate); the
+        // coercion is an infallible vtable attach and carries NO obligation, so
+        // admitting it restores this lane's pre-d806992cd4 behaviour exactly.
+        || crate::cast_target_is_trait_object_pointer(target_ty)
         || (source_ty.is_integer() && target_ty.is_integer())
         // float `as` casts are infallible (no panic obligation); the dest is left
         // unconstrained (no value-fact), so this is sound and stops one float cast

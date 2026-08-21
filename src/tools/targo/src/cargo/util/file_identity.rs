@@ -78,6 +78,26 @@ pub struct OpenedFileIdentity {
     links: u32,
 }
 
+impl OpenedFileIdentity {
+    /// Whether both live handles name the same filesystem object, excluding
+    /// continuity metadata that can move while that object remains selected.
+    ///
+    /// Windows `change_time` and `links` are intentionally absent here: they
+    /// detect mutation for callers that compare the complete identity, but a
+    /// directory's ordinary entry churn changes them. Path-chain guards pair
+    /// this stable identity with their own role-specific metadata policy.
+    pub fn same_file(&self, other: &Self) -> bool {
+        #[cfg(not(windows))]
+        {
+            self == other
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number == other.volume_serial_number && self.file_id == other.file_id
+        }
+    }
+}
+
 /// Capture the authoritative identity of an already-open file or directory.
 #[cfg(not(windows))]
 pub fn opened_file_identity(file: &fs::File) -> std::io::Result<OpenedFileIdentity> {
@@ -161,7 +181,7 @@ pub fn opened_file_identity(file: &fs::File) -> std::io::Result<OpenedFileIdenti
 pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> std::io::Result<bool> {
     let left = open_for_identity(left)?;
     let right = open_for_identity(right)?;
-    Ok(opened_file_identity(&left)? == opened_file_identity(&right)?)
+    Ok(opened_file_identity(&left)?.same_file(&opened_file_identity(&right)?))
 }
 
 #[cfg(not(windows))]
@@ -232,6 +252,18 @@ mod windows_tests {
         assert_ne!(
             base, extended_volume,
             "the complete 64-bit volume serial must participate in identity"
+        );
+
+        let mut ordinary_directory_churn = base.clone();
+        ordinary_directory_churn.change_time += 1;
+        ordinary_directory_churn.links += 1;
+        assert_ne!(
+            base, ordinary_directory_churn,
+            "full continuity metadata still moves"
+        );
+        assert!(
+            base.same_file(&ordinary_directory_churn),
+            "stable file identity must exclude directory-entry churn metadata"
         );
     }
 

@@ -606,7 +606,7 @@ else
 fi
 record_tier_status T3_e2e "$T3_RC"
 
-# T3b: the four ignored real-Targo certified-monitor tests are a distinct
+# T3b: the five ignored real-Targo certified-monitor tests are a distinct
 # release boundary. Ordinary `targo test` and the T3 shell glob do not execute
 # them. The dedicated gate proves each exact ignored test actually ran once;
 # it supports Linux/macOS x86_64/aarch64 and deliberately fails on other hosts

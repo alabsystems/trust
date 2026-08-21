@@ -9,6 +9,9 @@ use crate::core::config::flags::Color;
 use crate::core::config::{CompressDebuginfo, DebuginfoLevel, SplitDebuginfo};
 use crate::utils::build_stamp;
 use crate::utils::helpers::{self, LldThreads, check_cfg_arg, linker_flags};
+use crate::utils::shared_helpers::{
+    RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV, retired_trust_bootstrap_shim_target_only_refusal,
+};
 use crate::{
     BootstrapCommand, CLang, CodegenBackendKind, Compiler, Config, DryRun, EXTRA_CHECK_CFGS,
     GitRepo, Mode, RemapScheme, TargetSelection, command, prepare_behaviour_dump_dir, t,
@@ -126,27 +129,17 @@ fn is_trust_verifier_unstable_option(option: &str) -> bool {
     matches!(name, "trust-verify" | "trust-policy") || name.starts_with("trust-verify-")
 }
 
-fn rustflags_contain_trust_verifier_control(rustflags: &str) -> bool {
-    let mut tokens = rustflags.split_whitespace().peekable();
-
-    while let Some(token) = tokens.next() {
-        if let Some(option) = token.strip_prefix("-Z") {
-            if option.is_empty() {
-                if let Some(next) = tokens.peek().copied() {
-                    if is_trust_verifier_unstable_option(next) {
-                        return true;
-                    }
-                }
-            } else if is_trust_verifier_unstable_option(option) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn rustflags_request_bootstrap_verification(rustflags: &str) -> bool {
+/// Every Trust verifier control in `rustflags`, in order, in both token shapes
+/// (`-Zname=value` and the split `-Z name=value`).
+///
+/// ONE walker on purpose. Bootstrap asks two questions about these flags —
+/// "must this invocation be refused as a self-proof claim?" and "does bootstrap's
+/// default off-switch still apply?" — and they used to be answered by two
+/// separate walkers with two different notions of "a control". That is how the
+/// suppression came to admit strictly MORE than the refusal caught (see
+/// [`bootstrap_disables_default_trust_verification`]).
+fn trust_verifier_controls(rustflags: &str) -> Vec<&str> {
+    let mut controls = Vec::new();
     let mut tokens = rustflags.split_whitespace().peekable();
 
     while let Some(token) = tokens.next() {
@@ -155,23 +148,55 @@ fn rustflags_request_bootstrap_verification(rustflags: &str) -> bool {
             Some(option) => Some(option),
             None => None,
         };
-        let Some(option) = option else { continue };
-        if is_trust_verifier_unstable_option(option) && option != "trust-verify=off" {
-            return true;
+        if let Some(option) = option
+            && is_trust_verifier_unstable_option(option)
+        {
+            controls.push(option);
         }
     }
 
-    false
+    controls
 }
 
+fn rustflags_request_bootstrap_verification(rustflags: &str) -> bool {
+    trust_verifier_controls(rustflags)
+        .iter()
+        .any(|option| *option != TRUST_BOOTSTRAP_NO_VERIFY_OPTION)
+}
+
+/// Does bootstrap still owe this invocation its default off-switch?
+///
+/// FAIL-CLOSED, and deliberately not coupled to the self-proof refusal. Only
+/// the EXACT off-switch already being present suppresses the default; every
+/// other verifier control leaves the default in place, so the composed rustflags
+/// still end in `-Ztrust-verify=off` (last value wins) and the unit still has an
+/// off-switch.
+///
+/// This used to be "any verifier control at all suppresses the default", which
+/// was safe only by coincidence: [`refuse_bootstrap_verification_request`] runs
+/// first and aborts on every control except the exact off-switch, so the extra
+/// cases were unreachable. The two functions shared no assertion, though —
+/// narrowing the refusal (to admit some future authenticated lane, say) would
+/// have silently produced units with NO off-switch and verification default-ON.
+/// Enforcing the invariant here rather than pinning it to the panic is the
+/// choice that survives the panic being narrowed: with the exact-match rule the
+/// worst case is a redundant off-switch, never a missing one.
 fn bootstrap_disables_default_trust_verification(
     build_compiler_stage: u32,
     rustflags: &str,
 ) -> bool {
-    build_compiler_stage != 0 && !rustflags_contain_trust_verifier_control(rustflags)
+    build_compiler_stage != 0
+        && !trust_verifier_controls(rustflags)
+            .iter()
+            .any(|option| *option == TRUST_BOOTSTRAP_NO_VERIFY_OPTION)
 }
 
 pub(super) const TRUST_BOOTSTRAP_NO_VERIFY_FLAG: &str = "-Ztrust-verify=off";
+
+/// [`TRUST_BOOTSTRAP_NO_VERIFY_FLAG`] as it appears after the `-Z` prefix is
+/// stripped, i.e. as [`trust_verifier_controls`] yields it. Pinned equal to the
+/// flag by `no_verify_option_and_flag_are_the_same_switch`.
+const TRUST_BOOTSTRAP_NO_VERIFY_OPTION: &str = "trust-verify=off";
 
 /// Put bootstrap's non-self-proving off-switch in the ONE rustflags lane Cargo
 /// will actually read for these units.
@@ -191,9 +216,11 @@ pub(super) const TRUST_BOOTSTRAP_NO_VERIFY_FLAG: &str = "-Ztrust-verify=off";
 /// was aiming at, and host build-script/proc-macro units keep going through the
 /// shim's `TRUST_BOOTSTRAP_SHIM_NO_VERIFY` lane as before.
 ///
-/// An explicit verifier control already in `rustflags` still wins: it suppresses
-/// this default entirely (and any control other than the exact off-switch has
-/// already aborted in `rustflags_request_bootstrap_verification`).
+/// Bootstrap's own off-switch already being in `rustflags` — and ONLY that —
+/// suppresses this default, so the flag is never duplicated. Any other verifier
+/// control has already aborted in `rustflags_request_bootstrap_verification`;
+/// if it ever stops aborting, the default still lands and the unit still has an
+/// off-switch. See [`bootstrap_disables_default_trust_verification`].
 fn apply_bootstrap_trust_verification_default(
     rustflags: &mut Rustflags,
     build_compiler_stage: u32,
@@ -201,6 +228,149 @@ fn apply_bootstrap_trust_verification_default(
     if bootstrap_disables_default_trust_verification(build_compiler_stage, &rustflags.0) {
         rustflags.arg(TRUST_BOOTSTRAP_NO_VERIFY_FLAG);
     }
+}
+
+/// The self-proof refusal, as a value so it can be tested without a `Builder`.
+///
+/// Bootstrap has no authenticated artifact-bound proof session, so a verifier
+/// control in bootstrap's OWN rustflags is refused — for **every** [`Mode`],
+/// library modes included. That is deliberate and it is not what the per-unit
+/// library opt-in below relaxes: rustflags are invocation-wide, so honouring one
+/// here would turn the verifier on for every crate in the invocation (std's
+/// whole third-party dependency graph included) with no unit named anywhere.
+///
+/// Returns `None` when nothing in `rustflags` requests verification.
+fn bootstrap_verification_request_refusal(mode: Mode, rustflags: &str) -> Option<String> {
+    if !rustflags_request_bootstrap_verification(rustflags) {
+        return None;
+    }
+
+    // The first sentence is load-bearing text: `docs/SELF_PROOF.md` quotes it
+    // verbatim as the recorded refusal. Extend it, never reword it.
+    Some(format!(
+        "bootstrap compiler verification flags are unsupported without an authenticated \
+         artifact-bound bootstrap protocol; use scripts/stage2_verify_self_build.sh instead \
+         (refused for a {mode:?} unit; rustflags {rustflags:?}). To verify an in-tree \
+         `library/` unit — which is NOT a self-proof claim — use the per-unit opt-in \
+         `{TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV}=<unit>[,<unit>...]` instead; it is refused for \
+         compiler, bootstrap and tool units."
+    ))
+}
+
+#[track_caller]
+fn refuse_bootstrap_verification_request(mode: Mode, rustflags: &str) {
+    if let Some(message) = bootstrap_verification_request_refusal(mode, rustflags) {
+        panic!("{message}");
+    }
+}
+
+/// User-facing opt-in: verify these in-tree `library/` units with the already
+/// built stage>=1 `trustc`.
+///
+/// This is category (B) — "an existing compiler verified an ordinary Rust
+/// library as an ordinary target unit" — and it is deliberately a different
+/// switch from category (A), "bootstrap verified ITSELF", which
+/// [`bootstrap_verification_request_refusal`] still refuses outright.
+///
+/// Unset (the default) nothing changes: every stage>=1 unit keeps
+/// [`TRUST_BOOTSTRAP_NO_VERIFY_FLAG`], so a build that verifies nothing today
+/// still verifies nothing.
+pub(super) const TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV: &str = "TRUST_BOOTSTRAP_VERIFY_LIBRARY";
+
+/// Bootstrap -> rustc-shim IPC carrying the AUTHORIZED unit list for exactly one
+/// cargo invocation.
+///
+/// Bootstrap removes this from every command it builds and re-adds it only for
+/// invocations whose [`Mode`] it authorized, so an ambient value in the caller's
+/// environment can never reach a compiler, bootstrap or tool unit.
+pub(super) const TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV: &str = "TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS";
+
+/// The in-tree `library/` units this opt-in may be pointed at.
+///
+/// An enumerated allowlist, not a directory scan: the whole point of the lane is
+/// that the set of things a non-self-proving bootstrap may verify is small,
+/// named and reviewable. A name outside it is a hard error rather than a silent
+/// no-op — that includes every compiler crate, `bootstrap` itself, every tool,
+/// and every third-party crate in std's dependency graph (`compiler_builtins`,
+/// `libc`, `hashbrown`, `memchr`, ...), which are compiled by the same
+/// `Mode::Std` cargo invocation as `core` and must not be swept in with it.
+const TRUST_VERIFIABLE_LIBRARY_UNITS: &[&str] = &[
+    "alloc",
+    "core",
+    "panic_abort",
+    "panic_unwind",
+    "proc_macro",
+    "std",
+    "std_detect",
+    "test",
+    "unwind",
+];
+
+fn normalized_library_unit(name: &str) -> String {
+    name.trim().replace('-', "_")
+}
+
+/// Parse [`TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV`] into a canonical unit list.
+///
+/// `Ok(None)` means, and only means, "the variable is not set". Every other
+/// degenerate input — empty value, stray comma, non-UTF-8, a name that is not an
+/// allowed library unit — is an `Err`, because a control that is silently
+/// ignored is indistinguishable from one that worked. Unsetting the variable is
+/// the documented way to turn the lane off.
+fn parse_trust_verify_library_request(raw: Option<&OsStr>) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let allowed = || TRUST_VERIFIABLE_LIBRARY_UNITS.join(", ");
+    let Some(raw) = raw.to_str() else {
+        return Err(format!(
+            "{TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV} is not valid UTF-8; unset it to keep \
+             verification off, or name library units explicitly (allowed: {})",
+            allowed()
+        ));
+    };
+
+    let mut units: Vec<String> = Vec::new();
+    for entry in raw.split(',') {
+        let unit = normalized_library_unit(entry);
+        if unit.is_empty() {
+            return Err(format!(
+                "{TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV}={raw:?} contains an empty unit name; \
+                 unset the variable to keep verification off, or name library units \
+                 explicitly (allowed: {})",
+                allowed()
+            ));
+        }
+        if !TRUST_VERIFIABLE_LIBRARY_UNITS.contains(&unit.as_str()) {
+            return Err(format!(
+                "{TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV} names `{unit}`, which is not an in-tree \
+                 `library/` unit. This opt-in verifies library units only: compiler, \
+                 bootstrap and tool units are refused, because bootstrap has no \
+                 authenticated artifact-bound self-proof protocol (use \
+                 scripts/stage2_verify_self_build.sh for bounded compiler-crate \
+                 evidence). Allowed: {}",
+                allowed()
+            ));
+        }
+        if !units.contains(&unit) {
+            units.push(unit);
+        }
+    }
+
+    Ok(Some(units))
+}
+
+/// Which cargo invocations may carry the library-verification opt-in at all.
+///
+/// [`Mode::Std`] is the only mode whose primary units are `library/` crates.
+/// Every other mode compiles the compiler, bootstrap or a tool, and for those
+/// the refusal above is the whole answer: an artifact that built itself cannot
+/// also be the authority that proved itself.
+///
+/// `build_compiler_stage != 0` matches the existing off-switch condition: at
+/// stage 0 the build compiler is the *seed*, whose vintage is the pin's and not
+/// this tree's, so it is never the compiler this lane means by "an already-built
+/// stage2 trustc".
+fn trust_verify_library_units_authorized(mode: Mode, build_compiler_stage: u32) -> bool {
+    build_compiler_stage != 0 && matches!(mode, Mode::Std)
 }
 
 fn trust_cg_codegen_is_active(
@@ -635,16 +805,68 @@ impl From<Cargo> for BootstrapCommand {
                 "TRUST_FLYWHEEL is retired: bootstrap has no authenticated proof session and cannot claim self-verification; use scripts/stage2_verify_self_build.sh for bounded compiler-crate evidence"
             );
         }
-        if rustflags_request_bootstrap_verification(&cargo.rustflags.0) {
-            panic!(
-                "bootstrap compiler verification flags are unsupported without an authenticated artifact-bound bootstrap protocol; use scripts/stage2_verify_self_build.sh instead"
-            );
+        // Same rung: a retired name that is still scrubbed in six places but read
+        // nowhere. Refuse it here so it cannot be a silent no-op on the x.py path.
+        if let Some(message) = retired_trust_bootstrap_shim_target_only_refusal(
+            std::env::var_os(RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV).as_deref(),
+        ) {
+            panic!("{message}");
         }
+        refuse_bootstrap_verification_request(cargo.mode, &cargo.rustflags.0);
         cargo.command.env("TRUST_BOOTSTRAP_SHIM_NO_VERIFY", "1");
         // Trust (loud-when-off): the off-switch below is bootstrap's
         // announced, recorded non-self-proving policy — quiet the compiler's
         // once-per-crate vanilla note for every unit this invocation drives.
         cargo.command.env("TRUST_VANILLA_ANNOUNCED", "1");
+
+        // Trust: the per-unit `library/` verification opt-in.
+        //
+        // Two different claims used to ride the single off-switch below:
+        //   (A) "bootstrap verified ITSELF" — circular, no authenticated proof
+        //       session. Still blocked, by the refusal above.
+        //   (B) "the already-built stage>=1 trustc verified `library/core`, an
+        //       ordinary Rust library, as an ordinary target unit" — neither
+        //       circular nor a self-proof claim, and blocked today only because
+        //       it rode the same switch.
+        //
+        // (B) is now opted into per unit with `TRUST_BOOTSTRAP_VERIFY_LIBRARY=core[,...]`.
+        //
+        // The opt-in deliberately does NOT ride rustflags, and the off-switch
+        // below is applied exactly as before even when the opt-in is set. A
+        // `Mode::Std` invocation compiles std's whole third-party dependency
+        // graph alongside `core`; putting `-Ztrust-verify=on` in rustflags would
+        // verify all of it — the same batteries-on accident
+        // `apply_bootstrap_trust_verification_default` documents. So the
+        // invocation-wide default stays OFF and only the AUTHORIZED unit list
+        // travels, to the one component that knows which crate it is about to
+        // compile: the rustc shim, which flips exactly those `--crate-name`s to
+        // `-Ztrust-verify=on` at the driver boundary.
+        //
+        // Scrub first, unconditionally: the shim channel is bootstrap-internal
+        // IPC, so an ambient value inherited from the caller's environment must
+        // never reach a unit bootstrap did not authorize.
+        cargo.command.env_remove(TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV);
+        let library_verify_units = parse_trust_verify_library_request(
+            std::env::var_os(TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV).as_deref(),
+        )
+        .unwrap_or_else(|message| panic!("{message}"));
+        if let Some(units) = library_verify_units
+            && trust_verify_library_units_authorized(cargo.mode, cargo.build_compiler_stage)
+        {
+            let units = units.join(",");
+            // Loud when on, per invocation: the whole build otherwise looks
+            // identical to a default one.
+            eprintln!(
+                "trust: {TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV} is set — verifying library \
+                 unit(s) [{units}] with the stage{stage} compiler. This is not a \
+                 self-proof claim: every other unit in this {mode:?} invocation keeps \
+                 {TRUST_BOOTSTRAP_NO_VERIFY_FLAG}.",
+                stage = cargo.build_compiler_stage,
+                mode = cargo.mode,
+            );
+            cargo.command.env(TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV, units);
+        }
+
         apply_bootstrap_trust_verification_default(
             &mut cargo.rustflags,
             cargo.build_compiler_stage,

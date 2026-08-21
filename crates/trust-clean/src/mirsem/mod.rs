@@ -3171,8 +3171,9 @@ pub(crate) fn callee_signature_matches(
 pub struct SemCallReturn {
     /// The RESOLVED callee def-path — a key of the certified registry.
     pub callee: String,
-    /// The callee's index in the (sorted) certified registry — the `Nat`
-    /// callee-id the kernel `Call.mk` instance names.
+    /// The STABLE content-derived `Nat` callee-id the kernel `Call.mk` instance
+    /// names — FNV-1a 64 of the resolved def-path with the high bit forced
+    /// ([`call_lift::stable_callee_id`]), NOT a registry position.
     pub callee_id: u64,
     /// The modeled actual-argument operands (each gets Lemma-1A certified).
     pub args: Vec<SemOperand>,
@@ -3382,16 +3383,21 @@ impl PureTotalIntrinsic {
     /// A STABLE, deterministic `call_result` callee-id for this intrinsic. The
     /// kernel transport lemma `callRefinesContract` is UNIVERSAL over the `Call`
     /// value, so the concrete id is semantically vacuous — it only NAMES which
-    /// call. It MUST be SMALL: the kernel encodes it as a `Nat` literal inside
-    /// `Call.mk`, and the certified-callee lane's own ids are the tiny registry
-    /// indices `0..N` (the sizes `nat_lit` / def-eq are tuned for). A large id
-    /// (e.g. a hash) can drive pathological `Nat` reduction in the kernel proof's
-    /// def-eq — so this stays in the intrinsic-enum's small range: the bit-intrinsics
-    /// occupy `0..5`, `count_ones` (the pinned method) takes `5`, and the saturating
-    /// intrinsics take `6`/`7` (explicit discriminants that SKIP `5` to stay distinct
-    /// from `count_ones`). All ids remain `< 8`. The certificate is self-contained
-    /// per function (it never composes against the registry), so overlap with a
-    /// registry index is harmless.
+    /// call. The synthetic ids stay in the intrinsic-enum's small range: the
+    /// bit-intrinsics occupy `0..5`, `count_ones` (the pinned method) takes `5`,
+    /// and the saturating intrinsics take `6`/`7` (explicit discriminants that
+    /// SKIP `5` to stay distinct from `count_ones`). All synthetic ids remain
+    /// `< 8`, and the certified-callee lanes can NEVER collide with them:
+    /// [`call_lift::stable_callee_id`] forces the high bit, so every registry id
+    /// is `>= 2^63` by construction. (An earlier revision of this comment
+    /// required ALL callee ids to be small, warning that a large `Nat` literal
+    /// could drive pathological def-eq reduction. Re-validated 2026-08-19 when
+    /// the registry ids became 2^63-scale hashes: `nat_lit(u64)` encodes as
+    /// `BigNat::Small`, a literal is already WHNF, literal-vs-literal def-eq is
+    /// direct `BigNat` equality, and `call_result`'s iota-reduction discards the
+    /// id without reducing it — magnitude is free for the shapes the
+    /// certificates emit, confirmed by the full suite running live at 2^63
+    /// scale.)
     #[must_use]
     pub fn synthetic_callee_id(self) -> u64 {
         self as u64
@@ -4860,8 +4866,9 @@ pub struct SemAdtMapCompose {
     /// `Ty::Closure.name` AND to the certified-registry key (exact-only; NEVER a
     /// suffix match — the mandatory adversarial gate).
     pub callee: String,
-    /// The closure's index in the (sorted) certified registry — the `Nat` callee-id
-    /// the kernel `Call.mk` instance names.
+    /// The closure's STABLE content-derived `Nat` callee-id
+    /// ([`call_lift::stable_callee_id`] of the resolved key), the id the kernel
+    /// `Call.mk` instance names — NOT a registry position.
     pub callee_id: u64,
     /// The closure ENV operand (`Var(env_param_idx)`) — the FnOnce env the Call's
     /// first actual moves, traced to the bare closure parameter. This is the ONLY
@@ -4922,7 +4929,8 @@ pub struct SemAdtFilterCompose {
     pub none_variant: usize,
     /// The EXACT resolved closure def-path (exact-only; NEVER a suffix match).
     pub callee: String,
-    /// The closure's index in the (sorted) certified registry.
+    /// The closure's STABLE content-derived callee-id
+    /// ([`call_lift::stable_callee_id`] of the resolved key).
     pub callee_id: u64,
     /// The closure ENV operand (`Var(env_param_idx)`).
     pub env_operand: SemOperand,
@@ -7754,8 +7762,9 @@ pub struct SemTwoCallChain {
     pub inner: SemCallReturn,
     /// The RESOLVED outer callee def-path (a key of the certified registry).
     pub outer_callee: String,
-    /// The outer callee's registry index — the `Nat` callee-id its `Call.mk`
-    /// instance names.
+    /// The outer callee's STABLE content-derived `Nat` callee-id
+    /// ([`call_lift::stable_callee_id`] of the resolved key) — the id its
+    /// `Call.mk` instance names.
     pub outer_callee_id: u64,
     /// The outer call's actual arguments in program order: EXACTLY ONE is the
     /// [`ChainArg::Intermediate`] (the inner result temp `_t`), the rest are

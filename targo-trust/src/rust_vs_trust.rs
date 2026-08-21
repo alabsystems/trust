@@ -892,6 +892,24 @@ fn build_upstream_tests_command(
     root: &Path,
     args: &[String],
 ) -> Vec<String> {
+    // Trust: a Targo driver requires an explicit lane on every COMPILATION
+    // command, and `run` is one — a bare `targo run` refuses rather than
+    // create an implicitly unverified artifact. The porting engine is build
+    // infrastructure, not a proof subject, so the honest lane is
+    // `--unverified`, injected HERE (the run dispatch) and only here: the
+    // `--locked` metadata preflight above uses the same driver and a
+    // non-compilation `targo --unverified metadata` is itself an error, which
+    // is why the flag cannot ride the driver string. Measured 2026-08-20:
+    // without this, `targo trust domination upstream-tests` was unrunnable
+    // from a stage2 targo — the branded refusal on one side, the
+    // metadata-arg refusal on the other. Plain-cargo drivers take no flag.
+    if cargo_driver
+        .first()
+        .and_then(|program| Path::new(program).file_stem())
+        .is_some_and(|stem| stem.to_string_lossy().starts_with("targo"))
+    {
+        cargo_driver.push("--unverified".to_string());
+    }
     cargo_driver.extend([
         "run".to_string(),
         "--manifest-path".to_string(),

@@ -1,0 +1,269 @@
+{
+  "name": "mul_assign",
+  "def_path": "<main::bytesize::ByteSize as core::ops::arith::MulAssign<u64>>::mul_assign",
+  "span": {
+    "file": "/var/folders/t8/f940w1lj2dv2l9bmn9ccj3200000gn/T/tmp.CETwYNnKVP/bytesize-1.3.0/src/lib.rs",
+    "line_start": 292,
+    "col_start": 4,
+    "line_end": 294,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "main::bytesize::ByteSize",
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "rhs"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<u64 as core::convert::Into<u64>>::into",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "/var/folders/t8/f940w1lj2dv2l9bmn9ccj3200000gn/T/tmp.CETwYNnKVP/bytesize-1.3.0/src/lib.rs",
+              "line_start": 293,
+              "col_start": 18,
+              "line_end": 293,
+              "col_end": 28
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Mul",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        "Deref",
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "/var/folders/t8/f940w1lj2dv2l9bmn9ccj3200000gn/T/tmp.CETwYNnKVP/bytesize-1.3.0/src/lib.rs",
+                "line_start": 293,
+                "col_start": 8,
+                "line_end": 293,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Mul"
+            },
+            "target": 2,
+            "span": {
+              "file": "/var/folders/t8/f940w1lj2dv2l9bmn9ccj3200000gn/T/tmp.CETwYNnKVP/bytesize-1.3.0/src/lib.rs",
+              "line_start": 293,
+              "col_start": 8,
+              "line_end": 293,
+              "col_end": 35
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "/var/folders/t8/f940w1lj2dv2l9bmn9ccj3200000gn/T/tmp.CETwYNnKVP/bytesize-1.3.0/src/lib.rs",
+                "line_start": 293,
+                "col_start": 8,
+                "line_end": 293,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "rhs",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "rhs",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

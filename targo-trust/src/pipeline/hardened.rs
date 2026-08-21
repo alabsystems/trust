@@ -243,6 +243,45 @@ pub(crate) fn partition_outcome_counts(
             continue;
         }
 
+        // Trust (D2 part B): a row whose violation formula CONSUMED the bridge's
+        // entry `Assume(resume_state ∈ live_states)` without being one of the
+        // marked sentinel rows the contract describes. The compiler stamps this
+        // kind onto the row ITSELF — that is the link that was missing. Before
+        // D2 the whole-function panic-freedom aggregate reached here with
+        // `kind: "assert"` and `outcome: "proved"`, carrying a `Certified`
+        // grade and a CIC term byte-identical to the sentinel row's ex-falso
+        // derivation, and nothing connected it to the sibling
+        // `contract:coroutine-resume-state` row that held the conditionality —
+        // so it was counted as ordinary proof credit.
+        //
+        // Conditional evidence shares the `assumed` bucket with the assumption
+        // ledger and the published contract row; the distinct kind preserves the
+        // row's identity (the original kind survives after the prefix). Same
+        // fail-closed clause as its neighbours: the compiler strips
+        // `proof_evidence` and drops the outcome to `skipped` when it stamps
+        // this, so a row that still CLAIMS proof is a transport defect and
+        // counts as a genuine unknown.
+        if trust_types::assumption::is_coroutine_resume_conditional_row_kind(&result.kind) {
+            if result.outcome.is_proved() || result.outcome.is_runtime_checked() {
+                let subject = if result.function.is_empty() {
+                    result.kind.as_str()
+                } else {
+                    result.function.as_str()
+                };
+                counts.unknown += 1;
+                defects.push(format!(
+                    "transport defect: `{}` row for `{subject}` claims {} — an obligation \
+                     discharged under the coroutine resume-state entry assumption is conditional \
+                     evidence and carries no proof; counting it as a genuine unknown",
+                    result.kind,
+                    result.outcome.label(),
+                ));
+            } else {
+                counts.assumed += 1;
+            }
+            continue;
+        }
+
         // Trust (T9 contract-panic): the compiler's rewrite of an annotated,
         // message-matched FAILED panic row. Counted into its own always-visible
         // bucket. Classified by the SINGLE SOURCE OF TRUTH

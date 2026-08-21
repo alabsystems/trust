@@ -46,10 +46,27 @@ fn stable_json_sha256<T: Serialize>(value: &T) -> Option<String> {
     serde_json::to_vec(value).ok().map(|bytes| stable_sha256_hex(&bytes))
 }
 
+/// The canonical VC digest — trust-symex's spelling of targo-trust's
+/// `canonical_vc_bytes` rule (`verify_binary_evidence/digests.rs`).
+///
+/// This deliberately routes through [`trust_types::stable_model_json_bytes`]
+/// rather than `stable_json_sha256` above. A hash domain that spells its own
+/// `serde_json` re-serializes every future additive `#[serde(default)]
+/// Option<_>` field as `,"<key>":null` and moves already-recorded VC digests
+/// for a change that carries no information — `VerificationCondition::
+/// obligation` did exactly that to the checked-in x86_64 load replay golden.
+/// The canonical form omits those defaults and keeps every `Some`
+/// hash-visible, so a populated obligation record is still part of VC
+/// identity while an undeclared one stays invisible, as it was before the
+/// field existed.
+fn canonical_vc_sha256(vc: &VerificationCondition) -> Option<String> {
+    trust_types::stable_model_json_bytes(vc).ok().map(|bytes| stable_sha256_hex(&bytes))
+}
+
 fn binary_witness_verification_context(
     vc: &VerificationCondition,
 ) -> Option<BinaryWitnessVerificationContext> {
-    let vc_digest = stable_json_sha256(vc)?;
+    let vc_digest = canonical_vc_sha256(vc)?;
     let kind = serde_json::to_string(&vc.kind).unwrap_or_else(|_| format!("{:?}", vc.kind));
     Some(BinaryWitnessVerificationContext {
         vc_digest,
@@ -8759,6 +8776,50 @@ mod tests {
             contract_metadata: None,
             obligation: None,
         }
+    }
+
+    /// Mutation control for [`canonical_vc_sha256`], in both directions.
+    ///
+    /// Forward: the canonical digest must differ from a raw `serde_json` digest
+    /// for an obligation-less VC — i.e. the `,"obligation":null` strip is
+    /// actually active, so swapping the digest back to plain serialization
+    /// (the drift that moved the checked-in x86_64 load replay golden) fails
+    /// here first. Converse: the strip must never widen into erasure — a VC
+    /// carrying a REAL obligation record is a different object from the same
+    /// VC without one and must not share its digest.
+    #[test]
+    fn canonical_vc_digest_strips_the_default_obligation_and_keeps_a_real_record_visible() {
+        let base = VerificationCondition {
+            kind: VcKind::Unreachable,
+            function: "binary::digest_pin".into(),
+            location: span(),
+            formula: Formula::Bool(false),
+            contract_metadata: None,
+            obligation: None,
+        };
+
+        assert_ne!(
+            canonical_vc_sha256(&base),
+            stable_json_sha256(&base),
+            "an obligation-less VC must hash WITHOUT the `\"obligation\":null` fragment; \
+             equal digests mean the canonicalizer is no longer routed through \
+             trust_types::stable_model_json_bytes"
+        );
+
+        let declared = VerificationCondition {
+            obligation: Some(trust_types::ObligationRecord {
+                body: Formula::Bool(false),
+                wrappers: Vec::new(),
+                subject: None,
+                width: None,
+            }),
+            ..base.clone()
+        };
+        assert_ne!(
+            canonical_vc_sha256(&declared),
+            canonical_vc_sha256(&base),
+            "a populated obligation record is part of VC identity and must move the digest"
+        );
     }
 
     fn function(blocks: Vec<BasicBlock>) -> VerifiableFunction {

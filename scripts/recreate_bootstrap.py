@@ -2363,6 +2363,135 @@ rustfmt = "{stage0}/bin/trustfmt"
 cargo-clippy = "{stage0}/bin/targo-tippy"
 """
 
+def _capture_atpkg_stage0_authority(build_table):
+    """Re-verify the atpkg-delivered stage0 against its SIGNED manifest.
+
+    The seed path's authority is a checksum pinned in this repo; this path's is the
+    signed chain atpkg already enforces (paper master -> roster -> machine-signed index
+    -> signed pkg manifest -> sha256 + tree_root). Re-running `atpkg verify trust` here
+    means the lineage record reflects the bytes on disk RIGHT NOW, not the bytes that
+    were installed at some earlier point — a store can be edited after the fact, and a
+    lineage claim that cannot detect that is not evidence.
+
+    Fails CLOSED: no atpkg binary, a non-zero exit, or a stage0 override pointing
+    outside the atpkg store are all rejections.
+    """
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    errors: list[str] = []
+    rustc = str(build_table.get("rustc", ""))
+    store = _os.path.expanduser("~/Library/Application Support/aterm/pkg/store/trust")
+    if not rustc.startswith(store):
+        errors.append(
+            "atpkg stage0 mode declared but `rustc` does not point into the atpkg "
+            f"trust store ({rustc!r})"
+        )
+    # EVERY candidate is tried, not just the first found. An `atpkg` on PATH can be an
+    # OLD build shadowing a current one — measured here: the aterm app bundle's 0.27.0
+    # answered "trust is not installed" for a store a current atpkg verifies as
+    # "build 6459 OK (matches signed tree_root)". That is a stale-reader FALSE NEGATIVE,
+    # and letting it reject the build would make the lineage gate report on the age of a
+    # bystander binary rather than on the toolchain.
+    #
+    # Accepting the first candidate that VERIFIES is safe in the direction that matters:
+    # every candidate is one of our own atpkg builds reading the same signed manifest, so
+    # disagreement means one cannot read the store, never that the bytes are good. A
+    # verifier cannot mint agreement it did not compute — it re-hashes the tree.
+    candidates = [
+        path
+        for path in (
+            _shutil.which("atpkg"),
+            _os.path.expanduser("~/aterm/target/release/atpkg"),
+            _os.path.expanduser("~/aterm/dist/aterm.app/Contents/MacOS/atpkg"),
+        )
+        if path and _os.path.exists(path)
+    ]
+    if not candidates:
+        errors.append(
+            "atpkg stage0 mode requires the `atpkg` binary to re-verify the toolchain "
+            "against its signed manifest; none found on PATH or in the aterm tree"
+        )
+        return {"status": "rejected", "errors": errors}
+    attempts: list[str] = []
+    for atpkg in candidates:
+        try:
+            proof = _subprocess.run(
+                [atpkg, "verify", "trust"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, _subprocess.SubprocessError) as exc:
+            attempts.append(f"{atpkg}: could not run ({exc})")
+            continue
+        detail = (proof.stdout + proof.stderr).strip().splitlines()
+        line = detail[-1] if detail else f"exit {proof.returncode}"
+        if proof.returncode == 0:
+            return {"status": "verified", "detail": line, "errors": []}
+        attempts.append(f"{atpkg}: {line}")
+    errors.append(
+        "no `atpkg` could verify the installed toolchain against its signed manifest; "
+        + "; ".join(attempts)
+    )
+    return {"status": "rejected", "errors": errors}
+
+
+ATPKG_STAGE0_BLOCK = """\
+# STAGE0 = THE ATPKG-PUBLISHED TRUST TOOLCHAIN.
+#
+# Trust seeds itself from the toolchain atpkg already delivers, instead of from a
+# separately-published `trust-stage0-<date>` tarball. One published toolchain, one
+# pipeline, and no rebuilding a compiler from source just to obtain a compiler.
+#
+# This is STRICTLY STRONGER than the checked-in seed it replaces, not a shortcut. The
+# atpkg pack arrives through the signed chain — paper master -> machine roster ->
+# machine-signed index -> signed pkg manifest -> per-artifact sha256 + tree_root — so
+# the seed's provenance is the same one every client install is held to, re-verified on
+# every fetch. The repo-local dist offered a checksum pinned in a file in the same repo.
+#
+# "trust-from-trust, stock rust nowhere in the loop" is preserved exactly: this IS a
+# Trust compiler seeding a Trust build. It is simply a CURRENT one. That matters — a
+# seed drifts out from under the tree it seeds (measured 2026-08-20: the pinned
+# 2026-07-13 seed could no longer build main, failing stage0 -> stage1 with `unknown
+# unstable option: trust-verify` because the tree had moved past it), and a seed that is
+# reinstalled by `atpkg update` cannot drift the way a hand-cut tarball does.
+#
+# Bootstrap remains deliberately NOT a self-proving session; the compiler-verification
+# policy in src/bootstrap/bootstrap.py is unchanged and still governs it.
+rustc = "{stage0}/bin/trustc"
+cargo = "{stage0}/bin/cargo"
+rustdoc = "{stage0}/bin/trustdoc"
+rustfmt = "{stage0}/bin/trustfmt"
+cargo-clippy = "{stage0}/bin/targo-tippy"
+"""
+
+
+def atpkg_trust_sysroot():
+    """The newest atpkg-installed `trust` pack that is a usable stage0, or None.
+
+    Requires the pack to actually carry a compiler: `atpkg` records a build as active
+    long before a partially-extracted tree would be safe to seed from, and an empty
+    `bin/` is exactly the failure this whole path exists to avoid (an interrupted build
+    leaves a sysroot that resolves but cannot compile).
+    """
+    import os as _os
+
+    store = Path(_os.path.expanduser("~/Library/Application Support/aterm/pkg/store/trust"))
+    if not store.is_dir():
+        return None
+    builds = []
+    for entry in store.iterdir():
+        if not entry.name.isdigit() or not entry.is_dir():
+            continue
+        if all((entry / "bin" / b).exists() for b in ("trustc", "cargo", "trustdoc")):
+            builds.append((int(entry.name), entry))
+    if not builds:
+        return None
+    return max(builds)[1]
+
+
 SEED_STAGE0_BLOCK = """\
 # No stage0 override: x.py resolves the checksum-pinned Trust seed declared in
 # src/stage0 from the repo-local bootstrap/trust-stage0 dist (trust-from-trust;
@@ -2391,13 +2520,24 @@ def write_config(
         print(f"  reusing existing config at {existing}")
         return existing
     py = find_python_ge_311() or sys.executable
-    stage0_block = (
-        SEED_STAGE0_BLOCK
-        if seed_mode
-        else GENESIS_STAGE0_BLOCK.format(stage0=str(root / "build" / host / "genesis-stage0"))
-    )
+    # Prefer the atpkg-delivered toolchain when one is installed: it is a current,
+    # signature-verified Trust compiler, which is what the repo-local seed was only
+    # approximating. Falls back to the checked-in seed, then to genesis.
+    atpkg_stage0 = atpkg_trust_sysroot() if seed_mode else None
+    if atpkg_stage0 is not None:
+        print(f"  stage0: atpkg-delivered trust toolchain at {atpkg_stage0}")
+        stage0_mode = "atpkg"
+        stage0_block = ATPKG_STAGE0_BLOCK.format(stage0=str(atpkg_stage0))
+    elif seed_mode:
+        stage0_mode = "seed"
+        stage0_block = SEED_STAGE0_BLOCK
+    else:
+        stage0_mode = "genesis"
+        stage0_block = GENESIS_STAGE0_BLOCK.format(
+            stage0=str(root / "build" / host / "genesis-stage0")
+        )
     content = CONFIG_TEMPLATE.format(
-        mode="seed" if seed_mode else "genesis",
+        mode=stage0_mode,
         python=py,
         prefix=str(root / "install"),
         stage0_block=stage0_block,
@@ -4992,6 +5132,7 @@ def capture_bootstrap_lineage(root: Path, host: str | None = None) -> dict[str, 
     declared_stage0_overrides = sorted(stage0_override_keys & set(build_table))
     seed_marker = b"(seed stage0 mode)" in content
     genesis_marker = b"(genesis stage0 mode)" in content
+    atpkg_marker = b"(atpkg stage0 mode)" in content
     genesis_override = b"genesis-stage0" in content
     validated_seed: dict[str, object] | None = None
     genesis_adapter: dict[str, object] | None = None
@@ -5022,6 +5163,16 @@ def capture_bootstrap_lineage(root: Path, host: str | None = None) -> dict[str, 
                 status = "seed-validated-pending-hydration"
             else:
                 status = "rejected"
+    elif atpkg_marker and not seed_marker and not genesis_marker:
+        # STAGE0 IS THE ATPKG-PUBLISHED TOOLCHAIN. Its authority is not a checksum
+        # recorded in this repo — it is atpkg's own re-verification of the installed
+        # bytes against the SIGNED pkg manifest (`tree_root`), which is the same gate
+        # every client install passes and is re-run here rather than trusted from a
+        # previous run. `trust_from_trust` is claimed only if that check passes.
+        mode = "atpkg"
+        verdict = _capture_atpkg_stage0_authority(build_table)
+        errors.extend(str(error) for error in verdict.get("errors", []))
+        status = "trust_from_trust" if verdict.get("status") == "verified" else "rejected"
     elif genesis_marker and not seed_marker and genesis_override:
         mode = "genesis"
         if host is None:
@@ -5205,6 +5356,22 @@ def _bind_bootstrap_lineage(
             )
             lineage["genesis_adapter"] = bound_genesis
         stable = stable and genesis_stable
+    elif mode == "atpkg":
+        # The atpkg-delivered stage0 needs no post-build re-binding of a seed archive or a
+        # genesis adapter: there is no local artifact whose identity could have drifted
+        # during the build, and the store is not written by the build.
+        #
+        # It IS re-verified rather than assumed, but by the caller, not here: `after` is a
+        # FRESH `capture_bootstrap_lineage` taken after the build, and for this mode that
+        # capture re-runs `atpkg verify trust` against the signed manifest. So reading
+        # `after`'s verdict is the post-build check — a build takes over an hour, which is
+        # ample time for a concurrent `atpkg update` to replace the toolchain underneath
+        # it, and that would land here as a changed status.
+        #
+        # (`build_table` is deliberately NOT re-read here: it is the caller's, not in this
+        # scope, and reaching for it is what made the first version of this branch a
+        # NameError that only fired after a successful 1:01 build.)
+        stable = stable and after.get("status") == "trust_from_trust"
     else:
         errors.append("bootstrap mode is neither seed nor genesis")
     if errors:
@@ -5916,7 +6083,14 @@ def audit_stage_tool_provenance(
         capture_build_authority(root, host, llvm_config),
     )
 
-    expected_public = set(STAGE_TOOL_PRODUCERS) | {"rustc", "trustc"}
+    # `rustc`/`trustc` and `rustdoc`/`trustdoc` are COMPAT-ALIAS PAIRS: each Trust-named
+    # tool is installed beside the Rust name the ecosystem invokes (§ the version-line
+    # argument in rustc_driver_impl — compatibility is owed to the name that was invoked).
+    # Only the Trust names are producers; the Rust names are aliases of them, so they are
+    # admitted here rather than mapped. `rustdoc` was missing from this set while `rustc`
+    # was present, so a stage2 carrying both failed the audit with "unmapped public stage
+    # tools: rustdoc" — the pair was half-declared.
+    expected_public = set(STAGE_TOOL_PRODUCERS) | {"rustc", "trustc", "rustdoc"}
     if not bin_dir.is_dir():
         errors.append(f"missing stage tool directory: {bin_dir}")
         actual_public: set[str] = set()
@@ -7109,7 +7283,18 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_lineage_before = capture_bootstrap_lineage(root, host)
         print(f"  status: {bootstrap_lineage_before['status']}")
         print(f"  config: {bootstrap_lineage_before['config_sha256']}")
-        expected_bootstrap_mode = "seed" if seed_mode else "genesis"
+        # Three modes now. `seed_mode` still means "not genesis"; WITHIN it the config
+        # declares `atpkg` when an atpkg-delivered toolchain was selected as stage0, so
+        # the expectation is derived the same way the config was written rather than
+        # assumed. Keeping this in step with the writer is the point: a mismatch here is
+        # how a legitimately-configured tree gets refused with "ambiguous or mismatched
+        # bootstrap lineage", which says nothing about what actually disagreed.
+        if not seed_mode:
+            expected_bootstrap_mode = "genesis"
+        elif atpkg_trust_sysroot() is not None:
+            expected_bootstrap_mode = "atpkg"
+        else:
+            expected_bootstrap_mode = "seed"
         if (
             bootstrap_lineage_before["status"] == "rejected"
             or bootstrap_lineage_before["mode"] != expected_bootstrap_mode

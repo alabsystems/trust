@@ -43,6 +43,7 @@ use std::collections::{HashMap, HashSet};
 use ay::{BigInt, Logic, Solver, Term};
 use trust_disasm::{Condition, Opcode, decode_aarch64};
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::grade::GradeRecord;
 use trust_types::{
     BinOp, BlockId, ConstValue, Formula, Operand, Place, Projection, RoundingMode, Rvalue, Sort,
     Statement, Terminator, Ty, UnOp, VerifiableFunction,
@@ -132,8 +133,11 @@ pub enum ProvenEvidence {
     /// clean, because the encoder is Rust.
     ///
     /// The residual travels with the verdict rather than living in a comment:
-    /// this maps to `GradeRecord::cited_kernel_theorem`, whose named closure
-    /// caps the projection at `Trusted`. It can never read as `Certified`.
+    /// the `grade` field CARRIES a real `GradeRecord::cited_kernel_theorem`
+    /// (2026-08-20 carrier increment — this is the first production
+    /// constructor of that record that does not immediately collapse to its
+    /// legacy projection), whose named closure caps the projection at
+    /// `Trusted`. It can never read as `Certified`.
     ///
     /// ON BY DEFAULT (owner decision, 2026-08-16). `TCG_CITE_WIDE_MUL=0`
     /// restores the previous behaviour.
@@ -149,6 +153,14 @@ pub enum ProvenEvidence {
         residual: &'static str,
         /// Operand width of the cited multiply.
         width: u32,
+        /// The typed §7 grade this citation carries through the pipeline:
+        /// `GradeRecord::cited_kernel_theorem(theorem, residual)`, minted at
+        /// the same site as the citation itself (see
+        /// `structural_citation_evidence`, which is the ONLY constructor, so
+        /// the record and the string fields cannot drift apart). Additive:
+        /// classification, counting, and `StrictProvenOnly` refusal still key
+        /// on the variant, never on this record.
+        grade: GradeRecord,
     },
     /// A zero-trust bit-blast certificate kernel-re-checkable by clean's
     /// `certify_unsat_by_reflection` to Unsat with empty domain axioms. This is
@@ -210,7 +222,39 @@ pub enum ProvenEvidence {
     },
 }
 
+impl ProvenEvidence {
+    /// The typed §7 [`GradeRecord`] this evidence CARRIES, if the R-U grade
+    /// migration has threaded one through this variant.
+    ///
+    /// This increment (2026-08-20), only [`ProvenEvidence::StructuralCitation`]
+    /// carries a record — a `GradeRecord::cited_kernel_theorem` naming the
+    /// cited theorem and the unproved residual. Every other variant returns
+    /// `None`: deriving a record here for the kernel/[VALIDATED] grades would
+    /// be minting a claim at a read accessor rather than carrying one from the
+    /// evidence's production site, which is exactly the shape the migration
+    /// exists to remove. Additive: nothing in classification or policy reads
+    /// this — the legacy surfaces are unchanged.
+    #[must_use]
+    pub fn carried_grade(&self) -> Option<&GradeRecord> {
+        match self {
+            ProvenEvidence::StructuralCitation { grade, .. } => Some(grade),
+            _ => None,
+        }
+    }
+}
+
 impl OutputVerdict {
+    /// The typed §7 [`GradeRecord`] carried by this verdict's evidence, if
+    /// any — see [`ProvenEvidence::carried_grade`]. `None` for Refuted,
+    /// Unknown, and every Proven evidence the migration has not yet threaded.
+    #[must_use]
+    pub fn carried_grade(&self) -> Option<&GradeRecord> {
+        match self {
+            OutputVerdict::Proven { evidence } => evidence.carried_grade(),
+            _ => None,
+        }
+    }
+
     /// True iff this is a `Proven` verdict (either grade). Enforcement
     /// (`emit_objects_verified`) emits on this; the GRADE ([PROVED] vs
     /// [VALIDATED]) is read off [`OutputVerdict::Proven`]'s `evidence`.
@@ -532,14 +576,29 @@ pub(crate) fn try_kernel_recheckable_proof(
     if cite_wide_mul_enabled() {
         let width = wide_mul_width_for_citation(machine_out, auto);
         if width > MAX_RECHECKABLE_MUL_WIDTH {
-            return Some(ProvenEvidence::StructuralCitation {
-                theorem: CITED_MUL_THEOREM,
-                residual: CITED_MUL_RESIDUAL,
-                width,
-            });
+            return Some(structural_citation_evidence(width));
         }
     }
     None
+}
+
+/// The ONLY constructor of [`ProvenEvidence::StructuralCitation`] — the mint
+/// site of the citation's carried [`GradeRecord`].
+///
+/// The record is built through `GradeRecord::cited_kernel_theorem` from the
+/// SAME constants as the variant's string fields, so the typed grade and the
+/// human-readable fields cannot drift apart (pinned by
+/// `tests/wide_mul_citation_grade.rs`). By that constructor's own contract the
+/// record's closure NAMES the theorem and the residual and the grade can never
+/// read as `Certified`.
+#[cfg(feature = "ay-proofs")]
+fn structural_citation_evidence(width: u32) -> ProvenEvidence {
+    ProvenEvidence::StructuralCitation {
+        theorem: CITED_MUL_THEOREM,
+        residual: CITED_MUL_RESIDUAL,
+        width,
+        grade: GradeRecord::cited_kernel_theorem(CITED_MUL_THEOREM, CITED_MUL_RESIDUAL),
+    }
 }
 
 /// The widest `Mul` in either side of the obligation, or 0 when the obligation

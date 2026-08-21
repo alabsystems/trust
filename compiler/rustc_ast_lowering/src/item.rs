@@ -256,8 +256,17 @@ impl<'hir> LoweringContext<'_, 'hir> {
             // Declaration spans are lowered like any other span. `content_span`
             // stays the anchor for Clean's island-relative diagnostics.
             ItemKind::CleanIsland(island) => {
+                // Trust (I5): `node_id` is resolution-time identity and is reset
+                // here. A `NodeId` is not stable across compilations — its own
+                // `StableHash` impl panics — and nothing on the HIR side reads
+                // these decls, so carrying one into the HIR would be dead data
+                // that only invites an incremental-correctness bug.
                 let decls = self.arena.alloc_from_iter(island.decls.iter().map(|decl| {
-                    ast::CleanIslandDecl { span: self.lower_span(decl.span), ..*decl }
+                    ast::CleanIslandDecl {
+                        span: self.lower_span(decl.span),
+                        node_id: ast::DUMMY_NODE_ID,
+                        ..*decl
+                    }
                 }));
                 hir::ItemKind::CleanIsland {
                     content_span: self.lower_span(island.content_span),

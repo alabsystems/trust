@@ -11,6 +11,10 @@ use rustc_ast_pretty::pprust;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, PResult, StashKey, msg, struct_span_code_err};
 use rustc_session::lint::builtin::VARARGS_WITHOUT_PATTERN;
+// Trust (I8): `trust_clean_decls_from_text` is a free function shared with the
+// out-of-line `.clean` unit loader (via `crate::trust_parse_clean_unit_decls`),
+// so it takes the session explicitly rather than through `Parser`.
+use rustc_session::parse::ParseSess;
 use rustc_span::edit_distance::edit_distance;
 use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Ident, Span, Symbol, kw, respan, sym};
@@ -88,6 +92,129 @@ fn clean_decl_kind_and_name(decl: &clean_parser::SurfaceDecl) -> (CleanDeclKind,
     }
 }
 
+/// Trust: parse Clean source TEXT with the REAL Clean parser and hand back the
+/// recognised top-level declarations, reporting any Clean *syntax* error as an
+/// ordinary rustc diagnostic spanned inside `content_span`.
+///
+/// One function, two callers, deliberately (I8): the inline `clean { … }`
+/// island (`Parser::parse_clean_island`, `unit == None`) and the out-of-line
+/// `.clean` unit loader (`crate::trust_parse_clean_unit_decls`, called from
+/// `rustc_expand`'s module loader at the `ModKind::Unloaded` seam,
+/// `unit == Some(name)`). I8's acceptance control — a `.clean` unit and an
+/// inline island must produce identical graph entries — starts here: the two
+/// forms share one parse, one span remap, and one payload shape, and differ
+/// only in the diagnostic wording.
+///
+/// `parse_file_with_tactics_located` is the same strict entry point the
+/// verify pass uses: it rejects parser-recovery placeholders (a proof
+/// consumer must never mistake a recovered `RawDecl` for accepted source) and
+/// reports one unambiguous absolute byte offset.
+///
+/// The tactic-pattern table is EMPTY here, whereas the verify pass passes
+/// `clean_elab`'s builtin table. That is deliberate: pulling the whole Clean
+/// elaborator into `rustc_parse` to share the table is not a dependency this
+/// crate should carry. The table only affects how argument-pattern-aware
+/// named tactics inside `by …` blocks are split, so the two parses can
+/// disagree on tactic-heavy proofs. This lane is therefore SYNTAX-ONLY in
+/// both directions: the decls recorded here are not what the kernel sees, and
+/// the verify pass re-parses with its own table regardless of what happened
+/// here.
+pub(crate) fn trust_clean_decls_from_text(
+    psess: &ParseSess,
+    content_span: Span,
+    text: &str,
+    unit: Option<Ident>,
+) -> ThinVec<CleanIslandDecl> {
+    // Map a Clean island-relative byte range onto rustc coordinates. Same
+    // arithmetic the verify pass uses for Clean's own diagnostics, so a
+    // parse-time span and a kernel-time span point at the same bytes. For a
+    // `.clean` unit, `content_span` covers the unit file's own `SourceFile`,
+    // so a remapped span lands in that file at the right line — which is the
+    // entire point of loading the unit as a real `SourceFile`.
+    let remap = |start: usize, end: usize| -> Span {
+        let start = start.min(text.len());
+        let end = end.max(start).min(text.len());
+        let lo = content_span.lo() + rustc_span::BytePos(start as u32);
+        let mut hi = content_span.lo() + rustc_span::BytePos(end as u32);
+        if hi == lo && lo < content_span.hi() {
+            hi = lo + rustc_span::BytePos(1);
+        }
+        content_span.with_lo(lo).with_hi(hi)
+    };
+
+    let patterns = clean_parser::TacticPatterns::new();
+    let parsed = match clean_parser::parse_file_with_tactics_located(text, &patterns) {
+        Ok(decls) => decls,
+        Err(err) => {
+            let span = remap(err.byte_offset, err.byte_offset);
+            match unit {
+                None => {
+                    psess
+                        .dcx()
+                        .struct_span_err(span, format!("Clean island failed to parse: {err}"))
+                        .with_note(
+                            "`clean { … }` is a real parser island: the body is Clean (Lean) \
+                             source and is parsed by the Clean parser during rustc's own parse, \
+                             so this is a syntax error, not a failed proof"
+                                .to_string(),
+                        )
+                        .with_help(
+                            "options: fix the Clean syntax at the marked position; move the \
+                             declaration into a `.clean` file and `import` it; or, if the text is \
+                             meant to be Rust, drop the `clean` keyword so it parses as ordinary \
+                             items"
+                                .to_string(),
+                        )
+                        .emit();
+                }
+                Some(name) => {
+                    // Trust (I8): same failure, unit wording — the marked
+                    // position is inside the `.clean` file itself, because
+                    // `content_span` is the unit file's own `SourceFile` range.
+                    psess
+                        .dcx()
+                        .struct_span_err(
+                            span,
+                            format!("Clean unit `{name}.clean` failed to parse: {err}"),
+                        )
+                        .with_note(
+                            "`clean mod …;` names an out-of-line compilation unit: the whole \
+                             file is Clean (Lean) source and is parsed by the real Clean parser \
+                             when the unit is loaded, so this is a syntax error, not a failed \
+                             proof"
+                                .to_string(),
+                        )
+                        .with_help(
+                            "options: fix the Clean syntax at the marked position; or move the \
+                             declarations into the including file as an inline `clean { … }` \
+                             island"
+                                .to_string(),
+                        )
+                        .emit();
+                }
+            }
+            return ThinVec::new();
+        }
+    };
+
+    parsed
+        .iter()
+        .map(|decl| {
+            let (kind, name) = clean_decl_kind_and_name(decl);
+            let span = decl.span();
+            // Trust (I5): `DUMMY_NODE_ID` here is the normal parser
+            // contract, not a placeholder — `InvocationCollector::visit_id`
+            // renumbers it during expansion, before def collection.
+            CleanIslandDecl {
+                kind,
+                name,
+                span: remap(span.start, span.end),
+                node_id: DUMMY_NODE_ID,
+            }
+        })
+        .collect()
+}
+
 impl<'a> Parser<'a> {
     /// Parses a source module as a crate. This is the main entry point for the parser.
     pub fn parse_crate_mod(&mut self) -> PResult<'a, ast::Crate> {
@@ -130,76 +257,91 @@ impl<'a> Parser<'a> {
                 content_span,
                 text: sym::empty,
                 decls: ThinVec::new(),
+                unloaded_unit: None,
             }));
         };
 
-        // Map a Clean island-relative byte range onto rustc coordinates. Same
-        // arithmetic the verify pass uses for Clean's own diagnostics, so a
-        // parse-time span and a kernel-time span point at the same bytes.
-        let remap = |start: usize, end: usize| -> Span {
-            let start = start.min(text.len());
-            let end = end.max(start).min(text.len());
-            let lo = content_span.lo() + rustc_span::BytePos(start as u32);
-            let mut hi = content_span.lo() + rustc_span::BytePos(end as u32);
-            if hi == lo && lo < content_span.hi() {
-                hi = lo + rustc_span::BytePos(1);
-            }
-            content_span.with_lo(lo).with_hi(hi)
-        };
-
-        // `parse_file_with_tactics_located` is the same strict entry point the
-        // verify pass uses: it rejects parser-recovery placeholders (a proof
-        // consumer must never mistake a recovered `RawDecl` for accepted
-        // source) and reports one unambiguous absolute byte offset.
-        //
-        // The tactic-pattern table is EMPTY here, whereas the verify pass
-        // passes `clean_elab`'s builtin table. That is deliberate: pulling the
-        // whole Clean elaborator into `rustc_parse` to share the table is not
-        // a dependency this crate should carry. The table only affects how
-        // argument-pattern-aware named tactics inside `by …` blocks are split,
-        // so the two parses can disagree on tactic-heavy proofs. This lane is
-        // therefore SYNTAX-ONLY in both directions: the decls recorded here
-        // are not what the kernel sees, and the verify pass re-parses with its
-        // own table regardless of what happened here.
-        let patterns = clean_parser::TacticPatterns::new();
-        let parsed = match clean_parser::parse_file_with_tactics_located(&text, &patterns) {
-            Ok(decls) => decls,
-            Err(err) => {
-                let span = remap(err.byte_offset, err.byte_offset);
-                self.dcx()
-                    .struct_span_err(span, format!("Clean island failed to parse: {err}"))
-                    .with_note(
-                        "`clean { … }` is a real parser island: the body is Clean (Lean) \
-                         source and is parsed by the Clean parser during rustc's own parse, \
-                         so this is a syntax error, not a failed proof"
-                            .to_string(),
-                    )
-                    .with_help(
-                        "options: fix the Clean syntax at the marked position; move the \
-                         declaration into a `.clean` file and `import` it; or, if the text is \
-                         meant to be Rust, drop the `clean` keyword so it parses as ordinary \
-                         items"
-                            .to_string(),
-                    )
-                    .emit();
-                Vec::new()
-            }
-        };
-
-        let decls = parsed
-            .iter()
-            .map(|decl| {
-                let (kind, name) = clean_decl_kind_and_name(decl);
-                let span = decl.span();
-                CleanIslandDecl { kind, name, span: remap(span.start, span.end) }
-            })
-            .collect();
+        // Trust (I8): one shared parse for both island forms — the same free
+        // function the out-of-line `.clean` unit loader calls, so the two
+        // spellings cannot drift.
+        let decls = trust_clean_decls_from_text(&self.psess, content_span, &text, None);
 
         ItemKind::CleanIsland(Box::new(CleanIsland {
             content_span,
             text: Symbol::intern(&text),
             decls,
+            unloaded_unit: None,
         }))
+    }
+
+    /// Trust (I8): parse `clean mod name;` — the OUT-OF-LINE Clean compilation
+    /// unit form of the `clean { … }` island. Grammar-space is free for the
+    /// same reason the island's is: vanilla Rust rejects an item beginning
+    /// `ident ident` ("expected item"), so no valid program changes meaning.
+    ///
+    /// The parser deliberately does NOT load `name.clean` here. Out-of-line
+    /// Rust modules load during EXPANSION (`rustc_expand::module`), not during
+    /// the initial parse, and the unit rides the exact same seam so that
+    /// `#[cfg]`-stripped units are never demanded from disk and the directory
+    /// state used to resolve the file (`ModuleData` + `DirOwnership`,
+    /// including `#[path]`) is the real one rather than a parser-side
+    /// approximation. The pending state is carried on the island node itself
+    /// — `unloaded_unit: Some(name)` with the inert empty-island payload —
+    /// and `rustc_expand` replaces the payload with the loaded file's before
+    /// def collection ever sees the item.
+    ///
+    /// `clean mod name { … }` is refused with options (ruling v7/D3): the
+    /// braced body belongs either to an inline island or to the `.clean`
+    /// file, and guessing which would silently pick a semantics.
+    fn parse_clean_mod_unit(&mut self) -> PResult<'a, ItemKind> {
+        self.bump(); // `clean`
+        self.expect_keyword(exp!(Mod))?;
+        let ident = self.parse_ident()?;
+
+        if self.token == token::OpenBrace {
+            self.dcx()
+                .struct_span_err(
+                    self.token.span,
+                    format!(
+                        "`clean mod {ident}` takes no braced body: a Clean unit's \
+                         declarations live in `{ident}.clean`"
+                    ),
+                )
+                .with_note(
+                    "`clean { … }` is the inline island form and `clean mod name;` is the \
+                     out-of-line form; there is no form that names a unit AND carries a body"
+                        .to_string(),
+                )
+                .with_help(format!(
+                    "options: write `clean mod {ident};` and move the body to \
+                     `{ident}.clean`; drop `mod {ident}` to make this an inline \
+                     `clean {{ … }}` island in this module (declarations land in the \
+                     enclosing module either way); or, if you meant a Rust module \
+                     containing Clean, write `mod {ident} {{ clean {{ … }} }}`"
+                ))
+                .emit();
+            // Recover by consuming the braced body; the item becomes an inert
+            // empty island so parsing continues past it.
+            let _ = self.parse_token_tree();
+            return Ok(ItemKind::CleanIsland(Box::new(CleanIsland {
+                content_span: ident.span.shrink_to_hi(),
+                text: sym::empty,
+                decls: ThinVec::new(),
+                unloaded_unit: None,
+            })));
+        }
+
+        self.expect(exp!(Semi))?;
+        Ok(ItemKind::CleanIsland(Box::new(CleanIsland {
+            // Zero-width and empty until the expansion-time load replaces the
+            // payload: even if a defect let this node survive unloaded, every
+            // downstream consumer treats a zero-width, empty-text island as
+            // inert — no decls to mint, nothing to elaborate, no claim.
+            content_span: ident.span.shrink_to_hi(),
+            text: sym::empty,
+            decls: ThinVec::new(),
+            unloaded_unit: Some(ident),
+        })))
     }
 
     /// Parses a `mod <foo> { ... }` or `mod <foo>;` item.
@@ -562,6 +704,16 @@ impl<'a> Parser<'a> {
             // type-checked by rustc. Elaboration and CIC kernel checking stay
             // in the verify pass.
             self.parse_clean_island()
+        } else if self.isnt_macro_invocation()
+            && self.token.is_ident_named(sym::clean)
+            && self.look_ahead(1, |t| t.is_keyword(kw::Mod))
+        {
+            // Trust (I8): `clean mod name;` — the out-of-line `.clean` unit
+            // form of the island above. Same grammar argument (vanilla Rust
+            // rejects an item beginning `ident ident`), same fail-closed
+            // macro guard. The file is loaded at EXPANSION time, beside
+            // out-of-line `mod name;` — see `parse_clean_mod_unit`.
+            self.parse_clean_mod_unit()?
         } else if self.isnt_macro_invocation()
             && (self.token.is_ident_named(sym::import)
                 || self.token.is_ident_named(sym::using)

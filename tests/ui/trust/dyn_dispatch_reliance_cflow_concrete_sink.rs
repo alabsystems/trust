@@ -12,8 +12,42 @@
 //! `Formatter::write_str`), all of which the B-lane bundles. The ONLY `Unsize`
 //! coercion to `&mut dyn Write` anywhere in that bundle is the one
 //! `spec_write_fmt` performs on `&mut Sink`, so the reachable target set is
-//! exactly `{Sink}` and the site's obligation is discharged against
-//! `<Sink as Write>::write_str`, which is proved panic-free in this same crate.
+//! exactly `{Sink}`, whose `write_str` is proved panic-free in this same crate.
+//!
+//! ## WHICH LANE CARRIES IT CHANGED 2026-08-19 — read this before citing the file
+//!
+//! Measured with `TRUST_DYN_RELIANCE_PROBE=1` after the `dyn_principals_in_ty`
+//! field walk landed, this file still passes, but the `write_str` sites are
+//! **KEPT, not discharged**:
+//!
+//! ```text
+//! poison from an INDIRECT call's outputs: core::fmt::Write
+//! C-FLOW declined: trait core::fmt::Write poisoned
+//! site=<dyn core::fmt::Write as core::fmt::Write>::write_str (3 site(s)) => kept
+//! write_fmt site=<Sink as core::fmt::Write>::write_fmt (1 site(s)) => DISCHARGED
+//! ```
+//!
+//! The crate's verdict now comes from the SIBLING certificate — the `write_fmt`
+//! reduction in `static_str_write_fmt` — and no longer from C-FLOW.
+//!
+//! The poison is CORRECT and is not collateral. `core::fmt::write` calls each
+//! argument's formatter through a FUNCTION POINTER
+//! (`rt::Argument::formatter: unsafe fn(NonNull<()>, &mut Formatter<'_>)`), and an
+//! indirect call has no body to witness. Its `&mut Formatter` parameter is an
+//! out-channel, because `Formatter<'a>` holds `buf: &'a mut dyn Write` in a FIELD
+//! that such a callee could overwrite with a vtable this bundle never saw built.
+//! Until the field walk landed, `Formatter` decomposed to nothing and that channel
+//! was invisible — the same fail-open that made
+//! `dyn_dispatch_reliance_field_held_dyn_root_stays_closed.rs` a live false prove.
+//! The analysis is flow-insensitive, so it does not matter that a zero-argument
+//! `write!` never reaches that call.
+//!
+//! CONSEQUENCE, stated so nobody re-derives it: C-FLOW can no longer serve
+//! `<dyn fmt::Write>::write_str` in ANY bundle that contains `core::fmt::write` —
+//! i.e. in any `write!`/`format!`. That is this slice's one measured capability
+//! cost, and it is a fail-closed narrowing, not a lost verdict: the `write_fmt`
+//! reduction covers the shape. If that reduction ever stops covering it, this
+//! file goes red, which is the intended alarm.
 //!
 //! Before this rule the same file reported:
 //!

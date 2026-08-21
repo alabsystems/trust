@@ -1,0 +1,39 @@
+{
+  "note": "Recorded 2026-08-19. Oracle: Rosetta 2 (see A0 in src/main.rs — a second x86 implementation, not silicon). `mismatch_counts` are a CEILING; growth means words that used to agree with Rosetta no longer do. corpus and sweep are the GATED tiers (0 tolerated). random carries an adjudicated known-open set.",
+  "tiers": {
+    "corpus": {
+      "compared": 118,
+      "agreed": 118,
+      "mismatch_counts": {}
+    },
+    "sweep": {
+      "compared": 886,
+      "agreed": 886,
+      "mismatch_counts": {}
+    },
+    "random": {
+      "compared": 14011,
+      "agreed": 14004,
+      "seed": "0xc0ffee",
+      "limit": 20000,
+      "mismatch_counts": {
+        "Nop:hardware_refused": 3,
+        "Cmovcc:hardware_refused": 2,
+        "Setcc:hardware_refused": 1,
+        "Mov:hardware_refused": 1
+      }
+    }
+  },
+  "known_open": {
+    "Nop:hardware_refused": "`0f 1e /r` (bare, no F3). A reserved hint-NOP the SDM says EXECUTES AS NOP, LLVM decodes `<unknown>`, and Rosetta #UDs — three oracles, three answers. The model takes the SDM reading. Adjudicated, not a model bug; the decode differential records the same encoding at its own ceiling of 1.",
+    "Cmovcc:hardware_refused / Setcc:hardware_refused / Mov:hardware_refused": "A memory operand whose effective address, from a CORNER-VALUE register profile, lands unmapped so the hardware faults, while the model produces effects for an access that would succeed from a mapped state. The fault is a property of the corner address, not the semantics — the model's answer is correct for the instruction, wrong only about whether THIS address is mapped, which this harness's single fixed window cannot always arrange. A harness memory-model edge, counted."
+  },
+  "battery": [
+    "drop-flag-update",
+    "drop-mem-write",
+    "drop-pc-update",
+    "perturb-reg-value",
+    "wrong-dest-reg",
+    "perturb-pc-target"
+  ]
+}

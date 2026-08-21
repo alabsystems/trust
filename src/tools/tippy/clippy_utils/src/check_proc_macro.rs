@@ -260,8 +260,11 @@ fn item_search_pat(item: &Item<'_>) -> (Pat, Pat) {
         ItemKind::Const(..) => (Pat::Str("const"), Pat::Str(";")),
         ItemKind::Fn { sig, .. } => (fn_header_search_pat(sig.header), Pat::Str("")),
         ItemKind::ForeignMod { .. } => (Pat::Str("extern"), Pat::Str("}")),
-        // Trust: Clean islands start with the contextual `clean` keyword.
-        ItemKind::CleanIsland { .. } => (Pat::Str("clean"), Pat::Str("}")),
+        // Trust: Clean islands start with the contextual `clean` keyword. The
+        // inline form ends `}`; the out-of-line unit item (I8,
+        // `clean mod name;`) ends `;` — its HIR node is the same island kind,
+        // but the ITEM's span is the `clean mod name;` text in the `.rs` file.
+        ItemKind::CleanIsland { .. } => (Pat::Str("clean"), Pat::MultiStr(&["}", ";"])),
         ItemKind::TyAlias(..) => (Pat::Str("type"), Pat::Str(";")),
         ItemKind::Enum(..) => (Pat::Str("enum"), Pat::Str("}")),
         ItemKind::Struct(_, _, VariantData::Struct { .. }) => (Pat::Str("struct"), Pat::Str("}")),

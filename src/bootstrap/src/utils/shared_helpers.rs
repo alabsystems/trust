@@ -214,6 +214,49 @@ pub fn canonicalize_trust_no_verify(args: &mut Vec<OsString>) {
     args.insert(option_boundary, OsString::from("-Ztrust-verify=off"));
 }
 
+/// Bootstrap's per-unit `library/` verification channel.
+///
+/// The counterpart of [`TRUST_BOOTSTRAP_SHIM_NO_VERIFY`][no-verify]: bootstrap
+/// sets this ONLY on cargo invocations whose `Mode` it authorized (library
+/// units, stage>=1) and `env_remove`s it on every other invocation, so an
+/// ambient value cannot reach a compiler, bootstrap or tool unit. This function
+/// is the second half of the check and the reason the lane is *per unit* rather
+/// than per invocation: the same `Mode::Std` cargo invocation that compiles
+/// `core` also compiles std's third-party dependency graph, and only the shim
+/// knows the `--crate-name` of the crate it is about to hand to the driver.
+///
+/// Names are compared after `-` -> `_` normalization, matching how Cargo spells
+/// a crate name on the command line.
+///
+/// [no-verify]: trust_bootstrap_shim_marker_enabled
+pub fn trust_bootstrap_verify_unit_requested(
+    units: Option<&OsStr>,
+    crate_name: Option<&str>,
+) -> bool {
+    let (Some(units), Some(crate_name)) = (units.and_then(OsStr::to_str), crate_name) else {
+        return false;
+    };
+    let crate_name = crate_name.trim().replace('-', "_");
+    if crate_name.is_empty() {
+        return false;
+    }
+    units.split(',').any(|unit| unit.trim().replace('-', "_") == crate_name)
+}
+
+/// Replace every spelling/value of the Trust verification switch with one final
+/// `-Ztrust-verify=on`, immediately before a positional `--` boundary.
+///
+/// The unit reaches the shim carrying bootstrap's invocation-wide
+/// `-Ztrust-verify=off` in argv (rustflags arrive as argv). Last-value-wins
+/// would already do the right thing, but canonicalizing leaves exactly ONE
+/// verifier control on the command line, so `x.py -vv` output and any later
+/// audit of the recorded argv read unambiguously.
+pub fn canonicalize_trust_verify_on(args: &mut Vec<OsString>) {
+    strip_trust_no_verify(args);
+    let option_boundary = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    args.insert(option_boundary, OsString::from("-Ztrust-verify=on"));
+}
+
 /// Enforce Trust's verification switch at the final driver boundary. An
 /// unsupported driver sees no spelling of the Trust-only option. A supported
 /// real compile for which bootstrap requested isolation sees exactly one
@@ -256,16 +299,39 @@ fn args_request_trust_no_verify_off(args: &[OsString]) -> bool {
     false
 }
 
+/// EXACT, both spellings. This answer decides whether a snapshot compile gets
+/// the `TRUST_NO_VERIFY=1` transport, i.e. whether verification is ON or OFF for
+/// that unit, so a value this function does not recognize must never be read as
+/// "off".
+///
+/// * `trust-verify` is `parse_trust_verify`, "one of `on` or `off`"
+///   (`rustc_session/src/options.rs`), so only the literal `off` is an
+///   off-request.
+/// * `no-trust-verify`, the retired pre-`576db732cd` name, was
+///   `no_trust_verify: bool = (false, parse_bool, [TRACKED], ...)`
+///   (`576db732cd^:compiler/rustc_session/src/options.rs:2788`). `parse_bool`
+///   accepts `y`/`yes`/`on`/`true` and the bare form as TRUE (= do not verify),
+///   `n`/`no`/`off`/`false` as FALSE (= do verify), and REJECTS anything else.
+///   All three spellings the retired ecosystem actually emitted are covered:
+///   compiletest used bare and `=yes` to turn verification off and `=no` to turn
+///   it on (`576db732cd^:src/tools/compiletest/src/directives.rs:458-463`).
+///
+/// Note the double negative in `no-trust-verify=off`: under `parse_bool` that
+/// sets `no_trust_verify = false`, which means verification ON. This used to
+/// accept every value except the literal `no` — so `=off`, `=false`, `=0` and
+/// every typo silently meant "off". Anything outside `parse_bool`'s two sets
+/// would have been a hard parse error at the driver; treating it as "not an
+/// off-request" keeps the caller fail-closed (verification stays on and the
+/// build fails loudly) instead of silently unverified.
 fn is_trust_verify_off_option(option: &OsStr) -> bool {
     option.to_str().is_some_and(|option| {
-        let (name, value) = option.split_once('=').map_or((option, ""), |(name, value)| {
-            (name, value)
-        });
+        let (name, value) = match option.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (option, None),
+        };
         match name.replace('_', "-").as_str() {
-            "trust-verify" => value == "off",
-            // The retired spelling is a boolean whose truthy values (and bare
-            // form) request verification OFF; only an explicit `=no` does not.
-            "no-trust-verify" => value != "no",
+            "trust-verify" => value == Some("off"),
+            "no-trust-verify" => matches!(value, None | Some("y" | "yes" | "on" | "true")),
             _ => false,
         }
     })
@@ -326,6 +392,66 @@ pub fn cargo_test_no_verify_requested(
 /// truthy parsing cannot silently disable verification.
 pub fn trust_bootstrap_shim_marker_enabled(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
+}
+
+/// A retired bootstrap-shim marker that is still scrubbed in six places but read
+/// nowhere. Setting it used to be a silent no-op, which is indistinguishable
+/// from a control that worked.
+pub const RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV: &str =
+    "TRUST_BOOTSTRAP_SHIM_NO_VERIFY_TARGET_ONLY";
+
+/// Refuse the retired marker by name, the way `TRUST_FLYWHEEL` is refused.
+///
+/// It named a "target crates only" isolation lane that no longer exists:
+/// bootstrap isolation has to cover untargeted HOST units (build scripts, proc
+/// macros) too, so there is nothing left to select. Presence is the trigger —
+/// any value, including the empty string — because there is no value that could
+/// have the effect the name promises.
+///
+/// Returns `None` when the variable is unset, i.e. for every existing workflow.
+pub fn retired_trust_bootstrap_shim_target_only_refusal(value: Option<&OsStr>) -> Option<String> {
+    value.is_some().then(|| {
+        format!(
+            "{RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV} is retired and has no effect: \
+             bootstrap isolation must cover target crates AND untargeted host units (build \
+             scripts, proc macros), so there is no target-only lane to select. Unset it. The \
+             live controls are `TRUST_BOOTSTRAP_SHIM_NO_VERIFY=1` (bootstrap-internal IPC, set \
+             by bootstrap itself) and, to verify a `library/` unit, \
+             `TRUST_BOOTSTRAP_VERIFY_LIBRARY=<unit>[,<unit>...]`."
+        )
+    })
+}
+
+/// Does bootstrap's non-self-proving off-switch apply to THIS shim invocation?
+///
+/// One policy, one implementation. The rustc and rustdoc shims each used to
+/// carry a copy of this predicate and had already diverged once historically.
+/// A shim with a single driver (rustdoc) passes the same capability answer for
+/// both `has_target` arms, which reduces the expression to
+/// `requested && supports && is_a_real_compile` — exactly what its private copy
+/// computed.
+pub fn trust_bootstrap_no_verify_applies(
+    has_target: bool,
+    requested: bool,
+    targeted_driver_supports_no_verify: bool,
+    no_target_driver_supports_no_verify: bool,
+    args: &[OsString],
+    // Not read: the crate name selects the per-unit VERIFY opt-in
+    // (`trust_bootstrap_verify_unit_applies`), never the off-switch, which is
+    // invocation-wide. Kept in the signature because every call site has the
+    // name in hand and the two predicates are read side by side.
+    _crate_name: Option<&str>,
+) -> bool {
+    // Trust: `-Ztrust-verify=off` only exists in Trust drivers. With a
+    // bring-your-own stage0 (bootstrap/trust-stage0/README.md), targeted
+    // stage0 invocations run a stock upstream rustc, which rejects the flag.
+    requested
+        && compile_uses_trust_bootstrap_no_verify(args)
+        && if has_target {
+            targeted_driver_supports_no_verify
+        } else {
+            no_target_driver_supports_no_verify
+        }
 }
 
 /// Whether a shim invocation is a real crate compilation rather than a

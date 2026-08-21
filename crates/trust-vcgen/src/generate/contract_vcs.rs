@@ -615,6 +615,39 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     }
                 }
 
+                // Trust (std-intrinsics lane): the SAME return-slot problem for a
+                // function whose tail is a body-less rustc bit intrinsic —
+                // `fn f(x: u32) -> u32 ensures result <= 32 { ctpop(x) }`. The
+                // guard-map fact names the dest `__ret`, which never reaches the
+                // postcondition's `_0`, so the `#[ensures]` read an unconstrained
+                // havoc and the clause was REFUTED. Re-emit the intrinsic's facts
+                // under the RAW `_0` name, exactly as the saturating pin above does.
+                //
+                // No `ite_free_equality` lift is needed: unlike the saturating and
+                // `wrapping_neg` models, none of these definitions contains a term
+                // `Ite` (`ctpop`/`bswap`/`bitreverse` are pure bitvector terms and
+                // the `ctlz`/`cttz` facts are formula-level `Implies` already).
+                //
+                // SOUND: every fact is true of the intrinsic's result for EVERY
+                // input — `intrinsic_semantics` states them and its tests check
+                // each exhaustively at width 8 against the real Rust operation —
+                // and the builder itself requires `_0` to be single-static-assignment
+                // and the argument to be a stable whole local.
+                for term_block in [&**vc_block, block] {
+                    let ret_sort_here =
+                        crate::place_sort(func, &Place::local(0)).unwrap_or(Sort::Int);
+                    let ret_var = Formula::var_owned("_0".to_string(), ret_sort_here);
+                    if let Some((dest, facts)) =
+                        value_modeled_intrinsic_facts(func, &term_block.terminator, &ret_var)
+                        && dest.local == 0
+                        && dest.projections.is_empty()
+                    {
+                        for fact in facts {
+                            formula = Formula::And(vec![fact, formula]);
+                        }
+                    }
+                }
+
                 // Trust (clamp/min/max return pin, over-refutation audit #8): when a
                 // predecessor's TERMINATOR is an integer std `Ord::min`/`max`/`clamp`
                 // call whose dest IS the return slot `_0` (the function returns the

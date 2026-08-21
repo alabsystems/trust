@@ -2508,8 +2508,14 @@ fn aarch64_ldr_literal_effects(
         ));
     }
 
+    // `state.pc` is the concrete instruction address (set per instruction in the
+    // lift loop), so the literal address is ground. A free `Var("PC")` here was
+    // the same wrong-value class c071b22f0a fixed for AArch64 `PcRelative`; this
+    // path is currently dormant (LdrLiteral fails closed in
+    // `unsupported_aarch64_semantics_reason` before dispatch reaches it), but a
+    // dormant wrong address becomes a live one the day the refusal is lifted.
     let address = Formula::BvAdd(
-        Box::new(Formula::Var("PC".into(), trust_types::Sort::BitVec(64))),
+        Box::new(state.pc.clone()),
         Box::new(Formula::BitVec { value: i128::from(*offset), width: 64 }),
         64,
     );
@@ -7986,6 +7992,169 @@ mod apply_effect_totality_tests {
                 stmts_ok, state_ok,
                 "{name}: effect_to_stmts accepts={stmts_ok} but apply_effect_to_state \
                  accepts={state_ok}; the two views of one instruction disagree"
+            );
+        }
+    }
+
+    /// Every `Effect` variant has a MEASURED statement-visibility disposition.
+    ///
+    /// The trust-cg bridge's entry-register binding analysis
+    /// (`trust_cg_bridge::entry_binding::compute_entry_preservation`) derives
+    /// per-block register kill sets from the lifted STATEMENTS: an Assign to a
+    /// GPR local is a kill. That is complete only if every effect that can
+    /// change a GPR surfaces as exactly such an Assign — the invariant this
+    /// census pins. A fourteenth `Effect` variant breaks the build in
+    /// trust-machine-sem (`variant_name` is expanded wildcard-free from the
+    /// census token list), and this test then forces its statement visibility
+    /// to be measured before it can flow under the bridge's analysis.
+    #[test]
+    fn every_effect_variant_has_a_measured_statement_visibility() {
+        use std::collections::BTreeSet;
+
+        /// How an effect surfaces in the lifted statement stream.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum StatementVisibility {
+            /// An Assign whose place is a GPR local — the kill shape the
+            /// bridge's write-freedom analysis counts.
+            AssignsGprLocal,
+            /// Assigns only to non-GPR machine locals (SP/PC/flags/MEM):
+            /// invisible to GPR kill sets, and correctly so.
+            AssignsNonGprLocals,
+            /// No statement at all (`Nop`s are retained out of lifted
+            /// bodies; terminator-level effects emit empty statement lists).
+            NoStatement,
+            /// Refused by `effect_to_stmts`: unreachable in a lifted body,
+            /// so the bridge's analysis never sees it.
+            Refused,
+        }
+        use StatementVisibility::{
+            AssignsGprLocal, AssignsNonGprLocals, NoStatement, Refused,
+        };
+
+        let layout = LocalLayout::aarch64();
+        let flag = Formula::Bool(false);
+        let rows: Vec<(&str, Effect, StatementVisibility)> = vec![
+            (
+                "RegWrite",
+                Effect::RegWrite { index: 0, width: 64, value: bv(1) },
+                AssignsGprLocal,
+            ),
+            ("SpWrite", Effect::SpWrite { value: bv(1) }, AssignsNonGprLocals),
+            (
+                "MemWrite",
+                Effect::MemWrite { address: bv(0x1000), value: bv(7), width_bytes: 4 },
+                AssignsNonGprLocals,
+            ),
+            ("MemRead", Effect::MemRead { address: bv(0x1000), width_bytes: 4 }, NoStatement),
+            (
+                "FlagUpdate",
+                Effect::FlagUpdate {
+                    n: flag.clone(),
+                    z: flag.clone(),
+                    c: flag.clone(),
+                    v: flag.clone(),
+                },
+                AssignsNonGprLocals,
+            ),
+            ("Branch", Effect::Branch { target: bv(0x2000) }, NoStatement),
+            (
+                "ConditionalBranch",
+                Effect::ConditionalBranch {
+                    condition: trust_disasm::Condition::Eq,
+                    target: bv(0x2000),
+                    fallthrough: bv(0x1004),
+                },
+                NoStatement,
+            ),
+            (
+                "Call",
+                Effect::Call { target: bv(0x2000), return_addr: bv(0x1004) },
+                Refused,
+            ),
+            ("Return", Effect::Return { target: bv(0x2000) }, NoStatement),
+            (
+                "FpRegWrite",
+                Effect::FpRegWrite { index: 0, width: 64, value: bv(1) },
+                Refused,
+            ),
+            (
+                "Aarch64SyncBoundary",
+                Effect::Aarch64SyncBoundary {
+                    kind: Aarch64SyncBoundaryKind::DataMemoryBarrier,
+                    scope: Aarch64SyncScope::InnerShareable,
+                    ordering: Aarch64SyncOrdering::LoadsAndStores,
+                    clears_exclusive_monitor: false,
+                    raw_option: Some(0b1011),
+                },
+                NoStatement,
+            ),
+            (
+                "Aarch64AtomicAccess",
+                Effect::Aarch64AtomicAccess {
+                    kind: Aarch64AtomicAccessKind::Load,
+                    ordering: Aarch64AtomicOrdering::Acquire,
+                    address: bv(0x1000),
+                    width_bytes: 4,
+                    exclusive: false,
+                },
+                NoStatement,
+            ),
+            ("PcUpdate", Effect::PcUpdate { value: bv(0x1004) }, AssignsNonGprLocals),
+        ];
+
+        // COVERAGE: the table names every variant, and only real variants.
+        let covered: BTreeSet<&str> = rows.iter().map(|row| row.0).collect();
+        let declared: BTreeSet<&str> = Effect::VARIANT_NAMES.iter().copied().collect();
+        assert_eq!(
+            covered, declared,
+            "the statement-visibility table must cover every Effect variant; an \
+             uncovered variant is one whose GPR-kill visibility was never measured. \
+             Missing: {:?}; unknown: {:?}",
+            declared.difference(&covered).collect::<Vec<_>>(),
+            covered.difference(&declared).collect::<Vec<_>>()
+        );
+
+        let gpr_locals: std::ops::Range<usize> =
+            layout.gpr_base..layout.gpr_base + layout.gpr_count;
+        for (name, effect, declared_visibility) in rows {
+            let measured = match effect_to_stmts(&effect, &layout, 0x1000) {
+                Err(_) => Refused,
+                Ok(stmts) => {
+                    let mut assigns_gpr = false;
+                    let mut assigns_other = false;
+                    for stmt in &stmts {
+                        match stmt {
+                            Statement::Assign { place, .. } => {
+                                assert!(
+                                    place.projections.is_empty(),
+                                    "{name}: the lift must assign whole locals"
+                                );
+                                if gpr_locals.contains(&place.local) {
+                                    assigns_gpr = true;
+                                } else {
+                                    assigns_other = true;
+                                }
+                            }
+                            Statement::Nop => {}
+                            other => panic!(
+                                "{name}: the lift emitted a statement kind outside its \
+                                 contract: {other:?}"
+                            ),
+                        }
+                    }
+                    if assigns_gpr {
+                        AssignsGprLocal
+                    } else if assigns_other {
+                        AssignsNonGprLocals
+                    } else {
+                        NoStatement
+                    }
+                }
+            };
+            assert_eq!(
+                measured, declared_visibility,
+                "{name}: measured statement visibility diverges from the declared \
+                 disposition the bridge's kill analysis relies on"
             );
         }
     }

@@ -33,6 +33,21 @@ smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
 tracing = "0.1"
 trust-cache = { workspace = true }
 trust-certify = { workspace = true }
+# Trust (I5): the Clean-origin CALL lane's two decisions. This crate is a
+# DEPENDENCY of `rustc_mir_transform`, not a provider installer above
+# `rustc_interface` — §7's "installs the provider overrides" is not
+# implementable, because `changed_trust_critical_query_provider` address-compares
+# and fatally rejects a replaced `optimized_mir`/`mir_for_ctfe`/`mir_keys`.
+# `clean_origin_mir` is therefore CALLED from inside this crate's own provider
+# functions, which is strictly better: both call sites are inside the crate that
+# owns MIR construction, so there is no override to audit.
+trust-clean-origin = { workspace = true }
+# Trust (I5): the gate's admitted statement is at the CARRIER type, and the
+# emitter's local types are the carrier decision rather than a convenience
+# mapping. Named directly so `clean_origin_mir.rs` cannot silently acquire a
+# second, looser type mapping through a re-export.
+trust-clean-carrier = { workspace = true }
+clean-kernel = { workspace = true }
 trust-ir = { workspace = true, features = ["serde"] }
 trust-ir-bridge = { workspace = true, features = ["compiler-context"] }
 trust-mir-extract = { workspace = true }

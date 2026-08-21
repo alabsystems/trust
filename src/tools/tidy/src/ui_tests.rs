@@ -213,6 +213,7 @@ fn check_unexpected_extension(check: &mut RunningCheck, file_path: &Path, ext: &
         "svg",    // expected svg file, corresponds to a rs file, equivalent to stderr
         "stdout", // expected stdout file, corresponds to a rs file
         "fixed",  // expected source file after applying fixes
+        "clean",  // Trust (I8): out-of-line Clean units (`clean mod name;` loads `name.clean`)
         "md",     // test directory descriptions
     ];
 

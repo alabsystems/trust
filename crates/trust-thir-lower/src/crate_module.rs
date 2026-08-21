@@ -42,6 +42,17 @@
 //! value. Failures mark the body unsupported (`PendingConst(...)` reasons in coverage), and a
 //! final tripwire scans the assembled `Module`: any leftover sentinel aborts artifact emission.
 //!
+//! Trust (slice 20): patching is also what makes these bodies ADJUDICABLE, so they are routed
+//! through the crate-seam differential rather than left as permanent coverage-only skips.
+//! `differential::compare` still refuses to interpret a placeholder at the hook, but it now
+//! takes the MIR-side snapshot before refusing — the snapshot cannot be taken later, because
+//! `mir_built` is a `Steal` already stolen by `mir_promoted` and borrowck has been forced for
+//! every body owner long before this seam runs — and `deferred_to_seam` sends the body to
+//! [`run_seam_differentials`], which compares it AFTER the patch. That comparison re-tests
+//! `unsupported` emptiness first: `resolve_pending_consts` BUMPS it on every failure path, and a
+//! body still holding a placeholder must never be interpreted (it would manufacture a false
+//! TypeError-vs-value divergence — the exact thing the hook-time gate exists to prevent).
+//!
 //! # Fail-closed tripwires
 //!
 //! The producer's `map_ty` emits table-free types (scalars, `Tuple`, `Unit`, `Ptr`, `FatPtr`)
@@ -357,11 +368,26 @@ struct BodyRecord {
     /// never a guessed value). `PendingConst` is plain owned/`Copy` data (`DefId`/`Span` are
     /// lifetime-free), so the `'static` registry invariant holds.
     pending_consts: Vec<PendingConst>,
-    /// Trust (B9-A): this body is DEFERRED to the crate-finalize seam differential — clean (no
-    /// unsupported shapes, no pending consts) but call-bearing (`differential::deferred_to_seam`).
-    /// Its per-body module carries callees as bodyless declarations, so interpretation-equivalence
-    /// can only be asserted after the crate module links their bodies. The hook SUPPRESSES its
-    /// own differential event for such bodies (`deferred_to_seam` is the single source of truth);
+    /// Trust (slice 20): does this body's own module contain a call (`Lowered::contains_call`)?
+    /// Recorded so the seam can say WHY a body was deferred without re-deriving it from the
+    /// assembled instruction stream — the reachable-callee closure cannot answer it (a
+    /// self-recursive body has a one-element closure and is still call-bearing).
+    contains_call: bool,
+    /// Trust (B9-A, extended slice 20): this body is DEFERRED to the crate-finalize seam
+    /// differential (`differential::deferred_to_seam`). It is clean — no unsupported shapes —
+    /// and the hook could not reach a verdict for a reason the FINALIZER dissolves. Two such
+    /// reasons, and a body may carry either or both:
+    ///
+    ///   * CALL-BEARING (B9-A): its per-body module carries callees as bodyless declarations,
+    ///     so interpretation-equivalence can only be asserted after the crate module links
+    ///     their bodies.
+    ///   * PENDING-CONST (slice 20): it carries placeholder `Inst::Const` nodes that
+    ///     [`resolve_pending_consts`] patches with real values before the seam runs. Such a
+    ///     body may be call-FREE; the seam handles it uniformly, since its reachable-callee
+    ///     closure is then just the entry and the bundle is a single function.
+    ///
+    /// The hook SUPPRESSES its own differential event for such bodies (`deferred_to_seam` is the
+    /// single source of truth, shared component-wise via `deferred_to_seam_parts`);
     /// [`run_seam_differentials`] emits the one real verdict at finalize.
     deferred: bool,
     /// Typed hook-time interpreter result. A deferred body's hook result is `NotRun`; its final
@@ -1007,7 +1033,15 @@ pub fn record(
         // this destructure.
         enum_fold_switch_blocks: _enum_fold_switch_blocks,
     } = lowered;
-    let deferred = lowered_unsupported.is_empty() && pending_consts.is_empty() && contains_call;
+    // Trust (slice 20): the shared predicate, NOT a hand-rolled copy. `deferred_to_seam` is
+    // documented as the single source of truth for the hook's event suppression and this flag;
+    // it now actually is one. A divergence between the two drops seam verdicts silently (the
+    // scorecard is first-event-wins), so the two must not be separately maintained.
+    let deferred = crate::differential::deferred_to_seam_parts(
+        lowered_unsupported.is_empty(),
+        pending_consts.is_empty(),
+        contains_call,
+    );
     // Trust: `functions[0]` is THE body function. The producer maintains that: both
     // `lower_fn` and `lower_const_body` add exactly one function, and the fn-ptr adapter lane
     // appends its synthetic functions only AFTER that one (`lower_module_inner`'s flush, which
@@ -1156,6 +1190,7 @@ pub fn record(
         func_types: module.func_types,
         closure_types: module.closure_types,
         pending_consts,
+        contains_call,
         deferred,
         interpreter,
         derived_mir,
@@ -1301,6 +1336,36 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
 
     let mut verdicts = Vec::new();
     for r in records.iter().filter(|r| r.deferred) {
+        // Trust (slice 20) — THE PENDING-CONST FAIL-CLOSE. MANDATORY, and it must be the FIRST
+        // gate in this loop.
+        //
+        // `r.deferred` was decided at the HOOK, before `resolve_pending_consts` ran. That pass
+        // is not infallible and does not merely fail to improve a body — it BUMPS
+        // `r.unsupported` at every failure site it has (`PendingStr(eval failed at finalize)`,
+        // `PendingStr(empty)`, `PendingStr(global not patched)`, `PendingStr(global patch
+        // conflict)`, `PendingConst(eval failed at finalize)`, `PendingConst(placeholder not
+        // found)`, `PendingConst(sentinel leak)`, and the `check_str_global_ledger` rows).
+        //
+        // A body that took any of those still carries its PLACEHOLDER. Interpreting it is
+        // precisely what the hook-time gate exists to prevent: the placeholder is a
+        // `Constant::PhantomData` where the oracle has a real value, so the comparison
+        // manufactures a false TypeError-vs-value DIVERGENCE — a published claim that the
+        // producer is wrong about a body whose const nobody ever evaluated.
+        //
+        // Re-testing emptiness here is therefore not belt-and-braces: it is the same gate,
+        // re-asked at the only point where its answer can have changed. It is stated for ALL
+        // deferred bodies rather than only pending-const ones because it is true of all of them
+        // (a call-only deferred body's `unsupported` is untouched by that pass), and a gate that
+        // reads "no body may be linked while it carries an unsupported shape" is a stronger and
+        // more obviously correct invariant than one scoped to the lane that motivated it.
+        if !r.unsupported.is_empty() {
+            verdicts.push(skip(
+                r.def_index,
+                "seam-deferred body: finalizer const resolution failed (body marked unsupported \
+                 by resolve_pending_consts; placeholder never patched); coverage-only skip",
+            ));
+            continue;
+        }
         // Trust (B3-2c seam guard): a place-path VALUE-carrier body is CLEAN-ONLY
         // by the wave-RS/MC contract ("never interpreted") — the carrier arg is a
         // VALUE standing in for the callee's pointer param, so linked
@@ -1389,9 +1454,31 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         // body to link (extern / havoc / unresolved). LOAD-BEARING: a reachable vararg-sig
         // declaration would err `SignatureMismatch` in the interpreter, which would surface as a
         // FALSE oracle verdict.
-        if closure.iter().any(|&fid| {
-            assembled.module.function_by_id(fid).map(|f| f.is_declaration()).unwrap_or(true)
-        }) {
+        let declarations: Vec<FuncId> = closure
+            .iter()
+            .copied()
+            .filter(|&fid| {
+                assembled.module.function_by_id(fid).map(|f| f.is_declaration()).unwrap_or(true)
+            })
+            .collect();
+        if !declarations.is_empty() {
+            // Trust (slice 20 ride-along b): INSTRUMENT ONLY — the row-1 dead-path probe.
+            //
+            // This population (the largest single non-verdict class in the corpus) is skipped
+            // because SOME reachable callee has no local body. The open question it has never
+            // been possible to answer from the artifact is whether that callee is on a path any
+            // sample actually TAKES. If it is not, the body is adjudicable and the class is a
+            // campaign; if it is, the class is a dead end and the campaign should not be run.
+            //
+            // The probe answers it by doing what the gate refuses: build the oracle bundle with
+            // the bodyless callees declared EXPECTED-ABSENT, let the interpreter run, and record
+            // the verdict it would have reached. It writes to a PROBE COUNTER and its own
+            // tracing event ONLY. It must never touch `verdicts`, `note_class`, or any row —
+            // polluting the verdict stream with a measurement would corrupt the very Agreed
+            // delta this slice exists to measure.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                row1_dead_path_probe(r, entry, &closure, &declarations, records, assembled);
+            }
             verdicts.push(skip(
                 r.def_index,
                 "seam-deferred body: reachable callee closure includes an extern/declaration-only \
@@ -1419,8 +1506,16 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         }
 
         // step 4 — snapshot gathering. Map each closure FuncId -> callee def_index -> its record's
-        // `mir_snapshot`. Any missing snapshot (e.g. a finalizer-patched pending-const callee whose
-        // hook-time snapshot was skipped) => callee-set asymmetry => fail-closed skip.
+        // `mir_snapshot`. Any missing snapshot => callee-set asymmetry => fail-closed skip.
+        //
+        // Trust (slice 20): a PENDING-CONST callee is no longer an instance of that. It used to
+        // be — `compare` returned `None` for such a body, so any deferred caller reaching one
+        // lost its whole verdict to this asymmetry skip — and the parenthetical here named it as
+        // the example. Moving the pending-const gate below the extraction gives those bodies a
+        // snapshot like every other clean body, so the example is now stale and is removed
+        // rather than left to mislead. What remains genuinely missing here is a callee whose
+        // record never reached extraction at all (unsupported shapes, or the unrevealed-opaque
+        // guard), which is the real asymmetry this gate is for.
         let asymmetry = |def_index: u32| {
             skip(
                 def_index,
@@ -1495,6 +1590,10 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         }
         let mut bundle = bundle;
         differential::rewrite_bool_not_icmp(&mut bundle);
+        // Trust (vtable slice 12): same order as the hook's single-body path — the array
+        // InsertField→InsertElement respell runs BEFORE classification so the Array
+        // dead-seed walk sees the interpreter-native form.
+        differential::rewrite_array_insert_fields(&mut bundle);
         let bundle = match differential::classify_undefs(&bundle) {
             differential::UndefClass::Live => {
                 verdicts.push(skip(
@@ -1508,6 +1607,14 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
             differential::UndefClass::DeadSeeds => differential::substitute_dead_seeds(bundle),
             differential::UndefClass::None => bundle,
         };
+        // Trust (vtable slice 6): the seam mirrors the hook's single-body preprocessing
+        // step for step — same slot after the dead-seed substitution, same differential-
+        // local scope (the bundle is this comparison's own assembly). The call-bearing
+        // promoted-borrow mains (regions-reassign-let-bound-pointer, macro-named-default)
+        // carry the once-stored escaping slot in the ENTRY body and reach the tail gate
+        // only here, so a hook-only rewrite would leave the seam population unaligned.
+        let mut bundle = bundle;
+        differential::respell_promoted_slots_as_globals(&mut bundle);
 
         // step 8 — verdict.
         let mut rep = differential::compare_entries(
@@ -1522,9 +1629,20 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         // and the producer emits canonical zero-result unit calls, so neither case needs a seam-only
         // exception. Any remaining signature/result-arity mismatch is a genuine lowering defect.
         if rep.mode == DiffMode::Agreed {
+            // Trust (slice 20): the seam population is no longer call-bearing bodies alone, so
+            // the note names the reason this body was deferred rather than asserting the one
+            // that used to be the only possibility. A pending-const body may be call-FREE, and
+            // a note that called it "call-bearing" would be false on its face and would also
+            // mis-attribute the lane in every downstream reading of the log.
+            let why = if r.pending_consts.is_empty() {
+                "call-bearing body linked at crate finalize"
+            } else if r.contains_call {
+                "call-bearing pending-const body linked and const-patched at crate finalize"
+            } else {
+                "pending-const body re-adjudicated after finalizer const patching"
+            };
             rep.notes.push(format!(
-                "THIR-trust-ir == MIR-trust-ir on {} sampled input(s) (seam differential: \
-                 call-bearing body linked at crate finalize)",
+                "THIR-trust-ir == MIR-trust-ir on {} sampled input(s) (seam differential: {why})",
                 rep.samples_checked
             ));
         }
@@ -1537,6 +1655,165 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         });
     }
     verdicts
+}
+
+/// Trust (slice 20 ride-along b): the ROW-1 DEAD-PATH PROBE. **Instrument only — ships no
+/// behaviour.**
+///
+/// # The question
+///
+/// `run_seam_differentials` step 2 refuses every deferred body whose reachable-callee closure
+/// contains a bodyless (extern / unresolved / declaration-only) callee. That refusal is correct
+/// as a refusal — there is no body to link, and a reachable vararg declaration would err
+/// `SignatureMismatch` in the interpreter and surface as a FALSE oracle verdict. But it is
+/// STATIC: it asks whether such a callee exists in the closure, never whether any sampled
+/// execution reaches it.
+///
+/// Those two questions come apart exactly when the call sits behind a guard the samples do not
+/// satisfy — a `panic!` arm, an error path, a `debug_assert`. For such a body the declaration is
+/// present but dead, and interpretation-equivalence is perfectly assertible.
+///
+/// # What it measures
+///
+/// The bundle is rebuilt with the bodyless callees named EXPECTED-ABSENT (so the bridge demotes
+/// their obligation instead of minting the fatal marker step 6 aborts on), the two static aborts
+/// that would pre-empt the dynamic question are bypassed, and the comparison is run. A body that
+/// reaches `Agreed` proves no sample executed the absent-callee `Assert(false)` — the interpreter
+/// would have trapped on it. That count is the number this probe exists to produce.
+///
+/// # What it is NOT
+///
+/// It is not a verdict, and nothing it computes is written anywhere a verdict is read from. The
+/// caller pushes the identical step-2 skip either way. `Agreed` here means "would have been
+/// adjudicable", and the honest reading of the count is a LOWER BOUND on the dead-path
+/// population: a body can also fail to reach `Agreed` for an ordinary oracle-incapacity reason
+/// that has nothing to do with the absent callee. Under-counting is the right direction for a
+/// number whose purpose is to decide whether to spend a campaign.
+///
+/// # MEASURED LIMITATION — read this before quoting the number (2026-08-19, n=104)
+///
+/// The first run returned `absent-path-dead-agreed = 0` out of 104 probed bodies, split
+/// `oracle-live-havoc` 55 (52.9%), `not-run` 28 (26.9%), `bundle-failed` 21 (20.2%).
+///
+/// The 0 is real and decision-relevant: **no row-1 body is adjudicable through the seam
+/// machinery as it stands.** But the DOMINANT bucket is an artifact of this probe, not an
+/// independent obstacle, and saying otherwise would overstate what was measured. The bridge
+/// encodes an absent callee as `Assert(false)` + NoPanic marker + a HAVOC RESULT, and that
+/// havoc result is an `Inst::Undef` (trust-ir-bridge lower.rs ~19527, ~28385). A bare scalar
+/// `Undef` can never satisfy `undef_is_dead_seed` (which demands an aggregate InsertField
+/// chain), so `classify_undefs` returns `Live` and this function returns BEFORE the interpreter
+/// runs. For those 55 bodies the dynamic question was never actually asked — they were refused
+/// by the absent callee's own encoding.
+///
+/// So this probe answers "is row 1 cheap to unlock?" (no — lifting the static declaration gate
+/// alone yields zero) but it does NOT answer "is the absent call on a dead path?" for the
+/// majority of the population. Making row 1 adjudicable requires MODELLING AN ABSENT CALLEE'S
+/// RESULT as something the comparison tolerates — a fresh symbolic the dead-seed proof accepts,
+/// or a reachability test on the `Assert` itself — not merely relaxing step 2. Anyone extending
+/// this should fix that first; otherwise the same 53% will keep being counted as evidence for a
+/// conclusion it cannot support.
+fn row1_dead_path_probe(
+    r: &BodyRecord,
+    entry: FuncId,
+    closure: &[FuncId],
+    declarations: &[FuncId],
+    records: &[BodyRecord],
+    assembled: &Assembled,
+) {
+    use crate::differential::{self, DiffMode};
+
+    let emit = |outcome: &str, samples: usize| {
+        tracing::debug!(
+            def_index = r.def_index,
+            def_path = r.def_path.as_str(),
+            declarations = declarations.len(),
+            outcome,
+            samples,
+            "trust-ir-lower: row1 dead-path probe"
+        );
+    };
+
+    // The bodyless callees, by NAME — the key `expected_absent_callees` matches on.
+    let absent: std::collections::HashSet<String> = declarations
+        .iter()
+        .filter_map(|&fid| assembled.module.function_by_id(fid).map(|f| f.name.clone()))
+        .collect();
+
+    // Snapshot gathering over the SURVIVING members only: a declaration has no record and
+    // therefore no snapshot, which is the whole point — it is the member being declared absent.
+    let mut members: Vec<(u32, &trust_types::VerifiableFunction)> = Vec::new();
+    for &fid in closure {
+        if declarations.contains(&fid) {
+            continue;
+        }
+        let Some(di) = assembled.assigned.get(fid.as_usize()).map(|(d, _)| *d) else {
+            emit("member-not-spliced", 0);
+            return;
+        };
+        let Some(vf) = records
+            .binary_search_by_key(&di, |rec| rec.def_index)
+            .ok()
+            .and_then(|i| records[i].mir_snapshot.as_ref())
+        else {
+            emit("member-snapshot-missing", 0);
+            return;
+        };
+        members.push((di, vf));
+    }
+    members.sort_by_key(|(di, _)| *di);
+    let Some(entry_slot) = members.iter().position(|(di, _)| *di == r.def_index) else {
+        emit("entry-not-in-bundle", 0);
+        return;
+    };
+    let funcs: Vec<trust_types::VerifiableFunction> =
+        members.iter().map(|(_, vf)| (*vf).clone()).collect();
+
+    let bundle = match trust_ir_bridge::lower_to_trust_ir_functions_with_expected_absent(
+        format!("{}::row1probe", assembled.module.name),
+        &funcs,
+        &absent,
+    ) {
+        Ok(m) => m,
+        Err(_) => {
+            emit("bundle-failed", 0);
+            return;
+        }
+    };
+
+    // The two static aborts the real seam takes are DELIBERATELY not taken here. Step 6's
+    // absent-marker abort is pre-empted by the expected-absent demotion above; step 7's
+    // `oracle_has_const_false_assert` is the exact static test whose DYNAMIC counterpart is the
+    // question — an unconditional-looking `Assert(false)` that no sample reaches is precisely a
+    // dead path. Everything else mirrors the seam's preprocessing order step for step, so the
+    // probe measures the same pipeline the campaign would have to use.
+    let mut bundle = bundle;
+    differential::rewrite_bool_not_icmp(&mut bundle);
+    differential::rewrite_array_insert_fields(&mut bundle);
+    let bundle = match differential::classify_undefs(&bundle) {
+        differential::UndefClass::Live => {
+            emit("oracle-live-havoc", 0);
+            return;
+        }
+        differential::UndefClass::DeadSeeds => differential::substitute_dead_seeds(bundle),
+        differential::UndefClass::None => bundle,
+    };
+    let mut bundle = bundle;
+    differential::respell_promoted_slots_as_globals(&mut bundle);
+
+    let rep = differential::compare_entries(
+        &assembled.module,
+        entry,
+        &bundle,
+        FuncId::new(entry_slot as u32),
+    );
+    let outcome = match rep.mode {
+        // The load-bearing bucket: every sample ran to completion without the interpreter
+        // trapping on an absent callee, and both sides agreed.
+        DiffMode::Agreed => "absent-path-dead-agreed",
+        DiffMode::MirOracle => "divergence-or-trap",
+        DiffMode::NotRun => "not-run",
+    };
+    emit(outcome, rep.samples_checked);
 }
 
 /// Bind crate-seam results back to their deterministic per-body artifact rows.
@@ -2709,7 +2986,11 @@ fn is_const_sentinel(inst: &Inst) -> bool {
                 // `Ty::Unit` (the wave-UF unit-field value) stays OUTSIDE the sentinel set;
                 // the wave-UF seed inside a `Constant::Aggregate` is a nested constant, not
                 // an `Inst::Const` node, so it can never false-positive here either.
-                | Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Array(_, 0)
+                // Trust (vtable slice 15): ANY length — a deferred local const of a
+                // first-class scalar-element `[T; N>0]` (`Ty::Array(_, N)`) defers under the
+                // same sentinel; the finalizer's Array arm decodes it. `Ty::Array(_, 0)` was
+                // already here (B7).
+                | Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Array(..)
         ),
         _ => false,
     }
@@ -2794,7 +3075,7 @@ fn resolve_pending_consts(tcx: TyCtxt<'_>, records: &mut [BodyRecord]) {
             // missing placeholder yields None expected-ty and the eval fails closed; the
             // patch below then also reports the precise placeholder-not-found tag.
             let expected_ty = placeholder_ty(r.function.as_ref(), pc.value);
-            match eval_pending_const(tcx, pc, expected_ty.as_ref(), &r.structs, &r.enums) {
+            match eval_pending_const(tcx, pc, expected_ty.as_ref(), &r.structs, &r.enums, &r.types) {
                 Some(constant) => {
                     if !patch_placeholder(r.function.as_mut(), pc.value, constant) {
                         bump_unsupported(&mut r.unsupported, "PendingConst(placeholder not found)");
@@ -2965,6 +3246,9 @@ fn eval_pending_const(
     expected_ty: Option<&Ty>,
     structs: &[StructDef],
     enums: &[EnumDef],
+    // Trust (vtable slice 15): the body's pended types table — resolves the element of a
+    // first-class `Ty::Array(TyId, N>0)` placeholder (the scalar-element array spelling).
+    types: &[Ty],
 ) -> Option<Constant> {
     // An mgca `type const` must never be CTFE'd here (the observed ICE class); the hook's
     // deferral gate already refuses them — checked again, not assumed.
@@ -3043,7 +3327,7 @@ fn eval_pending_const(
     // level the decoder cannot prove faithful (the caller records the precise
     // PendingConst tag). Scalars keep the exact pre-B7 tail below.
     if pc.composite {
-        return finalize_valtree_to_constant(tcx, rty, valtree, expected_ty?, structs, enums, 0);
+        return finalize_valtree_to_constant(tcx, rty, valtree, expected_ty?, structs, enums, types, 0);
     }
     let value = ty::Value { ty: rty, valtree };
     if pc.is_bool {
@@ -3099,9 +3383,11 @@ fn placeholder_ty(func: Option<&Function>, value: ValueId) -> Option<Ty> {
 /// Trust (B7): the FINALIZER twin of the hook's eager `valtree_to_constant` decoder — decodes a
 /// CTFE branch valtree into the producer's aggregate constant model, DOUBLE-KEYED at every level
 /// on (the re-derived rustc type kind) x (the placeholder's mapped trust-ir type, resolved
-/// through the body's registered struct/enum tables). Mirrors `map_ty`'s value model exactly:
-/// tuples and `[T; N > 0]` arrays are `Constant::Aggregate` under `Ty::Tuple`; `[T; 0]` is the
-/// empty `Constant::Array`; structs are field-ordered `Aggregate`s; enums are the
+/// through the body's registered struct/enum tables and — Trust (vtable slice 15) — its pended
+/// types table). Mirrors `map_ty`'s value model exactly:
+/// tuples and AGGREGATE-element `[T; N > 0]` arrays are `Constant::Aggregate` under `Ty::Tuple`;
+/// `[T; 0]` and (slice 15) SCALAR-element `[T; N > 0]` are `Constant::Array` under the
+/// first-class `Ty::Array`; structs are field-ordered `Aggregate`s; enums are the
 /// `[Int(discriminant), fields...]` tag+payload convention with the discriminant read from the
 /// REGISTERED `EnumDef` (the same explicit per-variant table the Switch and seed lanes carry —
 /// never re-derived from rustc here). Any disagreement between the two keys, an unregistered
@@ -3113,6 +3399,7 @@ fn finalize_valtree_to_constant<'tcx>(
     expected: &Ty,
     structs: &[StructDef],
     enums: &[EnumDef],
+    types: &[Ty],
     depth: usize,
 ) -> Option<Constant> {
     if depth > 64 {
@@ -3165,7 +3452,7 @@ fn finalize_valtree_to_constant<'tcx>(
             }
             let mut out = Vec::with_capacity(branch.len());
             for ((c, frty), fex) in branch.iter().zip(fields.iter()).zip(elems.iter()) {
-                out.push(finalize_branch_elem(tcx, c, frty, fex, structs, enums, depth + 1)?);
+                out.push(finalize_branch_elem(tcx, c, frty, fex, structs, enums, types, depth + 1)?);
             }
             Some(Constant::Aggregate(out))
         }
@@ -3178,13 +3465,34 @@ fn finalize_valtree_to_constant<'tcx>(
             }
             let mut out = Vec::with_capacity(branch.len());
             for (c, fex) in branch.iter().zip(elems.iter()) {
-                out.push(finalize_branch_elem(tcx, c, *elem_rty, fex, structs, enums, depth + 1)?);
+                out.push(finalize_branch_elem(tcx, c, *elem_rty, fex, structs, enums, types, depth + 1)?);
             }
             Some(Constant::Aggregate(out))
         }
         (ty::Array(..), Ty::Array(_, 0)) => {
             let branch = valtree.try_to_branch()?;
             branch.is_empty().then(|| Constant::Array(Vec::new()))
+        }
+        // Trust (vtable slice 15): a FIRST-CLASS scalar-element `[T; N>0]` placeholder — the
+        // expected element type resolves through the body's pended types table (the same
+        // positional id space the placeholder's `Ty::Array(TyId, _)` references), and the
+        // decoded value takes the `Constant::Array` VARIANT (the interpreter's
+        // `(Ty::Array, Constant::Array)` pairing). Double-keyed like every other arm: a length
+        // mismatch, an unresolvable element id, or an element that fails its own pairing fails
+        // the whole decode closed.
+        (ty::Array(elem_rty, _), Ty::Array(tid, n)) => {
+            let elem_ex = types.get(tid.as_usize())?;
+            let branch = valtree.try_to_branch()?;
+            if branch.len() as u64 != *n || branch.is_empty() {
+                return None;
+            }
+            let mut out = Vec::with_capacity(branch.len());
+            for c in branch.iter() {
+                out.push(finalize_branch_elem(
+                    tcx, c, *elem_rty, elem_ex, structs, enums, types, depth + 1,
+                )?);
+            }
+            Some(Constant::Array(out))
         }
         (ty::Adt(adt, adt_args), Ty::Struct(sid)) if adt.is_struct() => {
             let sd = structs.get(sid.as_usize())?;
@@ -3196,7 +3504,7 @@ fn finalize_valtree_to_constant<'tcx>(
             let mut out = Vec::with_capacity(branch.len());
             for ((c, f), fd) in branch.iter().zip(variant.fields.iter()).zip(sd.fields.iter()) {
                 let frty = f.ty(tcx, adt_args).skip_normalization();
-                out.push(finalize_branch_elem(tcx, c, frty, &fd.ty, structs, enums, depth + 1)?);
+                out.push(finalize_branch_elem(tcx, c, frty, &fd.ty, structs, enums, types, depth + 1)?);
             }
             Some(Constant::Aggregate(out))
         }
@@ -3228,7 +3536,7 @@ fn finalize_valtree_to_constant<'tcx>(
                     out.push(Constant::PhantomData);
                     continue;
                 }
-                out.push(finalize_branch_elem(tcx, *c, frty, fex, structs, enums, depth + 1)?);
+                out.push(finalize_branch_elem(tcx, *c, frty, fex, structs, enums, types, depth + 1)?);
             }
             Some(Constant::Aggregate(out))
         }
@@ -3246,13 +3554,14 @@ fn finalize_branch_elem<'tcx>(
     expected: &Ty,
     structs: &[StructDef],
     enums: &[EnumDef],
+    types: &[Ty],
     depth: usize,
 ) -> Option<Constant> {
     let ty::ConstKind::Value(v) = c.kind() else { return None };
     if v.ty != expected_rty {
         return None;
     }
-    finalize_valtree_to_constant(tcx, v.ty, v.valtree, expected, structs, enums, depth)
+    finalize_valtree_to_constant(tcx, v.ty, v.valtree, expected, structs, enums, types, depth)
 }
 
 /// Replace the placeholder `Inst::Const`'s sentinel value with the evaluated constant. The
@@ -4457,9 +4766,10 @@ fn ty_spliceable(r: &BodyRecord, ty: &Ty) -> bool {
 /// Table-free types and Tuple/Vector/Ref-like nesting are fine; a nested `Ty::Struct(j)`
 /// must be strictly EARLIER (`j < i` — the nested-first registration order the remap relies
 /// on); a `Ty::Enum` must resolve in the body's enum table (ANY index — enums intern before
-/// structs, and their defs are checked self-contained, so no cycle is possible); anything
-/// else table-indexed (incl. `Ty::Array`, whose types-table entry may itself reference
-/// structs — a cross-table cycle) fails closed.
+/// structs, and their defs are checked self-contained, so no cycle is possible); Trust
+/// (vtable slice 15): a `Ty::Array` whose types entry is TABLE-FREE (the scalar-element
+/// spelling) is admitted — pass 1 pre-interns those entries before the def tables, so no
+/// cross-table cycle can arise. Anything else table-indexed fails closed.
 /// Trust (#174): may `ty` appear as a VARIANT FIELD of enum def `i` in a spliceable body?
 ///
 /// The sibling of [`def_field_ok`] for the enum table, and deliberately NOT the same rule.
@@ -4498,6 +4808,14 @@ fn def_field_ok(r: &BodyRecord, ty: &Ty, i: usize) -> bool {
         | Ty::Rc(inner) => def_field_ok(r, inner, i),
         Ty::Struct(sid) => sid.as_usize() < i,
         Ty::Enum(eid) => r.enums.get(eid.as_usize()).is_some_and(|ed| ed.id == *eid),
+        // Trust (vtable slice 15): a FIRST-CLASS array field is admitted iff its types-table
+        // entry is TABLE-FREE (a scalar element — exactly what `map_ty`'s spelling gate mints
+        // for N>0). That is what makes the cross-table cycle the pre-slice-15 comment recorded
+        // impossible here: pass 1's pre-pass interns table-free entries BEFORE the def tables,
+        // so the struct-field remap resolves this id without consulting a struct. An entry that
+        // references a struct/enum (a `[S; 0]` element) stays refused — fail-closed, no tag
+        // change (the body simply does not splice, exactly as before).
+        Ty::Array(tid, _) => r.types.get(tid.as_usize()).is_some_and(ty_table_free),
         _ => ty_table_free(ty),
     }
 }
@@ -4745,7 +5063,7 @@ fn validation_error_class(e: &trust_ir_build::ValidationError) -> String {
 struct BodyMaps {
     enum_map: Vec<Option<EnumId>>,
     struct_map: Vec<Option<StructId>>,
-    ty_map: Vec<TyId>,
+    ty_map: Vec<Option<TyId>>,
     closure_map: Vec<trust_ir::ClosureTyId>,
 }
 
@@ -4842,6 +5160,17 @@ fn prepare_body_tables(
     }
     let mut enum_map: Vec<Option<EnumId>> = vec![None; n_enums];
     let mut struct_map: Vec<Option<StructId>> = vec![None; n_structs];
+    // Trust (vtable slice 15): PRE-PASS over the types table — intern every TABLE-FREE entry
+    // (a scalar array element, the wave-17 bytes element) BEFORE the def tables, so a struct
+    // field's first-class `Ty::Array(TyId, N)` resolves during the def remap below. Entries
+    // that reference structs/enums (e.g. a `[S; 0]` element) stay holes here — `def_field_ok`
+    // refuses them in struct-def position, and the main loop after the def tables fills them.
+    // `intern_ty` dedups structurally, so re-reaching an entry later is idempotent.
+    let mut ty_map: Vec<Option<TyId>> = r
+        .types
+        .iter()
+        .map(|t| if ty_table_free(t) { Some(intern_ty(module, t.clone())) } else { None })
+        .collect();
     for n in &order {
         match *n {
             DefNode::Enum(i) => {
@@ -4860,7 +5189,10 @@ fn prepare_body_tables(
             DefNode::Struct(j) => {
                 let mut remapped = r.structs.get(j)?.clone();
                 for field in &mut remapped.fields {
-                    field.ty = remap_ty(&field.ty, &enum_map, &struct_map, &[], &[])?;
+                    // Trust (vtable slice 15): the pre-interned partial types map serves the
+                    // scalar-element `Ty::Array` fields `def_field_ok` admits; a hole (a
+                    // struct-referencing entry) fails closed, matching that gate.
+                    field.ty = remap_ty(&field.ty, &enum_map, &struct_map, &ty_map, &[])?;
                 }
                 struct_map[j] = Some(module.add_struct_def(remapped));
             }
@@ -4872,12 +5204,15 @@ fn prepare_body_tables(
     let struct_map: Vec<StructId> = struct_map.into_iter().collect::<Option<Vec<_>>>()?;
     let enum_map: Vec<Option<EnumId>> = enum_map.into_iter().map(Some).collect();
     let struct_map: Vec<Option<StructId>> = struct_map.into_iter().map(Some).collect();
-    let mut ty_map: Vec<TyId> = Vec::with_capacity(r.types.len());
-    for t in &r.types {
+    for (j, t) in r.types.iter().enumerate() {
         // (A types entry cannot reference a closure type — `type_entry_ok` refuses it —
         // so the closure map, built AFTER this loop, is passed empty: fail-closed.)
-        let remapped = remap_ty(t, &enum_map, &struct_map, &ty_map, &[])?;
-        ty_map.push(intern_ty(module, remapped));
+        // Pre-interned table-free entries (slice 15 pre-pass) are already `Some` and stay:
+        // re-interning would be idempotent, skipping is cheaper and keeps ids single-minted.
+        if ty_map[j].is_none() {
+            let remapped = remap_ty(t, &enum_map, &struct_map, &ty_map, &[])?;
+            ty_map[j] = Some(intern_ty(module, remapped));
+        }
     }
     // Trust (B6): closure-type table — after types (a ClosureTy's captures may reference
     // structs/types entries; its `func` indexes the BODY's func_types table and is
@@ -4979,7 +5314,11 @@ fn remap_ty(
     ty: &Ty,
     enum_map: &[Option<EnumId>],
     struct_map: &[Option<StructId>],
-    ty_map: &[TyId],
+    // Trust (vtable slice 15): `Option` like the enum/struct maps — pass 1 now pre-interns the
+    // TABLE-FREE types entries before the def tables (so a struct field's scalar-element
+    // `Ty::Array` id resolves), leaving holes for the struct/enum-referencing entries until the
+    // main types loop fills them. A hole fails the remap closed, exactly like an unfilled def.
+    ty_map: &[Option<TyId>],
     closure_map: &[trust_ir::ClosureTyId],
 ) -> Option<Ty> {
     Some(match ty {
@@ -5009,7 +5348,7 @@ fn remap_ty(
         }
         Ty::Struct(sid) => Ty::Struct((*struct_map.get(sid.as_usize())?)?),
         Ty::Enum(eid) => Ty::Enum((*enum_map.get(eid.as_usize())?)?),
-        Ty::Array(tid, n) => Ty::Array(*ty_map.get(tid.as_usize())?, *n),
+        Ty::Array(tid, n) => Ty::Array((*ty_map.get(tid.as_usize())?)?, *n),
         // Trust (B6): first-class closure types remap through the pass-1 closure map
         // (per-body positional id -> assembled-module id, exactly like structs/enums).
         Ty::Closure(cid) => Ty::Closure(*closure_map.get(cid.as_usize())?),
@@ -5019,7 +5358,7 @@ fn remap_ty(
         // trait_id is a CONTENT hash of the trait's def path, never a positional
         // table id; the producer's mint tripwire fail-closes hash collisions.)
         Ty::FatPtr(trust_ir::FatPtrKind::Slice(tid)) => {
-            Ty::FatPtr(trust_ir::FatPtrKind::Slice(*ty_map.get(tid.as_usize())?))
+            Ty::FatPtr(trust_ir::FatPtrKind::Slice((*ty_map.get(tid.as_usize())?)?))
         }
         other if ty_table_free(other) => other.clone(),
         _ => return None,
@@ -5240,9 +5579,19 @@ fn global_const_ok(r: &BodyRecord, ty: &Ty, c: &Constant) -> bool {
         (Ty::Array(tid, n), Constant::Array(elems)) => {
             // Trust (wave-17): declared length MUST equal the initializer element count (checked,
             // never assumed — a mismatch from any future minting path refuses the body).
+            // Trust (vtable slice 15): widened from Int-elements-only to the full promotable
+            // scalar family, VARIANT-MATCHED per element (an Int-family element takes only
+            // `Constant::Int`, a float only `Constant::Float`, bool only `Constant::Bool`) —
+            // the wave-PA promoted `&[1.5f32, 2.5]` now arrives spelled `(Ty::Array,
+            // Constant::Array)` instead of the tuple pair, and must stay exactly as admissible.
             *n as usize == elems.len()
-                && r.types.get(tid.as_usize()).is_some_and(scalar_int_ty)
-                && elems.iter().all(|e| matches!(e, Constant::Int(_)))
+                && r.types.get(tid.as_usize()).is_some_and(|et| {
+                    (scalar_int_ty(et) && elems.iter().all(|e| matches!(e, Constant::Int(_))))
+                        || (matches!(et, Ty::F32 | Ty::F64)
+                            && elems.iter().all(|e| matches!(e, Constant::Float(_))))
+                        || (matches!(et, Ty::Bool)
+                            && elems.iter().all(|e| matches!(e, Constant::Bool(_))))
+                })
         }
         (Ty::Tuple(elems), Constant::Aggregate(cs)) => {
             elems.len() == cs.len() && elems.iter().zip(cs).all(|(t, c)| global_const_ok(r, t, c))
@@ -5952,6 +6301,7 @@ mod authority_tests {
             callees: Vec::new(),
             func_types: Vec::new(),
             pending_consts: Vec::new(),
+            contains_call: false,
             deferred: false,
             interpreter: evidence(ArtifactVerdict::NotRun),
             derived_mir: DerivedMirEvidence {
@@ -7277,6 +7627,59 @@ mod str_const_finalize_tests {
         );
     }
 
+    /// Trust (vtable slice 15): `def_field_ok` admits a first-class array FIELD exactly when
+    /// its types entry is TABLE-FREE (the scalar-element spelling pass 1 pre-interns before
+    /// the def tables); a struct-referencing entry stays refused (the cross-table cycle the
+    /// pre-slice-15 refusal guarded), as does an out-of-range id.
+    #[test]
+    fn test_def_field_ok_scalar_element_array_field() {
+        let mut r = minimal_record();
+        r.types = vec![Ty::U8, Ty::Struct(StructId::new(0))];
+        assert!(def_field_ok(&r, &Ty::Array(TyId::new(0), 4), 0), "scalar-element: admitted");
+        assert!(def_field_ok(&r, &Ty::Array(TyId::new(0), 0), 0), "zero-length scalar: admitted");
+        assert!(
+            !def_field_ok(&r, &Ty::Array(TyId::new(1), 0), 0),
+            "struct-referencing entry: refused (cross-table cycle guard)"
+        );
+        assert!(!def_field_ok(&r, &Ty::Array(TyId::new(9), 4), 0), "out of range: refused");
+        // The enum sibling keeps refusing arrays outright — parity with the producer's
+        // enum_variant_field_admissible, which has no array arm either.
+        assert!(!enum_def_field_ok(&r, &Ty::Array(TyId::new(0), 4)));
+    }
+
+    /// Trust (vtable slice 15): the global Array arm, widened from Int-elements-only to the
+    /// variant-matched scalar family — a promoted `&[1.5f32, 2.5]` global arrives spelled
+    /// `(Ty::Array, Constant::Array)` now and must stay admissible; a variant-mismatched
+    /// element (Float under an int element, Int under a float one) stays refused.
+    #[test]
+    fn test_global_const_ok_array_scalar_family() {
+        let mut r = minimal_record();
+        r.types = vec![Ty::U8, Ty::F32, Ty::Bool];
+        let ints = Constant::Array(vec![Constant::Int(1), Constant::Int(2)]);
+        let floats = Constant::Array(vec![Constant::Float(1.5), Constant::Float(2.5)]);
+        let bools = Constant::Array(vec![Constant::Bool(true), Constant::Bool(false)]);
+        assert!(global_const_ok(&r, &Ty::Array(TyId::new(0), 2), &ints));
+        assert!(global_const_ok(&r, &Ty::Array(TyId::new(1), 2), &floats));
+        assert!(global_const_ok(&r, &Ty::Array(TyId::new(2), 2), &bools));
+        assert!(!global_const_ok(&r, &Ty::Array(TyId::new(0), 2), &floats), "variant mismatch");
+        assert!(!global_const_ok(&r, &Ty::Array(TyId::new(1), 2), &ints), "variant mismatch");
+        assert!(!global_const_ok(&r, &Ty::Array(TyId::new(0), 3), &ints), "length mismatch");
+    }
+
+    /// Trust (vtable slice 15): `remap_ty` over the now-Option types map — a filled entry
+    /// remaps, a HOLE fails closed (the two-phase pass-1 contract: struct-def fields may only
+    /// reference pre-interned table-free entries).
+    #[test]
+    fn test_remap_ty_option_ty_map_holes_fail_closed() {
+        let ty_map: Vec<Option<TyId>> = vec![Some(TyId::new(7)), None];
+        assert_eq!(
+            remap_ty(&Ty::Array(TyId::new(0), 3), &[], &[], &ty_map, &[]),
+            Some(Ty::Array(TyId::new(7), 3))
+        );
+        assert_eq!(remap_ty(&Ty::Array(TyId::new(1), 3), &[], &[], &ty_map, &[]), None);
+        assert_eq!(remap_ty(&Ty::Array(TyId::new(2), 3), &[], &[], &ty_map, &[]), None);
+    }
+
     /// THE KEY GATE. The untouched placeholder must NOT read as patched. The `*n > 0` clause in
     /// `str_global_patched` is the only thing standing between an unpatched global and a spliced
     /// `""`, so it is pinned on its own.
@@ -7435,6 +7838,7 @@ mod str_const_finalize_tests {
             callees: Vec::new(),
             func_types: Vec::new(),
             pending_consts: Vec::new(),
+            contains_call: false,
             deferred: false,
             interpreter: InterpreterEvidence {
                 verdict: ArtifactVerdict::NotRun,

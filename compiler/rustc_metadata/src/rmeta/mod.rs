@@ -60,7 +60,9 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
 /// Metadata encoding version.
 /// N.B., increment this if you change the format of metadata such that
 /// the rustc version can't be found to compare with `rustc_version()`.
-const METADATA_VERSION: u8 = 11;
+// Trust: (I7) — bumped 11 -> 12: +`trust_clean_verdict_digest` table,
+// +`trust_clean_island_sources`/`trust_clean_origin_exports` CrateRoot fields.
+const METADATA_VERSION: u8 = 12;
 
 /// Metadata header which includes `METADATA_VERSION`.
 ///
@@ -282,6 +284,15 @@ pub(crate) struct CrateRoot {
 
     exportable_items: LazyArray<DefIndex>,
     stable_order_of_exportable_impls: LazyArray<(DefIndex, usize)>,
+    // Trust: (I7) — Clean-origin cross-crate transport, root halves. The island
+    // sources are declaration TRANSPORT (the importer re-elaborates them under
+    // its OWN kernel; text is never authority). The export list is the digest
+    // table's second, independent encoding: an importer refuses a listed def
+    // without a decodable digest row, so row-absence cannot demote a
+    // Clean-origin def to ordinary Rust (I7 risk R1). Both empty for every
+    // crate without Clean-origin defs.
+    trust_clean_island_sources: LazyArray<String>,
+    trust_clean_origin_exports: LazyArray<DefIndex>,
     exported_non_generic_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>,
     exported_generic_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>,
 
@@ -443,6 +454,12 @@ define_tables! {
     mir_coroutine_witnesses: Table<DefIndex, LazyValue<mir::CoroutineLayout<'static>>>,
     promoted_mir: Table<DefIndex, LazyValue<IndexVec<mir::Promoted, mir::Body<'static>>>>,
     trust_contracts: Table<DefIndex, LazyValue<mir::trust_contract::TrustContractBundle<'static>>>,
+    // Trust: (I7) — opaque `VerdictDigest::encode` bytes, one row per Clean-origin
+    // def. Opaque ON PURPOSE: rmeta never names the Clean closure's types, and
+    // versioning lives in ONE place — the digest's own magic+format — so a format
+    // skew surfaces as the digest decoder's fail-closed refusal at the importer,
+    // never as an rmeta shape error.
+    trust_clean_verdict_digest: Table<DefIndex, LazyValue<Vec<u8>>>,
     thir_abstract_const: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
     impl_parent: Table<DefIndex, RawDefId>,
     const_conditions: Table<DefIndex, LazyValue<ty::ConstConditions<'static>>>,

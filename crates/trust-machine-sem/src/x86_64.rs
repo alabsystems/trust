@@ -158,20 +158,21 @@ impl X86_64Semantics {
         };
         let src = resolve_operand(state, insn.operand(0), insn.opcode, 0, src_width)?;
 
-        // In 64-bit mode, PUSH always pushes 8 bytes.
-        let push_bytes: u32 = 8;
+        // PUSH moves OPERAND-SIZE bytes: 8 by default in 64-bit mode, 2 under
+        // the 0x66 prefix (`pushw %ax`). This was hardcoded to 8, so `66 50`
+        // decremented rsp by 8 and stored 8 bytes — measured against Rosetta by
+        // the x86 semantic differential on its first corpus run (hardware:
+        // rsp -= 2, a 2-byte store).
+        let push_bytes: u32 = src_width / 8;
         let new_sp = Formula::BvSub(
             Box::new(state.sp.clone()),
             Box::new(Formula::BitVec { value: i128::from(push_bytes), width: 64 }),
             64,
         );
 
-        // Sign-extend or zero-extend source to 64 bits if needed.
-        let value_64 = zero_extend_to(src, src_width, 64);
-
         let effects = vec![
             Effect::SpWrite { value: new_sp.clone() },
-            Effect::MemWrite { address: new_sp, value: value_64, width_bytes: push_bytes },
+            Effect::MemWrite { address: new_sp, value: src, width_bytes: push_bytes },
             pc_advance(state, insn),
         ];
         Ok(effects)
@@ -183,15 +184,26 @@ impl X86_64Semantics {
 
     fn sem_pop(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
         let (dst, dst_width) = extract_dst(insn)?;
-        let pop_bytes: u32 = 8;
+        // POP moves OPERAND-SIZE bytes, like PUSH above.
+        let pop_bytes: u32 = dst_width / 8;
 
-        let loaded = load_le_bytes(state, &state.sp, pop_bytes, 64);
+        let value = load_le_bytes(state, &state.sp, pop_bytes, dst_width);
 
-        let value = if dst_width < 64 {
-            Formula::BvExtract { inner: Box::new(loaded.clone()), high: dst_width - 1, low: 0 }
-        } else {
-            loaded.clone()
-        };
+        // `pop rsp` is special: the final RSP is the VALUE POPPED, not
+        // rsp+8. The generic path below writes the popped value to the
+        // destination and THEN increments RSP, which for `pop rsp` clobbers
+        // the pop with old_rsp+8 — measured against Rosetta, `5c` (pop rsp)
+        // yielded old_rsp+8 where the hardware loaded [rsp]. Intel SDM: "If the
+        // RSP register is the destination operand ... the value ... is the
+        // value read from memory."
+        let dst_is_sp = matches!(dst, DstOperand::Reg { is_sp: true, .. });
+        if dst_is_sp {
+            return Ok(vec![
+                Effect::MemRead { address: state.sp.clone(), width_bytes: pop_bytes },
+                Effect::SpWrite { value },
+                pc_advance(state, insn),
+            ]);
+        }
 
         let new_sp = Formula::BvAdd(
             Box::new(state.sp.clone()),
@@ -330,25 +342,38 @@ impl X86_64Semantics {
             Formula::BvMul(Box::new(lhs), Box::new(rhs), dst_width)
         };
 
-        // IMUL sets CF and OF if the result is truncated; ZF/SF are undefined.
-        // Model as: CF=OF=false (simplified — correct for non-overflowing cases).
-        let sign_bit = dst_width - 1;
-        let sf = Formula::Eq(
-            Box::new(Formula::BvExtract {
-                inner: Box::new(result.clone()),
-                high: sign_bit,
-                low: sign_bit,
-            }),
-            Box::new(Formula::BitVec { value: 1, width: 1 }),
-        );
-        let flags = Effect::FlagUpdate {
-            n: sf,
-            z: Formula::Eq(
-                Box::new(result.clone()),
-                Box::new(Formula::BitVec { value: 0, width: dst_width }),
+        // IMUL's flags, per the SDM: CF and OF are SET IFF the full product
+        // does not fit the destination (the truncation lost significance);
+        // SF/ZF/AF/PF are UNDEFINED. The previous model asserted the exact
+        // opposite on both counts — CF=OF hardcoded false ("simplified —
+        // correct for non-overflowing cases", i.e. wrong exactly when the flag
+        // matters) and SF/ZF computed from the result. Measured against
+        // Rosetta: 0x8080..*n overflowed with hardware CF=OF=1 against the
+        // model's 0, and a zero product asserted ZF=1 where the hardware,
+        // free to do anything, left it 0.
+        //
+        // CF/OF: recompute the product with sign-extended operands at double
+        // width; overflow iff that differs from the sign-extension of the
+        // truncated result. SF/ZF: per-instruction unknowns, the same
+        // treatment as the shift flags — undefined is DECLINED, not asserted.
+        let wide = dst_width * 2;
+        let (wide_lhs, wide_rhs) = match &result {
+            Formula::BvMul(a, b, _) => (
+                Formula::BvSignExt(a.clone(), dst_width),
+                Formula::BvSignExt(b.clone(), dst_width),
             ),
-            c: Formula::Bool(false),
-            v: Formula::Bool(false),
+            _ => unreachable!("imul result is always a BvMul"),
+        };
+        let full = Formula::BvMul(Box::new(wide_lhs), Box::new(wide_rhs), wide);
+        let overflow = Formula::Not(Box::new(Formula::Eq(
+            Box::new(full),
+            Box::new(Formula::BvSignExt(Box::new(result.clone()), dst_width)),
+        )));
+        let flags = Effect::FlagUpdate {
+            n: Formula::Var(format!("x86_imul_sf@{:#x}", insn.address), Sort::Bool),
+            z: Formula::Var(format!("x86_imul_zf@{:#x}", insn.address), Sort::Bool),
+            c: overflow.clone(),
+            v: overflow,
         };
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
@@ -540,8 +565,8 @@ impl X86_64Semantics {
         let count = resolve_operand(state, insn.operand(1), insn.opcode, 1, dst_width)?;
         let count = mask_shift_count(count, dst_width);
 
-        let result = Formula::BvShl(Box::new(val.clone()), Box::new(count), dst_width);
-        let flags = shift_eflags(&result, dst_width, insn.address);
+        let result = Formula::BvShl(Box::new(val.clone()), Box::new(count.clone()), dst_width);
+        let flags = shift_eflags(state, &result, &count, dst_width, insn.address);
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
         effects.push(pc_advance(state, insn));
@@ -558,8 +583,8 @@ impl X86_64Semantics {
         let count = resolve_operand(state, insn.operand(1), insn.opcode, 1, dst_width)?;
         let count = mask_shift_count(count, dst_width);
 
-        let result = Formula::BvLShr(Box::new(val.clone()), Box::new(count), dst_width);
-        let flags = shift_eflags(&result, dst_width, insn.address);
+        let result = Formula::BvLShr(Box::new(val.clone()), Box::new(count.clone()), dst_width);
+        let flags = shift_eflags(state, &result, &count, dst_width, insn.address);
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
         effects.push(pc_advance(state, insn));
@@ -576,8 +601,8 @@ impl X86_64Semantics {
         let count = resolve_operand(state, insn.operand(1), insn.opcode, 1, dst_width)?;
         let count = mask_shift_count(count, dst_width);
 
-        let result = Formula::BvAShr(Box::new(val.clone()), Box::new(count), dst_width);
-        let flags = shift_eflags(&result, dst_width, insn.address);
+        let result = Formula::BvAShr(Box::new(val.clone()), Box::new(count.clone()), dst_width);
+        let flags = shift_eflags(state, &result, &count, dst_width, insn.address);
 
         let mut effects = vec![write_dst_checked(state, &dst, dst_width, result)?, flags];
         effects.push(pc_advance(state, insn));
@@ -614,7 +639,29 @@ impl X86_64Semantics {
             64,
         );
 
-        Ok(vec![Effect::ConditionalBranch { condition, target, fallthrough }])
+        // TWO effects, deliberately. The `ConditionalBranch` marker carries the
+        // raw `Condition` ENUM for CFG consumers (trust-lift builds terminators
+        // from it) — but the enum is ARM-shaped, and the arch-neutral concrete
+        // replayer evaluates `Hi` as ARM's C AND NOT Z. x86 stores CF with the
+        // OPPOSITE carry convention (CF = borrow), so that reading turns JA
+        // into "taken iff CF" — measured against Rosetta: `ja +5` took the
+        // branch the hardware fell through and fell through the branch the
+        // hardware took, in both directions. The FIFTH borrowed-ARM-type
+        // instance of the 2026-08-18 campaign.
+        //
+        // The `PcUpdate` carries the x86-CORRECT evaluation as a formula
+        // (`x86_condition_to_formula` has always had the right reading), so any
+        // consumer that replays VALUES uses it and never touches the enum.
+        let cond_formula = x86_condition_to_formula(state, condition, insn, 0)?;
+        let pc_value = Formula::Ite(
+            Box::new(cond_formula),
+            Box::new(target.clone()),
+            Box::new(fallthrough.clone()),
+        );
+        Ok(vec![
+            Effect::ConditionalBranch { condition, target, fallthrough },
+            Effect::PcUpdate { value: pc_value },
+        ])
     }
 
     // -----------------------------------------------------------------------
@@ -1655,15 +1702,47 @@ fn logic_eflags(result: &Formula, width: u32) -> Effect {
 /// The symbol is keyed by instruction address so two different shifts get two
 /// different unknowns. Sharing one symbol would force independent unknowns
 /// equal, which excludes real executions — unsound in its own right.
-fn shift_eflags(result: &Formula, width: u32, insn_address: u64) -> Effect {
+/// `masked_count` is the shift amount AFTER the architectural mask: when it is
+/// zero the instruction is a no-op and EVERY flag is left UNCHANGED — a
+/// recomputed SF/ZF would be a claim about a write that never happens.
+/// Measured against Rosetta: `shl rax, 64` (masked count 0) recomputed SF from
+/// the unchanged register while the hardware preserved the prior flags.
+fn shift_eflags(
+    state: &MachineState,
+    result: &Formula,
+    masked_count: &Formula,
+    width: u32,
+    insn_address: u64,
+) -> Effect {
     let Effect::FlagUpdate { n: sf, z: zf, .. } = logic_eflags(result, width) else {
         unreachable!("logic_eflags always returns a FlagUpdate")
     };
+    let count_is_zero = Formula::Eq(
+        Box::new(masked_count.clone()),
+        Box::new(Formula::BitVec { value: 0, width }),
+    );
+    let keep_or = |computed: Formula, prior: &Formula| {
+        Formula::Ite(
+            Box::new(count_is_zero.clone()),
+            Box::new(prior.clone()),
+            Box::new(computed),
+        )
+    };
     Effect::FlagUpdate {
-        n: sf,
-        z: zf,
-        c: Formula::Var(format!("x86_shift_cf@{insn_address:#x}"), Sort::Bool),
-        v: Formula::Var(format!("x86_shift_of@{insn_address:#x}"), Sort::Bool),
+        n: keep_or(sf, &state.flags.n),
+        z: keep_or(zf, &state.flags.z),
+        // CF/OF stay per-instruction unknowns for a NONZERO count (undefined
+        // off the happy path; see the commit that introduced them). At count
+        // zero the unknown is replaced by the PRESERVED prior flag, which is a
+        // real claim the hardware makes.
+        c: keep_or(
+            Formula::Var(format!("x86_shift_cf@{insn_address:#x}"), Sort::Bool),
+            &state.flags.c,
+        ),
+        v: keep_or(
+            Formula::Var(format!("x86_shift_of@{insn_address:#x}"), Sort::Bool),
+            &state.flags.v,
+        ),
     }
 }
 
@@ -1706,10 +1785,139 @@ fn load_le_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::concrete::ConcreteState;
     use trust_disasm::decode_x86_64;
 
     fn sem() -> X86_64Semantics {
         X86_64Semantics
+    }
+
+    fn regs(insn_bytes: &[u8], setup: &[(u8, u64)], flags_in: u8) -> (Vec<Effect>, ConcreteState) {
+        let insn = decode_x86_64(insn_bytes, 0x1000).expect("decodes");
+        let effects = sem().effects(&MachineState::symbolic(), &insn).expect("models");
+        let mut c = ConcreteState::new();
+        c.pc = 0x1000;
+        for &(i, v) in setup {
+            c.write_gpr(i, 64, u128::from(v)).unwrap();
+        }
+        c.flags = crate::ConcreteFlags {
+            n: flags_in & 8 != 0,
+            z: flags_in & 4 != 0,
+            c: flags_in & 2 != 0,
+            v: flags_in & 1 != 0,
+        };
+        (effects, c)
+    }
+
+    /// `ja` (above) is `!CF && !ZF`. The ARM-shaped `Condition::Hi` the marker
+    /// carries evaluates to ARM's `C && !Z`, and x86 stores CF with the
+    /// OPPOSITE convention — so the marker read would make `ja` "taken iff CF".
+    /// The `PcUpdate` beside it must carry the x86-correct evaluation. Found by
+    /// the semantic differential against Rosetta.
+    #[test]
+    fn ja_is_taken_on_not_carry_and_not_zero() {
+        // 77 05 = ja +5, at 0x1000 (size 2) -> target 0x1007, fallthrough 0x1002.
+        for (cf, zf, taken) in [(false, false, true), (true, false, false), (false, true, false)] {
+            let flags = u8::from(cf) << 1 | u8::from(zf) << 2;
+            let (effects, c) = regs(&[0x77, 0x05], &[], flags);
+            let pc = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::PcUpdate { value } => Some(c.eval_bv(value, 64).unwrap()),
+                    _ => None,
+                })
+                .expect("ja emits a PcUpdate");
+            assert_eq!(pc, if taken { 0x1007 } else { 0x1002 }, "cf={cf} zf={zf}");
+        }
+    }
+
+    /// `pop rsp` ends with RSP = the value popped from memory, NOT old_rsp+8.
+    #[test]
+    fn pop_rsp_loads_the_popped_value() {
+        let (effects, _) = regs(&[0x5C], &[], 0);
+        // Exactly one SpWrite, and it is the memory load, not an increment.
+        let sp_writes: Vec<_> =
+            effects.iter().filter(|e| matches!(e, Effect::SpWrite { .. })).collect();
+        assert_eq!(sp_writes.len(), 1, "pop rsp writes rsp once: {effects:?}");
+        // No separate MemRead-then-increment overwriting it: the value must be
+        // a memory load (Select over MEM), not a BvAdd of the old sp.
+        if let Effect::SpWrite { value } = sp_writes[0] {
+            let dbg = format!("{value:?}");
+            assert!(dbg.contains("Select") || dbg.contains("MEM"), "sp = [rsp], got {dbg}");
+        }
+    }
+
+    /// IMUL sets CF=OF iff the product overflowed the destination; SF/ZF are
+    /// UNDEFINED and declined, not asserted. Previously CF=OF were hardcoded
+    /// false (wrong exactly when they matter).
+    #[test]
+    fn imul_overflow_sets_carry_and_overflow() {
+        // 48 0f af c3 = imul rax, rbx.
+        // rax=0x8000..., rbx=2 overflows i64.
+        let (effects, c) = regs(&[0x48, 0x0F, 0xAF, 0xC3], &[(0, 0x8000_0000_0000_0000), (3, 2)], 0);
+        let (cf, ov) = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FlagUpdate { c: cf, v, .. } => {
+                    Some((c.eval_bool(cf).unwrap(), c.eval_bool(v).unwrap()))
+                }
+                _ => None,
+            })
+            .expect("imul sets flags");
+        assert!(cf && ov, "0x8000..*2 overflows i64: CF=OF=1");
+        // Non-overflowing: 3 * 4.
+        let (effects, c) = regs(&[0x48, 0x0F, 0xAF, 0xC3], &[(0, 3), (3, 4)], 0);
+        if let Some(Effect::FlagUpdate { c: cf, v, .. }) =
+            effects.iter().find(|e| matches!(e, Effect::FlagUpdate { .. }))
+        {
+            assert!(!c.eval_bool(cf).unwrap() && !c.eval_bool(v).unwrap(), "3*4 fits: CF=OF=0");
+        }
+    }
+
+    /// A shift by a masked count of ZERO leaves ALL flags unchanged.
+    #[test]
+    fn shift_by_zero_preserves_flags() {
+        // 48 c1 e0 40 = shl rax, 64 -> masked count 0 -> no-op, flags unchanged.
+        let (effects, c) = regs(&[0x48, 0xC1, 0xE0, 0x40], &[(0, 0x1234)], 0b1111);
+        let (n, z, cf, v) = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FlagUpdate { n, z, c: cf, v } => Some((
+                    c.eval_bool(n).unwrap(),
+                    c.eval_bool(z).unwrap(),
+                    c.eval_bool(cf).unwrap(),
+                    c.eval_bool(v).unwrap(),
+                )),
+                _ => None,
+            })
+            .expect("shift sets flags");
+        assert_eq!((n, z, cf, v), (true, true, true, true), "count 0 preserves prior 1111");
+    }
+
+    /// Illegal `LOCK`, unmodeled segment/address-size overrides, `63` without
+    /// REX.W, and illegal `REP`/`REPNE` are all REFUSED at decode — a verifying
+    /// compiler must not model an instruction the CPU traps on or whose address
+    /// it cannot honor. All found by the semantic differential against Rosetta.
+    #[test]
+    fn prefixes_the_model_cannot_honor_are_refused() {
+        for bytes in [
+            vec![0xF0u8, 0x90],       // lock nop — LOCK on a non-RMW
+            vec![0xF0, 0x89, 0xC3],   // lock mov r,r — LOCK, non-memory dest
+            vec![0x65, 0x8B, 0x00],   // gs mov — segment override
+            vec![0x67, 0x8B, 0x00],   // addr-size mov
+            vec![0x63, 0xC3],         // movsxd w/o REX.W — implementation-defined
+            vec![0xF3, 0x5A],         // rep pop — illegal REP
+            vec![0xF2, 0x5C],         // repne pop
+        ] {
+            assert!(
+                decode_x86_64(&bytes, 0x1000).is_err(),
+                "{bytes:02x?} must be refused fail-closed"
+            );
+        }
+        // The LEGAL forms still decode: lock add [mem], REX.W movsxd, pause, endbr.
+        assert!(decode_x86_64(&[0xF0, 0x01, 0x18], 0x1000).is_ok(), "lock add [rax],rbx is legal");
+        assert!(decode_x86_64(&[0x48, 0x63, 0xC3], 0x1000).is_ok(), "REX.W movsxd is legal");
+        assert!(decode_x86_64(&[0xF3, 0x90], 0x1000).is_ok(), "F3 90 = pause is legal");
     }
 
     /// A shift must not CLAIM its carry and overflow flags are clear.

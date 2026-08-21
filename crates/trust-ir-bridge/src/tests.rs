@@ -4560,6 +4560,340 @@ fn test_drop_glue_kept_for_adt_with_user_drop_impl() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Drop-glue: VARIANT-SENSITIVE accounting.
+//
+// An enum's drop glue is a SWITCH on the discriminant. The blanket per-ADT row
+// charged every arm, including arms the tag provably rules out and arms whose
+// payload holds nothing droppable. The lane below charges each arm separately.
+// SOUNDNESS is pinned by the negative twins: an unknown tag, an escaping
+// borrow, and a constant-`Err` tag must all still charge the `Err` arm.
+// ---------------------------------------------------------------------------
+
+/// The `Err` payload used by the variant tests: a plain user ADT that is NOT in
+/// `structural_drop`, so the classifier cannot prove its drop panic-free and the
+/// `Err` arm is genuinely undischargeable.
+fn variant_test_err_payload() -> Ty {
+    Ty::adt("myapp::PanickyErr", vec![("x".to_string(), Ty::i64())])
+}
+
+/// `core::result::Result<(), myapp::PanickyErr>`, flattened exactly as the real
+/// extractor's `lower_enum_adt` shapes it (`__tag` + one `__v{idx}_{field}`
+/// entry per variant field) — the same shape a stage2 `-Ztrust-dump=mir:` of
+/// `Result<(), std::io::Error>` produces.
+fn variant_test_result_ty() -> Ty {
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "core::result::Result".to_string(),
+        fields: vec![
+            ("__tag".to_string(), Ty::i64()),
+            ("__v0_0".to_string(), Ty::Unit),
+            ("__v1_0".to_string(), variant_test_err_payload()),
+        ],
+        variants: vec![
+            trust_types::VariantDef {
+                name: "Ok".to_string(),
+                discriminant: 0,
+                fields: vec![("0".to_string(), Ty::Unit)],
+            },
+            trust_types::VariantDef {
+                name: "Err".to_string(),
+                discriminant: 1,
+                fields: vec![("0".to_string(), variant_test_err_payload())],
+            },
+        ],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+/// One block that runs `stmts`, then drops local 1, then returns. `arg_count`
+/// controls whether local 1 is an ARGUMENT (whose value no statement here
+/// produces, so the tag can never be proved).
+fn variant_drop_fn(drop_ty: Ty, arg_count: usize, stmts: Vec<Statement>) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "variant_drop_fn".to_string(),
+        def_path: "test::variant_drop_fn".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: drop_ty, name: Some("r".into()) },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(Ty::Unit) },
+                    name: Some("borrow".into()),
+                },
+                LocalDecl {
+                    index: 3,
+                    ty: variant_test_err_payload(),
+                    name: Some("payload".into()),
+                },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts,
+                    terminator: Terminator::Drop {
+                        unwind: UnwindEdge::Unreachable,
+                        place: Place::local(1),
+                        target: BlockId(1),
+                        span: SourceSpan::default(),
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// `_1 = Result::<_, _>::<variant>(..)` — a constant-variant aggregate write,
+/// the shape a source-level `Ok(())` / `Err(e)` lowers to.
+fn variant_const_write(variant: usize, operands: Vec<Operand>) -> Statement {
+    Statement::Assign {
+        place: Place::local(1),
+        rvalue: Rvalue::Aggregate(
+            AggregateKind::Adt {
+                name: "core::result::Result".to_string(),
+                variant,
+                active_field: None,
+                args: None,
+            },
+            operands,
+        ),
+        span: SourceSpan::default(),
+    }
+}
+
+/// Descriptions of the per-variant drop-glue assumption rows on `module`.
+fn drop_glue_variant_rows(module: &trust_ir::Module) -> Vec<String> {
+    module
+        .proof_obligations
+        .iter()
+        .filter(|o| {
+            o.kind == trust_ir::ObligationKind::PanicFreedom
+                && o.description.starts_with(trust_types::assumption::DROP_GLUE_ASSUMPTION_PREFIX)
+        })
+        .map(|o| o.description.clone())
+        .collect()
+}
+
+#[test]
+fn test_drop_glue_constant_ok_tag_does_not_charge_the_err_variant() {
+    // THE PROBE. `let _r: Result<(), E> = Ok(());` writes a COMPILE-TIME
+    // CONSTANT tag, so the `Err` arm of the drop-glue switch is dead code and
+    // the `Ok` arm carries a unit payload with nothing to drop. Before the
+    // variant lane this minted one blanket `[trust-drop-glue-assumption]` row
+    // for the whole ADT; the drop now executes no code at all and is charged
+    // nothing.
+    let module = lower_to_trust_ir(&variant_drop_fn(
+        variant_test_result_ty(),
+        0,
+        vec![variant_const_write(0, vec![Operand::Constant(ConstValue::Unit)])],
+    ))
+    .expect("constant-Ok drop must lower");
+    assert_valid_module(&module);
+    assert_eq!(
+        drop_glue_variant_rows(&module),
+        Vec::<String>::new(),
+        "a provably-Ok tag with a unit payload must charge no drop-glue row"
+    );
+    assert_eq!(
+        drop_glue_marker_count(&module),
+        0,
+        "no arm can panic, so no reachable-panic marker may be emitted"
+    );
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        insts.iter().any(|n| matches!(n.inst, Inst::Br { .. })),
+        "the drop must still branch to its target"
+    );
+}
+
+#[test]
+fn test_drop_glue_constant_err_tag_still_charges_the_err_variant() {
+    // The exclusion must be DIRECTIONAL, not a free pass: the same shape with a
+    // constant `Err` tag proves the `Ok` arm dead and charges `Err`.
+    let module = lower_to_trust_ir(&variant_drop_fn(
+        variant_test_result_ty(),
+        0,
+        vec![variant_const_write(1, vec![Operand::Move(Place::local(3))])],
+    ))
+    .expect("constant-Err drop must lower");
+    assert_valid_module(&module);
+    let rows = drop_glue_variant_rows(&module);
+    assert_eq!(rows.len(), 1, "the live `Err` arm must still be charged: {rows:?}");
+    assert!(rows[0].contains("variant `Err`"), "the row must name the charged arm: {rows:?}");
+    assert!(rows[0].contains("Ok#0=excluded"), "the plan must record the exclusion: {rows:?}");
+    assert_eq!(
+        drop_glue_marker_count(&module),
+        1,
+        "a charged arm keeps its reachable-panic marker"
+    );
+}
+
+#[test]
+fn test_drop_glue_unknown_tag_charges_only_the_droppable_variant() {
+    // An ARGUMENT's tag is written outside this body, so nothing is proved and
+    // every variant is live (fail-closed). `Ok`'s unit payload still needs no
+    // obligation — the second, independent win — so exactly one row is charged,
+    // matching today's blanket count for this shape.
+    let module = lower_to_trust_ir(&variant_drop_fn(variant_test_result_ty(), 1, vec![]))
+        .expect("argument drop must lower");
+    assert_valid_module(&module);
+    let rows = drop_glue_variant_rows(&module);
+    assert_eq!(rows.len(), 1, "unknown tag must charge every undischargeable arm: {rows:?}");
+    assert!(rows[0].contains("variant `Err`"));
+    assert!(
+        rows[0].contains("Ok#0=no-droppable-payload"),
+        "the unit `Ok` payload runs no destructor: {rows:?}"
+    );
+}
+
+#[test]
+fn test_drop_glue_escaping_borrow_defeats_the_tag_proof() {
+    // A `&mut` to the dropped local could rewrite the discriminant, so the
+    // constant-Ok write no longer proves anything and the `Err` arm is charged.
+    // Silence must never be reachable through an unmodelled write.
+    let module = lower_to_trust_ir(&variant_drop_fn(
+        variant_test_result_ty(),
+        0,
+        vec![
+            variant_const_write(0, vec![Operand::Constant(ConstValue::Unit)]),
+            Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
+                span: SourceSpan::default(),
+            },
+        ],
+    ))
+    .expect("escaping-borrow drop must lower");
+    assert_valid_module(&module);
+    let rows = drop_glue_variant_rows(&module);
+    assert_eq!(rows.len(), 1, "an escaping borrow must forfeit the exclusion: {rows:?}");
+    assert!(rows[0].contains("variant `Err`"));
+    assert!(
+        !rows[0].contains("=excluded"),
+        "no variant may be reported excluded once the local escapes: {rows:?}"
+    );
+}
+
+#[test]
+fn test_drop_glue_charges_one_row_per_undischargeable_variant() {
+    // Attribution, not aggregation: a COMPILER-CERTIFIED no-`Drop` enum (in
+    // `structural_drop`) with two independently-undischargeable payloads gets
+    // two named rows where the blanket lane minted one. Each keeps its own
+    // reachable-panic marker, so nothing is weakened — the charge is split, not
+    // reduced.
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "myapp::TwoBad".to_string(),
+        fields: vec![
+            ("__tag".to_string(), Ty::i64()),
+            ("__v0_0".to_string(), variant_test_err_payload()),
+            ("__v1_0".to_string(), Ty::adt("myapp::OtherErr", vec![("y".to_string(), Ty::i64())])),
+        ],
+        variants: vec![
+            trust_types::VariantDef {
+                name: "Left".to_string(),
+                discriminant: 0,
+                fields: vec![("0".to_string(), variant_test_err_payload())],
+            },
+            trust_types::VariantDef {
+                name: "Right".to_string(),
+                discriminant: 1,
+                fields: vec![(
+                    "0".to_string(),
+                    Ty::adt("myapp::OtherErr", vec![("y".to_string(), Ty::i64())]),
+                )],
+            },
+        ],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let structural_drop: std::collections::HashSet<String> =
+        ["myapp::TwoBad".to_string()].into_iter().collect();
+    let module = lower_to_trust_ir_functions_with_context(
+        "test_mod",
+        &[variant_drop_fn(enum_ty, 1, vec![])],
+        &std::collections::HashSet::new(),
+        &structural_drop,
+    )
+    .expect("two-bad-variant drop must lower");
+    assert_valid_module(&module);
+    let rows = drop_glue_variant_rows(&module);
+    assert_eq!(rows.len(), 2, "each undischargeable arm gets its own row: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains("variant `Left`")));
+    assert!(rows.iter().any(|r| r.contains("variant `Right`")));
+    assert_eq!(
+        drop_glue_marker_count(&module),
+        2,
+        "every charged arm keeps a reachable-panic marker"
+    );
+}
+
+#[test]
+fn test_drop_glue_unlicensed_user_enum_keeps_the_blanket_row() {
+    // A user enum absent from `structural_drop` may carry its own `Drop` impl,
+    // which would run on EVERY arm. The variant lane declines and the drop keeps
+    // today's byte-identical blanket row even though the tag is a constant.
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "myapp::MaybePanicky".to_string(),
+        fields: vec![("__tag".to_string(), Ty::i64()), ("__v1_0".to_string(), Ty::i64())],
+        variants: vec![
+            trust_types::VariantDef { name: "A".to_string(), discriminant: 0, fields: vec![] },
+            trust_types::VariantDef {
+                name: "B".to_string(),
+                discriminant: 1,
+                fields: vec![("0".to_string(), variant_test_err_payload())],
+            },
+        ],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let module = lower_to_trust_ir(&variant_drop_fn(
+        enum_ty,
+        0,
+        vec![Statement::Assign {
+            place: Place::local(1),
+            rvalue: Rvalue::Aggregate(
+                AggregateKind::Adt {
+                    name: "myapp::MaybePanicky".to_string(),
+                    variant: 0,
+                    active_field: None,
+                    args: None,
+                },
+                vec![],
+            ),
+            span: SourceSpan::default(),
+        }],
+    ))
+    .expect("unlicensed enum drop must lower");
+    assert_valid_module(&module);
+    let rows = drop_glue_variant_rows(&module);
+    assert_eq!(rows.len(), 1, "an unlicensed enum keeps one blanket row: {rows:?}");
+    assert!(
+        !rows[0].contains("variant `"),
+        "the blanket row must not claim per-variant attribution: {rows:?}"
+    );
+}
+
+
+
 #[test]
 fn test_drop_glue_vec_of_plain_element_fails_closed_when_element_is_erased() {
     // A flattened `Vec` field tree does not authenticate its generic element or
@@ -4643,7 +4977,7 @@ fn test_trait_object_drop_is_fatal_and_generic_param_drop_is_expected_absent() {
     // (dynamic dispatch to whatever concrete type is behind the vtable).
     let boxed_dyn_ty = Ty::Adt { adt_kind: None, layout: None, 
         name: "alloc::boxed::Box".to_string(),
-        fields: vec![("0".to_string(), Ty::Dynamic { trait_name: "myapp::MyTrait".to_string() })],
+        fields: vec![("0".to_string(), Ty::Dynamic { trait_name: "myapp::MyTrait".to_string(), principal_key: Some("myapp::MyTrait".to_string()) })],
         variants: vec![],
         disc_index_safe: false,
         faithful_enum_repr: None, enum_layout: None, };
@@ -8316,7 +8650,7 @@ fn test_lower_array_raw_ptr_to_slice_raw_ptr_cast_builds_fat_pointer() {
 fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
     let data_ptr_ty = Ty::RawPtr { pointee: Box::new(Ty::u8()), mutable: false };
     let dyn_ptr_ty = Ty::RawPtr {
-        pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into() }),
+        pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
         mutable: false,
     };
     let func = VerifiableFunction {
@@ -8336,7 +8670,7 @@ fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
                     place: Place::local(3),
                     rvalue: Rvalue::Aggregate(
                         AggregateKind::RawPtr {
-                            pointee_ty: Ty::Dynamic { trait_name: "Debug".into() },
+                            pointee_ty: Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) },
                             mutable: false,
                         },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -8372,7 +8706,7 @@ fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
 fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
     let trait_name = "core::fmt::Debug";
     let dyn_ref_ty =
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into() }) };
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }) };
     let func = VerifiableFunction {
         name: "unsize_to_dyn_fn".to_string(),
         def_path: "test::unsize_to_dyn_fn".to_string(),
@@ -8476,7 +8810,7 @@ fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
 fn test_trait_object_unsize_same_key_shares_one_vtable_global() {
     let trait_name = "core::fmt::Debug";
     let dyn_ref_ty =
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into() }) };
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }) };
     let func = VerifiableFunction {
         name: "unsize_twice_fn".to_string(),
         def_path: "test::unsize_twice_fn".to_string(),
@@ -8566,7 +8900,7 @@ fn test_trait_object_unsize_same_key_shares_one_vtable_global() {
 fn test_trait_object_unsize_nominal_source_declines_identity_keeps_havoc() {
     let trait_name = "core::fmt::Debug";
     let dyn_ref_ty =
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into() }) };
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }) };
     let adt_src = Ty::Ref {
         mutable: false,
         inner: Box::new(Ty::adt(
@@ -8632,7 +8966,7 @@ fn test_trait_object_unsize_nominal_source_declines_identity_keeps_havoc() {
 fn test_lower_thin_mut_dyn_unsize_cast_stays_a_whole_value_havoc() {
     let dyn_mut_ref_ty = Ty::Ref {
         mutable: true,
-        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into() }),
+        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into(), principal_key: Some("core::fmt::Debug".into()) }),
     };
     let func = VerifiableFunction {
         name: "unsize_to_mut_dyn_fn".to_string(),
@@ -15457,7 +15791,7 @@ fn test_round6_fnonce_erased_zst_receiver_fail_soft() {
 fn test_lower_dyn_callable_receiver_fail_soft() {
     let dyn_recv_ty = Ty::Ref {
         mutable: true,
-        inner: Box::new(Ty::Dynamic { trait_name: "core::ops::function::FnMut".into() }),
+        inner: Box::new(Ty::Dynamic { trait_name: "core::ops::function::FnMut".into(), principal_key: Some("core::ops::function::FnMut".into()) }),
     };
     let func = VerifiableFunction {
         name: "calls_dyn".to_string(),
@@ -15768,6 +16102,199 @@ fn test_opaque_const_stays_fact_free_undef() {
         }),
         "OpaqueConst must not acquire any asserted fact (no Assume, no metadata lane)"
     );
+}
+
+/// Trust (vtable slice 8): a one-statement `_1 = const <Str literal>` body whose
+/// destination local has type `dest_ty` — the marshalling arms' harness.
+fn str_const_assign_func(bytes: &[u8], dest_ty: Ty) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "str_const_dest".to_string(),
+        def_path: "test::str_const_dest".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i64(), name: None },
+                LocalDecl { index: 1, ty: dest_ty, name: None },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Str {
+                        bytes: bytes.to_vec(),
+                    })),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// Trust (vtable slice 8): at a `&[u8; N]` destination (`N == bytes.len()`) a
+/// `ConstValue::Str` stops being a fact-free thin `Undef` and becomes the
+/// FAITHFUL value rustc promoted it to: the address of a named, internal,
+/// immutable, initializer-bearing `[u8; N]` module global — the THIR producer's
+/// `emit_bytes_global` convention, mirrored bit-exactly (name grammar
+/// `__trust_bytes_{idx}`, `Constant::Array` of `Int` elements; the differential's
+/// paired-global admission compares initializers bit-exactly, so the `Constant`
+/// VARIANT is part of the contract, not a style choice).
+#[test]
+fn test_str_constant_at_byte_array_ref_dest_lowers_to_bytes_global_address() {
+    let bytes = b"foo";
+    let func = str_const_assign_func(
+        bytes,
+        Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Array {
+                elem: Box::new(Ty::Int { width: 8, signed: false }),
+                len: bytes.len() as u64,
+            }),
+        },
+    );
+    let module = lower_to_trust_ir(&func).expect("a byte-array-ref Str constant must lower");
+    assert_valid_module(&module);
+
+    assert_eq!(module.globals.len(), 1, "exactly one bytes global");
+    let g = &module.globals[0];
+    assert_eq!(g.name, "__trust_bytes_0", "the producer's name grammar, index 0");
+    assert!(!g.mutable);
+    assert_eq!(g.linkage, trust_ir::Linkage::Internal);
+    let trust_ir::ty::Ty::Array(tid, len) = g.ty else {
+        panic!("bytes global must be an Array ty, got {:?}", g.ty);
+    };
+    assert_eq!(len, bytes.len() as u64);
+    assert_eq!(module.ty(tid), Some(&trust_ir::ty::Ty::U8));
+    assert_eq!(
+        g.initializer,
+        Some(trust_ir::Constant::Array(
+            bytes.iter().map(|b| trust_ir::Constant::Int(*b as i128)).collect()
+        )),
+        "bit-exact producer initializer spelling (Constant::Array of Int)"
+    );
+
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        insts.iter().any(|n| matches!(n.inst, Inst::GlobalAddr { .. })),
+        "the constant's value is the global's address"
+    );
+    assert!(
+        !insts.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
+        "no havoc seed remains for the marshalled constant"
+    );
+}
+
+/// Trust (vtable slice 8): at a `&str` destination the same literal assembles the
+/// producer's own `LitKind::Str` spelling — `PtrFromParts(FatPtr(Str), GlobalAddr,
+/// len)` over the bytes global.
+#[test]
+fn test_str_constant_at_str_ref_dest_lowers_to_fat_pointer_over_bytes_global() {
+    let bytes = b"abc";
+    let func = str_const_assign_func(
+        bytes,
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Str) },
+    );
+    let module = lower_to_trust_ir(&func).expect("a str-ref Str constant must lower");
+    assert_valid_module(&module);
+
+    assert_eq!(module.globals.len(), 1, "exactly one bytes global");
+    assert_eq!(module.globals[0].name, "__trust_bytes_0");
+    assert!(module.globals[0].initializer.is_some());
+
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    let ga: Vec<_> =
+        insts.iter().filter(|n| matches!(n.inst, Inst::GlobalAddr { .. })).collect();
+    assert_eq!(ga.len(), 1, "one address of the bytes global");
+    let data = ga[0].results[0];
+    assert!(
+        insts.iter().any(|n| matches!(
+            &n.inst,
+            Inst::PtrFromParts {
+                ptr_ty: trust_ir::ty::Ty::FatPtr(trust_ir::FatPtrKind::Str),
+                metadata_ty: trust_ir::ty::Ty::U64,
+                data: d,
+                ..
+            } if *d == data
+        )),
+        "the fat value is assembled from the real data lane at the Str fat kind"
+    );
+    assert!(
+        insts.iter().any(|n| matches!(
+            &n.inst,
+            Inst::Const { ty: trust_ir::ty::Ty::U64, value: trust_ir::Constant::Int(v) }
+                if *v == bytes.len() as i128
+        )),
+        "the metadata lane is the exact length"
+    );
+    assert!(
+        !insts.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
+        "no havoc seed remains for the marshalled constant"
+    );
+}
+
+/// Trust (vtable slice 8), the scope pin: every destination OUTSIDE the two proven
+/// shapes keeps the typed fact-free `Undef` byte-identically — a nested `&&str`
+/// (same bytes, but the VALUE is a pointer to a fat pointer, not to the bytes: the
+/// address of the bytes there would be a WRONG value, not a weak one), a
+/// length-mismatched array ref, and the empty literal (the producer refuses `""`/
+/// `b""` too — `emit_bytes_global` fails closed, so neither side guesses a
+/// zero-length global).
+#[test]
+fn test_str_constant_out_of_shape_dests_keep_fact_free_undef() {
+    let nested = str_const_assign_func(
+        b"abc",
+        Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Ref { mutable: false, inner: Box::new(Ty::Str) }),
+        },
+    );
+    let len_mismatch = str_const_assign_func(
+        b"abc",
+        Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Array {
+                elem: Box::new(Ty::Int { width: 8, signed: false }),
+                len: 4,
+            }),
+        },
+    );
+    let empty = str_const_assign_func(
+        b"",
+        Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Array {
+                elem: Box::new(Ty::Int { width: 8, signed: false }),
+                len: 0,
+            }),
+        },
+    );
+    for (what, func) in
+        [("nested &&str", nested), ("length mismatch", len_mismatch), ("empty literal", empty)]
+    {
+        let module = lower_to_trust_ir(&func).expect("out-of-shape Str constants still lower");
+        assert_valid_module(&module);
+        assert!(
+            module.globals.is_empty(),
+            "{what}: no bytes global may be minted out of shape"
+        );
+        let insts: Vec<_> =
+            module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+        assert!(
+            insts.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
+            "{what}: the typed fact-free Undef seed is kept"
+        );
+        assert!(
+            !insts.iter().any(|n| matches!(n.inst, Inst::GlobalAddr { .. })),
+            "{what}: no address is fabricated"
+        );
+    }
 }
 
 /// A bundled closure does not make an absent higher-order std wrapper equivalent
@@ -18093,4 +18620,310 @@ fn coroutine_gen_family_legal_returned_arm_declines_contract_end_to_end() {
             "{shape}: no contract => no module evidence"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trust (vtable slice 13, chain item (2d)): linked-call integer-literal
+// argument width conformance. The trust-types signed literal carrier
+// (`ConstValue::Int`) is width-less and the contextless `emit_const` defaults
+// it to I64; `ConstValue::Uint` carries a fixed width that erases the
+// pointer-size identity of a faithfully-extracted `usize` param. At a LINKED
+// call the callee's declared params are known, so a literal that exactly fits
+// the declared type is emitted AT that type — repairing the measured
+// `expected i32, got i64` / `expected usize, got u64` interpreter incapacity
+// and the `CallArgTypeMismatch` validator rejection of the same bundles.
+// ---------------------------------------------------------------------------
+
+/// A two-function bundle: `caller` invokes `test::callee(<literal>)` where the
+/// callee declares one parameter of `param_ty` and returns it.
+fn linked_call_literal_bundle(param_ty: Ty, literal: ConstValue) -> trust_ir::Module {
+    let callee = VerifiableFunction {
+        name: "callee".to_string(),
+        def_path: "test::callee".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: param_ty.clone(), name: None },
+                LocalDecl { index: 1, ty: param_ty.clone(), name: Some("n".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: param_ty.clone(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let caller = VerifiableFunction {
+        name: "caller".to_string(),
+        def_path: "test::caller".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: param_ty.clone(), name: None }],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        func: "test::callee".to_string(),
+                        args: vec![Operand::Constant(literal)],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0,
+            return_ty: param_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    lower_to_trust_ir_functions("linked_call_literal", &[caller, callee])
+        .expect("linked-call literal bundle must lower")
+}
+
+/// The type of the `Inst::Const` that defines the linked call's argument 0 in
+/// the caller (functions[0]).
+fn linked_call_arg0_const_ty(module: &trust_ir::Module) -> TrustIrTy {
+    let caller = &module.functions[0];
+    assert_eq!(caller.name, "caller");
+    let arg0 = caller
+        .blocks
+        .iter()
+        .flat_map(|b| b.body.iter())
+        .find_map(|n| match &n.inst {
+            Inst::Call { args, .. } => Some(args[0]),
+            _ => None,
+        })
+        .expect("caller must contain a linked Call");
+    caller
+        .blocks
+        .iter()
+        .flat_map(|b| b.body.iter())
+        .find_map(|n| match (&n.inst, n.results.as_slice()) {
+            (Inst::Const { ty, .. }, [r]) if *r == arg0 => Some(ty.clone()),
+            _ => None,
+        })
+        .expect("call argument 0 must be defined by an Inst::Const")
+}
+
+#[test]
+fn test_linked_call_int_literal_arg_conforms_to_callee_param_width() {
+    // The measured issue-87988 shape: `hotplug_callback(1)` at a declared
+    // `i32` param. Pre-fix the width-less `ConstValue::Int` defaulted to I64
+    // (interpreter: "expected i32, got i64"; validator: CallArgTypeMismatch).
+    let module =
+        linked_call_literal_bundle(Ty::Int { width: 32, signed: true }, ConstValue::Int(1));
+    assert_eq!(
+        linked_call_arg0_const_ty(&module),
+        TrustIrTy::I32,
+        "a fitting signed literal argument must adopt the callee's declared width"
+    );
+    assert_valid_module(&module);
+}
+
+#[test]
+fn test_linked_call_uint_literal_arg_adopts_ptr_sized_param_identity() {
+    // The measured locals-in-const-fn/mod-pub-access shape: `foo(42)` at a
+    // declared `usize` param. Pre-fix the fixed-width `ConstValue::Uint(_, 64)`
+    // emitted U64 against the faithful Usize param ("expected usize, got u64").
+    let module = linked_call_literal_bundle(
+        Ty::PtrSizedInt { signed: false },
+        ConstValue::Uint(42, 64),
+    );
+    assert_eq!(
+        linked_call_arg0_const_ty(&module),
+        TrustIrTy::Usize,
+        "a fitting unsigned literal argument must adopt the callee's pointer-size identity"
+    );
+    assert_valid_module(&module);
+}
+
+#[test]
+fn test_linked_call_nonfitting_literal_keeps_contextless_spelling() {
+    // A literal the declared width cannot represent must NOT be conformed
+    // (no truncation, no sign reinterpretation): the exact-fit guard refuses
+    // and the contextless I64 spelling is kept byte-identically — the module
+    // then fails closed downstream exactly as before, never silently retyped.
+    // (Unreachable from well-typed MIR; pinned so the guard cannot rot.)
+    let module =
+        linked_call_literal_bundle(Ty::Int { width: 8, signed: true }, ConstValue::Int(300));
+    assert_eq!(
+        linked_call_arg0_const_ty(&module),
+        TrustIrTy::I64,
+        "a non-fitting literal must keep the contextless width-collapsed spelling"
+    );
+}
+
+// Trust (vtable slice 16): the FAITHFUL first-class enum construction with the
+// WIDENED field set — the oracle half of the flat-enum-model alignment. A
+// struct-payload variant construction must seed `Const{Ty::Enum,
+// Aggregate([Int(disc), <recursive struct zero>])}` (the producer's own
+// spelling — probe dump `const enum.0 { 0, { 0, 0 } }`) and carry NO
+// `Inst::Undef` at the enum type: the Undef seed with only tag+selected lanes
+// covered is exactly the LIVE-havoc shape that held the slice-11 family.
+#[test]
+fn test_faithful_struct_payload_enum_construction_seeds_const_no_undef() {
+    let payload = Ty::Adt {
+        adt_kind: Some(trust_types::AdtKind::Struct),
+        layout: None,
+        name: "test::Payload".into(),
+        fields: vec![
+            ("a".into(), Ty::Int { width: 32, signed: false }),
+            ("b".into(), Ty::Int { width: 64, signed: false }),
+        ],
+        variants: vec![],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let enum_ty = faithful_enum_ty(
+        "test::Result",
+        None,
+        vec![
+            VariantDef {
+                name: "Ok".into(),
+                discriminant: 0,
+                fields: vec![("0".into(), payload.clone())],
+            },
+            VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), Ty::Unit)] },
+        ],
+    );
+    let func = VerifiableFunction {
+        name: "mk_ok".into(),
+        def_path: "test::mk_ok".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: enum_ty.clone(), name: None },
+                LocalDecl { index: 1, ty: payload, name: Some("p".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Aggregate(
+                        trust_types::AggregateKind::Adt {
+                            name: "test::Result".into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
+                        vec![Operand::Move(Place::local(1))],
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: enum_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let module = lower_to_trust_ir(&func).expect("struct-payload enum construction should lower");
+    let bb0 = &module.functions[0].blocks[0];
+    // No Undef anywhere: the construction is Const-seeded.
+    assert!(
+        bb0.body.iter().all(|n| !matches!(&n.inst, Inst::Undef { .. })),
+        "first-class enum construction must not seed Undef (the LIVE-havoc shape)"
+    );
+    // The seed: an enum-typed Const whose head is the EFFECTIVE discriminant and
+    // whose payload lane is the RECURSIVE struct zero (not a raw Int).
+    let seed = bb0
+        .body
+        .iter()
+        .find_map(|n| match &n.inst {
+            Inst::Const { ty: TrustIrTy::Enum(_), value: trust_ir::Constant::Aggregate(elems) } => {
+                Some(elems.clone())
+            }
+            _ => None,
+        })
+        .expect("enum construction must seed an enum-typed aggregate Const");
+    assert_eq!(seed[0], trust_ir::Constant::Int(0), "head must be the effective discriminant");
+    assert_eq!(
+        seed[1],
+        trust_ir::Constant::Aggregate(vec![
+            trust_ir::Constant::Int(0),
+            trust_ir::Constant::Int(0)
+        ]),
+        "a struct payload lane seeds as the recursive struct zero (interpreter-typed), never Int(0)"
+    );
+    // The payload lane is then overwritten positionally at 1 + 0.
+    assert!(
+        bb0.body
+            .iter()
+            .any(|n| matches!(&n.inst, Inst::InsertField { field: 1, .. })),
+        "the struct payload operand must overwrite lane 1"
+    );
+    assert_valid_module(&module);
+}
+
+// Trust (vtable slice 16): the zero-seed helper's recursive/refusal contract —
+// nested enum lanes seed variant-0 (the producer's wave-ES convention), thin
+// pointers seed the NullPtr Int(0) pairing, and a fat lane REFUSES (trust-ir has
+// no fat-pointer constant spelling; the producer's ctor refuses the same lane
+// with `EnumCtor(fat field seed)`).
+#[test]
+fn test_enum_field_zero_seed_recursive_and_fat_refusal() {
+    use crate::lower::first_class_enum_field_zero_seed;
+    let mut module = trust_ir::Module::new("seed_test");
+    let inner = trust_ir::EnumDef::new(
+        trust_ir::value::EnumId::new(0),
+        "Inner",
+        vec![
+            trust_ir::EnumVariant {
+                name: "A".into(),
+                fields: vec![TrustIrTy::Ptr],
+                field_names: vec![],
+            },
+            trust_ir::EnumVariant { name: "B".into(), fields: vec![], field_names: vec![] },
+        ],
+    )
+    .with_discriminants(vec![Some(7), Some(9)]);
+    let inner_id = module.add_enum_def(inner);
+    assert_eq!(
+        first_class_enum_field_zero_seed(&module, &TrustIrTy::Enum(inner_id), 0).unwrap(),
+        trust_ir::Constant::Aggregate(vec![
+            trust_ir::Constant::Int(7),
+            trust_ir::Constant::Int(0)
+        ]),
+        "a nested enum lane seeds variant 0 at its EFFECTIVE discriminant with recursive zeros"
+    );
+    assert_eq!(
+        first_class_enum_field_zero_seed(&module, &TrustIrTy::Ptr, 0).unwrap(),
+        trust_ir::Constant::Int(0),
+        "a thin pointer lane seeds the (Ty::Ptr, Int(0)) NullPtr pairing"
+    );
+    assert!(
+        first_class_enum_field_zero_seed(
+            &module,
+            &TrustIrTy::FatPtr(trust_ir::FatPtrKind::Str),
+            0
+        )
+        .is_err(),
+        "a fat lane must refuse — no fat-pointer constant spelling exists"
+    );
 }

@@ -1137,17 +1137,61 @@ fn align_up_u32(value: u32, align: u32) -> u32 {
 
 /// Resolve the in-declaration-order scalar field types of an aggregate type,
 /// threading the `module` so a `Ty::Struct(sid)` resolves its fields from the
-/// Module's `StructDef` EXACTLY as the interpreter's `struct_layout` does
-/// (`def.fields.iter().map(|f| &f.ty)`). A `Ty::Tuple` is self-describing.
+/// Module's `StructDef` (`def.fields.iter().map(|f| &f.ty)`). A `Ty::Tuple` is
+/// self-describing.
 ///
 /// FAIL-CLOSED on any non-aggregate type, and — for a struct — on a missing
-/// `StructDef` or a `repr` other than the layout-default `Rust`: the converter
-/// reproduces ONLY the natural C-style layout the interpreter computes (which
-/// ignores `repr`/`size`/`align`/`offset`), so a `#[repr(C/packed/transparent)]`
-/// struct — whose real ABI layout could differ — is rejected rather than laid
-/// out under a layout the emitted bytes are not proven against. The bridge emits
-/// `StructRepr::Rust` for every ADT/closure-env it lowers, so this covers the
-/// real emitted shape; a non-default repr is out of the proven slice.
+/// `StructDef` or a `repr` other than the layout-default `Rust`: this converter
+/// reproduces ONLY a natural declaration-order C-style layout, so a
+/// `#[repr(C/packed/transparent)]` struct — whose real ABI layout could differ —
+/// is rejected rather than laid out under a layout the emitted bytes are not
+/// proven against. The bridge emits `StructRepr::Rust` for every ADT/closure-env
+/// it lowers, so this covers the real emitted shape; a non-default repr is out
+/// of the proven slice.
+///
+/// # KNOWN GAP — this doc used to claim parity with the interpreter, and that
+/// claim is FALSE at the current `first-party/trust-ir` pin
+///
+/// The wording removed above said the interpreter's layout "ignores
+/// `repr`/`size`/`align`/`offset`". That was true when it was written and stopped
+/// being true at trust-ir `c951b2e` (*"a declared struct layout is NORMATIVE"*).
+/// `interpret::struct_layout` now DISPATCHES on `(def.size, def.align)`:
+///
+/// * both `Some` -> `declared_struct_layout`, which lays the struct out at
+///   `FieldDef::offset` verbatim (and errors on an incoherent size/align);
+/// * both `None`  -> the declaration-order `aggregate_layout` this file mirrors —
+///   and that branch additionally ERRORS if any field declares an offset;
+/// * one of each -> an error.
+///
+/// So for a `StructDef` that carries a declared layout, the interpreter and this
+/// function are TWO DIFFERENT LAYOUT ALGORITHMS for one type. That is not
+/// hypothetical: the producer's `register_struct` fills `size`/`align`/`offset`
+/// from rustc's REORDER-AWARE `layout.fields.offset` for every concrete struct it
+/// registers, and wave-SG measured 3,489 of 4,788 field offsets on `clean-kernel`
+/// differing from the declaration-order layout. Grep this file: it holds exactly
+/// ONE `struct_def(` call — right below — and reads NONE of `def.size`,
+/// `def.align` or `FieldDef::offset` anywhere.
+///
+/// Why it is not (yet) a wrong emission, stated exactly: the admitted slice only
+/// ever round-trips a WHOLE aggregate through one slot, so a Store and its Load
+/// use the same (possibly non-rustc) offsets and the observable value survives;
+/// partial access, a re-derived `GEP` into the slot, and every escape already
+/// fail closed; and the declaration-order slot is never SMALLER than rustc's.
+/// Remove any one of those three and the two algorithms disagree silently.
+///
+/// The `module_to_lir_struct_mem_proven_output.rs` suite does not cover this:
+/// every `StructDef` it builds is `size: None, align: None` with no field offset,
+/// i.e. exactly the one branch on which the two algorithms cannot differ. Its
+/// "value-differential (layout agreement)" test is therefore green by
+/// construction for the divergent case.
+///
+/// The fix is a decision, not a patch, and it is deliberately NOT made here:
+/// either REFUSE a `StructDef` that declares a layout this file does not read
+/// (fail-closed, but that is most producer-emitted structs and its coverage cost
+/// is unmeasured), or READ the declared triple and lay the slot out at
+/// `FieldDef::offset` (parity, but it moves emitted bytes and needs its own
+/// proven-output gate). Recorded here so the next reader does not inherit a doc
+/// comment that asserts the opposite of the contract.
 fn aggregate_field_types(ty: &Ty, module: &Module, name: &str) -> Result<Vec<Ty>, ModuleLirError> {
     match ty {
         Ty::Tuple(elems) => Ok(elems.clone()),
@@ -1160,9 +1204,12 @@ fn aggregate_field_types(ty: &Ty, module: &Module, name: &str) -> Result<Vec<Ty>
                         sid.as_usize()
                     ),
                 })?;
-            // Reproduce ONLY the interpreter's natural C layout, which ignores
+            // Reproduce ONLY a natural declaration-order C layout, which ignores
             // `repr`. A non-`Rust` repr's real ABI layout could diverge from the
             // natural layout the emitted bytes are proven against; fail closed.
+            // NOTE: a `StructRepr::Rust` struct that DECLARES `size`/`align`/
+            // `FieldDef::offset` is admitted here and laid out in declaration
+            // order anyway — see the KNOWN GAP on `aggregate_field_types`.
             if def.repr != trust_ir::ty::StructRepr::Rust {
                 return Err(ModuleLirError::UnsupportedAggregate {
                     name: name.to_string(),

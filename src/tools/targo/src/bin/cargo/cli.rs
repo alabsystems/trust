@@ -255,9 +255,34 @@ fn print_list(gctx: &GlobalContext, is_verbose: bool) {
 
 pub fn get_version_string(is_verbose: bool) -> String {
     let version = cargo::version();
-    let mut version_string = format!("{} {}\n", cargo_binary_name(), version);
+    // Trust: brand by the INVOKED name, exactly as `rustc_driver_impl` does for
+    // `trustc`. `version` here is the Rust COMPAT line (CFG_RELEASE — "which Rust is
+    // this compatible with"), NOT Trust's own version, and it must keep leading:
+    // dispatched as `cargo`, this banner is parsed by the same version-sniffing build
+    // scripts that assert the `cargo <semver>` shape, and Trust's `0.1.0` there would
+    // read as a Cargo predating 1.0.
+    //
+    // But under `targo` there is no such obligation — nothing in the ecosystem expects
+    // a tool called `targo`, so wearing the compat number as its own name buys nothing
+    // and hides what the binary actually is. The parenthetical is where it says so,
+    // and it is emitted ONLY for the non-`cargo` frontend, so the compat surface is
+    // untouched.
+    let brand = match (cargo_binary_name(), option_env!("CFG_TRUST_VERSION")) {
+        ("cargo", _) => String::new(),
+        (name, Some(trust_version)) => format!(" ({name} {trust_version})"),
+        (name, None) => format!(" ({name})"),
+    };
+    let mut version_string = format!("{} {}{}\n", cargo_binary_name(), version, brand);
     if is_verbose {
         version_string.push_str(&format!("release: {}\n", version.version));
+        // Trust: the product version, beside the compat `release:` above and never in
+        // place of it — the two answer different questions and a consumer must not have
+        // to infer either from the other. Absent binding reports as `unknown` rather
+        // than being omitted, so a parser can tell "standalone build" from "old build".
+        version_string.push_str(&format!(
+            "trust: {}\n",
+            option_env!("CFG_TRUST_VERSION").unwrap_or("unknown")
+        ));
         if let Some(ref ci) = version.commit_info {
             version_string.push_str(&format!("commit-hash: {}\n", ci.commit_hash));
             version_string.push_str(&format!("commit-date: {}\n", ci.commit_date));
@@ -959,4 +984,74 @@ fn verbose_version_reports_the_exact_trust_repo_binding_only_once() {
         [expected]
     );
     assert!(!get_version_string(false).contains("trust-repo-commit-hash:"));
+}
+
+/// THE TWO NUMBERS NEVER TRADE PLACES.
+///
+/// `release:` is the Rust COMPAT line (CFG_RELEASE, from `src/rust-compat-version`) —
+/// the field ecosystem build scripts parse. `trust:` is Trust's own product version
+/// (CFG_TRUST_VERSION, from `src/version`). Reporting the product version in
+/// `release:` would tell every `autocfg`-style build script that this toolchain
+/// predates Rust 1.0, which is exactly the confusion `rustc_driver_impl` documents and
+/// avoids for `trustc`.
+///
+/// Both lines must therefore be present and DISTINCTLY NAMED. This asserts the shape,
+/// not the values — a bootstrap that binds neither still satisfies it, and the values
+/// are the bootstrap's business.
+#[test]
+fn verbose_version_reports_compat_and_product_versions_as_separate_fields() {
+    let verbose = get_version_string(true);
+    let field = |k: &str| {
+        verbose
+            .lines()
+            .filter_map(|l| l.strip_prefix(k))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(field("release: ").len(), 1, "exactly one compat line:\n{verbose}");
+    assert_eq!(field("trust: ").len(), 1, "exactly one product line:\n{verbose}");
+    // `trust-repo-commit-hash:` also starts with "trust" — the product line must not
+    // be that one misread by a sloppier prefix test.
+    assert_ne!(field("trust: ")[0], "");
+    assert!(!get_version_string(false).contains("trust: "), "terse banner stays terse");
+}
+
+/// The parenthetical brand is owed to the INVOKED NAME, not to the binary.
+///
+/// Under `cargo` the banner must stay byte-identical to Cargo's, because that is the
+/// string version-sniffing build scripts assert against. Under `targo` there is no
+/// such consumer, so the tool says what it actually is instead of wearing the compat
+/// number as its name.
+///
+/// This pins the RULE (branded iff not `cargo`) rather than a literal, because which
+/// frontend a test binary reports depends on how it was invoked.
+#[test]
+fn the_version_banner_is_branded_only_for_the_non_cargo_frontend() {
+    let first = get_version_string(false)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let name = cargo_binary_name();
+    assert!(first.starts_with(name), "banner must lead with the invoked name: {first}");
+    if name == "cargo" {
+        // Cargo's native banner can itself contain a parenthesized commit hash
+        // and date, for example `cargo 1.99.0-nightly (abc123 2026-08-20)`.
+        // That provenance is part of the compatibility surface, not Trust's
+        // product brand. Reject only the suffix shapes emitted by `brand`
+        // above; rejecting every `(` makes a correctly bootstrap-bound Cargo
+        // banner fail this test.
+        assert!(
+            !first.contains(" (cargo ") && !first.ends_with(" (cargo)"),
+            "the `cargo` frontend carries a compat obligation and must not be branded: {first}"
+        );
+    } else {
+        let expected_brand = option_env!("CFG_TRUST_VERSION").map_or_else(
+            || format!(" ({name})"),
+            |version| format!(" ({name} {version})"),
+        );
+        assert!(
+            first.ends_with(&expected_brand),
+            "the `{name}` frontend must identify itself: {first}"
+        );
+    }
 }

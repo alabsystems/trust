@@ -206,6 +206,49 @@ pub struct ResolverGlobalCtxt {
     // Information about delegations which is used when handling recursive delegations
     // and ensures easy access to delegation-only `LocalDefId`s.
     pub delegation_infos: FxIndexMap<LocalDefId, DelegationInfo>,
+    /// Trust (I5): every def in this crate that originated from a `clean { … }`
+    /// island declaration, as `(def, declaration name, span inside the island)`.
+    ///
+    /// An ENUMERATION, not a filter, and that is not a style choice:
+    /// `rustc_mir_transform`'s `mir_keys` has to *find* these defs, and every
+    /// `tcx`-side inventory available there (`hir_body_owners`,
+    /// `hir_crate_items(()).definitions()`, `…free_items()`) is derived from
+    /// HIR — which a Clean-origin def is exactly the thing that has none of. A
+    /// predicate applied to any of them would be vacuously false forever while
+    /// looking like a working filter.
+    ///
+    /// Written only by `rustc_resolve`'s Clean-origin mint site, which cannot
+    /// mint without a `KernelChecked` status, an audited-empty axiom closure
+    /// and a total carrier. Empty in every crate with no `clean { … }` island.
+    pub clean_origin_defs: Vec<(LocalDefId, Symbol, Span)>,
+    /// Trust (I6): the `DefId` of `trust_bignum::Nat` — the carrier DefId of
+    /// record, when this crate minted a `Nat`-carried Clean-origin def.
+    /// Recorded by `rustc_resolve`'s carrier step from the creader-loaded,
+    /// sysroot-residency-checked crate; `None` in every other crate.
+    pub trust_bignum_nat: Option<DefId>,
+    /// Trust (I6): the carrier signatures of `Nat`-carrying Clean-origin defs,
+    /// whose `fn_sig` is served by a PROVIDER ARM (`rustc_hir_analysis`)
+    /// instead of a resolve-time feed. Why deferral is forced: building the
+    /// `Nat` type demands `adt_def(trust_bignum::Nat)`, an extern-crate decode
+    /// that walks `lang_items` -> `resolver_for_lowering` — a query CYCLE from
+    /// inside resolution (measured: E0391 on the first `Nat` fixture). The
+    /// fixed-width defs keep the feed lane; this vec is empty unless a `Nat`
+    /// grant survived. The signature travels as carriers, not types, because
+    /// no `Ty` can be built where this is written.
+    pub clean_origin_deferred_sigs: Vec<(LocalDefId, Vec<TrustCleanCarrier>, TrustCleanCarrier)>,
+}
+
+/// Trust (I6): a discharged I4 carrier, in the resolver's closed vocabulary,
+/// carried to the `fn_sig` provider arm. See
+/// [`ResolverGlobalCtxt::clean_origin_deferred_sigs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, StableHash)]
+pub enum TrustCleanCarrier {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    Nat,
 }
 
 #[derive(Debug)]

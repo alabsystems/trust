@@ -304,14 +304,15 @@ pub fn sem_adt_payload_extract_of_discriminant_switch(
 /// over the uncertified `|x| x+1` (which aborts on `Some(i32::MAX)`) by matching the
 /// certified `|x| x` sibling — a false certification. Exact def-path equality only;
 /// exact-miss means "not certified", NEVER "less qualified". Returns
-/// `(resolved_key, fact, registry_index)`.
+/// `(resolved_key, fact, stable_id)` — the id is the same content key
+/// [`super::call_lift::stable_callee_id`] mints, so BOTH resolvers give the
+/// same callee the same id and neither is a function of registry membership.
 pub(super) fn resolve_certified_callee_exact<'a>(
     callees: &'a std::collections::BTreeMap<String, CalleeFact>,
     callee: &str,
 ) -> Option<(&'a str, &'a CalleeFact, u64)> {
     let (k, f) = callees.get_key_value(callee)?;
-    let id = callees.keys().position(|x| x == k)?;
-    Some((k.as_str(), f, u64::try_from(id).ok()?))
+    Some((k.as_str(), f, super::call_lift::stable_callee_id(k)))
 }
 
 /// Recognize the W6 increment-1 CLOSURE-COMPOSITION shape (section comment above).

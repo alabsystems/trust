@@ -42,6 +42,22 @@ pub(super) fn stable_json_sha256<T: Serialize>(value: &T) -> Option<String> {
     serde_json::to_vec(value).ok().map(|bytes| trust_types::digest::stable_sha256_hex(&bytes))
 }
 
+/// Canonical variant of [`stable_json_sha256`] for hash material that embeds
+/// trust-types MODEL values — above all the VC (`SolverDispatchRecord::vc`).
+/// Routes through [`trust_types::stable_model_json_bytes`] so an additive
+/// `#[serde(default)] Option<_>` model field does not move the digest — the
+/// exact drift class `canonical_vc_bytes` above exists to stop. A raw-serde
+/// hash over a VC-bearing struct is how `VerificationCondition::obligation`
+/// moved already-recorded digests; use THIS for any artifact whose
+/// serialization transitively contains model structs. (The canonicalizer's
+/// fragment strips cannot fire inside string contents: the fragments contain
+/// raw quotes, which JSON string literals always escape.)
+pub(super) fn stable_model_json_sha256<T: Serialize>(value: &T) -> Option<String> {
+    trust_types::stable_model_json_bytes(value)
+        .ok()
+        .map(|bytes| trust_types::digest::stable_sha256_hex(&bytes))
+}
+
 pub(super) fn production_checker_evidence_status_label(
     production_checker_evidence_sha256: Option<&str>,
 ) -> &'static str {

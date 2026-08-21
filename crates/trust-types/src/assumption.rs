@@ -270,6 +270,53 @@ pub const COROUTINE_RESUME_CONTRACT_ROW_REASON: &str =
      sentinel was discharged by the solver under the coroutine resume-state entry contract; \
      the crate's proof remains conditional on every caller establishing the resume state";
 
+/// Kind PREFIX stamped on a row whose violation formula CONSUMED the bridge's
+/// entry resume-state `Assume` without being one of the bridge-marked sentinel
+/// rows that the contract exists to describe.
+///
+/// WHY THIS EXISTS (the D2 false-PROVE). The bridge injects
+/// `Assume(resume_state ∈ live_states)` at the coroutine body's ENTRY, and entry
+/// DOMINATES every block — so every obligation discharged in that body is
+/// conditional on the executor-protocol premise, not just the sentinels. The
+/// sentinel rows say so in their description (they carry
+/// [`COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX`]); the whole-function
+/// panic-freedom AGGREGATE did not, and shipped as bare
+/// `proved` / `Certified` / `KernelRechecked` / `axiom_closure: Empty` with a
+/// CIC term BYTE-IDENTICAL to the sentinel row's — an ex-falso derivation from
+/// `resume_state = 0 ∧ resume_state = 1`. The conditionality lived only on a
+/// SIBLING `contract:coroutine-resume-state` row with `outcome: skipped`, so
+/// nothing linked the aggregate to the premise it had silently consumed.
+///
+/// The marker therefore belongs on the ROW THAT CONSUMED THE ASSUME. A row
+/// carrying this prefix is conditional evidence exactly like the assumption
+/// ledger and shares targo's `assumed` bucket; it may never carry
+/// `Outcome::Proved` (the producer strips the proof evidence when it stamps
+/// this, and targo counts a proved-claiming row as a genuine unknown defect).
+pub const COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX: &str =
+    "contract-conditional:coroutine-resume-state:";
+
+/// Exact `reason` stamped on a contract-conditional row, naming the premise the
+/// row's formula consumed. Consumers require this exact string as part of the
+/// fail-closed row-shape check.
+pub const COROUTINE_RESUME_CONDITIONAL_ROW_REASON: &str =
+    "conditional-on-exported-precondition: this obligation was discharged under the coroutine \
+     resume-state entry assumption injected at function entry, which dominates every block; the \
+     result is conditional on every caller establishing the resume state and is NOT an \
+     unconditional proof";
+
+/// Stamp `kind` as contract-conditional, preserving the original kind after the
+/// prefix so the row keeps its diagnostic identity.
+#[must_use]
+pub fn coroutine_resume_conditional_row_kind(original_kind: &str) -> String {
+    format!("{COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX}{original_kind}")
+}
+
+/// Whether `kind` was stamped by [`coroutine_resume_conditional_row_kind`].
+#[must_use]
+pub fn is_coroutine_resume_conditional_row_kind(kind: &str) -> bool {
+    kind.starts_with(COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX)
+}
+
 /// Reserved coroutine state discriminant: the coroutine has returned/completed.
 ///
 /// Pinned to `rustc_middle::ty::CoroutineArgsExt::RETURNED` (a rustc ABI
@@ -542,6 +589,48 @@ mod tests {
         assert_eq!(COROUTINE_STATE_UNRESUMED, 0);
         assert_eq!(COROUTINE_RESERVED_STATE_RETURNED, 1);
         assert_eq!(COROUTINE_RESERVED_STATE_POISONED, 2);
+    }
+
+    /// D2 regression pin: the contract-conditional marker is a DISTINCT bucket
+    /// from the published contract row, never reads as an assumption row, is
+    /// marker-free, and round-trips the original kind it wraps.
+    #[test]
+    fn coroutine_resume_conditional_kind_is_distinct_and_round_trips() {
+        for s in [
+            COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX,
+            COROUTINE_RESUME_CONDITIONAL_ROW_REASON,
+        ] {
+            let lower = s.to_ascii_lowercase();
+            for marker in FULL_VERIFIER_MARKERS {
+                assert!(
+                    !lower.contains(marker),
+                    "conditional string `{s}` must not contain full-verifier marker `{marker}`"
+                );
+            }
+        }
+        assert!(!COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX.starts_with("assumption:"));
+        assert!(
+            !COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX
+                .starts_with(CONTRACT_PANIC_ROW_KIND_PREFIX)
+        );
+        // The conditional prefix and the published contract kind must be
+        // mutually non-substring: a `starts_with` classifier must never read a
+        // conditional row as the published contract row (which targo counts
+        // through a different, shape-checked path) or vice versa.
+        assert!(
+            !COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX
+                .starts_with(COROUTINE_RESUME_CONTRACT_ROW_KIND)
+                && !COROUTINE_RESUME_CONTRACT_ROW_KIND
+                    .starts_with(COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX)
+        );
+        let stamped = coroutine_resume_conditional_row_kind("assert");
+        assert!(is_coroutine_resume_conditional_row_kind(&stamped));
+        assert_eq!(
+            stamped.strip_prefix(COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX),
+            Some("assert")
+        );
+        assert!(!is_coroutine_resume_conditional_row_kind("assert"));
+        assert!(!is_coroutine_resume_conditional_row_kind(COROUTINE_RESUME_CONTRACT_ROW_KIND));
     }
 
     #[test]

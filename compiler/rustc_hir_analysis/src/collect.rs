@@ -1006,6 +1006,46 @@ fn fn_sig(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_, ty::PolyFn
     use rustc_hir::Node::*;
     use rustc_hir::*;
 
+    // Trust (I6): a `Nat`-carrying Clean-origin def has a synthetic HIR owner
+    // and no `fn_sig` FEED — the feed would have to build the `Nat` ADT type
+    // during resolution, where `adt_def`'s extern decode cycles through
+    // `lang_items` -> `resolver_for_lowering` (measured: E0391). This arm is
+    // the deferral's other half: it runs post-resolution, where the decode is
+    // legal, and rebuilds the signature from the SAME discharged carriers the
+    // mint recorded. Fixed-width Clean-origin defs never reach here (their
+    // feed stands); ordinary Rust never reaches here (the vec is empty).
+    if let Some((_, params, result)) = tcx
+        .resolutions(())
+        .clean_origin_deferred_sigs
+        .iter()
+        .find(|&&(def, ..)| def == def_id)
+    {
+        let carrier_ty = |c: &ty::TrustCleanCarrier| -> ty::Ty<'_> {
+            match c {
+                ty::TrustCleanCarrier::Bool => tcx.types.bool,
+                ty::TrustCleanCarrier::U8 => tcx.types.u8,
+                ty::TrustCleanCarrier::U16 => tcx.types.u16,
+                ty::TrustCleanCarrier::U32 => tcx.types.u32,
+                ty::TrustCleanCarrier::U64 => tcx.types.u64,
+                ty::TrustCleanCarrier::Nat => {
+                    let Some(nat) = tcx.resolutions(()).trust_bignum_nat else {
+                        tcx.dcx().fatal(
+                            "internal: a Clean-origin def carries `Nat` but no \
+                             `trust_bignum::Nat` DefId is on record from the resolve-time \
+                             carrier load. This is a compiler defect and nothing you write \
+                             will change it. Please report it.",
+                        );
+                    };
+                    ty::Ty::new_adt(tcx, tcx.adt_def(nat), ty::List::empty())
+                }
+            }
+        };
+        let inputs = params.iter().map(&carrier_ty).collect::<Vec<_>>();
+        let output = carrier_ty(result);
+        let sig = tcx.mk_fn_sig_rust_abi(inputs, output, rustc_hir::Safety::Safe);
+        return ty::EarlyBinder::bind(tcx, ty::Binder::dummy(sig));
+    }
+
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
 
     let icx = ItemCtxt::new(tcx, def_id);

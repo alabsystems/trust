@@ -46,6 +46,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# An ay `Proved` that the clean kernel does not certify is reported `Unknown`
+# under `-Ztrust-policy=certify`, so "the solver said UNSAT" is not the property
+# a refute-lane test should assert. `nested_merge_cursor_clamp_realmir.rs` asserts
+# the CERTIFIED one — measured to be the direction that separates a discharged
+# fixture from an undischarged one. Dev-only: nothing the compiler links.
+trust-certify = { workspace = true }
 trust-router = { workspace = true, features = ["ay-backend"] }
 trust-report = { workspace = true }
 # range.rs's bound helpers are duplicated verbatim in trust-semantics, which

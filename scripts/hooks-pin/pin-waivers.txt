@@ -29,3 +29,22 @@
 # dropped, so the next reader can see the waiver expired by being FIXED.
 #
 # No active rows. That is the intended steady state: every drift blocks.
+
+# --- Opened 2026-08-19 at 45acd105ad ------------------------------------------
+# first-party/ay is AT its recorded pin; the PIN-DIRTY finding is one untracked
+# file, crates/ay/examples/exec_parity_probe.rs — an orphan of unknown ownership
+# that the 2026-08-19 binary-stack handoff (item 6) records as deliberately
+# PRESERVED across pin restores. Deleting another lane's uncommitted work is not
+# this lane's call; committing it into first-party/ay is not either. Waived so
+# the (just-reinstalled) pin gate does not teach --no-verify, expiring soon
+# enough to force a real disposition.
+# CLOSED 2026-08-20. The row that stood here waived first-party/ay for ONE untracked file,
+# crates/ay/examples/exec_parity_probe.rs. That file no longer exists in the ay
+# checkout (`git status --untracked-files=all` in first-party/ay is empty) and the
+# submodule is at its recorded pin, so the hook's own rule fired: "once the path is
+# back AT its pin, the row FAILS the push until deleted." Deleted here rather than
+# silently dropped, per the convention above, so the next reader can see that this
+# waiver expired by being RESOLVED and not by timing out. The orphan's disposition
+# is therefore no longer an open question for the pin gate.
+#
+# No active rows. That is the intended steady state: every drift blocks.

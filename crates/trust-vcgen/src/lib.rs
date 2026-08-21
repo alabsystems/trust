@@ -347,7 +347,7 @@ pub use memory_provenance::{BorrowStack, ProvenanceTracker, check_provenance};
 // Trust: Re-export modular verification API.
 pub use modular::{
     ContractCheck, FunctionSummary, ModularVcResult, ModularVerifier, SummaryDatabase,
-    generate_modular_vcs, modular_vcgen,
+    clean_origin_wrapping_binop_postconditions, generate_modular_vcs, modular_vcgen,
 };
 // Re-export ownership and borrow checking API.
 pub use ownership::{BorrowKind, BorrowRecord, BorrowState, BorrowViolation, scan_body};
@@ -1201,6 +1201,12 @@ pub use generate::discharge_captured_raw_body_with_context;
 // Bounded-model-checking refutation of a statically-sized array reduction whose
 // accumulator genuinely overflows (refutation-only; see `bmc_reduction`).
 pub use generate::generate_bounded_reduction_bmc_refutation_candidates;
+// Trust (coroutine resume-state contract): the sentinel refutation lane. See
+// `generate::coroutine_sentinel` for exactly what an UNSAT here does and does
+// NOT establish.
+pub use generate::coroutine_sentinel::{
+    body_has_coroutine_protocol_sentinel, coroutine_sentinel_refutation_vcs,
+};
 pub use generate::{
     derive_float_result_range, generate_callsite_l0_replay_candidates,
     generate_callsite_precondition_vcs, generate_callsite_precondition_vcs_attributed,
@@ -2614,6 +2620,33 @@ pub(crate) fn cast_target_is_slice_ref(to_ty: &Ty) -> bool {
         _ => return false,
     };
     matches!(**pointee, Ty::Slice { .. })
+}
+
+/// True when a cast TARGET is a reference or raw pointer to a trait object
+/// (`&dyn T` / `&mut dyn T` / `*const dyn T` / `*mut dyn T`) — the trait-object
+/// POINTER unsize coercion.
+///
+/// `convert.rs` emits an `Rvalue::Cast` with such a target ONLY for
+/// `PointerCoercion::Unsize` (see `unsize_target_is_trait_object_pointer`);
+/// Rust rejects a thin→fat `as` cast, so no other construct can produce one.
+/// Before commit d806992cd4 this coercion lowered to `Use(OpaqueConst)` and
+/// reached no cast predicate at all; that commit made the oracle spell it
+/// precisely but left this lane's accept-list untaught, so every `&T -> &dyn T`
+/// in the program fell to `unsupported_mir` and poisoned its whole function.
+///
+/// Sound: the coercion is an infallible vtable attach (no panic/overflow/alloc),
+/// so it carries NO obligation. The result's vtable lane is not modeled here, so
+/// callers admit it as a FRESH UNCONSTRAINED value — never the source operand's
+/// formula, which would falsely assert a fat pointer equals the thin one it was
+/// built from. That is exactly the `OpaqueConst` over-approximation this lane had
+/// before, so nothing can be proved that was not provable then.
+pub(crate) fn cast_target_is_trait_object_pointer(to_ty: &Ty) -> bool {
+    let pointee = match to_ty {
+        Ty::Ref { inner, .. } => inner,
+        Ty::RawPtr { pointee, .. } => pointee,
+        _ => return false,
+    };
+    matches!(**pointee, Ty::Dynamic { .. })
 }
 
 pub(crate) fn is_modeled_identity_cast(from_ty: &Ty, to_ty: &Ty) -> bool {

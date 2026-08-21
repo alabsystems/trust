@@ -1720,8 +1720,11 @@ fn inline_operand_formula(
         // `IrBody::is_grounder_connected` at every call site that matters
         // (`body_refinement_statement`); returning its (non-live-matching) `to_formula`
         // here keeps this fold total without ever reaching a live kernel check. Trust:
-        // ptr-spine call-arg leaf — `Index` is never produced inside a straight-line
-        // BODY (call-arg-only, built by `prove::sem_call_arg_to_ir`); `Len` HAS been a
+        // ptr-spine call-arg leaf — `Index` was call-arg-only until 2026-08-19; the
+        // FS-RHS-FIELD walk (`prove::field_post_mutator_ir_cfgs`) now mints it inside
+        // body `Bin`/`Use` rvalues too — the staged param-field RMW rhs — but on the
+        // MODEL lane (`check_cell_post_branch_model`), which never enters this fold;
+        // `Len` HAS been a
         // body operand since 2026-08-11 (the chain lane's `PtrMetadata` arm), but only
         // ever over a PARAMETER, and this LIVE-grounder fold is gated by
         // `is_grounder_connected` before any live kernel check regardless — both carry

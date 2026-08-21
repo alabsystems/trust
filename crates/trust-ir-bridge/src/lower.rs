@@ -428,11 +428,26 @@ pub fn map_type(ty: &Ty) -> Result<TrustIrTy, BridgeError> {
         // keeps the thin catch-all below (status-quo spelling; the producer fail-closes
         // those bodies, so the pair is never compared), as do `&mut dyn` (producer-thin
         // on both sides this slice) and raw `*dyn` (producer fail-closed).
-        Ty::Ref { mutable: false, inner } if matches!(inner.as_ref(), Ty::Dynamic { trait_name } if trait_name != "dyn") =>
+        //
+        // Trust (vtable slice 17, SOUNDNESS): keyed on the FAITHFUL `principal_key`, NEVER
+        // on the generics-erased `trait_name`. `trait_name` records the principal's def
+        // path and nothing else, so `dyn Convert<u32>` and `dyn Convert<u64>` hashed to
+        // ONE `trait_id` — and this id IS the type identity `tys_agree` compares by value,
+        // so it returned TRUE for two different types (a false Agreed). The key is minted
+        // `tcx`-side by the ONE shared renderer (`trust_mir_extract::faithful_principal_key`,
+        // also called by the producer's `trait_object_id`); this crate holds no `tcx` and
+        // must never acquire one — it only HASHES the string it was handed, which is what
+        // makes producer/oracle drift impossible by construction rather than by discipline.
+        // `principal_key: None` (principal-less, or not injectively renderable) keeps the
+        // thin catch-all below, exactly as the `"dyn"` sentinel did.
+        Ty::Ref { mutable: false, inner }
+            if matches!(inner.as_ref(), Ty::Dynamic { principal_key: Some(_), .. }) =>
         {
-            let Ty::Dynamic { trait_name } = inner.as_ref() else { unreachable!() };
+            let Ty::Dynamic { principal_key: Some(key), .. } = inner.as_ref() else {
+                unreachable!()
+            };
             Ok(TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject {
-                trait_id: trust_ir::stable_trait_object_id(trait_name),
+                trait_id: trust_ir::stable_trait_object_id(key),
             }))
         }
         // Trust (wave-RD): the RAW twin of the arm above — `*const dyn Trait` / `*mut dyn Trait`.
@@ -450,11 +465,15 @@ pub fn map_type(ty: &Ty) -> Result<TrustIrTy, BridgeError> {
         // The principal-less sentinel keeps the thin catch-all, exactly as above: the producer
         // fail-closes `*const dyn Send` (`Ty(dyn no principal)`), so that pair is never compared
         // and must not be given a shared sentinel id.
-        Ty::RawPtr { pointee, .. } if matches!(pointee.as_ref(), Ty::Dynamic { trait_name } if trait_name != "dyn") =>
+        // Trust (vtable slice 17): same faithful key as the ref arm above, same reasons.
+        Ty::RawPtr { pointee, .. }
+            if matches!(pointee.as_ref(), Ty::Dynamic { principal_key: Some(_), .. }) =>
         {
-            let Ty::Dynamic { trait_name } = pointee.as_ref() else { unreachable!() };
+            let Ty::Dynamic { principal_key: Some(key), .. } = pointee.as_ref() else {
+                unreachable!()
+            };
             Ok(TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject {
-                trait_id: trust_ir::stable_trait_object_id(trait_name),
+                trait_id: trust_ir::stable_trait_object_id(key),
             }))
         }
         Ty::Ref { .. } | Ty::RawPtr { .. } => Ok(TrustIrTy::Ptr),
@@ -514,7 +533,7 @@ fn map_type_shared_dynamic_ref_uses_stable_trait_object_id() {
     let trait_name = "core::fmt::Debug";
     let ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Dynamic { trait_name: trait_name.to_string() }),
+        inner: Box::new(Ty::Dynamic { trait_name: trait_name.to_string(), principal_key: Some(trait_name.to_string()) }),
     };
 
     assert_eq!(
@@ -523,6 +542,92 @@ fn map_type_shared_dynamic_ref_uses_stable_trait_object_id() {
             trait_id: trust_ir::stable_trait_object_id(trait_name),
         }),
     );
+}
+
+/// Trust (vtable slice 17) — THE REGRESSION PIN for the type-identity fail-open.
+///
+/// `trait_name` is the principal's GENERICS-ERASED def path, so `dyn Convert<u32>` and
+/// `dyn Convert<u64>` carry ONE `trait_name` and used to hash to ONE `trait_id`. That id
+/// IS the trait object's type identity, and `differential.rs`'s `tys_agree` compares it
+/// with `Ok(x == y)` — so two genuinely different types compared EQUAL, a path to a false
+/// Agreed. The faithful `principal_key` separates them; this pins that they never merge
+/// again, and that the merge is impossible even though `trait_name` still coincides.
+#[cfg(test)]
+#[test]
+fn map_type_separates_two_generic_trait_objects_that_share_one_erased_trait_name() {
+    let erased = "krate::Convert";
+    let mk = |key: &str| Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Dynamic {
+            trait_name: erased.to_string(),
+            principal_key: Some(key.to_string()),
+        }),
+    };
+    let u32_obj = mk("krate::Convert<u32>");
+    let u64_obj = mk("krate::Convert<u64>");
+
+    let id = |t: &Ty| match map_type(t).unwrap() {
+        TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id }) => trait_id,
+        other => panic!("expected a TraitObject fat pointer, got {other:?}"),
+    };
+
+    assert_ne!(
+        id(&u32_obj),
+        id(&u64_obj),
+        "dyn Convert<u32> and dyn Convert<u64> must NOT share a trait_id — they are \
+         different types with different vtables, and this id is what `tys_agree` compares"
+    );
+    // and the erased name really is common to both, i.e. the old key would have merged them
+    assert_eq!(
+        trust_ir::stable_trait_object_id(erased),
+        trust_ir::stable_trait_object_id(erased)
+    );
+}
+
+/// Trust (vtable slice 17): an args-free principal must key BYTE-IDENTICALLY to the
+/// pre-slice spelling, so no already-minted `trait_id` or vtable global name churns.
+#[cfg(test)]
+#[test]
+fn map_type_argless_principal_key_is_unchanged() {
+    let name = "core::fmt::Debug";
+    let ty = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Dynamic {
+            trait_name: name.to_string(),
+            principal_key: Some(name.to_string()),
+        }),
+    };
+    assert_eq!(
+        map_type(&ty).unwrap(),
+        TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject {
+            trait_id: trust_ir::stable_trait_object_id(name),
+        })
+    );
+}
+
+/// Trust (vtable slice 17): `principal_key: None` — principal-less (`dyn Send`) OR not
+/// injectively renderable — must keep the THIN catch-all, never a shared sentinel id.
+/// Falling back to `trait_name` here is exactly the bug the field exists to close.
+#[cfg(test)]
+#[test]
+fn map_type_unkeyable_dynamic_stays_thin_and_never_falls_back_to_trait_name() {
+    for inner in [
+        Ty::Dynamic { trait_name: "core::marker::Send".to_string(), principal_key: None },
+        Ty::Dynamic { trait_name: "dyn".to_string(), principal_key: None },
+        // a REAL principal whose args could not be rendered injectively
+        Ty::Dynamic { trait_name: "krate::Convert".to_string(), principal_key: None },
+    ] {
+        assert_eq!(
+            map_type(&Ty::Ref { mutable: false, inner: Box::new(inner.clone()) }).unwrap(),
+            TrustIrTy::Ptr,
+            "unkeyable {inner:?} must stay thin"
+        );
+        assert_eq!(
+            map_type(&Ty::RawPtr { mutable: false, pointee: Box::new(inner.clone()) }).unwrap(),
+            TrustIrTy::Ptr,
+            "unkeyable {inner:?} must stay thin through a raw pointer too"
+        );
+    }
 }
 
 /// Trust: build the `FuncTy` for a `Ty::FnPtr` signature IFF it lies in the producer's
@@ -1456,6 +1561,51 @@ impl<'a> LoweringCtx<'a> {
         self.emit_exact_usize_metadata_cast(metadata, TrustIrTy::U64, dest_ir_ty, context, body)
     }
 
+    /// The DECLARED byte offset of field `field_idx` in the trust-ir type `ty`,
+    /// or `None` when this module does not declare one.
+    ///
+    /// Read back out of `self.module` on purpose. The bridge fills
+    /// `StructDef::{size, align}` and `FieldDef::offset` from rustc's layout in
+    /// `map_type_ctx` (B3-4 T3), and `Module::ty_layout_shape` is the same view
+    /// the interpreter's `declared_struct_layout`, the validator, and trust-mc's
+    /// `exact_gep_lane_ty` read — so an address this bridge emits and the address
+    /// its consumers compute come from ONE source, and a layout the bridge would
+    /// not itself honour cannot be minted here.
+    ///
+    /// A `None` means "this module states no byte offset for that field", and the
+    /// callers must decide what that licenses. The four ways to get one:
+    ///
+    /// * `ty_layout_shape` returns a `TyLayoutKind::Struct` only for a
+    ///   `TrustIrTy::Struct` whose `size` is present, and `offset_bits` only for a
+    ///   field whose `FieldDef::offset` is present — i.e. exactly when the
+    ///   extractor ran `layout_of` on a fully concrete ADT under the FAITHFUL lane's
+    ///   T3 gate. A generic ADT, and every ADT on the verifier lane, has none.
+    /// * a non-empty `TrustIrTy::Tuple` and a `TrustIrTy::Closure` have NO layout
+    ///   shape at all (`LayoutError::UnsupportedTyShape`). Their in-module layout is
+    ///   whatever the interpreter's C-style `aggregate_layout` derives, which this
+    ///   crate deliberately does not re-derive: a second implementation of one
+    ///   layout rule is the same class of defect as the one being repaired above.
+    /// * a `TrustIrTy::Enum` is a `TyLayoutKind::Enum`, never a struct — the
+    ///   per-variant offsets live in `EnumLayoutDescriptor::variant_field_offsets`
+    ///   and are not reachable through this view (the variant-bearing guard in
+    ///   `address_from_pointer` refuses the walk before it gets here anyway).
+    /// * a bit offset that is not byte-aligned yields `None` rather than a rounded
+    ///   number.
+    fn declared_field_byte_offset(&self, ty: &TrustIrTy, field_idx: usize) -> Option<u64> {
+        let shape = self.module.ty_layout_shape(ty).ok()?;
+        let trust_ir::TyLayoutKind::Struct { fields, .. } = shape.kind else {
+            return None;
+        };
+        let offset_bits = fields.get(field_idx)?.offset_bits?;
+        (offset_bits % 8 == 0).then_some(offset_bits / 8)
+    }
+
+    /// This module's byte size for `ty`, or `None` when it declares none.
+    fn byte_size_of(&self, ty: &TrustIrTy) -> Option<u64> {
+        let size_bits = self.module.ty_layout_shape(ty).ok()?.size_bits;
+        (size_bits % 8 == 0).then_some(size_bits / 8)
+    }
+
     fn emit_usize_const(&mut self, value: u64, body: &mut Vec<InstrNode>) -> ValueId {
         let result = self.fresh_value();
         body.push(
@@ -1744,6 +1894,72 @@ impl<'a> LoweringCtx<'a> {
         Ok(value)
     }
 
+    /// Trust (vtable slice 8 — oracle fat-pointer const marshalling): materialize a
+    /// `ConstValue::Str { bytes }` literal's bytes as a NAMED, internal, immutable,
+    /// initializer-BEARING `[u8; N]` module global and return its `'static` address
+    /// (`Inst::GlobalAddr`, a thin `Ty::Ptr`).
+    ///
+    /// This is a byte-exact MIRROR of the THIR producer's wave-17 convention
+    /// (`trust-thir-lower` `emit_bytes_global`): same name grammar
+    /// (`__trust_bytes_{idx}`, idx = the module globals table length at mint time —
+    /// the producer's `pending_globals.len()` rule), same type spelling
+    /// (`Ty::Array(interned u8 TyId, N)`), same initializer spelling
+    /// (`Constant::Array([Constant::Int(b)])` — NOT `Constant::Bytes`; the
+    /// differential's paired-global admission compares initializers BIT-EXACTLY, so
+    /// a different `Constant` variant would refuse the pair even at equal bytes),
+    /// and the same empty-bytes refusal (`None`; the producer fails `""`/`b""`
+    /// closed, so the oracle keeps its fact-free `Undef` there — never a guessed
+    /// zero-length global on one side only).
+    ///
+    /// FAITHFUL, not a model: rustc promotes a string/byte-string literal to a
+    /// `'static` read-only allocation holding exactly these bytes, and the constant
+    /// IS that allocation's address. A FRESH global per occurrence asserts no
+    /// address identity ACROSS occurrences (two `b"foo"`s get two globals — the
+    /// language does not promise allocation dedup); non-nullness and content are
+    /// true of every real execution.
+    ///
+    /// Verifier visibility (stated per the slice contract): this replaces a bare,
+    /// annotation-less `Inst::Undef` — which the trust-mc proof-authority floor
+    /// already REJECTS (`Undef` without `FreshSymbolicHavoc` is a structural
+    /// preflight error) — with a `GlobalAddr` of an initializer-bearing global,
+    /// which the floor admits. A function holding such a const may therefore now
+    /// ENTER the proof-grade lane it was previously rejected from, with the real
+    /// constant's value; capability may widen, trust does not (v7/D2).
+    fn emit_str_const_bytes_global(
+        &mut self,
+        bytes: &[u8],
+        body: &mut Vec<InstrNode>,
+    ) -> Option<ValueId> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let elem = TrustIrTy::U8;
+        // Position-scan dedup into the module types table (the `map_type_ctx`
+        // slice-element idiom; `add_type` never dedups).
+        let tid = match self.module.types.iter().position(|e| *e == elem) {
+            Some(i) => trust_ir::value::TyId::new(i as u32),
+            None => self.module.add_type(elem),
+        };
+        let idx = self.module.globals.len();
+        let global = trust_ir::value::GlobalId::new(idx as u32);
+        self.module.globals.push(trust_ir::Global {
+            name: format!("__trust_bytes_{idx}"),
+            ty: TrustIrTy::Array(tid, bytes.len() as u64),
+            mutable: false,
+            initializer: Some(TrustIrConstant::Array(
+                bytes.iter().map(|b| TrustIrConstant::Int(*b as i128)).collect(),
+            )),
+            linkage: trust_ir::Linkage::Internal,
+            tls: None,
+            // No explicit over-alignment: a byte array is 1-aligned by type
+            // (the producer's rule verbatim).
+            align: None,
+        });
+        let data_ptr = self.fresh_value();
+        body.push(InstrNode::new(Inst::GlobalAddr { global }).with_result(data_ptr));
+        Some(data_ptr)
+    }
+
     /// Get the TrustIr ValueId for a trust-types local index.
     fn local_value(&self, index: usize) -> Result<ValueId, BridgeError> {
         self.local_values.get(&index).copied().ok_or(BridgeError::MissingLocal(index))
@@ -1958,26 +2174,92 @@ impl<'a> LoweringCtx<'a> {
             // type-only and the following `Field(i)` uses a flattened physical
             // index; for a faithful enum that can target the tag/canonical wrong
             // lane, and for a flat enum it can target another variant's field.
-            // Reject every address walk, before emitting a GEP. Checking at
-            // every step also catches an enum nested inside a struct/array. A
-            // whole-enum address/store has no remaining projection and stays
-            // supported, as do projections through non-enum aggregates.
+            // Reject every address walk, before emitting a GEP.
             //
             // A variant-qualified lane derivation (`variant_field_projection`,
             // the oracle the READ path already uses) was tried here and REVERTED.
-            // The lane arithmetic itself was right; the problem is downstream and
-            // is why this guard is soundness-load-bearing, not merely a precision
-            // guard. In trust-mc's CHC lane `translate_stack_store` is keyed by
-            // the ALLOCA's ValueId, so a `Store` through `GEP`+`BorrowMut` misses
-            // the precise `stack_cell`, and the `ValidBorrow` annotation then
-            // SUPPRESSES the `MemoryAccessWithoutPreciseModel` fail-close — the
-            // write is silently dropped while a later `Load` of the same alloca
-            // returns the PRE-store aggregate. `if let Some(x) = &mut opt { *x = 7; }`
-            // then reads back the value it just overwrote, and any obligation over
-            // it is discharged against a stale value. That hole is PRE-EXISTING for
-            // structs; this guard is the only thing keeping enums out of it.
-            // Re-land only once a `Store` whose ptr derives (through GEP/Borrow)
-            // from a base holding a precise `stack_cell` invalidates that cell.
+            // The lane arithmetic itself was right; the reason recorded for the
+            // revert was downstream — see below, and read it as history.
+            //
+            // THE STATED UNBLOCKING CONDITION IS MET; THE GUARD STAYS ANYWAY, FOR A
+            // DIFFERENT AND NARROWER REASON (slice 19, 2026-08-19).
+            //
+            // What this comment used to say, in the present tense, was: in
+            // trust-mc's CHC lane `translate_stack_store` is keyed by the ALLOCA's
+            // ValueId, so a `Store` through `GEP`+`BorrowMut` misses the precise
+            // `stack_cell`; the `ValidBorrow` annotation then SUPPRESSES the
+            // `MemoryAccessWithoutPreciseModel` fail-close; the write is silently
+            // dropped while a later `Load` of the same alloca returns the PRE-store
+            // aggregate; "that hole is PRE-EXISTING for structs; this guard is the
+            // only thing keeping enums out of it"; and it named its own release
+            // condition — *"Re-land only once a `Store` whose ptr derives (through
+            // GEP/Borrow) from a base holding a precise `stack_cell` invalidates
+            // that cell."*
+            //
+            // trust-mc `03eda5653` did exactly that. The `Store` arm's predicate is
+            // `stale_cell || (!valid_reference && !known_stack)`; `ValidBorrow`
+            // suppresses only the right disjunct; `stale_cell`
+            // (`store_target_cell_survives`) is an annotation-blind tripwire outside
+            // its reach; and `Borrow`/`BorrowMut` propagate interior-pointer
+            // provenance verbatim, which was the link the revert assumed missing.
+            // `tests/interior_pointer_store_modeling.rs` and
+            // `tests/stale_readback_on_lowered_module.rs` assert the verdict. The
+            // full citation is on the `Projection::Field` arm below. An auditor
+            // reading the old text was told a fixed hole was open, and a coverage
+            // lane was held shut on an obsolete premise — that is the defect this
+            // paragraph exists to retire.
+            //
+            // WHAT STILL JUSTIFIES THE GUARD is representation, and after the
+            // byte-offset repair below the reason is both narrower and STRONGER than
+            // the store-model one it replaces. `Downcast` below is TYPE-ONLY, so the
+            // `Field(i)` that follows it is a FLATTENED index into the enum's UNION
+            // view — one entry per distinct field NAME across all variants — and not
+            // a physical field index of the selected variant at all.
+            //
+            // A variant-bearing ADT reaches the `Projection::Field` arm with NO
+            // struct-shaped offsets, on both spellings and for different reasons:
+            // a first-class enum maps to `TrustIrTy::Enum`, whose `ty_layout_shape`
+            // is `TyLayoutKind::Enum` (its real per-variant offsets live in
+            // `EnumLayoutDescriptor::variant_field_offsets`, which that view does not
+            // expose); a FLATTENED enum maps to a `TrustIrTy::Struct` whose
+            // `StructDef` has no size and no offsets, because `ty_convert` fills
+            // `AdtLayoutInfo` only on the struct/union path and gives every enum
+            // `layout: None`. Either way `declared_field_byte_offset` answers `None`
+            // — which is case 3, the layout-less case, whose disposition is to KEEP
+            // the index spelling. So lifting this guard would not produce a refusal
+            // and would not produce a byte offset: it would emit
+            // `base + i * size_of(union-view field i)` into a variant-bearing
+            // interior, an address that can land on the tag lane or inside another
+            // variant's payload. That is precisely the case-3 residual's one
+            // unacceptable instance, and refusing before any GEP is emitted is what
+            // keeps it out. Checking at every step also catches an enum nested
+            // inside a struct or array.
+            //
+            // MEASURED AT ZERO, which retires the figure that used to justify
+            // re-landing this ("the entire enum-interior class, 348 bodies, loses
+            // its interpreter channel"). That count is the PRODUCER's population and
+            // does not transfer: the oracle is lowered only for bodies the producer
+            // already lowered CLEAN, so this guard can only cost a body that lands in
+            // `clean-skip-oracle-lowering-failed` / `clean-skip-oracle-bundle-failed`.
+            // In the postbuild-vtable18 control (7256 bodies over the seeded 2000-file
+            // ui_sample) those two buckets hold 14 bodies between them and NOT ONE is
+            // this refusal — they are nested-address-of-Deref (5), `TyKind::Alias`
+            // (2), `Box` deref (2), a fake-shallow borrow, an async-closure aggregate,
+            // a `char` constant, a `Discriminant` type mismatch, and a recursive ADT.
+            // Grepping the control for this message returns zero rows. So lifting the
+            // guard would buy no measured coverage while re-admitting the shape below.
+            //
+            // WHAT WOULD LIFT IT is not this guard's removal but the offsets it
+            // names: consult `EnumLayoutDescriptor::variant_field_offsets` — which
+            // `map_type_ctx` already copies through verbatim — for a
+            // `Downcast(v) + Field(i)` PAIR, and emit a flat-byte GEP at that
+            // per-variant offset, which is exactly the shape trust-thir-lower's
+            // wave-L4G by-ref payload lane already emits on the producer side. That
+            // is a slice of its own, with its own before/after; it is deliberately
+            // not bundled with the byte-offset repair below.
+            //
+            // A whole-enum address/store has no remaining projection and stays
+            // supported, as do projections through non-enum aggregates.
             if current_ty.is_enum_adt() {
                 return Err(BridgeError::UnsupportedOp(
                     "address walk into variant-bearing ADT interior".to_string(),
@@ -2119,11 +2401,129 @@ impl<'a> LoweringCtx<'a> {
                 Projection::Downcast(_) => {}
                 Projection::Field(idx) => {
                     // Trust Gap 3: `&place.field` — advance the pointer to field
-                    // `idx` with a GEP, exactly like the array-index case above.
-                    // Unblocks lowering of functions that take field addresses
-                    // (derived Clone/Default/PartialEq, `&mut self.field`, ...).
-                    // `field_type` fails closed for shapes it can't resolve,
-                    // preserving the previous refusal there.
+                    // `idx`. Unblocks lowering of functions that take field
+                    // addresses (derived Clone/Default/PartialEq,
+                    // `&mut self.field`, ...). `field_type` fails closed for
+                    // shapes it can't resolve, preserving the previous refusal
+                    // there.
+                    //
+                    // THE DISPLACEMENT IS A BYTE OFFSET, NOT A FIELD INDEX (slice 19,
+                    // 2026-08-19). This arm used to emit
+                    // `GEP { pointee_ty: <field ty>, indices: [<field INDEX>] }`, and
+                    // trust-ir GEP is defined as
+                    // `base + sum(indices) * size_of(pointee_ty)` (`eval_gep`,
+                    // `interpret.rs`), so the address it named was
+                    // `base + field_index * size_of(field_ty)` — a stride, not a
+                    // displacement. For `struct S { a: u32, b: u8 }` field 1 that is
+                    // `base + 1*1 = base + 1`; the real offset of `b` is 4. The two
+                    // coincide only when every preceding field has exactly the same
+                    // size as this one (a homogeneous prefix), which is why it
+                    // survived: the committed fixture that exercises the shape
+                    // (`trust-mc/.../fixtures/stale_struct_native_bundle.json`) is
+                    // `{u32,u32}`.
+                    //
+                    // Three facts fixed the direction of the repair:
+                    //   * the ORACLE ALREADY HAD the right number and did not use it
+                    //     — `map_type_ctx`'s `Ty::Adt` arm fills `FieldDef.offset`
+                    //     from rustc's `layout.field_offsets` verbatim (B3-4 T3).
+                    //   * the OTHER PRODUCER disagrees. `trust-thir-lower` spells a
+                    //     field address `GEP { pointee_ty: I8, indices: [<BYTE
+                    //     offset>], inbounds: true }` at all three of its sites
+                    //     (`lib.rs` wave-25/wave-DP/wave-L4G). The oracle was the
+                    //     outlier, not the convention.
+                    //   * the interpreter's own EXECUTED witness uses the byte
+                    //     spelling
+                    //     (`declared_struct_layout_round_trips_a_value_at_the_declared_offsets`),
+                    //     and since the trust-ir pin at `c951b2e` a DECLARED struct
+                    //     layout is NORMATIVE
+                    //     (`struct_layout_uses_the_declared_offsets_not_declaration_order`)
+                    //     — so field-index scaling cannot track rustc's field
+                    //     reordering even in principle.
+                    //
+                    // Every OTHER GEP this bridge emits stays index-scaled and stays
+                    // correct: `Index`, `ConstantIndex`, `Subslice`,
+                    // `emit_slice_index_load`, `emit_slice_element_ptr`,
+                    // `constant_slice_index`. An array stride genuinely IS
+                    // `index * size_of(elem)`. That asymmetry is the evidence this
+                    // was the sole wrong site.
+                    //
+                    // WHY IT WAS LATENT rather than a live false-PROVE, each verified
+                    // at the consumer: trust-mc's `exact_gep_lane_ty`
+                    // (`translate_chc.rs`) re-derives exactly the condition "the
+                    // declared start equals `field * size_of(pointee_ty)`" and
+                    // returns `None` otherwise, dropping to whole-cell havoc rather
+                    // than updating a different field's lane; BMC's `translate_gep`
+                    // bounds-checks the raw index sum against the `count = 1` every
+                    // `count: None` alloca gets, so any field GEP at index >= 1 is an
+                    // unconditional `OutOfBounds` (a false-FAIL, the safe direction);
+                    // and the differential cannot sample the shape at all through a
+                    // reference parameter (`&S` maps to `TrustIrTy::Ptr`, which
+                    // `differential.rs` admits only under the two-sided
+                    // `param_never_read` proof).
+                    //
+                    // THE REPAIR IS SCOPED TO WHERE A BYTE ADDRESS EXISTS, and the
+                    // scoping was MEASURED, not assumed. Three cases, in this order:
+                    //
+                    //  1. the base carries a DECLARED layout and the declared offset
+                    //     is exactly `idx * size_of(field)`. The two spellings then
+                    //     name the SAME address, and the index spelling is the one
+                    //     trust-mc's `exact_gep_lane_ty` can make precise (it matches
+                    //     only an index-scaled step whose `pointee_ty` IS the selected
+                    //     field's type). Emit it unchanged. Every module that was
+                    //     already correct is therefore BYTE-IDENTICAL after this
+                    //     change — no lane loses precision, and the differential's
+                    //     wave-DA byte-walk gate stays as free as it was.
+                    //  2. the base carries a DECLARED layout and the offsets DIFFER.
+                    //     This is the defect class and nothing else: a heterogeneous
+                    //     struct, a rustc-REORDERED one, a union field at index >= 1.
+                    //     Emit the producer's flat-byte spelling at the real offset.
+                    //  3. the base declares NO layout. Retain the index spelling —
+                    //     see the residual below, which is why this is not a refusal.
+                    //
+                    // WHICH LANE THIS CAN MOVE, and it is exactly one. `AdtLayoutInfo`
+                    // is filled under `ty_convert`'s T3 gate, whose first conjunct is
+                    // `faithful_scalars()` — set only by
+                    // `trust_mir_extract::extract_function_faithful`, which its own doc
+                    // names as "the trust-ir DIFFERENTIAL's lane", adding that "the
+                    // verifier pipeline stays on the legacy entry". So case 1/2 are
+                    // reachable ONLY from the differential's MIR-side oracle, and every
+                    // field address on the verifier pipeline — `targo trust check`,
+                    // trust-mc CHC/BMC, the falsification-gate fixtures — takes case 3
+                    // and is emitted BYTE-IDENTICALLY to before this change. This is
+                    // not a hope about blast radius; it is the extraction entry point.
+                    //
+                    // THE RESIDUAL, stated rather than implied. That same fact is the
+                    // residual read the other way: on the verifier lane, and for a
+                    // generic ADT on either lane, the displacement below is a LANE
+                    // SELECTOR in a module that declares no layout, not a byte address
+                    // — and no consumer of such a module turns it into one:
+                    //
+                    //   * trust-mc's `exact_gep_lane_ty` requires `definition_field.offset?`
+                    //     for EVERY field of the aggregate before it will name a lane,
+                    //     so a layout-less struct returns `None` unconditionally and
+                    //     the pointer drops to "unknown offset" (a later store havocs
+                    //     the whole cell). It cannot select the wrong field because it
+                    //     declines to select any.
+                    //   * BMC bounds-checks the raw index sum against the `count = 1`
+                    //     every `count: None` alloca gets, so a non-zero displacement
+                    //     is an unconditional `OutOfBounds` — a false-FAIL.
+                    //   * the interpreter, the one consumer that WOULD compute
+                    //     `base + idx * size_of(pointee_ty)` and compare it against
+                    //     its own C-style `aggregate_layout`, is reached only through
+                    //     the trust-thir-lower differential, which builds its oracle
+                    //     from the faithful lane — case 1/2 — and excludes generic
+                    //     bodies as SYMBOLIC before sampling.
+                    //
+                    // DENYING case 3 was implemented and MEASURED first, because that
+                    // is what the slice was asked to do. It costs 48 functions their
+                    // `generate_native_safety_vcs` cross-check on the flip corpus
+                    // (`missing_obligation_ratchet`: spine declines 228 -> 276), which
+                    // is a capability loss with no soundness gain in a lane where the
+                    // address is already inert — precisely the trade that ratchet
+                    // exists to refuse. Retiring the residual means giving the
+                    // VERIFIER lane real offsets (carry `AdtLayoutInfo` there, or
+                    // teach this bridge trust-ir's C-style fold behind an EXECUTED
+                    // cross-check against the interpreter), not denying the lane.
                     //
                     // WHAT THE CONSUMERS ACTUALLY DO WITH THIS GEP — measured in
                     // `first-party/trust-mc/trust-mc-trust-bmc/src/`, because an
@@ -2132,46 +2532,110 @@ impl<'a> LoweringCtx<'a> {
                     // true in NEITHER lane:
                     //
                     // CHC (`translate_chc.rs`). The GEP RESULT is havoc'd — a fresh
-                    // symbolic `gep_ptr` — so no address fact is minted, and that
-                    // part is sound. But a GEP off a stack/valid-ref base also
-                    // PROPAGATES safe provenance (`valid_ref_ptrs`), and it is NOT
-                    // flagged. The hazard is the STORE that follows, not this
-                    // instruction: `translate_stack_store` is keyed by the ALLOCA's
-                    // ValueId, so a store through a GEP-derived pointer never finds
-                    // the precise `stack_cell` — and the `ValidBorrow` annotation
-                    // this bridge puts on safe-reference stores then SUPPRESSES the
-                    // `MemoryAccessWithoutPreciseModel` fail-close. The write is
-                    // silently dropped while `translate_stack_load` on the SAME
-                    // alloca still answers from the precise pre-store cell. That is
-                    // a false-PROVE generator, it is PRE-EXISTING for structs
-                    // (`s.f = v` after `&mut s.f` spilled `s`), and it is the whole
-                    // reason the variant-bearing guard at the top of this loop keeps
-                    // enums out of the same shape. So the "no false facts / stays
-                    // unknown" claim holds for the ADDRESS and fails for a store
-                    // THROUGH it; fixing it means invalidating a base's `stack_cell`
-                    // when a GEP/Borrow derived from it is stored to.
+                    // symbolic `gep_ptr` — so no address fact is minted. A GEP off a
+                    // stack/valid-ref base also PROPAGATES safe provenance
+                    // (`valid_ref_ptrs`), and it is not flagged.
+                    //
+                    // THE STORE-DROP HOLE THIS COMMENT USED TO DESCRIBE IS CLOSED.
+                    // Until slice 19 (2026-08-19) the text here — and the enum guard
+                    // at the top of this loop, which cites it — asserted IN THE
+                    // PRESENT TENSE that a `Store` through a GEP-derived pointer
+                    // misses `translate_stack_store`'s alloca-keyed `stack_cell`,
+                    // that `ValidBorrow` then SUPPRESSES the
+                    // `MemoryAccessWithoutPreciseModel` fail-close, and that the
+                    // resulting silent write-drop "is a false-PROVE generator,
+                    // PRE-EXISTING for structs". That was fixed in trust-mc by
+                    // `03eda5653` and is no longer true:
+                    //
+                    //   * the fail-close predicate is now
+                    //     `stale_cell || (!valid_reference && !known_stack)`
+                    //     (`translate_chc.rs`, the `Store` arm). `ValidBorrow`
+                    //     suppresses ONLY the right-hand disjunct.
+                    //   * `stale_cell` is `IndirectStoreOutcome::NoTrackedTarget &&
+                    //     store_target_cell_survives(ptr)` — a tripwire that is
+                    //     deliberately ANNOTATION-BLIND and therefore outside
+                    //     `ValidBorrow`'s reach. A store that claims to have changed
+                    //     no precise cell, while a cell reachable from its own
+                    //     pointer is still standing with its pre-store value, is
+                    //     reported unsupported no matter what the annotations say.
+                    //   * the link this comment assumed was missing exists:
+                    //     `Borrow`/`BorrowMut` propagate interior-pointer provenance
+                    //     verbatim ("a borrow is a transparent alias"), so
+                    //     `*(&mut local.field)` keeps its base.
+                    //   * two suites assert the verdict exactly —
+                    //     `trust-mc-trust-bmc/tests/interior_pointer_store_modeling.rs`
+                    //     and `.../tests/stale_readback_on_lowered_module.rs`, the
+                    //     latter over a verbatim `-Ztrust-dump=native-bundle`
+                    //     artifact rather than a hand-built module.
+                    //
+                    // The unblocking condition the enum guard names for itself — "a
+                    // `Store` whose ptr derives (through GEP/Borrow) from a base
+                    // holding a precise `stack_cell` invalidates that cell" — is
+                    // therefore MET. See that guard for what is and is not implied.
+                    //
+                    // PRECISION, not soundness, is what the byte spelling costs in
+                    // this lane, and it costs it in the safe direction:
+                    // `exact_gep_lane_ty` matches only an index-scaled step whose
+                    // `pointee_ty` IS the selected field's type, so a flat-I8 byte
+                    // GEP leaves `lanes: None` and a later store havocs the whole
+                    // cell instead of updating one lane. Havoc widens what must be
+                    // proven; it can never narrow it. That is also exactly why case 1
+                    // above KEEPS the index spelling when it is provably the same
+                    // address: `exact_gep_lane_ty`'s own admission test is
+                    // "the declared start equals `field * size_of(pointee_ty)`", so
+                    // the modules that were losing precision under the byte spelling
+                    // are precisely the ones the byte spelling was not needed for.
                     //
                     // BMC (`translate.rs`). Not "unsupported" either: `translate_alloca`
                     // gives every `count: None` alloca `count = Some(1)`, and
                     // `translate_gep` bounds-checks the raw index SUM against that
-                    // count. A field GEP at index >= 1 therefore emits `1 >= 1`, an
-                    // UNCONDITIONAL `OutOfBounds` violation. BMC fails LOUDLY on
-                    // every non-zero field address (a false-FAIL, the safe
-                    // direction) rather than resolving anything.
+                    // count. Under the byte spelling the sum is the byte offset, so
+                    // every field address at a non-zero offset is still an
+                    // unconditional `OutOfBounds` violation — BMC fails LOUDLY (a
+                    // false-FAIL, the safe direction) rather than resolving anything,
+                    // exactly as it did under the index spelling. Only the reported
+                    // index in the violation payload changes.
                     let field_ty = field_type(&current_ty, *idx)?;
                     let field_trust_ir_ty = self.map_type_ctx(&field_ty)?;
-                    let index = self.emit_usize_const(*idx as u64, body);
+                    let base_trust_ir_ty = self.map_type_ctx(&current_ty)?;
+                    let indexed_displacement = self
+                        .byte_size_of(&field_trust_ir_ty)
+                        .and_then(|size| size.checked_mul(*idx as u64));
+                    let (pointee_ty, displacement, inbounds) =
+                        match self.declared_field_byte_offset(&base_trust_ir_ty, *idx) {
+                            // Case 1 — declared, and the index spelling already names
+                            // it. Byte-identical to the pre-repair emission.
+                            Some(offset) if Some(offset) == indexed_displacement => {
+                                (field_trust_ir_ty, *idx as u64, false)
+                            }
+                            // Case 2 — declared, and the index spelling does NOT name
+                            // it. The producer's flat-byte spelling, `inbounds`
+                            // because a field of a laid-out ADT is in bounds by
+                            // construction. Spelling it `inbounds: false` would also
+                            // hide it from `first_adt_interior_byte_arithmetic`, the
+                            // differential's wave-DA gate, which keys on
+                            // `I8|U8 + inbounds`; that gate exists to stop a verdict
+                            // being minted over an executed ADT-interior byte offset,
+                            // and evading it by spelling would be exactly the
+                            // "the premise was never tested" failure this repair is
+                            // cleaning up.
+                            Some(offset) => (TrustIrTy::I8, offset, true),
+                            // Case 3 — the base declares NO layout. See the RESIDUAL
+                            // note above: the index spelling is retained verbatim.
+                            None => (field_trust_ir_ty, *idx as u64, false),
+                        };
+                    let displacement = self.emit_usize_const(displacement, body);
                     let result = self.fresh_value();
                     body.push(
                         InstrNode::new(Inst::GEP {
-                            pointee_ty: field_trust_ir_ty,
+                            pointee_ty,
                             base: ptr,
-                            indices: vec![index],
-                            inbounds: false,
+                            indices: vec![displacement],
+                            inbounds,
                         })
                         .with_result(result),
                     );
-                    self.mark_result_symbolic_from(result, &[ptr, index]);
+                    self.mark_result_symbolic_from(result, &[ptr, displacement]);
                     ptr = result;
                     current_ty = field_ty;
                 }
@@ -2315,6 +2779,34 @@ impl<'a> LoweringCtx<'a> {
         }
     }
 
+    /// Trust (B1): is `callee` a body this bundle contains — under the EXACT key the
+    /// compiler rendered, or under the refined key of [`refined_callee_base`]?
+    ///
+    /// This is the SINGLE predicate for "is the callee bundled?". It must be, because
+    /// the answer is consumed twice per call: by the absent-callee arm guards in
+    /// `lower_terminator_normal`, which decide whether to mint an absent-callee
+    /// obligation, and by `resolve_call_target`, which decides whether to emit a real
+    /// call edge. If those two disagreed, a call could skip the absent arm as "known"
+    /// and then hard-`Err` in resolution, converting a coverage-only skip into a whole
+    /// bundle-construction failure — a class move with no mechanism behind it.
+    ///
+    /// The refined lookup additionally requires the resolved body's declared ARITY to
+    /// match the call's, because unlike the exact key the refined one was never
+    /// rendered from this body's own `DefId`. An arity split means the strip reached
+    /// something else, and the call fails closed to the absent-callee lane it is on
+    /// today. (MEASURED: 97 of 97 refinable call sites on the corpus are zero-argument
+    /// calls to zero-parameter bodies, so this gate withholds nothing that motivated
+    /// the lane — it is here to bound what the rule can reach in general.)
+    fn resolve_known_function(&self, callee: &str, arg_count: usize) -> Option<FuncId> {
+        if let Some(id) = self.known_functions.get(callee).copied() {
+            return Some(id);
+        }
+        let base = refined_callee_base(callee)?;
+        let id = self.known_functions.get(base).copied()?;
+        let signature = self.known_function_signatures.get(base)?;
+        (signature.params.len() == arg_count).then_some(id)
+    }
+
     fn resolve_call_target(
         &self,
         callee: &str,
@@ -2335,7 +2827,20 @@ impl<'a> LoweringCtx<'a> {
         // narrower def-path spelling cannot, because the sound and unsound cases
         // render byte-identically. See `trust_mir_extract::direct_call_def_path`,
         // residual 1.
-        if let Some(callee_id) = self.known_functions.get(callee).copied() {
+        //
+        // Trust (B1): the lookup is `resolve_known_function`, not a bare
+        // `known_functions.get`, so it also accepts the REFINED key — the same
+        // `DefId` rendered by the other member of the extract rendering seam, which
+        // differs by a trailing turbofish. That widens the by-name bind, so it is
+        // gated to keep it away from exactly the residual-1 shape this paragraph
+        // describes: a qualified-self key is never refined, because a trait-or-impl
+        // child is what rustc prints qualified once arguments are supplied, and that
+        // is the only shape in which an unresolvable dispatch can name a blanket
+        // impl's body. The gate is pinned RED-CHECKED end to end by
+        // `refined_callee_key_tests::a_blanket_impl_dispatch_still_fails_closed_
+        // with_its_body_in_the_bundle`. Nothing here closes residual 1 itself; the
+        // sentences above still stand unamended for the args-free key.
+        if let Some(callee_id) = self.resolve_known_function(callee, args.len()) {
             return Ok(ResolvedCall { callee: callee_id, args: CallArgLowering::AsWritten });
         }
 
@@ -2519,8 +3024,10 @@ impl<'a> LoweringCtx<'a> {
                     discs.push(Some(sign_extend(v.discriminant)));
                 }
                 // Id AFTER field mapping (the #46 nested-collision discipline) —
-                // though enum variant fields are scalars by eligibility, keep the
-                // pattern so a future widening cannot reintroduce the collision.
+                // LOAD-BEARING since vtable slice 16: eligibility now admits
+                // struct-kind and nested enum-kind variant fields, so the loop
+                // above really does register nested defs and an id taken before
+                // it would collide.
                 let mut def = trust_ir::EnumDef::new(
                     trust_ir::value::EnumId::new(self.module.enums.len() as u32),
                     name.clone(),
@@ -2582,8 +3089,8 @@ impl<'a> LoweringCtx<'a> {
                 // a descriptor whose normative claim is wrong (the widening
                 // above removes that disagreement wherever it legally can; the
                 // gate stays for the residue); (b) an unmappable niche lane
-                // (unreachable today: eligibility is Direct-only, but the
-                // mapping must not rot). A decline keeps layout=None — the
+                // (LIVE since vtable slice 16: eligibility admits niche-encoded
+                // enums — `Option<&T>`, `Option<String>`). A decline keeps layout=None — the
                 // documented fail-safe; a producer-side fill asymmetry then
                 // surfaces as a coverage-only Err in tys_agree.
                 if let Some(el) = enum_layout {
@@ -3027,14 +3534,60 @@ impl<'a> LoweringCtx<'a> {
             // module, never a demonic havoc that solves).
             // `Str` first: when the consumer's declared sort IS the byte-slice
             // fat spelling, the literal's length is statically known and the
-            // faithful lowering applies (`emit_str_const_byte_slice`). At any
-            // OTHER declared sort (a `&dyn Trait` destination, a thin promoted
-            // array ref) no length lane exists, so it keeps the typed fact-free
-            // seed below — same fail-closed havoc, correct sort.
+            // faithful lowering applies (`emit_str_const_byte_slice`,
+            // deliberately UNCHANGED by slice 8 — its length-assumed model is
+            // the floor-fitted verifier lane).
+            //
+            // Trust (vtable slice 8): at the two REFERENCE destinations whose
+            // pointee the literal's bytes fully determine, the value is no
+            // longer a fact-free havoc — the bytes are materialized as the
+            // producer-convention `__trust_bytes_*` global
+            // (`emit_str_const_bytes_global`) and the constant becomes the
+            // FAITHFUL value rustc promoted it to:
+            //   * `&[u8; N]` with `N == bytes.len()` (thin `Ptr` sort): the
+            //     global's address itself — `_2 = const b"foo"` in a
+            //     `&'static [u8]` initializer body, the `undef ty ptr`
+            //     LIVE-havoc family;
+            //   * `&str` (`FatPtr(Str)` sort): `PtrFromParts(GlobalAddr, len)`
+            //     — the producer's own `LitKind::Str` spelling, the
+            //     `undef ty fatptr<str>` family.
+            // The trust-types-level shape gate is load-bearing, not cosmetic:
+            // `ConstValue::Str` also reaches thin sorts whose POINTEE is not
+            // the byte allocation (the extractor peels `&&str` to the same
+            // bytes), and emitting the bytes' address there would be a wrong
+            // value, not a weak one. Everything outside the two proven shapes
+            // — nested refs, raw pointers, `&dyn` destinations, an
+            // array-length mismatch, the empty literal — keeps the typed
+            // fact-free `Undef` seed below, byte-identically.
             Operand::Constant(ConstValue::Str { bytes }) => {
                 let ty = self.map_type_ctx(expected_ty)?;
                 if matches!(byte_slice_fat_ty(self), Ok(fat) if fat == ty) {
                     return self.emit_str_const_byte_slice(bytes.len(), ty, body);
+                }
+                let byte_array_ref = matches!(
+                    expected_ty,
+                    Ty::Ref { mutable: false, inner }
+                        if matches!(
+                            inner.as_ref(),
+                            Ty::Array { elem, len }
+                                if matches!(elem.as_ref(), Ty::Int { width: 8, signed: false })
+                                    && *len == bytes.len() as u64
+                        )
+                );
+                if byte_array_ref && ty == TrustIrTy::Ptr {
+                    if let Some(data_ptr) = self.emit_str_const_bytes_global(bytes, body) {
+                        return Ok(data_ptr);
+                    }
+                }
+                let str_ref = matches!(
+                    expected_ty,
+                    Ty::Ref { mutable: false, inner } if matches!(inner.as_ref(), Ty::Str)
+                );
+                if str_ref && ty == TrustIrTy::FatPtr(trust_ir::FatPtrKind::Str) {
+                    if let Some(data_ptr) = self.emit_str_const_bytes_global(bytes, body) {
+                        let len = self.emit_u64_const(bytes.len() as u64, body);
+                        return self.emit_slice_fat_pointer(ty, data_ptr, len, body);
+                    }
                 }
                 let result = self.fresh_value();
                 body.push(InstrNode::new(Inst::Undef { ty }).with_result(result));
@@ -4557,7 +5110,40 @@ fn reconstruct_bv_mul_overflow_body(
     }
     let a = reconstruct_bv_operand_term(locals, lhs, width, "lhs")?;
     let b = reconstruct_bv_operand_term(locals, rhs, width, "rhs")?;
-    Some(bv_mul_failure_formula(a, b, width, signed))
+    let bv = bv_mul_failure_formula(a, b, width, signed);
+    // Trust: UMUL RECORD, RE-LANDED (2026-08-20) — trust-vcgen's UNSIGNED
+    // var*var mul arm conjoins the Int-reading out-of-range core as the
+    // formula's FINAL conjunct, so the spine's byte-reproduction must too or
+    // this class silently drops out of the native lane (measured the first
+    // time: 3 flip pins red and the native producer retiring for these
+    // functions). See that arm's comment for why the conjunct is safe again.
+    if signed {
+        return Some(bv);
+    }
+    Some(Formula::And(vec![bv, unsigned_mul_int_out_of_range_core(locals, lhs, rhs, width)?]))
+}
+
+/// The Int-reading out-of-range core trust-vcgen conjoins onto an UNSIGNED
+/// var*var mul violation, byte-mirrored (including `type_max_formula`'s u128
+/// totality: an i128 shift would overflow at width 128).
+fn unsigned_mul_int_out_of_range_core(
+    locals: &[LocalDecl],
+    lhs: &Operand,
+    rhs: &Operand,
+    width: u32,
+) -> Option<Formula> {
+    let lhs_f = safety_operand_to_formula(locals, lhs)?;
+    let rhs_f = safety_operand_to_formula(locals, rhs)?;
+    let result = Formula::Mul(Box::new(lhs_f), Box::new(rhs_f));
+    let max_f = if width == 128 {
+        Formula::UInt(u128::MAX)
+    } else {
+        Formula::Int((1i128 << width) - 1)
+    };
+    Some(Formula::Or(vec![
+        Formula::Lt(Box::new(result.clone()), Box::new(Formula::Int(0))),
+        Formula::Gt(Box::new(result), Box::new(max_f)),
+    ]))
 }
 
 /// Build trust-vcgen's fixed-width BV mul OVERFLOW (failure) condition for the
@@ -4624,10 +5210,27 @@ fn reconstruct_bv_mul_overflow_candidates(
     }
     let lhs_terms = reconstruct_bv_operand_terms(locals, all_blocks, lhs, width, "lhs");
     let rhs_terms = reconstruct_bv_operand_terms(locals, all_blocks, rhs, width, "rhs");
+    // The Int core is OPERAND-ENCODING-INDEPENDENT (always over the source
+    // operands' Int rendering), so it wraps every cartesian BV candidate.
+    let or_core = if signed {
+        None
+    } else {
+        match unsigned_mul_int_out_of_range_core(locals, lhs, rhs, width) {
+            Some(core) => Some(core),
+            // The unsigned emission ALWAYS carries the Int core; with no faithful
+            // Int rendering no candidate can byte-match — decline (fail-closed,
+            // the flip keeps trust-vcgen's formula).
+            None => return Vec::new(),
+        }
+    };
     let mut out = Vec::with_capacity(lhs_terms.len() * rhs_terms.len());
     for a in &lhs_terms {
         for b in &rhs_terms {
-            out.push(bv_mul_failure_formula(a.clone(), b.clone(), width, signed));
+            let bv = bv_mul_failure_formula(a.clone(), b.clone(), width, signed);
+            out.push(match &or_core {
+                Some(core) => Formula::And(vec![bv, core.clone()]),
+                None => bv,
+            });
         }
     }
     out
@@ -8297,6 +8900,230 @@ fn conjoin_native_slice_len_bounds(func: &VerifiableFunction, formula: Formula) 
     Formula::And(bounds)
 }
 
+/// Trust (#61, C1) — the slice range-index call plan: the SINGLE source of truth
+/// consumed by BOTH the lowering arm (which mints the `ObligationKind::BoundsCheck`
+/// module obligation) and the native VC lane in [`generate_native_safety_vcs`]
+/// (which emits the matching `VcKind::SliceBoundsCheck`). One recognizer, two
+/// consumers: if they ever disagreed about whether a call is in scope, the
+/// completeness gate would see unequal counts and decline the whole function --
+/// which C0's `SPINE_DECLINED_PIN` census turns red instead of silent (it was a
+/// `SPINE_DECLINED_CEILING` count until #63 replaced it with a named set).
+///
+/// THE SHAPE (measured on the corpus, 14 calls across byteorder + harvest dumps):
+///
+/// ```text
+/// _5 = Aggregate(Adt "core::ops::range::RangeTo", [Const 8usize])
+/// Call { func: "<[u8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index",
+///        args: [Copy(_1), Move(_5)], .. }
+/// ```
+///
+/// GATES, all fail-closed (a decline leaves the call on the existing absent-callee
+/// path, byte-identical behaviour to before):
+///  * callee: `<[..] as core::ops::index::Index<core::ops::range::FAM<usize>>>::index`
+///    with FAM in {RangeTo, RangeFrom, Range}. EXACT family names -- RangeInclusive
+///    does NOT match (its end+1 arithmetic carries an overflow subtlety this plan
+///    does not model), and a `<str as ..>` receiver cannot match the `<[` prefix
+///    (str range-index carries the unmodeled UTF-8 char-boundary panic; vcgen's own
+///    RangeIndex arm fails closed on it for the same reason).
+///  * receiver (arg 0): projection-free local whose declared type carries a modeled
+///    slice length (`reconstruct_slice_len_formula` returns Some) -- the same
+///    byte-for-byte helper the bounds path uses, so the VC's length term is the
+///    SAME `{name}__slice_len` variable a dominating `n <= s.len()` guard binds.
+///  * range (arg 1): projection-free local whose UNIQUE in-block definition is the
+///    matching `Range*` aggregate, with every endpoint a CONSTANT usize. Constant
+///    endpoints are the measured corpus shape (`&buf[..8]`); a variable endpoint
+///    declines -- scope can widen later, measured, but a constant is resolvable
+///    identically by both consumers today.
+///  * no cleanup unwind successor (the same G8 discipline the call recognizers
+///    apply: a real cleanup edge is CFG this shape does not model).
+struct SliceRangeIndexPlan {
+    /// Endpoint operands, in violation order. `To`: [end]; `From`: [start];
+    /// `Exclusive`: [start, end]. Each is ADMISSIBLE per
+    /// [`slice_range_endpoint_admissible`]: a constant usize, or — Trust (#61,
+    /// C1b) — a projection-free local whose declared type is PRECISELY usize.
+    /// Both consumers resolve the SAME operand their own way (the VC lane to a
+    /// `Formula`, the lowering through `resolve_usize_operand_as_u64`), so the
+    /// admissibility gate lives here, once.
+    endpoints: Vec<Operand>,
+    family: SliceRangeIndexFamily,
+}
+
+/// Trust (#61, C1b): the endpoint admissibility gate, shared by construction.
+/// A constant usize (the C1 scope: `&buf[..8]`), or a projection-free local of
+/// declared usize type (the C1b widening: byteorder `read_uint`'s
+/// `&buf[..nbytes]`, `nbytes` a parameter). Anything else — a projection, a
+/// non-usize integer — declines the WHOLE plan, keeping both consumers on the
+/// absent-callee path together.
+fn slice_range_endpoint_admissible(locals: &[LocalDecl], op: &Operand) -> bool {
+    if const_usize_operand(op).is_some() {
+        return true;
+    }
+    match op {
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => locals
+            .iter()
+            .find(|d| d.index == p.local)
+            .is_some_and(|d| is_trust_usize_ty(&d.ty)),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SliceRangeIndexFamily {
+    To,
+    From,
+    Exclusive,
+}
+
+/// Parse the callee rendering. Returns the family iff the callee is EXACTLY the
+/// slice range-index shape. Fail-closed on everything else.
+fn slice_range_index_family(callee: &str) -> Option<SliceRangeIndexFamily> {
+    if !callee.starts_with("<[") || !callee.ends_with(">>::index") {
+        return None;
+    }
+    let mid = " as core::ops::index::Index<core::ops::range::";
+    let pos = callee.find(mid)?;
+    let after = &callee[pos + mid.len()..];
+    // `after` is now `RangeTo<usize>>>::index` (etc.). Exact-match the family and
+    // the `<usize>` argument -- `RangeInclusive<usize>` fails all three arms.
+    if let Some(rest) = after.strip_prefix("RangeTo<usize>") {
+        return (rest == ">>::index").then_some(SliceRangeIndexFamily::To);
+    }
+    if let Some(rest) = after.strip_prefix("RangeFrom<usize>") {
+        return (rest == ">>::index").then_some(SliceRangeIndexFamily::From);
+    }
+    if let Some(rest) = after.strip_prefix("Range<usize>") {
+        return (rest == ">>::index").then_some(SliceRangeIndexFamily::Exclusive);
+    }
+    None
+}
+
+/// The constant-usize value of `op`, or None.
+fn const_usize_operand(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::Constant(ConstValue::Uint(v, _)) => u64::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+fn slice_range_index_call_plan(
+    locals: &[LocalDecl],
+    block: &trust_types::BasicBlock,
+) -> Option<SliceRangeIndexPlan> {
+    let Terminator::Call { func: callee, args, unwind, .. } = &block.terminator else {
+        return None;
+    };
+    if unwind.cleanup_target().is_some() {
+        return None;
+    }
+    let family = slice_range_index_family(callee)?;
+    let [receiver, range] = args.as_slice() else { return None };
+    // Receiver: modeled slice length, via the SAME helper the VC lane's formula
+    // uses -- gating here is what keeps the two consumers in lockstep.
+    reconstruct_slice_len_formula(locals, receiver)?;
+    // Range: projection-free local, unique in-block aggregate definition.
+    let range_local = match range {
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
+        _ => return None,
+    };
+    let mut agg: Option<&[Operand]> = None;
+    for stmt in &block.stmts {
+        if let Statement::Assign { place, rvalue, .. } = stmt {
+            if place.local == range_local && place.projections.is_empty() {
+                if agg.is_some() {
+                    return None; // second write -- not the unique-def shape.
+                }
+                let Rvalue::Aggregate(kind, ops) = rvalue else { return None };
+                let trust_types::AggregateKind::Adt { name, .. } = kind else { return None };
+                let want = match family {
+                    SliceRangeIndexFamily::To => "RangeTo",
+                    SliceRangeIndexFamily::From => "RangeFrom",
+                    SliceRangeIndexFamily::Exclusive => "Range",
+                };
+                let leaf = name.split('<').next().unwrap_or(name);
+                let leaf = leaf.rsplit("::").next().unwrap_or(leaf);
+                if leaf != want {
+                    return None;
+                }
+                agg = Some(ops.as_slice());
+            }
+        }
+    }
+    let ops = agg?;
+    let expected_arity = match family {
+        SliceRangeIndexFamily::To | SliceRangeIndexFamily::From => 1,
+        SliceRangeIndexFamily::Exclusive => 2,
+    };
+    if ops.len() != expected_arity {
+        return None;
+    }
+    if !ops.iter().all(|op| slice_range_endpoint_admissible(locals, op)) {
+        return None;
+    }
+    Some(SliceRangeIndexPlan { endpoints: ops.to_vec(), family })
+}
+
+/// Trust (#61, C1) — the native VC for a recognized slice range-index call: the
+/// violation trust-vcgen's RangeIndex arm builds, over the SAME
+/// `{name}__slice_len` variable, at the call span.
+///
+///   To(end):          end > len
+///   From(start):      start > len
+///   Exclusive(s, e):  s > e  OR  e > len
+///
+/// The formula need not byte-match vcgen's (vcgen conjoins path guards and
+/// block-defs); a formula difference only keeps dispatch on the verdict-flip
+/// path, which is the safe direction. What closes the alarm rows is the
+/// (class, span) agreement.
+fn slice_range_index_native_vc(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    plan: &SliceRangeIndexPlan,
+) -> Option<VerificationCondition> {
+    let Terminator::Call { func: callee, args, span, .. } = &block.terminator else {
+        return None;
+    };
+    let _ = callee;
+    let len = reconstruct_slice_len_formula(&func.body.locals, args.first()?)?;
+    // Constant endpoint -> Int; local endpoint -> the collision-safe local name
+    // (the SAME naming discipline the `__slice_len` variable uses, so a guard
+    // `if nbytes <= buf.len()` connects on both sides). The plan admitted only
+    // these two shapes.
+    let ep = |i: usize| -> Formula {
+        let op = &plan.endpoints[i];
+        if let Some(v) = const_usize_operand(op) {
+            return Formula::Int(i128::from(v));
+        }
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => {
+                Formula::var(&collision_safe_local_name(&func.body.locals, p.local), Sort::Int)
+            }
+            _ => unreachable!("admissibility admits const usize or a bare local"),
+        }
+    };
+    let violation = match plan.family {
+        SliceRangeIndexFamily::To | SliceRangeIndexFamily::From => {
+            Formula::Gt(Box::new(ep(0)), Box::new(len))
+        }
+        SliceRangeIndexFamily::Exclusive => Formula::Or(vec![
+            Formula::Gt(Box::new(ep(0)), Box::new(ep(1))),
+            Formula::Gt(Box::new(ep(1)), Box::new(len)),
+        ]),
+    };
+    Some(VerificationCondition {
+        kind: VcKind::SliceBoundsCheck,
+        function: func.name.as_str().into(),
+        location: span.clone(),
+        formula: violation.clone(),
+        contract_metadata: None,
+        obligation: Some(trust_types::ObligationRecord {
+            body: violation,
+            wrappers: Vec::new(),
+            subject: None,
+            width: None,
+        }),
+    })
+}
+
 pub fn generate_native_safety_vcs(func: &VerifiableFunction) -> Option<Vec<VerificationCondition>> {
     let all_blocks = &func.body.blocks;
     let locals = &func.body.locals;
@@ -8434,6 +9261,19 @@ pub fn generate_native_safety_vcs(func: &VerifiableFunction) -> Option<Vec<Verif
                 contract_metadata: None,
                 obligation: None,
             });
+        }
+    }
+
+    // Trust (#61, C1) — the CALL lane: a recognized slice range-index call gets its
+    // native SliceBoundsCheck VC at the call span, paired with the BoundsCheck
+    // obligation the lowering arm mints for the SAME plan. One recognizer feeds
+    // both, so the completeness gate below stays an equality rather than gaining a
+    // second, weaker equation. A call the plan declines keeps today's behaviour
+    // exactly (absent-callee fail-soft; its PanicFreedom rows are not counted by
+    // the gate and its vcgen rows stay in the measured coverage gap).
+    for block in all_blocks {
+        if let Some(plan) = slice_range_index_call_plan(&func.body.locals, block) {
+            vcs.push(slice_range_index_native_vc(func, block, &plan)?);
         }
     }
 
@@ -11584,6 +12424,18 @@ fn field_type(ty: &Ty, field_idx: usize) -> Result<Ty, BridgeError> {
                 elems.len()
             ))
         }),
+        // Trust: a positively identified union has overlapping fields, while the
+        // trust-ir aggregate spelling used by this bridge has independent fields.
+        // Any field projection would therefore invent struct semantics.  Refuse
+        // centrally so reads, writes, borrows, and address walks all fail closed;
+        // whole-value traffic remains on the historical compatibility lane.
+        Ty::Adt {
+            name,
+            adt_kind: Some(trust_types::AdtKind::Union),
+            ..
+        } => Err(BridgeError::UnsupportedOp(format!(
+            "field projection on union {name} requires a trust-ir union representation"
+        ))),
         Ty::Adt { fields, .. } => {
             fields.get(field_idx).map(|(_, fty): &(String, Ty)| fty.clone()).ok_or_else(|| {
                 BridgeError::UnsupportedOp(format!(
@@ -13550,6 +14402,29 @@ fn len_call_result_has_isize_bound(callee: &str, args: &[Operand], ctx: &Lowerin
 /// Deliberately absent, because each carries a precondition a caller can violate:
 /// `unchecked_*`, `*_nonzero`, `arith_offset`, `ptr_offset_from_unsigned`,
 /// `assume`, `unreachable`. Those must be proved, not assumed.
+///
+/// # THIS ANSWERS PANIC-FREEDOM ONLY — the VALUE model lives elsewhere
+///
+/// A `true` here makes the call's destination a clean `Undef` at the consumption
+/// site below, i.e. an UNCONSTRAINED result. That is deliberate for this lane and
+/// it is not the whole story for the intrinsic: the arithmetic/bitvector members
+/// of this list now have an EXACT value semantics in
+/// `trust_vcgen::generate::intrinsic_semantics`, which pins the call destination
+/// to the defining bitvector term (`ctpop` as the sum of extracted bits, `bswap`
+/// / `bitreverse` as the byte / bit cascade) plus the `[0, W]` bound for the
+/// counting family, and routes the saturating pair into the existing clamp model.
+/// So `x.count_ones() <= 32` is decided there, on the trust-vcgen path the
+/// compiler's verification verdict actually runs (`rustc_mir_transform::
+/// trust_verify` calls `trust_vcgen::generate_vcs`), not here.
+///
+/// The value model is NOT mirrored into this lane, and that is a measured choice
+/// rather than an omission: trust-ir's nearest op is `UnOp::CtPop`, which
+/// `trust_clean::trustir_bridge` reports as HONESTLY UN-BRIDGED ("Clean has no
+/// popcount denotation anywhere"). Emitting it would trade a clean `Undef` for a
+/// term the certifying backend cannot denote, which is a loss on the lane that
+/// decides `-Ztrust-policy=certify`. Adding it here therefore waits on a Clean
+/// popcount denotation, and until then the honest division of labour is:
+/// panic-freedom in this file, VALUE in trust-vcgen.
 fn is_total_rustc_intrinsic(callee: &str) -> bool {
     let Some(rest) = callee.strip_prefix(trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX) else {
         return false;
@@ -14859,6 +15734,75 @@ fn is_total_str_pattern_method(callee: &str) -> bool {
     matches!(pattern, "char" | "&str")
 }
 
+/// `<[T]>::contains` where the MONOMORPHIZED element `T` is a PRIMITIVE.
+///
+/// WHY THIS IS A RAW-SPELLING GATE AND NOT AN `EXACT_TOTAL` ENTRY. `strip_generics`
+/// erases `core::slice::<impl [i32]>::contains` to `core::slice::contains`, so an
+/// `EXACT_TOTAL` entry would grant totality for EVERY element type — including a
+/// user ADT whose `PartialEq::eq` panics. That is exactly why `PartialEq::eq` sits
+/// on this file's `DELIBERATELY EXCLUDED` list, and why `contains` was never added
+/// there. This gate reads `callee` BEFORE stripping, the same discipline (and for
+/// the same stated reason) as `is_total_str_pattern_method` above.
+///
+/// SOUNDNESS. `contains` is one call to `cmp::SliceContains::slice_contains`
+/// (`library/core/src/slice/mod.rs`). Its implementations are core's own
+/// (`library/core/src/slice/cmp.rs`): `memchr` for `u8`/`i8`, a `chunks_exact`
+/// SIMD scan for `u16`/`u32`/`u64`/`i16`/`i32`/`i64`/`f32`/`f64`/`usize`/`isize`/
+/// `char`, and the default `x.iter().any(|y| *y == *self)` otherwise. For a
+/// PRIMITIVE element every one of those bottoms out in the BUILT-IN `PartialEq`,
+/// so no user `eq`, no `Drop` and no callback can run; there is no allocation and
+/// no panic path (the SIMD lane count is a nonzero compile-time constant for every
+/// admitted width, so `chunks_exact` cannot hit its zero-size panic). The needle
+/// is `&T` — a shared reference, so nothing is dropped either.
+///
+/// ANCHORING. `core::slice::<impl [` is the inherent impl on the PRIMITIVE slice,
+/// which only `core` can write, and an ADT element prints its crate-qualified
+/// path — so no user type can spell a match. The element must additionally be one
+/// of the listed primitive literals, which closes the "unauthenticated component
+/// inside a generic argument" hole `path_root_is_authenticated_sysroot_crate`
+/// documents: an impersonating crate is stamped `__trust_crate@<id>::…` by the
+/// extractor and can appear neither at the root (the `strip_prefix` anchor fails)
+/// nor in the element position (the stamp is not a primitive literal). The
+/// authenticated-root predicate is asserted here as well, per the #58 discipline
+/// that a matcher must ask it before GRANTING anything on a `core::` spelling.
+///
+/// Any non-primitive element, any other method, any other anchor and any trailing
+/// segment FAIL CLOSED and keep the honest may-panic obligation.
+///
+/// DELIBERATELY NOT EXTENDED to `starts_with`/`ends_with`/`binary_search`/
+/// `contains_key`: the first two take a `&[T]` needle and are the same shape but
+/// were not measured, and `binary_search` runs a caller-supplied `Ord`. Add them
+/// only with their own audit note.
+fn is_total_primitive_slice_contains(callee: &str) -> bool {
+    const ANCHOR: &str = "core::slice::<impl [";
+    if !trust_types::path_root_is_authenticated_sysroot_crate(callee) {
+        return false;
+    }
+    let Some(rest) = callee.strip_prefix(ANCHOR) else { return false };
+    let Some((elem, tail)) = rest.split_once("]>::") else { return false };
+    if tail != "contains" {
+        return false;
+    }
+    matches!(
+        elem,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+    )
+}
+
 /// Closed string-only summary surface. Every entry names a concrete inherent or
 /// free library operation whose implementation cannot dispatch a user trait,
 /// callback, clone, drop, hasher, ordering implementation, formatter, or generic
@@ -14876,6 +15820,13 @@ pub(crate) fn total_no_panic_call_summary(callee: &str) -> bool {
     // Pattern-generic `str` inherent methods carry the monomorphized pattern type in
     // the RAW spelling, which `strip_generics` erases — so this gate reads `callee`.
     if is_total_str_pattern_method(callee) {
+        return true;
+    }
+    // `<[T]>::contains` carries its monomorphized ELEMENT type in the RAW spelling,
+    // which `strip_generics` erases to a element-blind `core::slice::contains` — so
+    // this gate, like the `str` one above, must read `callee`. Primitive elements
+    // only; a user element type keeps the honest may-panic obligation.
+    if is_total_primitive_slice_contains(callee) {
         return true;
     }
     // Body-less rustc intrinsics never reach the std-root gate below: the extractor
@@ -15188,6 +16139,28 @@ pub(crate) fn total_no_panic_call_summary(callee: &str) -> bool {
         "std::path::Path::parent",
         "std::path::Path::display",
         "std::ffi::OsStr::to_str",
+        // `BufReader::new(inner)` is `with_capacity(DEFAULT_BUF_SIZE, inner)` ->
+        // `Buffer::with_capacity(DEFAULT_BUF_SIZE)` -> `Box::new_uninit_slice(8192)`
+        // plus two struct constructions (`library/std/src/io/buffered/bufreader.rs`,
+        // `.../bufreader/buffer.rs`). The reader `R` is only MOVED into the struct —
+        // no `Read` method is called, nothing is dropped, so NO user code runs. The
+        // one allocation is a raw uninit slice of a COMPILE-TIME-CONSTANT size, the
+        // shape this file's retired-lane note already classifies total ("`Box::new_uninit`
+        // (raw uninit alloc, no user code) IS total"; OOM is outside the panic model),
+        // and a constant length leaves no layout arithmetic that could overflow.
+        //
+        // MEASURED (ay `ay-proof-common`): this call is absent from the lowered bundle
+        // because the CALLER (`parse_cnf_core<R: Read>`) is generic, so
+        // `instance.args.has_non_region_param()` declines the monomorphic-foreign
+        // bundling lane. A summary is the only route, and the bundling gate must not
+        // be relaxed — it is what guarantees the bundled body is THE body the call
+        // reaches.
+        //
+        // `with_capacity` is DELIBERATELY ABSENT and must stay absent: its capacity is
+        // CALLER-SUPPLIED, so its layout arithmetic is unbounded and it is
+        // conditionally total at best. Same for `BufWriter::with_capacity`. Only the
+        // fixed-size `new` is admitted.
+        "std::io::buffered::bufreader::BufReader::new",
     ];
     if EXACT_TOTAL.contains(&normalized.as_str()) {
         return true;
@@ -19169,11 +20142,49 @@ fn lower_call_arg_values(
         // fail-softs to a param-typed havoc instead of dropping the whole
         // caller (see `resolve_place_expecting`). Everything else resolves
         // exactly as before.
+        //
+        // Trust (vtable slice 13, chain item (2d)): an INTEGER LITERAL argument
+        // additionally conforms to the callee's declared param type when the
+        // value exactly fits it — `resolve_operand_as_trust_type`'s existing
+        // Int/Uint retyping, scoped here to exactly the linked-call seam. The
+        // trust-types carrier for a signed literal (`ConstValue::Int`) is
+        // WIDTH-LESS, so the contextless `emit_const` defaults it to `I64`
+        // (`i32::MAX`-fitting literals included), and `ConstValue::Uint`
+        // carries a fixed width that erases the pointer-size identity a
+        // faithfully-extracted callee declares (`usize` param vs `u64`
+        // spelling). Both collapse at a LINKED call: the callee's params are
+        // lowered from its declared signature (`i32`/`usize`), the interpreter
+        // checks call args by exact type (`check_signature_values`), and the
+        // trust-ir validator rejects the module (`CallArgTypeMismatch`) — the
+        // measured `expected i32, got i64` / `expected usize, got u64` seam
+        // incapacity. The declared param type is the SAME source both the
+        // callee lowering and this conforming read (`sig.params`), and the
+        // exact-fit guards refuse any value the declared width cannot
+        // represent (falling back to the contextless spelling unchanged), so
+        // the conformed constant is the MIR's own value at the MIR's own
+        // declared sort — a faithfulness repair, never a reinterpretation.
+        // Non-integer constants, place reads, and the Rust-call tuple lanes
+        // below are deliberately untouched.
         CallArgLowering::AsWritten => match expected_params {
             Some(params) if params.len() == args.len() => args
                 .iter()
                 .zip(params)
-                .map(|(arg, param_ty)| ctx.resolve_operand_expecting(arg, Some(param_ty), body))
+                .map(|(arg, param_ty)| {
+                    let fits = match arg {
+                        Operand::Constant(ConstValue::Int(v)) => {
+                            int_constant_fits_trust_type(*v, param_ty)
+                        }
+                        Operand::Constant(ConstValue::Uint(v, _)) => {
+                            uint_constant_fits_trust_type(*v, param_ty)
+                        }
+                        _ => false,
+                    };
+                    if fits {
+                        ctx.resolve_operand_as_trust_type(arg, param_ty, body)
+                    } else {
+                        ctx.resolve_operand_expecting(arg, Some(param_ty), body)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>(),
             _ => {
                 args.iter().map(|arg| ctx.resolve_operand(arg, body)).collect::<Result<Vec<_>, _>>()
@@ -19826,6 +20837,142 @@ pub fn lower_to_trust_ir_function(
         &FxHashSet::default(), // no paired-condvar site authority
         &FxHashSet::default(),
     )
+}
+
+/// Trust (B1 — the REFINED CALLEE KEY): the args-free prefix of a callee key that
+/// ends in a depth-0 TRAILING TURBOFISH, or `None` if the key has none or the strip
+/// is not provably identity-preserving.
+///
+/// # The asymmetry this exists for
+///
+/// The two sides of the call join render the SAME `DefId` through two different
+/// members of the `trust_mir_extract` rendering seam:
+///
+/// * the CALL key is `func_operand_name` → `safe_def_path_str_with_args`, which
+///   prints the call's generic arguments;
+/// * the BODY key is `VerifiableFunction::def_path` / `.name` →
+///   `safe_def_path_str`, which prints none.
+///
+/// For a call whose arguments are the CALLER's own type parameters — the shape a
+/// generic body is full of — the two therefore differ by exactly a trailing
+/// turbofish (`krate::assert_iterator::<A>` vs `krate::assert_iterator`), the
+/// lookup misses, and the bridge mints an absent-callee marker for a body that is
+/// sitting in the very same bundle. MEASURED on the corpus: 97 call sites across
+/// 51 files, every one of them a bundled local body.
+///
+/// # Why this is a NARROWING and not a bare `::<…>` strip
+///
+/// Dropping the turbofish unconditionally would widen
+/// `trust_mir_extract::direct_call_def_path`'s RESIDUAL 1 — the live false proof
+/// where an unresolvable generic dispatch renders exactly like the blanket-impl
+/// body it must NOT bind to. MEASURED, with a five-line reproducer that is checked
+/// in as `refined_callee_base_refuses_the_blanket_impl_dispatch` below:
+///
+/// ```text
+/// pub trait Tr2 { fn p<X>(&self) -> u32; }
+/// impl<T> Tr2 for T { fn p<X>(&self) -> u32 { 3 } }   // def_path `<T as k::Tr2>::p`
+/// pub fn viaparam3<T: Tr2>(x: &T) -> u32 { x.p::<u8>() }
+/// //                                       call key `<T as k::Tr2>::p::<u8>`
+/// ```
+///
+/// Stripping there binds an unresolvable dispatch to a proved body. So the strip is
+/// gated on the prefix being a PLAIN path — one that does not open with a
+/// qualified-self `<Self as Trait>` segment. That gate is exact rather than
+/// heuristic, because rustc's `print_def_path` renders EVERY trait-or-impl child
+/// through the qualified form once generic arguments are supplied: MEASURED, a call
+/// to a trait method with its own generics is `<T as k::Tr>::m::<u8>` (refused) while
+/// a free function is `k::freegen::<T>` and an inherent associated function is
+/// `k::Inh::q::<u8>` (both admitted, both statically resolved — neither is a dispatch
+/// target). The gate costs ZERO coverage on the measured population: 97 of 97
+/// refinable keys are plain paths.
+///
+/// A turbofish holding a `__trust_`-prefixed token is refused outright. Those are
+/// not generic arguments — they are facts `func_operand_name` deliberately WELDED
+/// onto the key (`::<__trust_try_total>`, `::<__trust_elem_bytes@N>`), and dropping
+/// one is precisely the information loss this whole rule exists to avoid.
+///
+/// # Non-merging
+///
+/// The strip is a FUNCTION of the key, and `known_functions` maps each key to at most
+/// one `FuncId` (`insert_or_poison` REMOVES any key two bodies claim). So a refined
+/// lookup can never return an ambiguous body, and it cannot make two bodies share a
+/// key. What it can do is bind one call to the wrong body, which is what the
+/// plain-path gate above bounds. Two calls that differ only in their turbofish
+/// (`assert_impl::<H<12,12>>` and `assert_impl::<H<13,13>>`, both MEASURED in
+/// `tests/ui/const-generics/generic_const_exprs/abstract-const-as-cast-4.rs`) collapse
+/// onto one key by design: this bundle is PRE-MONOMORPHIZATION and holds exactly one
+/// body per `DefId`, so both calls genuinely do target it.
+fn refined_callee_base(callee: &str) -> Option<&str> {
+    let bytes = callee.as_bytes();
+    if bytes.last() != Some(&b'>') {
+        return None;
+    }
+    // A qualified-self path (`<Self as Trait>::m`) is a DISPATCH shape; never refine it.
+    if callee.starts_with('<') {
+        return None;
+    }
+    // Locate the last depth-0 `::<`. `->` is stepped over so a fn-pointer return arrow
+    // inside a turbofish (`apply::<fn(u32) -> S {S}>`) is not read as a closing bracket.
+    let mut depth = 0i32;
+    let mut open: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'<' => {
+                if depth == 0 && i >= 2 && &bytes[i - 2..i] == b"::" {
+                    open = Some(i - 2);
+                }
+                depth += 1;
+            }
+            b'>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    let open = open?;
+    // The trailing turbofish must close at the very end — otherwise it is a MIDDLE
+    // turbofish (`Vec::<u8>::with_capacity`) and the tail is a real path segment.
+    let mut d = 0i32;
+    let mut j = open + 2;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'-' if bytes.get(j + 1) == Some(&b'>') => {
+                j += 2;
+                continue;
+            }
+            b'<' => d += 1,
+            b'>' => {
+                d -= 1;
+                if d == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    if j != bytes.len() - 1 {
+        return None;
+    }
+    let args = &callee[open + 3..callee.len() - 1];
+    // A welded Trust discrimination token is a CARRIED FACT, not a generic argument.
+    if args.contains("__trust_") {
+        return None;
+    }
+    let base = &callee[..open];
+    if base.is_empty() { None } else { Some(base) }
 }
 
 fn register_function_name(
@@ -20805,6 +21952,124 @@ fn lower_block(bb: &TrustBlock, ctx: &mut LoweringCtx<'_>) -> Result<TrustIrBloc
 // ---------------------------------------------------------------------------
 // Statement lowering
 // ---------------------------------------------------------------------------
+
+/// Trust (vtable slice 16): the ZERO SEED for one variant-field lane of a FAITHFUL
+/// first-class enum construction — the bridge mirror of the THIR producer's
+/// `seed_lane_ty` (trust-thir-lower), needed because `constant_to_value` type-checks
+/// every lane of the seed `Constant::Aggregate` BEFORE the per-operand `InsertField`s
+/// overwrite it (an ill-typed lane traps the construction outright, even though its
+/// value is dead). Every seed this returns is either overwritten wholesale by the
+/// construction loop or (the `Unit` lane) IS the final value, so only interpreter
+/// LEGALITY matters, never the zero's "choice" — the wave-PS overwritten-lane rule.
+///
+///  * scalars (ints incl. isize/usize/char) → `Int(0)`; bool/floats → their own kind.
+///  * `Unit` → `PhantomData` — the final value; the construction loop skips the
+///    operand (B3-2c convention, unchanged).
+///  * `Ptr` → `Int(0)`, the NULL POINTER — the `(Ty::Ptr, Constant::Int(0))`
+///    pairing `shape_matches_ty` has always admitted and the interpreter
+///    materializes as the distinguished `NullPtr`.
+///  * `Struct(sid)` → recursive `Constant::Aggregate` over the def's own fields —
+///    exactly the producer's spelling (probe dump: `const enum.0 { 0, { 0, 0 } }`
+///    for `Ok(Payload { .. })`).
+///  * `Enum(eid)` → variant-0 `Aggregate([Int(disc0), zeros…])` — the producer's
+///    wave-ES convention, recursive.
+///  * `FatPtr(_)` → REFUSE (fail-closed): trust-ir's `Constant` has no fat-pointer
+///    spelling (the ratified fat spelling is the PtrFromParts trio), and the
+///    producer's own ctor refuses the lane with `EnumCtor(fat field seed)` — a
+///    body constructing a fat-payload variant never reaches the differential from
+///    the producer side either.
+///  * anything else → REFUSE (fail-closed default; inadmissible under the
+///    faithful-eligibility gate, kept as defense in depth).
+///
+/// Depth-capped like the producer's seeder: the eligibility gates make a cycle
+/// unreachable (a by-value recursive def cannot register), so the cap is a
+/// tripwire, not a policy.
+pub(crate) fn first_class_enum_field_zero_seed(
+    module: &Module,
+    fty: &TrustIrTy,
+    depth: u8,
+) -> Result<trust_ir::Constant, BridgeError> {
+    if depth > 64 {
+        return Err(BridgeError::UnsupportedOp(
+            "enum construction zero-seed depth exceeded (recursive by-value def?)".to_string(),
+        ));
+    }
+    Ok(match fty {
+        TrustIrTy::Bool => trust_ir::Constant::Bool(false),
+        TrustIrTy::F32 | TrustIrTy::F64 => trust_ir::Constant::Float(0.0),
+        // Trust (B3-2c): the canonical unit-field seed — Int(0) under Ty::Unit is
+        // an interpreter type_error (the exact producer convention: PhantomData IS
+        // the final value).
+        TrustIrTy::Unit => trust_ir::Constant::PhantomData,
+        TrustIrTy::Struct(sid) => {
+            let def = module.struct_def(*sid).ok_or_else(|| {
+                BridgeError::UnsupportedOp(format!(
+                    "struct id {} unregistered at enum construction seed",
+                    sid.index()
+                ))
+            })?;
+            let fields = def.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>();
+            let mut elems = Vec::with_capacity(fields.len());
+            for f in &fields {
+                elems.push(first_class_enum_field_zero_seed(module, f, depth + 1)?);
+            }
+            trust_ir::Constant::Aggregate(elems)
+        }
+        TrustIrTy::Enum(eid) => {
+            let def = module.enum_def(*eid).ok_or_else(|| {
+                BridgeError::UnsupportedOp(format!(
+                    "enum id {} unregistered at enum construction seed",
+                    eid.index()
+                ))
+            })?;
+            let discs = def.effective_discriminants().ok_or_else(|| {
+                BridgeError::UnsupportedOp(format!(
+                    "enum {} has unresolvable discriminants at construction seed",
+                    def.name
+                ))
+            })?;
+            let (Some(disc0), Some(v0)) = (discs.first(), def.variants.first()) else {
+                return Err(BridgeError::UnsupportedOp(format!(
+                    "enum {} has no variant 0 at construction seed",
+                    def.name
+                )));
+            };
+            let v0_fields = v0.fields.clone();
+            let mut elems = Vec::with_capacity(1 + v0_fields.len());
+            elems.push(trust_ir::Constant::Int(*disc0));
+            for f in &v0_fields {
+                elems.push(first_class_enum_field_zero_seed(module, f, depth + 1)?);
+            }
+            trust_ir::Constant::Aggregate(elems)
+        }
+        TrustIrTy::FatPtr(_) => {
+            return Err(BridgeError::UnsupportedOp(
+                "enum construction fat field seed (no fat-pointer constant spelling)".to_string(),
+            ));
+        }
+        // Ints of every width, isize/usize, char, and the thin pointer (the
+        // NullPtr pairing) — `Int(0)` is interpreter-legal at all of them.
+        TrustIrTy::I8
+        | TrustIrTy::I16
+        | TrustIrTy::I32
+        | TrustIrTy::I64
+        | TrustIrTy::I128
+        | TrustIrTy::U8
+        | TrustIrTy::U16
+        | TrustIrTy::U32
+        | TrustIrTy::U64
+        | TrustIrTy::U128
+        | TrustIrTy::Isize
+        | TrustIrTy::Usize
+        | TrustIrTy::Char
+        | TrustIrTy::Ptr => trust_ir::Constant::Int(0),
+        other => {
+            return Err(BridgeError::UnsupportedOp(format!(
+                "enum construction zero-seed for inadmissible field type {other}"
+            )));
+        }
+    })
+}
 
 fn lower_statement(
     stmt: &Statement,
@@ -22807,26 +24072,28 @@ fn lower_rvalue(
                     // identity when it is mintable (vtable slice 3), else stays the
                     // slice-1 fresh havoc.
                     TrustIrTy::FatPtr(trust_ir::FatPtrKind::TraitObject { .. }) => {
-                        // Trust (vtable slice 3): derive the identity key from what the
-                        // extractor recorded — the principal spelling it stamped into
-                        // `Ty::Dynamic { trait_name }` (refusing the principal-less
-                        // "dyn" sentinel outright), and the ONE shared renderer over the
-                        // recorded source pointee (`vtable_source_type_key`, the same
-                        // function the THIR producer applies to the same converter's
-                        // output — equal rustc types render equal strings by
-                        // construction). An unmintable key keeps the fresh havoc.
+                        // Trust (vtable slice 3, amended by slice 17): derive the identity
+                        // key from what the extractor recorded — now the FAITHFUL
+                        // `principal_key` rather than the generics-ERASED `trait_name`
+                        // (which merged `dyn Convert<u32>` with `dyn Convert<u64>` into ONE
+                        // global name, asserting `Load`-equality of two DIFFERENT vtables);
+                        // `None` there is principal-less or not injectively renderable and
+                        // keeps the fresh havoc. The source half uses the BODY-SCOPED
+                        // renderer, which additionally admits a bare generic parameter
+                        // keyed by the owning body's def path — `ctx.function_def_path` is
+                        // `safe_def_path_str` of the same `DefId` the producer passes, so
+                        // both sides render one string for one coercion by construction.
+                        let owner = ctx.function_def_path.clone();
                         let vtable_name = target_ty
                             .pointee_ty()
                             .and_then(|p| match p {
-                                Ty::Dynamic { trait_name } if trait_name != "dyn" => {
-                                    Some(trait_name.as_str())
-                                }
+                                Ty::Dynamic { principal_key: Some(k), .. } => Some(k.as_str()),
                                 _ => None,
                             })
                             .zip(
                                 src_trust_ty
                                     .pointee_ty()
-                                    .and_then(Ty::vtable_source_type_key),
+                                    .and_then(|p| p.vtable_source_type_key_in_body(&owner)),
                             )
                             .and_then(|(principal, source_key)| {
                                 trust_ir::stable_vtable_global_name(principal, &source_key)
@@ -23106,17 +24373,16 @@ fn lower_rvalue(
                 }
                 let mut elems = vec![trust_ir::Constant::Int(*disc)];
                 for fty in &variant_def.fields {
-                    // Scalar-only by the faithful-eligibility gate; a zero seed of
-                    // the field's own kind (immediately overwritten below).
-                    elems.push(match fty {
-                        TrustIrTy::Bool => trust_ir::Constant::Bool(false),
-                        TrustIrTy::F32 | TrustIrTy::F64 => trust_ir::Constant::Float(0.0),
-                        // Trust (B3-2c): the canonical unit-field seed — Int(0)
-                        // under Ty::Unit is an interpreter type_error (the exact
-                        // producer convention: PhantomData IS the final value).
-                        TrustIrTy::Unit => trust_ir::Constant::PhantomData,
-                        _ => trust_ir::Constant::Int(0),
-                    });
+                    // A zero seed of the field's own kind (immediately overwritten
+                    // below, or — for a Unit lane — the final value). Trust (vtable
+                    // slice 16): the faithful-eligibility gate now admits the
+                    // producer's full field set (thin Ptr, sized Struct,
+                    // FatPtr(Str), nested Enum), so the seed is the recursive
+                    // producer-mirror (`seed_lane_ty`), not the B3-1 scalar list:
+                    // `constant_to_value` type-checks EVERY lane of the seed
+                    // constant before the InsertFields run, so an `Int(0)` under a
+                    // `Ty::Struct` lane would trap the construction outright.
+                    elems.push(first_class_enum_field_zero_seed(&ctx.module, fty, 0)?);
                 }
                 let seed = ctx.fresh_value();
                 body.push(
@@ -23947,7 +25213,7 @@ mod thread_local_ref_lowering_tests {
                 elem: Box::new(Ty::u8()),
                 len_sym: trust_types::ConstLen { index: 0, name: "N".into() },
             },
-            Ty::Dynamic { trait_name: "test::Trait".into() },
+            Ty::Dynamic { trait_name: "test::Trait".into(), principal_key: Some("test::Trait".into()) },
         ] {
             for fat_destination in [
                 Ty::Ref { mutable: false, inner: Box::new(fat_pointee.clone()) },
@@ -24750,6 +26016,349 @@ fn is_panic_free_drop_ext(
 
     true
 }
+
+/// How ONE variant of an enum being dropped is accounted for by the
+/// variant-sensitive drop-glue lane. See [`drop_glue_variant_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropVariantVerdict {
+    /// The discriminant PROVABLY cannot be this variant at this drop site, so
+    /// this arm of the glue switch is dead code. Never charged.
+    Excluded,
+    /// The variant is live, but every field of its payload is trivially
+    /// non-droppable (`is_trivially_no_drop_ty`), so this arm of the glue
+    /// switch runs NO destructor at all. Nothing to charge.
+    NoDroppablePayload,
+    /// The variant is live and its payload IS droppable, but every payload
+    /// field's drop glue is POSITIVELY PROVED panic-free by the structural
+    /// classifier. Recorded as a discharge, never assumed.
+    Discharged,
+    /// The variant is live and its payload's drop panic-freedom is unproven.
+    /// Charged with its own honest assumption row — the fail-closed default.
+    Charged,
+}
+
+/// The per-variant accounting for one enum `Drop`.
+#[derive(Debug, Clone)]
+struct DropGlueVariantPlan {
+    /// Parallel to the enum's `variants`: `(variant name, verdict)`.
+    verdicts: Vec<(String, DropVariantVerdict)>,
+    /// Which root-node licence admitted the decomposition.
+    licence: DropGlueVariantLicence,
+    /// True when the live-variant set was NARROWED by a proof (some variant is
+    /// `Excluded`). Purely diagnostic — soundness never depends on it.
+    narrowed: bool,
+}
+
+impl DropGlueVariantPlan {
+    fn charged(&self) -> impl Iterator<Item = (usize, &str)> {
+        self.verdicts.iter().enumerate().filter_map(|(idx, (name, verdict))| {
+            matches!(verdict, DropVariantVerdict::Charged).then_some((idx, name.as_str()))
+        })
+    }
+
+    fn any_discharged(&self) -> bool {
+        self.verdicts.iter().any(|(_, v)| matches!(v, DropVariantVerdict::Discharged))
+    }
+
+    /// Human-readable `Name(verdict)` list for the obligation description /
+    /// debug probe. Attribution is the whole point of the lane: a reader must be
+    /// able to see WHICH arms were charged and WHY the others were not.
+    fn render(&self) -> String {
+        let mut out = String::new();
+        for (idx, (name, verdict)) in self.verdicts.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(", ");
+            }
+            let tag = match verdict {
+                DropVariantVerdict::Excluded => "excluded",
+                DropVariantVerdict::NoDroppablePayload => "no-droppable-payload",
+                DropVariantVerdict::Discharged => "proved-panic-free",
+                DropVariantVerdict::Charged => "CHARGED",
+            };
+            out.push_str(&format!("{name}#{idx}={tag}"));
+        }
+        out
+    }
+}
+
+/// The ROOT-NODE licence for decomposing an enum's drop glue variant-by-variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropGlueVariantLicence {
+    /// The enum is CERTIFIED to carry no `Drop` impl of its own, so its glue is
+    /// EXACTLY "switch on the discriminant, drop the active variant's payload".
+    /// If every live arm's payload is non-droppable, literally no destructor
+    /// code runs and the drop is a plain branch — the same conclusion
+    /// [`is_trivially_no_drop_ty`] already licenses for a scalar.
+    NoOwnDestructor,
+    /// A `Drop::drop` DOES run before the field drops, but its BODY is in this
+    /// bundle and carries its own obligations. The per-variant split applies to
+    /// the FIELD drops only, and the drop always keeps a visible ledger row.
+    BundledDestructor,
+}
+
+/// `core::option::Option` / `core::result::Result` — the two std ENUMS whose
+/// absence of a `Drop` impl is already an audited premise of this file (see
+/// [`is_std_owning_or_scaffold`]'s doc: "plain core enums with NO user `Drop`
+/// impl … drop is solely 'drop the active variant's payload'"). Path-gated so a
+/// same-named user enum cannot match.
+///
+/// This is deliberately NARROWER than `is_std_owning_or_scaffold`: that
+/// predicate's `::collections::` entry would also admit unaudited std enums, and
+/// the variant lane's `NoOwnDestructor` licence is the one that can conclude
+/// "no code runs at all". Every other std enum keeps today's blanket lowering.
+fn is_std_no_drop_impl_enum(name: &str) -> bool {
+    (name.starts_with("std::") || name.starts_with("alloc::") || name.starts_with("core::"))
+        && (name.contains("::option::Option") || name.contains("::result::Result"))
+}
+
+/// Decide whether an enum's drop glue may be accounted for variant-by-variant,
+/// and under which licence. Fail-closed: `None` keeps today's byte-identical
+/// blanket lowering for the whole ADT.
+fn drop_glue_variant_licence(
+    ty: &Ty,
+    structural_drop: &FxHashSet<String>,
+    bundled_destructors: &FxHashSet<String>,
+) -> Option<DropGlueVariantLicence> {
+    match ty {
+        // `structural_drop` is the COMPILER-authenticated
+        // `collect_structural_drop_adts` set (`!has_dtor` — certified to have no
+        // `Drop` impl at all, walking every nested ADT).
+        Ty::Adt { name, .. } if structural_drop.contains(name) => {
+            Some(DropGlueVariantLicence::NoOwnDestructor)
+        }
+        Ty::Adt { name, .. } if is_std_no_drop_impl_enum(name) => {
+            Some(DropGlueVariantLicence::NoOwnDestructor)
+        }
+        Ty::Adt { name, .. } if bundled_destructors.contains(name) => {
+            Some(DropGlueVariantLicence::BundledDestructor)
+        }
+        // `Ty::Datatype` is a by-name marker whose variant list is the SMT
+        // constructor view, not a MIR drop-glue switch; it keeps the old lane.
+        _ => None,
+    }
+}
+
+/// PROVE which variants the dropped local can hold at this drop site.
+///
+/// Returns `Some(set)` only when EVERY write to the dropped local in the whole
+/// body is a constant-variant write (`Aggregate(AggregateKind::Adt { variant })`
+/// or `SetDiscriminant { variant_index }`) to the WHOLE local, and the local's
+/// address is never taken. The value live at the drop was produced by one of
+/// those writes (a MIR local has no other producer, and an uninitialized local
+/// runs no glue at all), so the returned set over-approximates the discriminant
+/// at the drop — which is the sound direction: it can only leave a variant IN.
+///
+/// `None` means "not proved" and the caller MUST charge every variant. Every
+/// bail below is therefore fail-closed:
+///
+///  * a projected drop place (`*p`, `x.f`) — the analysis tracks whole locals;
+///  * an ARGUMENT or the return local — written from outside this body;
+///  * any write to the local this function cannot classify (a `Use`, a call
+///    destination, `Deinit`, a projected write, an out-of-range variant index,
+///    an aggregate for a DIFFERENT ADT);
+///  * any `Ref` / `AddressOf` of the local — a pointer could rewrite the tag
+///    (and once no pointer to the local exists, no pointer-write statement —
+///    `CopyNonOverlapping`, an intrinsic, an opaque write — can reach it);
+///  * a `Terminator::Opaque` anywhere in the body — unmodelled control flow;
+///  * an EMPTY write set — the local is initialized by something not seen here
+///    (this also covers the legacy fast paths that leave `all_blocks` empty).
+fn provable_live_variants(
+    place: &Place,
+    drop_ty_name: &str,
+    variant_count: usize,
+    ctx: &LoweringCtx<'_>,
+    root_runs_own_destructor: bool,
+) -> Option<FxHashSet<usize>> {
+    if !place.projections.is_empty() {
+        return None;
+    }
+    let local = place.local;
+    // Locals `1..=arg_count` are function arguments and local `0` is the return
+    // place; both receive values that no statement in this body produces.
+    if local == 0 || local <= ctx.arg_count {
+        return None;
+    }
+    if ctx.all_blocks.is_empty() {
+        return None;
+    }
+
+    let mentions = |p: &Place| p.local == local;
+
+    let mut seen: FxHashSet<usize> = FxHashSet::default();
+    for blk in ctx.all_blocks {
+        for stmt in &blk.stmts {
+            match stmt {
+                Statement::Assign { place: dest, rvalue, .. } => {
+                    // Any escaping borrow/raw pointer to the local forfeits the
+                    // proof: the tag could be rewritten through it.
+                    match rvalue {
+                        Rvalue::Ref { place: q, .. } | Rvalue::AddressOf(_, q) => {
+                            if mentions(q) {
+                                return None;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !mentions(dest) {
+                        continue;
+                    }
+                    if !dest.projections.is_empty() {
+                        return None;
+                    }
+                    match rvalue {
+                        Rvalue::Aggregate(AggregateKind::Adt { name, variant, .. }, _) => {
+                            if name != drop_ty_name || *variant >= variant_count {
+                                return None;
+                            }
+                            seen.insert(*variant);
+                        }
+                        _ => return None,
+                    }
+                }
+                Statement::SetDiscriminant { place: dest, variant_index } => {
+                    if !mentions(dest) {
+                        continue;
+                    }
+                    if !dest.projections.is_empty() || *variant_index >= variant_count {
+                        return None;
+                    }
+                    seen.insert(*variant_index);
+                }
+                Statement::Deinit { place: dest } | Statement::Retag { place: dest } => {
+                    if mentions(dest) {
+                        return None;
+                    }
+                }
+                Statement::Unsupported { .. } => {
+                    // An unmodelled statement class: assume it may write anything.
+                    return None;
+                }
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::PlaceMention(_)
+                | Statement::Intrinsic { .. }
+                | Statement::CopyNonOverlapping { .. }
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                // A future `Statement` variant must not be silently assumed
+                // write-free.
+                _ => return None,
+            }
+        }
+        match &blk.terminator {
+            Terminator::Call { dest, .. } => {
+                if mentions(dest) {
+                    return None;
+                }
+            }
+            Terminator::Opaque { .. } => return None,
+            // A `Drop` TERMINATOR IS A WRITE — do not move it up into the
+            // no-write arm below.
+            //
+            // Adversarial review measured this as a blocking soundness defect in
+            // the first draft, which listed `Drop` as write-free. rustc's enum drop
+            // glue for an ADT carrying a `Drop` impl is
+            //   `Drop::drop(&mut self); switch discriminant(*self) { .. }`
+            // (`elaborate_drop.rs` wires the destructor-call block's successor to
+            // `open_drop_for_adt_contents`, and `open_drop_for_multivariant` emits a
+            // RUNTIME `discriminant(self)` read). So the destructor receives a `&mut`
+            // to the tracked local with NO `Rvalue::Ref`/`AddressOf` anywhere in the
+            // caller's MIR — the escape check below cannot see it — and the tag it
+            // leaves behind is the one the glue then switches on. Trust's own model
+            // already says this: `model.rs` classifies
+            // `Terminator::Drop { .. } => WriteEffect::FailClosedOrBackstopped,
+            //  // needs a &mut escape`.
+            //
+            // Excluding a variant on the strength of a stale tag would mark a LIVE
+            // arm dead and silently drop its obligation — unproved becoming silence,
+            // the exact defect this campaign exists to remove.
+            //
+            // The distinction that makes this precise rather than blanket: a
+            // `Drop::drop(&mut self)` only runs if the root HAS one.
+            //   * `NoOwnDestructor` — the licence CERTIFIES no `Drop` impl (via the
+            //     compiler-authenticated `structural_drop` set, or the path-gated
+            //     core `Option`/`Result` pair). The glue is exactly "switch on the
+            //     discriminant, drop the active payload"; there is no destructor to
+            //     rewrite the tag, so the drop is genuinely write-free for the tag.
+            //   * `BundledDestructor` — a real `Drop::drop` DOES run first, and its
+            //     body can rewrite the discriminant the glue then switches on. The
+            //     escape check cannot see that `&mut`, so the tag is not trustworthy.
+            // Bail on the second; the caller then keeps today's blanket lowering.
+            Terminator::Drop { .. } if root_runs_own_destructor => return None,
+            Terminator::Drop { .. } => {}
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            _ => return None,
+        }
+    }
+
+    if seen.is_empty() { None } else { Some(seen) }
+}
+
+/// Account for an enum `Drop` VARIANT BY VARIANT instead of minting one blanket
+/// row for the whole ADT.
+///
+/// `None` = the variant lane declines and the caller keeps today's byte-identical
+/// blanket lowering. `Some(plan)` charges only the arms that genuinely need it:
+/// an arm the discriminant provably excludes is dead code, and an arm whose
+/// payload holds nothing droppable runs no destructor.
+///
+/// SOUNDNESS: the lane can only ever REMOVE a charge for an arm it has a PROOF
+/// about — a proved-excluded discriminant, a payload with no droppable field, or
+/// a payload the structural classifier positively proves panic-free (the same
+/// bar the whole-ADT lane uses). Every other arm is `Charged`, so an enum whose
+/// tag is unknown and whose payloads are unproved is charged exactly as before.
+fn drop_glue_variant_plan(
+    drop_ty: &Ty,
+    place: &Place,
+    ctx: &LoweringCtx<'_>,
+) -> Option<DropGlueVariantPlan> {
+    let (name, variants) = match drop_ty {
+        Ty::Adt { name, variants, .. } if !variants.is_empty() => (name, variants),
+        _ => return None,
+    };
+    let licence = drop_glue_variant_licence(
+        drop_ty,
+        &ctx.structural_drop_adts,
+        &ctx.bundled_destructor_adts,
+    )?;
+
+    let live = provable_live_variants(
+        place,
+        name,
+        variants.len(),
+        ctx,
+        matches!(licence, DropGlueVariantLicence::BundledDestructor),
+    );
+    let narrowed = live.as_ref().is_some_and(|set| set.len() < variants.len());
+
+    let verdicts = variants
+        .iter()
+        .enumerate()
+        .map(|(idx, variant)| {
+            let verdict = if live.as_ref().is_some_and(|set| !set.contains(&idx)) {
+                DropVariantVerdict::Excluded
+            } else if variant.fields.iter().all(|(_, ty)| is_trivially_no_drop_ty(ty)) {
+                DropVariantVerdict::NoDroppablePayload
+            } else if variant.fields.iter().all(|(_, ty)| {
+                is_panic_free_drop_ext(ty, &ctx.structural_drop_adts, &ctx.bundled_destructor_adts)
+            }) {
+                DropVariantVerdict::Discharged
+            } else {
+                DropVariantVerdict::Charged
+            };
+            (variant.name.clone(), verdict)
+        })
+        .collect();
+
+    Some(DropGlueVariantPlan { verdicts, licence, narrowed })
+}
+
 
 /// Build-5: a std/num type whose drop glue is panic-free but that the field-recursion
 /// classifier must accept as a LEAF (not recurse into) — either a non-owning borrow
@@ -25769,6 +27378,129 @@ fn lower_terminator_normal(
                 let dest_ty = place_type(dest, ctx)?;
                 if !matches!(dest_ty, Ty::Unit | Ty::Never) {
                     assign_value_to_place(dest, elem_ptr, ctx, body)?;
+                }
+            } else if let Some(range_plan) = ctx
+                .all_blocks
+                .iter()
+                .find(|b| b.id == block)
+                .and_then(|b| slice_range_index_call_plan(ctx.locals, b))
+            {
+                // Trust (#61, C1) — NATIVE slice range-index model
+                // (`&s[..n]` / `&s[a..]` / `&s[a..b]` through
+                // `<[T] as Index<Range*>>::index`): the callee's COMPLETE panic set
+                // for a `[T]` slice receiver is exactly the bounds condition
+                // (`end <= len`, `start <= len`, or `start <= end && end <= len`),
+                // so — exactly like the `get_unchecked` arm above — emit the REAL
+                // conditional obligation instead of the absent-callee fail-soft
+                // (`Assert(false)+NoPanic` + assumption-prefixed PanicFreedom row,
+                // which left the verdict a permanent UNKNOWN). str and
+                // RangeInclusive DECLINE in the plan (unmodeled char-boundary panic;
+                // end+1 overflow) and keep today's fail-soft path byte-for-byte.
+                //
+                // The SAME plan drives the native VC lane in
+                // `generate_native_safety_vcs`, which emits the paired
+                // `VcKind::SliceBoundsCheck` at this call's span — the completeness
+                // gate counts this arm's BoundsCheck obligation against that VC, so
+                // the two consumers cannot drift without the gate (and C0's
+                // SPINE_DECLINED_PIN census, formerly SPINE_DECLINED_CEILING) going
+                // red.
+                let recv_ty = operand_trust_type(&args[0], ctx)?;
+                let recv = ctx.resolve_operand(&args[0], body)?;
+                let fat_trust_ir = ctx.map_type_ctx(&recv_ty)?;
+                // `len` = element COUNT (fat-ptr metadata field 1) — the SAME term
+                // `s.len()` / `Rvalue::Len` produce, so a dominating guard connects.
+                let len = ctx.emit_slice_metadata(fat_trust_ir, recv, body);
+                let ep = |ctx: &mut LoweringCtx<'_>, body: &mut Vec<InstrNode>, i: usize| {
+                    // Uniform for constant AND local endpoints: the resolver
+                    // type-gates on precise usize itself and yields canonical U64.
+                    ctx.resolve_usize_operand_as_u64(
+                        &range_plan.endpoints[i],
+                        "slice range index endpoint",
+                        body,
+                    )
+                };
+                let cond = match range_plan.family {
+                    SliceRangeIndexFamily::To | SliceRangeIndexFamily::From => {
+                        // To: panics iff end > len; From: iff start > len. Assert the
+                        // complement: endpoint <= len.
+                        let bound = ep(ctx, body, 0)?;
+                        let c = ctx.fresh_value();
+                        body.push(
+                            InstrNode::new(Inst::ICmp {
+                                op: ICmpOp::Ule,
+                                ty: TrustIrTy::U64,
+                                lhs: bound,
+                                rhs: len,
+                            })
+                            .with_result(c),
+                        );
+                        ctx.mark_result_symbolic_from(c, &[bound, len]);
+                        c
+                    }
+                    SliceRangeIndexFamily::Exclusive => {
+                        // Panics iff start > end OR end > len. Assert both complements;
+                        // two asserts, ONE obligation (the completeness gate counts
+                        // obligations, and the VC lane emits exactly one VC whose
+                        // violation is the OR of both failures).
+                        let start = ep(ctx, body, 0)?;
+                        let end = ep(ctx, body, 1)?;
+                        let c1 = ctx.fresh_value();
+                        body.push(
+                            InstrNode::new(Inst::ICmp {
+                                op: ICmpOp::Ule,
+                                ty: TrustIrTy::U64,
+                                lhs: start,
+                                rhs: end,
+                            })
+                            .with_result(c1),
+                        );
+                        ctx.mark_result_symbolic_from(c1, &[start, end]);
+                        body.push(
+                            InstrNode::new(Inst::Assert { cond: c1 })
+                                .with_proof(ProofAnnotation::InBounds),
+                        );
+                        let c2 = ctx.fresh_value();
+                        body.push(
+                            InstrNode::new(Inst::ICmp {
+                                op: ICmpOp::Ule,
+                                ty: TrustIrTy::U64,
+                                lhs: end,
+                                rhs: len,
+                            })
+                            .with_result(c2),
+                        );
+                        ctx.mark_result_symbolic_from(c2, &[end, len]);
+                        c2
+                    }
+                };
+                body.push(
+                    InstrNode::new(Inst::Assert { cond }).with_proof(ProofAnnotation::InBounds),
+                );
+                let desc =
+                    format!("slice range index `{callee}` requires the range within bounds");
+                let placeholder = Operand::Constant(ConstValue::Bool(false));
+                let source = ObligationSourceMetadata::for_mir_assert(
+                    &ctx.function_def_path,
+                    block,
+                    span,
+                    &desc,
+                    ctx.locals,
+                    &[],
+                    block,
+                    &placeholder,
+                    &AssertMessage::Custom(desc.clone()),
+                );
+                ctx.add_obligation(ObligationKind::BoundsCheck, desc, source);
+                // The sub-slice result stays HAVOCKED, exactly as the absent-callee
+                // arm leaves it — this arm upgrades the PANIC model only; the value
+                // model is unchanged (a fresh fat pointer the verifier constrains
+                // nothing about).
+                let dest_ty = place_type(dest, ctx)?;
+                if !matches!(dest_ty, Ty::Unit | Ty::Never) {
+                    let ty = ctx.map_type_ctx(&dest_ty)?;
+                    let result = ctx.fresh_value();
+                    body.push(InstrNode::new(Inst::Undef { ty }).with_result(result));
+                    assign_value_to_place(dest, result, ctx, body)?;
                 }
             } else if let Some(plan) = unwrap_family_model_plan(callee, args, dest, ctx) {
                 // NATIVE unwrap-family model (`Option`/`Result`
@@ -26798,7 +28530,7 @@ fn lower_terminator_normal(
                 );
                 ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
             } else if is_rust_callable_trait_call(callee)
-                && !ctx.known_functions.contains_key(callee)
+                && ctx.resolve_known_function(callee, args.len()).is_none()
                 && untypeable_callable_receiver(args, ctx)
             {
                 // Trust (T4, aterm-scrollback): a `Fn`/`FnMut`/`FnOnce::call*`
@@ -26862,7 +28594,7 @@ fn lower_terminator_normal(
                     &AssertMessage::Custom(desc.clone()),
                 );
                 ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
-            } else if !ctx.known_functions.contains_key(callee)
+            } else if ctx.resolve_known_function(callee, args.len()).is_none()
                 && !is_rust_callable_trait_call(callee)
                 && (is_ratio_new_absent_callee(callee) || is_ratio_recip_absent_callee(callee))
                 // F6-ext: a `Ratio::new` whose denominator is a PROVABLY-NONZERO
@@ -26932,8 +28664,20 @@ fn lower_terminator_normal(
                                 let bool_ty = ctx.map_type_ctx(&Ty::Bool)?;
                                 // `!g` as `Select(g, false, true)` — the validator's
                                 // `UnOp::Not` is bitwise (integer/bool-vector only), so a
-                                // scalar-bool negation is a Select, exactly as the bool
-                                // connective lowering does.
+                                // scalar-bool negation needs a respelling.
+                                //
+                                // Trust (#60, 2026-08-19): this comment used to say
+                                // "exactly as the bool connective lowering does" — STALE
+                                // since bffcc45c5a, which routed every in-crate
+                                // scalar-bool `Not` through `emit_unop`, whose spelling
+                                // is `ICmp Eq(x, false)`, NOT `Select`. This site is now
+                                // the ONE remaining in-crate `Select` spelling of
+                                // bool-not. Both denote `!g` (`x == false` is
+                                // `x ? false : true`), so this is a spelling divergence,
+                                // not a soundness issue — but converging it on
+                                // `emit_unop` changes emitted IR for downstream
+                                // consumers and belongs to a deliberate follow-up, not a
+                                // comment fix.
                                 let false_c = ctx.emit_const(&ConstValue::Bool(false), body)?;
                                 let true_c = ctx.emit_const(&ConstValue::Bool(true), body)?;
                                 let not_g = ctx.fresh_value();
@@ -27034,7 +28778,7 @@ fn lower_terminator_normal(
                         ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
                     }
                 }
-            } else if !ctx.known_functions.contains_key(callee)
+            } else if ctx.resolve_known_function(callee, args.len()).is_none()
                 && !is_rust_callable_trait_call(callee)
                 && is_vec_with_capacity_absent_callee(callee)
             {
@@ -27145,7 +28889,7 @@ fn lower_terminator_normal(
                         ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
                     }
                 }
-            } else if !ctx.known_functions.contains_key(callee)
+            } else if ctx.resolve_known_function(callee, args.len()).is_none()
                 && !is_rust_callable_trait_call(callee)
                 && is_vec_u8_grow_absent_callee(callee)
             {
@@ -27304,7 +29048,7 @@ fn lower_terminator_normal(
                     );
                     ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
                 }
-            } else if !ctx.known_functions.contains_key(callee)
+            } else if ctx.resolve_known_function(callee, args.len()).is_none()
                 && !is_rust_callable_trait_call(callee)
                 // Trust (FIX 1): a genuinely BODYLESS FOREIGN non-unwinding extern-"C"
                 // absent callee (member of `abi_total_panic_free_callees`, populated by
@@ -27490,7 +29234,7 @@ fn lower_terminator_normal(
                     );
                     assign_value_to_place(dest, result, ctx, body)?;
                 }
-            } else if !ctx.known_functions.contains_key(callee)
+            } else if ctx.resolve_known_function(callee, args.len()).is_none()
                 && !is_rust_callable_trait_call(callee)
             {
                 // FAIL-SOFT ABSENT CALLEE: the target's body is not in the
@@ -27589,9 +29333,30 @@ fn lower_terminator_normal(
                 //       demotion allowlist (`transport_row_is_unproved_
                 //       assumption_panic` names absent-callee/drop-glue only),
                 //       so strict AND memory-safe lanes fail closed on it.
-                // This is what keeps a hand-rolled in-crate executor —
-                // including one that polls after completion — from verifying
-                // clean on the strength of the callee's contract row.
+                // SCOPE — CORRECTED 2026-08-20 (D2). This charge fires ONLY for
+                // an in-bundle direct `Call` terminator whose callee signature
+                // carries `coroutine_resume_contract`. It was previously
+                // described here as "what keeps a hand-rolled in-crate executor
+                // — including one that polls after completion — from verifying
+                // clean on the strength of the callee's contract row". That is
+                // true of a direct in-crate `Call` and FALSE of the case that
+                // actually matters, which is why it read as a boundary defence
+                // it never was:
+                //   * the real resumer of an `async fn` body is the generated
+                //     `Future::poll` shim plus an executor, and the executor
+                //     normally lives in ANOTHER CRATE — Targo compiles every
+                //     dependency unit with `-Ztrust-verify=off`, so nothing
+                //     there is charged anything;
+                //   * MEASURED: a cross-crate consumer under strict
+                //     verification receives NO resume-precondition obligation,
+                //     and an in-crate `async fn` CALLER receives none either
+                //     (awaiting is not a direct `Call` to the resume body).
+                // So the callee's exported precondition has no discharge lane
+                // in the case that produced the D2 false PROVE. The compiler
+                // therefore refuses to PUBLISH the contract row in any
+                // fail-closed lane (`coroutine_protocol_publish_decision`);
+                // this callsite charge is a genuine but NARROW belt, not the
+                // boundary defence, and must not be cited as one.
                 // Refutation-free by design: a WELL-behaved single-poll
                 // executor also stays red (honest conservatism, the documented
                 // follow-on discharge lane), which can only withhold green,
@@ -27741,6 +29506,15 @@ fn lower_terminator_normal(
                     ctx.bundled_destructor_adts,
                     ctx.structural_drop_adts.len()
                 );
+                match drop_glue_variant_plan(&drop_ty, place, ctx) {
+                    Some(plan) => eprintln!(
+                        "[DROP_VARIANT] ty={name} licence={:?} narrowed={} plan=[{}]",
+                        plan.licence,
+                        plan.narrowed,
+                        plan.render()
+                    ),
+                    None => eprintln!("[DROP_VARIANT] ty={name} lane=DECLINED (blanket row)"),
+                }
             }
             if !is_trivially_no_drop_ty(&drop_ty)
                 && is_panic_free_drop_ext(
@@ -27767,6 +29541,110 @@ fn lower_terminator_normal(
                     Some(Formula::Bool(false)),
                 );
                 ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
+            } else if !is_trivially_no_drop_ty(&drop_ty)
+                && let Some(plan) = drop_glue_variant_plan(&drop_ty, place, ctx)
+            {
+                // VARIANT-SENSITIVE LANE. Reached only when the WHOLE-ADT
+                // classifier above already FAILED, so this arm can never disturb
+                // a drop that is green today — it only refines a drop that was
+                // about to mint the blanket assumption row.
+                //
+                // An enum's drop glue is a SWITCH on the discriminant: arm `i`
+                // drops variant `i`'s payload fields. Charging one blanket row
+                // for the union of all arms charges arms that provably never
+                // execute. This lane instead accounts for each arm separately:
+                //
+                //  * `Excluded`            — the discriminant PROVABLY is not this
+                //                            variant here (`provable_live_variants`);
+                //                            the arm is dead code.
+                //  * `NoDroppablePayload`  — the arm's payload has no droppable
+                //                            field, so the arm runs no destructor.
+                //  * `Discharged`          — the arm's payload is POSITIVELY
+                //                            PROVED panic-free by the structural
+                //                            classifier.
+                //  * `Charged`             — everything else: an honest,
+                //                            per-variant assumption row.
+                //
+                // FAIL-CLOSED: `provable_live_variants` returns `None` (⇒ every
+                // variant live) for anything it cannot prove, and the licence
+                // check declines any enum whose own `Drop::drop` might run
+                // un-verified. An enum with an unknown tag and unproved payloads
+                // is therefore charged exactly as it is today.
+                let charged: Vec<(usize, String)> =
+                    plan.charged().map(|(i, n)| (i, n.to_string())).collect();
+                if !charged.is_empty() {
+                    for (idx, variant_name) in &charged {
+                        let variant_panic_cond = ctx.emit_const(&ConstValue::Bool(false), body)?;
+                        body.push(
+                            InstrNode::new(Inst::Assert { cond: variant_panic_cond })
+                                .with_proof(ProofAnnotation::NoPanic),
+                        );
+                        let desc = format!(
+                            "{}drop glue for variant `{variant_name}` (#{idx}) of `{drop_ty:?}` has \
+                             unproven panic-freedom (user Drop impls may panic) [variant plan: {}]",
+                            trust_types::assumption::DROP_GLUE_ASSUMPTION_PREFIX,
+                            plan.render(),
+                        );
+                        let panic_cond = Operand::Constant(ConstValue::Bool(false));
+                        let source = ObligationSourceMetadata::for_mir_assert(
+                            &ctx.function_def_path,
+                            block,
+                            span,
+                            &desc,
+                            ctx.locals,
+                            &[],
+                            block,
+                            &panic_cond,
+                            &AssertMessage::Custom(desc.clone()),
+                        );
+                        ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
+                    }
+                } else if plan.any_discharged()
+                    || plan.licence == DropGlueVariantLicence::BundledDestructor
+                {
+                    // Real destructor code still runs on some live arm (a
+                    // classifier-proved payload, or the enum's own bundled
+                    // `Drop::drop`). Record the discharge as a VISIBLE ledger row
+                    // — the same `Assert(true)+NoPanic` / constant-`false`
+                    // panic-condition construct the whole-ADT proven case uses —
+                    // so a bad classifier change surfaces as row/verdict movement
+                    // rather than as silent scope shrinkage.
+                    let safe_cond = ctx.emit_const(&ConstValue::Bool(true), body)?;
+                    body.push(
+                        InstrNode::new(Inst::Assert { cond: safe_cond })
+                            .with_proof(ProofAnnotation::NoPanic),
+                    );
+                    let licence_note = match plan.licence {
+                        DropGlueVariantLicence::NoOwnDestructor => {
+                            "the enum runs no Drop impl of its own"
+                        }
+                        DropGlueVariantLicence::BundledDestructor => {
+                            "the enum's own Drop body is in this bundle and carries its own \
+                             obligations"
+                        }
+                    };
+                    let desc = format!(
+                        "drop glue for `{drop_ty:?}` — discharged per variant: every live arm of \
+                         the discriminant switch is proved panic-free ({licence_note}) \
+                         [variant plan: {}]",
+                        plan.render(),
+                    );
+                    let source = ObligationSourceMetadata::for_conditional_panic(
+                        &ctx.function_def_path,
+                        block,
+                        span,
+                        &desc,
+                        Some(Formula::Bool(false)),
+                    );
+                    ctx.add_obligation(ObligationKind::PanicFreedom, desc, source);
+                }
+                // Otherwise: the enum runs NO destructor of its own
+                // (`NoOwnDestructor`) and every live arm's payload is
+                // non-droppable, so this `Drop` executes no code whatsoever. It
+                // is a plain branch — exactly what `is_trivially_no_drop_ty`
+                // already licenses for a scalar — so there is nothing to charge
+                // and nothing to discharge. `TRUST_DROP_GATE_DEBUG` prints the
+                // full plan that reached this conclusion.
             } else if !is_trivially_no_drop_ty(&drop_ty) {
                 // A drop of a bare GENERIC TYPE PARAMETER `T` (unmonomorphized —
                 // `Ty::Unsupported{kind:"TyKind::Param"}`) dispatches to the CONCRETE
@@ -28117,6 +29995,230 @@ mod aggregate_projection_tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Trust (slice 19): the field-address displacement is a BYTE OFFSET.
+    //
+    // trust-ir GEP is `base + sum(indices) * size_of(pointee_ty)`, so the field
+    // INDEX this arm used to emit named `base + idx * size_of(field_ty)` — the
+    // right address only for a homogeneous field prefix. These pin the repaired
+    // arithmetic against the two shapes an index cannot express (a heterogeneous
+    // struct and a rustc-REORDERED one) and the refusal that must replace a guess.
+    // ---------------------------------------------------------------------
+
+    /// A struct `Ty::Adt` carrying rustc's concrete layout, as the FAITHFUL
+    /// extraction lane fills it (`ty_convert`'s B3-4 T3 arm).
+    fn adt_with_layout(
+        name: &str,
+        fields: Vec<(String, Ty)>,
+        size: u64,
+        align: u64,
+        field_offsets: Vec<u64>,
+    ) -> Ty {
+        Ty::Adt {
+            name: name.to_string(),
+            fields,
+            variants: Vec::new(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: Some(Box::new(trust_types::AdtLayoutInfo {
+                size,
+                align,
+                field_offsets,
+                repr: "rust".to_string(),
+            })),
+            enum_layout: None,
+            adt_kind: None,
+        }
+    }
+
+    /// `let r = &base.field;` as a one-statement body over a struct local.
+    fn field_address_function(base_ty: Ty, field: usize, field_ty: Ty) -> VerifiableFunction {
+        unit_function(
+            "trust_ir_field_address",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(field_ty) },
+                    name: None,
+                },
+                LocalDecl { index: 2, ty: base_ty, name: Some("base".into()) },
+            ],
+            vec![Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Ref {
+                    mutable: false,
+                    place: Place { local: 2, projections: vec![Projection::Field(field)] },
+                },
+                span: SourceSpan::default(),
+            }],
+        )
+    }
+
+    /// The sole `Inst::GEP` of the lowered body, as `(pointee_ty, inbounds,
+    /// resolved displacement)`. Fails loudly on zero or many, so a test cannot
+    /// pass by inspecting the wrong instruction.
+    fn sole_gep(module: &Module) -> (TrustIrTy, bool, i128) {
+        let mut consts: FxHashMap<ValueId, i128> = FxHashMap::default();
+        let mut found: Option<(TrustIrTy, bool, Vec<ValueId>)> = None;
+        for block in &module.functions[0].blocks {
+            for node in &block.body {
+                match &node.inst {
+                    Inst::Const { value: TrustIrConstant::Int(k), .. } => {
+                        if let Some(r) = node.results.first() {
+                            consts.insert(*r, *k);
+                        }
+                    }
+                    Inst::GEP { pointee_ty, indices, inbounds, .. } => {
+                        assert!(found.is_none(), "expected exactly one GEP in the body");
+                        found = Some((pointee_ty.clone(), *inbounds, indices.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (pointee_ty, inbounds, indices) = found.expect("expected one GEP in the body");
+        assert_eq!(indices.len(), 1, "a field address displaces by exactly one index");
+        let displacement =
+            *consts.get(&indices[0]).expect("the GEP index must be a materialized constant");
+        (pointee_ty, inbounds, displacement)
+    }
+
+    #[test]
+    fn heterogeneous_struct_field_address_displaces_by_the_byte_offset_not_the_index() {
+        // `struct S { a: u32, b: u8 }` — rustc: size 8, align 4, offsets [0, 4].
+        // `&s.b` is `base + 4`. The retired index spelling named
+        // `base + 1 * size_of(u8)` = `base + 1`, an address INTERIOR to `a`.
+        let s = adt_with_layout(
+            "S",
+            vec![("a".into(), Ty::u32()), ("b".into(), Ty::u8())],
+            8,
+            4,
+            vec![0, 4],
+        );
+        let module = lower_to_trust_ir(&field_address_function(s, 1, Ty::u8()))
+            .expect("a laid-out struct field address must lower");
+        assert_valid_module(&module);
+        let (pointee_ty, inbounds, displacement) = sole_gep(&module);
+        assert_eq!(
+            pointee_ty,
+            TrustIrTy::I8,
+            "a field address walks a FLAT BYTE lane; a typed pointee re-scales the displacement"
+        );
+        assert!(inbounds, "a field of a laid-out ADT is in bounds by construction");
+        assert_eq!(displacement, 4, "`b`'s declared byte offset, not its field index");
+    }
+
+    #[test]
+    fn reordered_struct_field_address_uses_the_declared_offset_not_declaration_order() {
+        // `struct R { a: u8, b: u64 }` — repr(Rust) reorders: `b` at 0, `a` at 8
+        // (size 16, align 8). Field 0 is therefore at byte EIGHT. No index-scaled
+        // rule can produce this: `0 * size_of(u8)` is 0 whatever the sizes are, so
+        // this is the case the arithmetic could not reach even in principle. It is
+        // the bridge twin of the interpreter's own
+        // `struct_layout_uses_the_declared_offsets_not_declaration_order`.
+        let r = adt_with_layout(
+            "R",
+            vec![("a".into(), Ty::u8()), ("b".into(), Ty::u64())],
+            16,
+            8,
+            vec![8, 0],
+        );
+        let module = lower_to_trust_ir(&field_address_function(r.clone(), 0, Ty::u8()))
+            .expect("a reordered struct field address must lower");
+        assert_valid_module(&module);
+        let (pointee_ty, inbounds, displacement) = sole_gep(&module);
+        assert_eq!(pointee_ty, TrustIrTy::I8);
+        assert!(inbounds);
+        assert_eq!(displacement, 8, "`a`'s DECLARED offset, not its declaration position");
+
+        // The control: the field declared SECOND is the one at byte 0. Without it
+        // the assertion above could pass on a coincidence of the two rules.
+        let module = lower_to_trust_ir(&field_address_function(r, 1, Ty::u64()))
+            .expect("a reordered struct field address must lower");
+        assert_eq!(sole_gep(&module).2, 0);
+    }
+
+    #[test]
+    fn union_field_address_fails_closed_without_a_union_type() {
+        // A union's fields all start at byte 0, but trust-ir StructDef explicitly
+        // requires non-overlapping fields and has no union type.  The old bridge
+        // registered this as a StructDef anyway.  Its layout query correctly
+        // rejected the overlap, after which address lowering fell back to the
+        // layout-less spelling and gave field 1 `base + 1`.  A positively
+        // authenticated union kind must instead refuse before emitting a module.
+        let mut u = adt_with_layout(
+            "U",
+            vec![("a".into(), Ty::u32()), ("b".into(), Ty::u8())],
+            4,
+            4,
+            vec![0, 0],
+        );
+        let Ty::Adt { adt_kind, .. } = &mut u else {
+            unreachable!("the helper always constructs an ADT")
+        };
+        *adt_kind = Some(trust_types::AdtKind::Union);
+
+        let err = lower_to_trust_ir(&field_address_function(u, 1, Ty::u8()))
+            .expect_err("a union must fail closed until trust-ir has a union representation");
+        assert!(
+            matches!(err, BridgeError::UnsupportedOp(ref detail) if detail.contains("union U")),
+            "the refusal must identify the unsupported union: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_layout_less_base_keeps_the_index_spelling_verbatim() {
+        // THE MEASURED SCOPE BOUNDARY. `AdtLayoutInfo` is filled on the FAITHFUL
+        // extraction lane only, so on the verifier lane — and for any generic ADT on
+        // either lane — a field address arrives here with no offsets at all. There is
+        // no byte address to emit and no consumer of a layout-less module derives
+        // one (trust-mc's `exact_gep_lane_ty` requires an offset on EVERY field
+        // before it will name a lane; BMC bounds-rejects; the interpreter is reached
+        // only through the faithful-lane differential). Denying instead was
+        // implemented and measured: it costs 48 functions their
+        // `generate_native_safety_vcs` cross-check (`missing_obligation_ratchet`,
+        // spine declines 228 -> 276) for no soundness gain. So the emission is
+        // retained VERBATIM here, and the residual is carried in the comment on the
+        // arm rather than paid for by the ratchet.
+        for base in [
+            Ty::adt("S", vec![("a".into(), Ty::u32()), ("b".into(), Ty::u8())]),
+            Ty::Tuple(vec![Ty::u32(), Ty::u8()]),
+        ] {
+            let module = lower_to_trust_ir(&field_address_function(base, 1, Ty::u8()))
+                .expect("a layout-less field address must keep lowering");
+            assert_valid_module(&module);
+            let (pointee_ty, inbounds, displacement) = sole_gep(&module);
+            assert_eq!(pointee_ty, TrustIrTy::U8, "the pre-repair typed-pointee spelling");
+            assert!(!inbounds, "the pre-repair `inbounds` flag");
+            assert_eq!(displacement, 1, "the pre-repair index, not a byte offset");
+        }
+    }
+
+    #[test]
+    fn a_declared_offset_the_index_already_named_keeps_the_index_spelling() {
+        // `struct H { a: u32, b: u32 }` — offsets [0, 4], and `1 * size_of(u32)` is
+        // also 4. The two spellings name the same address, so the emission must not
+        // move: the index spelling is the one `exact_gep_lane_ty` can make precise,
+        // and a gratuitous respelling would cost every already-correct module its
+        // CHC field-lane precision for nothing. This is the assertion that makes
+        // "predicted zero movement" a property of the code and not a hope.
+        let h = adt_with_layout(
+            "H",
+            vec![("a".into(), Ty::u32()), ("b".into(), Ty::u32())],
+            8,
+            4,
+            vec![0, 4],
+        );
+        let module = lower_to_trust_ir(&field_address_function(h, 1, Ty::u32()))
+            .expect("a homogeneous laid-out struct field address must lower");
+        assert_valid_module(&module);
+        let (pointee_ty, inbounds, displacement) = sole_gep(&module);
+        assert_eq!(pointee_ty, TrustIrTy::U32);
+        assert!(!inbounds);
+        assert_eq!(displacement, 1);
+    }
+
     fn unit_function(
         name: &str,
         locals: Vec<LocalDecl>,
@@ -28204,7 +30306,7 @@ mod aggregate_projection_tests {
                 "copy_for_deref_dyn",
                 Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into() }),
+                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into(), principal_key: Some("core::fmt::Debug".into()) }),
                 },
             ),
             (
@@ -28247,7 +30349,7 @@ mod aggregate_projection_tests {
     fn copy_for_deref_mismatched_mir_types_fail_closed_before_validation() {
         let dyn_ref = Ty::Ref {
             mutable: false,
-            inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into() }),
+            inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into(), principal_key: Some("core::fmt::Debug".into()) }),
         };
         let mut malformed = copy_for_deref_function("copy_for_deref_mismatched", dyn_ref);
         malformed.body.locals[2].ty = Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) };
@@ -29068,7 +31170,7 @@ mod aggregate_projection_tests {
     fn raw_ptr_aggregate_rejects_dyn_vtable_metadata() {
         let data_ptr_ty = Ty::RawPtr { pointee: Box::new(Ty::u8()), mutable: false };
         let dyn_ptr_ty = Ty::RawPtr {
-            pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into() }),
+            pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
             mutable: false,
         };
         let func = unit_function(
@@ -29083,7 +31185,7 @@ mod aggregate_projection_tests {
                 place: Place::local(3),
                 rvalue: Rvalue::Aggregate(
                     AggregateKind::RawPtr {
-                        pointee_ty: Ty::Dynamic { trait_name: "Debug".into() },
+                        pointee_ty: Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) },
                         mutable: false,
                     },
                     vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -29613,7 +31715,7 @@ mod aggregate_projection_tests {
             &Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) },
             &Ty::Ref {
                 mutable: false,
-                inner: Box::new(Ty::Dynamic { trait_name: "Debug".into() }),
+                inner: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
             },
         )
         .expect("a trait-object target is not an internal error, just unmodeled");
@@ -29628,7 +31730,7 @@ mod aggregate_projection_tests {
             },
             &Ty::Ref {
                 mutable: false,
-                inner: Box::new(Ty::Dynamic { trait_name: "Debug".into() }),
+                inner: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
             },
         )
         .expect("a trait-object target is not an internal error, just unmodeled");
@@ -29889,6 +31991,91 @@ mod strict_total_no_panic_call_summary_tests {
             "core::str::<impl str>::split",
         ] {
             assert!(!is_total_str_pattern_method(callee), "must fail closed: {callee}");
+            assert!(!total_no_panic_call_summary(callee), "must fail closed: {callee}");
+        }
+    }
+
+    // Trust-Std: `<[T]>::contains` for a PRIMITIVE element. Every admitted width
+    // bottoms out in core's own `SliceContains` impl over the BUILT-IN `PartialEq`
+    // (`library/core/src/slice/cmp.rs`: memchr for `u8`/`i8`, a `chunks_exact` SIMD
+    // scan for the listed widths, `iter().any` otherwise), so no user `eq`, `Drop`
+    // or callback can run and there is no panic path.
+    #[test]
+    fn test_primitive_slice_contains_admits_only_primitive_elements() {
+        for callee in [
+            // The measured ay-proof-common call site.
+            "core::slice::<impl [i32]>::contains",
+            "core::slice::<impl [u8]>::contains",
+            "core::slice::<impl [i8]>::contains",
+            "core::slice::<impl [u64]>::contains",
+            "core::slice::<impl [usize]>::contains",
+            "core::slice::<impl [f64]>::contains",
+            "core::slice::<impl [char]>::contains",
+            "core::slice::<impl [bool]>::contains",
+        ] {
+            assert!(is_total_primitive_slice_contains(callee), "expected total: {callee}");
+            assert!(total_no_panic_call_summary(callee), "expected exact total: {callee}");
+        }
+    }
+
+    // THE PLANTED VIOLATION for B2. A user element type reaches the DEFAULT
+    // `SliceContains` impl, which calls that type's `PartialEq::eq` — user code that
+    // may panic. `strip_generics` erases the element (`core::slice::<impl
+    // [my_crate::T]>::contains` -> `core::slice::contains`), so an `EXACT_TOTAL`
+    // entry would admit it; this test is what fails if anyone "simplifies" the raw
+    // gate into one. It also pins the crate-root anchor against a stamped
+    // impersonating crate and against a same-named user method.
+    #[test]
+    fn test_primitive_slice_contains_fails_closed_on_user_elements_and_lookalikes() {
+        for callee in [
+            // A user ADT element: its `PartialEq::eq` is user code that may panic.
+            "core::slice::<impl [my_crate::Widget]>::contains",
+            // A std ADT element is equally out: `String`'s `eq` is not the built-in.
+            "core::slice::<impl [alloc::string::String]>::contains",
+            // References and nested generics are not primitive literals.
+            "core::slice::<impl [&i32]>::contains",
+            "core::slice::<impl [core::option::Option<i32>]>::contains",
+            // Right element, wrong method — no method-name families.
+            "core::slice::<impl [i32]>::binary_search",
+            "core::slice::<impl [i32]>::starts_with",
+            "core::slice::<impl [i32]>::contains_key",
+            // Right name, wrong root: a user crate must never inherit authority,
+            // including through the extractor's impersonation stamp.
+            "my_crate::slice::<impl [i32]>::contains",
+            "__trust_crate@deadbeef::core::slice::<impl [i32]>::contains",
+            // Generic, unmonomorphized spelling: the element is unknown, fail closed.
+            "core::slice::<impl [T]>::contains",
+            // The element-blind form `strip_generics` would produce. It must not be
+            // admitted by any surface — this is the exact shape an `EXACT_TOTAL`
+            // entry would have matched.
+            "core::slice::contains",
+        ] {
+            assert!(!is_total_primitive_slice_contains(callee), "must fail closed: {callee}");
+            assert!(!total_no_panic_call_summary(callee), "must fail closed: {callee}");
+        }
+    }
+
+    // Trust-Std (B3): `BufReader::new` has a COMPILE-TIME-CONSTANT buffer size and
+    // moves `R` without touching it. `with_capacity` takes a CALLER-SUPPLIED
+    // capacity, so its layout arithmetic is unbounded — it must never ride along.
+    #[test]
+    fn test_bufreader_new_is_total_and_with_capacity_is_not() {
+        for callee in [
+            "std::io::buffered::bufreader::BufReader::<impl Read>::new",
+            "std::io::buffered::bufreader::BufReader::<std::fs::File>::new",
+        ] {
+            assert!(total_no_panic_call_summary(callee), "expected exact total: {callee}");
+        }
+        for callee in [
+            "std::io::buffered::bufreader::BufReader::<impl Read>::with_capacity",
+            "std::io::buffered::bufwriter::BufWriter::<impl Write>::with_capacity",
+            // Reading is where the `Read` impl (user code) actually runs.
+            "std::io::buffered::bufreader::BufReader::<impl Read>::fill_buf",
+            "std::io::buffered::bufreader::BufReader::<impl Read>::read_line",
+            // Right name, wrong root.
+            "my_crate::io::buffered::bufreader::BufReader::<impl Read>::new",
+            "__trust_crate@deadbeef::std::io::buffered::bufreader::BufReader::new",
+        ] {
             assert!(!total_no_panic_call_summary(callee), "must fail closed: {callee}");
         }
     }
@@ -32458,7 +34645,7 @@ mod fnptr_indirect_call_tests {
         // falls through to the fail-closed `resolve_call_target` (Unsupported), never
         // silently modeled as an indirect call.
         assert!(fnptr_indirect_call_sig(&Ty::i32()).is_none());
-        assert!(fnptr_indirect_call_sig(&Ty::Dynamic { trait_name: "Fn".into() }).is_none());
+        assert!(fnptr_indirect_call_sig(&Ty::Dynamic { trait_name: "Fn".into(), principal_key: Some("Fn".into()) }).is_none());
         // A concrete fn-pointer (thin and behind `&`) is accepted.
         assert!(fnptr_indirect_call_sig(&fn_i32_to_i32()).is_some());
         assert!(
@@ -34474,5 +36661,511 @@ mod trusted_std_root_stamp_tests {
                 "must agree with the shared predicate for {p:?}"
             );
         }
+    }
+}
+
+/// Trust (#62, C-D1) — the MODULE-SHAPE PIN for the deferred Assertion rows.
+///
+/// The Assertion-row design panel's DEFER verdict rests on one factual premise:
+/// **the module side already mints the real check at every user-assert panic
+/// site** — the diverging panic-call arm emits `Assert(cond = const false)`
+/// annotated `NoPanic` (in CHC terms: prove this branch unreachable, under the
+/// block's path condition) followed by `Unreachable`, plus a `PanicFreedom`
+/// obligation. This test turns that premise from an audit claim into a
+/// regression pin on the REAL dumps, so an accidental future regression of the
+/// arm at these sites goes red WITHOUT any gate machinery.
+#[cfg(test)]
+mod diverging_panic_site_module_shape_tests {
+    use super::*;
+
+    fn load_dump(dir: &str, def_path: &str) -> VerifiableFunction {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../trust-clean/fixtures")
+            .join(dir);
+        for entry in std::fs::read_dir(&root).expect("corpus dir").flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            if let Ok(f) = serde_json::from_str::<VerifiableFunction>(&text) {
+                if f.def_path == def_path {
+                    return f;
+                }
+            }
+        }
+        panic!("dump {def_path} not found under {dir}");
+    }
+
+    /// The pinned shape, asserted structurally: somewhere in the lowered module
+    /// there is an `Assert` whose condition resolves to `Const Bool(false)`,
+    /// carrying the `NoPanic` annotation, followed in its block by `Unreachable`;
+    /// and the module mints a `PanicFreedom` obligation with the arm's pinned
+    /// description for the named callee.
+    fn assert_diverging_panic_shape(func: &VerifiableFunction, callee_fragment: &str) {
+        let module = lower_to_trust_ir(func).expect("lowering succeeds");
+        let f = &module.functions[0];
+        let mut found_structure = false;
+        for block in &f.blocks {
+            let body = &block.body;
+            for (i, node) in body.iter().enumerate() {
+                let Inst::Assert { cond } = &node.inst else { continue };
+                if !node.proofs.contains(&ProofAnnotation::NoPanic) {
+                    continue;
+                }
+                // The condition must resolve to a literal `false` const.
+                let cond_is_false = body.iter().take(i).any(|n| {
+                    n.results.first() == Some(cond)
+                        && matches!(
+                            &n.inst,
+                            Inst::Const { value: TrustIrConstant::Bool(false), .. }
+                        )
+                });
+                let followed_by_unreachable =
+                    body.iter().skip(i + 1).any(|n| matches!(n.inst, Inst::Unreachable));
+                if cond_is_false && followed_by_unreachable {
+                    found_structure = true;
+                }
+            }
+        }
+        assert!(
+            found_structure,
+            "{}: the diverging panic-call arm's structure (Assert(const false) + NoPanic, \
+             then Unreachable) is MISSING from the lowered module — the defer verdict's \
+             factual premise regressed",
+            func.def_path
+        );
+        let has_obligation = module.proof_obligations.iter().any(|o| {
+            matches!(o.kind, ObligationKind::PanicFreedom)
+                && o.description.contains("must be unreachable")
+                && o.description.contains(callee_fragment)
+        });
+        assert!(
+            has_obligation,
+            "{}: no PanicFreedom obligation with the pinned description for `{}` — the \
+             module-side check the defer verdict relies on is gone",
+            func.def_path, callee_fragment
+        );
+    }
+
+    /// The 17-row family: byteorder's `assert_eq!` prelude lowers through
+    /// `core::panicking::assert_failed`.
+    #[test]
+    fn byteorder_assert_eq_prelude_keeps_the_module_check() {
+        let func = load_dump(
+            "census-2026-07-06/byteorder",
+            "<lib::BigEndian as lib::ByteOrder>::write_u16_into",
+        );
+        assert_diverging_panic_shape(&func, "assert_failed");
+    }
+
+    /// The sentinel row at `panic.rs:73` (`check_ascii_printable`) — a different
+    /// panic entry point, same required structure.
+    #[test]
+    fn ascii_sentinel_keeps_the_module_check() {
+        let func = load_dump("census-rung2-2026-07-07/ascii_utils", "lib::check_ascii_printable");
+        assert_diverging_panic_shape(&func, "panic");
+    }
+}
+
+/// Trust (#61, C1) — the slice range-index plan: positive fixture on the REAL
+/// byteorder dump, negative controls on every gate.
+#[cfg(test)]
+mod slice_range_index_plan_tests {
+    use super::*;
+
+    fn byteorder_read_u64() -> VerifiableFunction {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../trust-clean/fixtures/census-2026-07-06/byteorder");
+        for entry in std::fs::read_dir(&path).expect("byteorder corpus dir").flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).expect("read dump");
+            if let Ok(f) = serde_json::from_str::<VerifiableFunction>(&text) {
+                if f.def_path == "<lib::BigEndian as lib::ByteOrder>::read_u64" {
+                    return f;
+                }
+            }
+        }
+        panic!("byteorder read_u64 dump not found");
+    }
+
+    /// POSITIVE — the real `&buf[..8]` shape: the plan recognizes, the native VC
+    /// lane emits a SliceBoundsCheck AT THE CALL SPAN, the completeness gate
+    /// passes (module BoundsCheck obligation count == VC count), and the module
+    /// carries the paired obligation.
+    #[test]
+    fn byteorder_read_u64_derives_the_bounds_vc() {
+        let func = byteorder_read_u64();
+        let vcs = generate_native_safety_vcs(&func)
+            .expect("the gate must pass: one BoundsCheck obligation, one VC");
+        let bounds: Vec<_> =
+            vcs.iter().filter(|v| matches!(v.kind, VcKind::SliceBoundsCheck)).collect();
+        assert_eq!(bounds.len(), 1, "exactly one range-index VC: {vcs:?}");
+        // The violation is `8 > buf__slice_len` over the SAME __slice_len variable
+        // a dominating guard binds.
+        let rendered = format!("{:?}", bounds[0].formula);
+        assert!(
+            rendered.contains("__slice_len"),
+            "the length term must be the canonical __slice_len variable: {rendered}"
+        );
+        assert!(rendered.contains("Int(8)"), "the RangeTo endpoint is the constant 8: {rendered}");
+        // And the lowered module mints the PAIRED BoundsCheck obligation (this is
+        // what the completeness gate counted).
+        let module = lower_to_trust_ir(&func).expect("lowering succeeds");
+        let bc = module
+            .proof_obligations
+            .iter()
+            .filter(|o| matches!(o.kind, ObligationKind::BoundsCheck))
+            .count();
+        assert_eq!(bc, 1, "one paired module obligation");
+    }
+
+    /// NEGATIVE — every gate declines what it must. A decline is NOT a failure:
+    /// the call keeps today's absent-callee fail-soft path byte-for-byte.
+    #[test]
+    fn the_plan_declines_out_of_scope_shapes() {
+        // str receiver: cannot match the `<[` prefix.
+        assert!(
+            slice_range_index_family(
+                "<str as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index"
+            )
+            .is_none(),
+            "str carries the unmodeled char-boundary panic and must decline"
+        );
+        // RangeInclusive: end+1 overflow subtlety, must decline.
+        assert!(
+            slice_range_index_family(
+                "<[u8] as core::ops::index::Index<core::ops::range::RangeInclusive<usize>>>::index"
+            )
+            .is_none(),
+            "RangeInclusive must decline"
+        );
+        // RangeFull never panics and renders without the range:: family — declines.
+        assert!(
+            slice_range_index_family(
+                "<[u8] as core::ops::index::Index<core::ops::range::RangeFull>>::index"
+            )
+            .is_none()
+        );
+        // Vec receiver renders as `Vec<T>`, not `[T]` — declines (its bounds check
+        // lives inside the opaque impl; vcgen's #7c lane owns it).
+        assert!(
+            slice_range_index_family(
+                "<alloc::vec::Vec<u8> as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index"
+            )
+            .is_none()
+        );
+        // The families that DO match.
+        assert!(matches!(
+            slice_range_index_family(
+                "<[u8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index"
+            ),
+            Some(SliceRangeIndexFamily::To)
+        ));
+        assert!(matches!(
+            slice_range_index_family(
+                "<[T] as core::ops::index::Index<core::ops::range::Range<usize>>>::index"
+            ),
+            Some(SliceRangeIndexFamily::Exclusive)
+        ));
+        assert!(matches!(
+            slice_range_index_family(
+                "<[i32] as core::ops::index::Index<core::ops::range::RangeFrom<usize>>>::index"
+            ),
+            Some(SliceRangeIndexFamily::From)
+        ));
+    }
+
+    /// Trust (#61, C1b) — the endpoint TYPE gate: a variable endpoint is admitted
+    /// IFF its local's declared type is precisely usize. Pointing the endpoint at
+    /// the `&[u8]` RECEIVER local must decline (wrong type); pointing it at a
+    /// genuine usize local must RECOGNIZE (the read_uint widening).
+    #[test]
+    fn variable_endpoint_type_gate() {
+        let func = byteorder_read_u64();
+        // Rebuild the call block with the aggregate endpoint swapped to a local.
+        let mut mutated = func.clone();
+        let mut changed = false;
+        for block in &mut mutated.body.blocks {
+            for stmt in &mut block.stmts {
+                if let Statement::Assign { rvalue, .. } = stmt {
+                    if let Rvalue::Aggregate(kind, ops) = rvalue {
+                        if let trust_types::AggregateKind::Adt { name, .. } = kind {
+                            if name.contains("RangeTo") {
+                                ops[0] = Operand::Copy(trust_types::Place::local(1));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed, "fixture must contain the RangeTo aggregate");
+        // Local 1 is the `&[u8]` receiver — NOT usize — so the type gate declines.
+        for block in &mutated.body.blocks {
+            assert!(
+                slice_range_index_call_plan(&mutated.body.locals, block).is_none(),
+                "a non-usize endpoint local must decline"
+            );
+        }
+        // Now add a genuine usize local and point the endpoint at it: RECOGNIZED.
+        let usize_local = mutated.body.locals.len();
+        mutated.body.locals.push(LocalDecl {
+            index: usize_local,
+            ty: Ty::Int { width: 64, signed: false },
+            name: Some("nbytes".into()),
+        });
+        let mut retargeted = false;
+        for block in &mut mutated.body.blocks {
+            for stmt in &mut block.stmts {
+                if let Statement::Assign { rvalue: Rvalue::Aggregate(kind, ops), .. } = stmt {
+                    if let trust_types::AggregateKind::Adt { name, .. } = kind {
+                        if name.contains("RangeTo") {
+                            ops[0] = Operand::Copy(trust_types::Place::local(usize_local));
+                            retargeted = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(retargeted);
+        let recognized = mutated
+            .body
+            .blocks
+            .iter()
+            .any(|b| slice_range_index_call_plan(&mutated.body.locals, b).is_some());
+        assert!(recognized, "a usize-typed variable endpoint must RECOGNIZE (C1b)");
+    }
+}
+
+/// Trust (B1 — the refined callee key). The unit tests pin the RULE; the two
+/// end-to-end tests pin what it does to a real bundle, in BOTH directions.
+#[cfg(test)]
+mod refined_callee_key_tests {
+    use trust_types::UnwindEdge;
+    use trust_types::{BlockId, SourceSpan, VerifiableBody};
+
+    use super::*;
+
+    // ---- the rule ----------------------------------------------------------
+
+    #[test]
+    fn refined_callee_base_strips_a_trailing_turbofish_on_a_plain_path() {
+        // The measured population: a free function called with the CALLER's own
+        // type parameter, and with a projection through one.
+        assert_eq!(
+            refined_callee_base("trait_params::assert_iterator::<A>"),
+            Some("trait_params::assert_iterator")
+        );
+        assert_eq!(
+            refined_callee_base(
+                "trait_params::assert_copy::<<A as core::iter::traits::iterator::Iterator>::Item>"
+            ),
+            Some("trait_params::assert_copy")
+        );
+        // An INHERENT associated function renders plain and is statically resolved.
+        assert_eq!(refined_callee_base("dispatch::Inh::q::<u8>"), Some("dispatch::Inh::q"));
+        // Concrete arguments strip too — this bundle is pre-monomorphization and holds
+        // exactly one body per DefId, so both instantiations genuinely target it.
+        assert_eq!(
+            refined_callee_base("canonicalization_rerun::impls_trait::<u32, u32>"),
+            Some("canonicalization_rerun::impls_trait")
+        );
+    }
+
+    /// NEGATIVE CONTROL — the gate that makes this a narrowing rather than a bare
+    /// `::<…>` strip. MEASURED reproducer (`probe/dispatch.rs`, five lines):
+    ///
+    /// ```text
+    /// pub trait Tr2 { fn p<X>(&self) -> u32; }
+    /// impl<T> Tr2 for T { fn p<X>(&self) -> u32 { 3 } }
+    /// pub fn viaparam3<T: Tr2>(x: &T) -> u32 { x.p::<u8>() }
+    /// ```
+    ///
+    /// The blanket impl's body is keyed `<T as dispatch::Tr2>::p` and the
+    /// UNRESOLVABLE dispatch renders `<T as dispatch::Tr2>::p::<u8>`. Stripping
+    /// would bind one to the other — `direct_call_def_path` RESIDUAL 1, a live
+    /// false proof. Deleting the `starts_with('<')` line turns this test red.
+    #[test]
+    fn refined_callee_base_refuses_the_blanket_impl_dispatch() {
+        assert_eq!(refined_callee_base("<T as dispatch::Tr2>::p::<u8>"), None);
+        assert_eq!(refined_callee_base("<T as dispatch::Tr>::m::<u8>"), None);
+        assert_eq!(
+            refined_callee_base("<krate::S as core::fmt::Write>::write_fmt::<u8>"),
+            None
+        );
+    }
+
+    #[test]
+    fn refined_callee_base_refuses_everything_that_is_not_a_trailing_turbofish() {
+        // A MIDDLE turbofish: the tail is a real path segment, not an argument list.
+        assert_eq!(refined_callee_base("alloc::vec::Vec::<u8>::with_capacity"), None);
+        assert_eq!(refined_callee_base("core::str::<impl str>::bytes"), None);
+        // No turbofish at all.
+        assert_eq!(refined_callee_base("krate::plain"), None);
+        // A WELDED Trust discrimination token is a carried fact, never an argument.
+        assert_eq!(refined_callee_base("core::ops::Try::branch::<__trust_try_total>"), None);
+        assert_eq!(
+            refined_callee_base("alloc::vec::Vec::with_capacity::<__trust_elem_bytes@16>"),
+            None
+        );
+        // Unbalanced / degenerate spellings fail closed rather than panicking.
+        assert_eq!(refined_callee_base("krate::f::<u8"), None);
+        assert_eq!(refined_callee_base("krate::f::<u8>>"), None);
+        assert_eq!(refined_callee_base("::<u8>"), None);
+        assert_eq!(refined_callee_base(""), None);
+        assert_eq!(refined_callee_base(">"), None);
+    }
+
+    /// `->` inside a turbofish must not be read as a closing bracket: a reified fn
+    /// item renders its whole `FnDef` type as the argument.
+    #[test]
+    fn refined_callee_base_steps_over_a_fn_pointer_return_arrow() {
+        assert_eq!(
+            refined_callee_base("krate::apply::<fn(u32) -> krate::go::S {krate::go::S}>"),
+            Some("krate::apply")
+        );
+    }
+
+    // ---- what it does to a bundle ------------------------------------------
+
+    fn nullary_unit_fn(def_path: &str) -> VerifiableFunction {
+        VerifiableFunction {
+            name: def_path.rsplit("::").next().unwrap_or(def_path).to_string(),
+            def_path: def_path.to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+                blocks: vec![TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Unit)),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    /// A caller whose single block calls `callee_key` with no arguments.
+    fn nullary_caller(def_path: &str, callee_key: &str) -> VerifiableFunction {
+        let mut f = nullary_unit_fn(def_path);
+        f.body.locals.push(LocalDecl { index: 1, ty: Ty::Unit, name: Some("out".into()) });
+        f.body.blocks = vec![
+            TrustBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    is_foreign: false,
+                    func: callee_key.to_string(),
+                    args: vec![],
+                    dest: Place::local(1),
+                    target: Some(BlockId(1)),
+                    span: SourceSpan::default(),
+                    atomic: None,
+                },
+            },
+            TrustBlock {
+                id: BlockId(1),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Unit)),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            },
+        ];
+        f
+    }
+
+    fn absent_callee_markers(module: &Module) -> usize {
+        module
+            .proof_obligations
+            .iter()
+            .filter(|o| {
+                o.description
+                    .contains(trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX)
+            })
+            .count()
+    }
+
+    fn direct_call_edges(module: &Module) -> usize {
+        module
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.body.iter())
+            .filter(|n| matches!(n.inst, Inst::Call { .. }))
+            .count()
+    }
+
+    /// POSITIVE — the whole point. The call renders with the caller's own type
+    /// parameter; the body is keyed args-free and is sitting in the same bundle.
+    /// Before this rule the bundle carried a fatal absent-callee marker, which is
+    /// what `run_seam_differentials` step 6 aborts the comparison on.
+    #[test]
+    fn a_generic_call_binds_to_its_bundled_body_and_mints_no_absent_marker() {
+        let funcs = vec![
+            nullary_caller("krate::caller", "krate::assert_iterator::<A>"),
+            nullary_unit_fn("krate::assert_iterator"),
+        ];
+        let module = lower_to_trust_ir_functions("b1", &funcs).expect("bundle lowers");
+        assert_eq!(
+            absent_callee_markers(&module),
+            0,
+            "the callee IS in the bundle; no absent-callee marker may be minted"
+        );
+        assert_eq!(direct_call_edges(&module), 1, "a real call edge must be emitted");
+    }
+
+    /// NEGATIVE CONTROL, end to end — the same shape with a QUALIFIED-SELF key.
+    /// The blanket-impl body is present and the stripped key would name it exactly,
+    /// so only the plain-path gate stands between this and a false bind. The
+    /// absent-callee marker must survive.
+    #[test]
+    fn a_blanket_impl_dispatch_still_fails_closed_with_its_body_in_the_bundle() {
+        let funcs = vec![
+            nullary_caller("krate::viaparam3", "<T as krate::Tr2>::p::<u8>"),
+            nullary_unit_fn("<T as krate::Tr2>::p"),
+        ];
+        let module = lower_to_trust_ir_functions("b1neg", &funcs).expect("bundle lowers");
+        assert_eq!(
+            absent_callee_markers(&module),
+            1,
+            "an unresolvable generic dispatch must NOT bind to the blanket-impl body"
+        );
+        assert_eq!(direct_call_edges(&module), 0);
+    }
+
+    /// The ARITY gate. The refined key was never rendered from this body's own
+    /// `DefId`, so a body whose declared parameter count disagrees with the call
+    /// means the strip reached something else — fail closed to the absent lane.
+    #[test]
+    fn the_refined_bind_requires_the_arity_to_match() {
+        let mut callee = nullary_unit_fn("krate::takes_one");
+        callee.body.locals.push(LocalDecl { index: 1, ty: Ty::Unit, name: Some("x".into()) });
+        callee.body.arg_count = 1;
+        let funcs =
+            vec![nullary_caller("krate::caller", "krate::takes_one::<A>"), callee];
+        let module = lower_to_trust_ir_functions("b1arity", &funcs).expect("bundle lowers");
+        assert_eq!(
+            absent_callee_markers(&module),
+            1,
+            "an arity split must fail closed, not bind"
+        );
     }
 }

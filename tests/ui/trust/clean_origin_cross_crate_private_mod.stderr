@@ -1,0 +1,17 @@
+error[E0603]: module `m` is private
+  --> $DIR/clean_origin_cross_crate_private_mod.rs:27:39
+   |
+LL |     let _ = clean_origin_aux_private::m::pick(1, 2);
+   |                                       ^  ---- function `pick` is not publicly re-exported
+   |                                       |
+   |                                       private module
+   |
+note: the module `m` is defined here
+  --> $DIR/auxiliary/clean_origin_aux_private.rs:20:1
+   |
+LL | mod m {
+   | ^^^^^
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `trustc --explain E0603`.

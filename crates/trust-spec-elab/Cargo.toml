@@ -26,5 +26,14 @@ workspace = true
 clean-kernel = { workspace = true }
 clean-auto = { workspace = true }
 cert-meter = { package = "trust-cert-meter", path = "../trust-cert-meter" }
+# I2 (docs/design/2026-08-04-two-language-compiler-architecture.md §7): an
+# `Admission` records WHICH producer minted the kernel constant and on whose
+# authority. Spelled as a path (not `workspace = true`) so it resolves
+# identically from the compiler workspace, which names these crates by path.
+# This crate can name `clean-kernel`, so it could in principle fabricate a
+# kernel verdict — it cannot, because `KernelStatus::KernelChecked` is behind
+# `trust-symbols`' sealed `KernelAuthority` seam and this crate never holds the
+# token. Every admission it mints is `Reflected`.
+trust-symbols = { path = "../trust-symbols" }
 syn = { workspace = true }
 quote = { workspace = true }

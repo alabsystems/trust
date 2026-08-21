@@ -1,7 +1,7 @@
 //! Validates all used crates and extern libraries and loads their metadata
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{cmp, env, iter};
 
@@ -13,6 +13,7 @@ use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{self, FreezeReadGuard, FreezeWriteGuard};
 use rustc_data_structures::unord::UnordMap;
 use rustc_expand::base::SyntaxExtension;
+use rustc_fs_util::try_canonicalize;
 use rustc_hir as hir;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE, LocalDefId, StableCrateId};
 use rustc_hir::definitions::Definitions;
@@ -58,6 +59,21 @@ pub struct CStore {
 
     metas: IndexVec<CrateNum, Option<Box<CrateMetadata>>>,
     injected_panic_runtime: Option<CrateNum>,
+    // Trust (I6): the memoized outcome of [`CStore::trust_load_bignum_carrier`]
+    // — the injected `trust_bignum` carrier-runtime crate, or the typed refusal
+    // explaining why it could not be loaded. Memoizing the FAILURE too is
+    // deliberate: the load is attempted once per crate (from the resolver's
+    // carrier step), and a second attempt could not honestly succeed where the
+    // first refused.
+    trust_bignum_carrier: Option<Result<CrateNum, TrustBignumLoadRefusal>>,
+    // Trust (I6): the `DefId` of `trust_bignum::Nat` — THE carrier `DefId` of
+    // record, recorded by the resolver's carrier step after it verified the
+    // loaded crate exports exactly one root `struct Nat`. Every rustc-side
+    // carrier→type mapping must resolve through this one value (the mint's
+    // `rustc_ty` at resolve time, `carrier_to_rustc_ty` at MIR time via
+    // `ResolverGlobalCtxt`), so an impersonating crate cannot split the
+    // signature typeck checked from the body the emitter builds.
+    trust_bignum_nat: Option<DefId>,
     /// This crate needs an allocator and either provides it itself, or finds it in a dependency.
     /// If the above is true, then this field denotes the kind of the found allocator.
     allocator_kind: Option<AllocatorKind>,
@@ -84,6 +100,59 @@ pub struct CStore {
 impl std::fmt::Debug for CStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CStore").finish_non_exhaustive()
+    }
+}
+
+// Trust (I6): why the `trust_bignum` carrier runtime could not become the
+// carrier of record for this compilation.
+//
+// A value of this type is a REFUSAL, not a diagnostic: nothing is emitted when
+// it is constructed (review amendment 5 — the loader is built on
+// `maybe_resolve_crate`, which returns the `CrateError` instead of reporting
+// it). The resolver's carrier step converts it into a v7/D3 mint refusal, so
+// the user sees `E0425` on the call plus a note that names this reason and the
+// options — never a bare loader error about a crate they did not mention.
+//
+// `NoUniqueNatStruct` is constructed by the resolver half (the `Nat` lookup
+// runs a `module_children` query, which must not run while the `CStore` write
+// guard is held — see `trust_load_bignum_carrier`); the other variants are
+// constructed here.
+#[derive(Clone, Debug)]
+pub enum TrustBignumLoadRefusal {
+    /// No loadable `trust_bignum` crate was found. `details` is the
+    /// human-readable rendering of the locator's `CrateError`.
+    NotFound { details: String },
+    /// A crate named `trust_bignum` resolved, but not from this session's
+    /// sysroot target library directory — e.g. a `--extern trust_bignum=…`
+    /// substitution. The carrier of record executes inside every verified
+    /// binary that calls a `Nat`-carried declaration, so a copy this compiler
+    /// did not ship is refused, not trusted.
+    NotFromSysroot { path: PathBuf, expected_dir: PathBuf },
+    /// The loaded crate does not export exactly one root `struct Nat`.
+    NoUniqueNatStruct { found: usize },
+}
+
+impl TrustBignumLoadRefusal {
+    /// The reason, phrased for embedding in a v7/D3 refusal note.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NotFound { details } => {
+                format!("the `trust_bignum` carrier runtime could not be resolved — {details}")
+            }
+            Self::NotFromSysroot { path, expected_dir } => format!(
+                "a crate named `trust_bignum` was found at `{}`, but the carrier of record \
+                 must come from this compiler's own sysroot (`{}`). A substituted carrier \
+                 runtime would execute in every binary that calls a `Nat`-carried \
+                 declaration, so it is refused rather than trusted",
+                path.display(),
+                expected_dir.display(),
+            ),
+            Self::NoUniqueNatStruct { found } => format!(
+                "the loaded `trust_bignum` crate does not export exactly one `struct Nat` at \
+                 its root (found {found}), so it is not the carrier runtime this compiler \
+                 shipped — the sysroot copy is corrupt or from a different Trust version"
+            ),
+        }
     }
 }
 
@@ -293,6 +362,35 @@ impl CStore {
 
     pub(crate) fn injected_panic_runtime(&self) -> Option<CrateNum> {
         self.injected_panic_runtime
+    }
+
+    // Trust (I6): the `DefId` of `trust_bignum::Nat`, if the carrier step
+    // recorded one. `Some` exactly when the loader succeeded AND the loaded
+    // crate passed the unique-`Nat` check; every rustc-side consumer of the
+    // Nat carrier type must resolve through this accessor.
+    pub fn trust_bignum_nat(&self) -> Option<DefId> {
+        self.trust_bignum_nat
+    }
+
+    // Trust (I6): record the `DefId` of `trust_bignum::Nat`.
+    //
+    // Called exactly once, by the resolver's carrier step
+    // (`Resolver::trust_resolve_carrier_crates`), after it verified via
+    // `module_children` that the crate `trust_load_bignum_carrier` loaded
+    // exports exactly one root `struct Nat`. That query cannot run inside the
+    // loader itself: its provider takes a read guard on this `CStore`, and the
+    // loader necessarily runs under the write guard — hence the split, and
+    // this setter. A second, disagreeing recording is a compiler defect, not a
+    // negotiation; it panics rather than silently re-pointing the carrier.
+    pub fn trust_record_bignum_nat(&mut self, def_id: DefId) {
+        match self.trust_bignum_nat {
+            None => self.trust_bignum_nat = Some(def_id),
+            Some(existing) if existing == def_id => {}
+            Some(existing) => bug!(
+                "trust_bignum::Nat DefId recorded twice with different values: \
+                 {existing:?} then {def_id:?}"
+            ),
+        }
     }
 
     pub(crate) fn allocator_kind(&self) -> Option<AllocatorKind> {
@@ -540,6 +638,8 @@ impl CStore {
             // `None`.
             metas: IndexVec::from_iter(iter::once(None)),
             injected_panic_runtime: None,
+            trust_bignum_carrier: None,
+            trust_bignum_nat: None,
             allocator_kind: None,
             alloc_error_handler_kind: None,
             has_global_allocator: false,
@@ -1020,6 +1120,117 @@ impl CStore {
         }
 
         self.injected_panic_runtime = Some(cnum);
+    }
+
+    // Trust (I6): load the `trust_bignum` carrier-runtime crate from the
+    // sysroot, on the `inject_panic_runtime` precedent — a compiler-injected
+    // crate (`CrateOrigin::Injected`) with a sanity check on what was loaded —
+    // with two deliberate differences:
+    //
+    // * It is built on `maybe_resolve_crate`, NOT `resolve_crate`: the latter
+    //   reports its own diagnostic before returning `None`, which would emit
+    //   an unconditional loader error about a crate the user never named. A
+    //   failure here is instead returned as a typed
+    //   [`TrustBignumLoadRefusal`], which the resolver's carrier step converts
+    //   into a v7/D3 mint refusal — the declaration stops being callable, and
+    //   the `E0425` at the call site carries the reason and the options.
+    //   (Review amendment 5.)
+    // * `CrateDepKind::Unconditional`, not `Conditional`: this is called only
+    //   when at least one Clean-origin grant carries `Nat`, at which point the
+    //   dependency is real — there is no two-coexisting-runtimes situation
+    //   like panic_unwind/panic_abort's to defer.
+    //
+    // The sanity check here is SYSROOT RESIDENCY: every source path of the
+    // loaded crate must live in this session's target library directory
+    // (`sess.target_tlib_path.dir` — exactly where the std build ships
+    // `libtrust_bignum-*.rlib`). This refuses `--extern trust_bignum=…`
+    // substitutions and same-named user crates: the carrier runtime executes
+    // inside every binary that calls a `Nat`-carried declaration, so a copy
+    // this compiler did not ship must not silently become the carrier of
+    // record.
+    //
+    // ACCEPTED RESIDUAL (review amendment 6): configurations that supply the
+    // standard library from OUTSIDE the sysroot — `-Zbuild-std`, and
+    // bootstrap-style graphs that pass sysroot crates by `--extern` — fail
+    // this residency check even for a genuine crate. The consequence is
+    // fail-closed and disclosed: every `Nat`-carried mint is demoted to a
+    // refusal whose note names this limitation; no wrong carrier can load,
+    // but the lane is unavailable there until a hash-matching admission for
+    // non-sysroot paths is built.
+    //
+    // The second half of the load — verifying the crate exports exactly one
+    // root `struct Nat`, and recording its `DefId` — lives in the CALLER
+    // (`Resolver::trust_resolve_carrier_crates`): it needs the
+    // `module_children` query, whose provider takes a read guard on this
+    // `CStore`, and this method necessarily runs under the write guard.
+    pub fn trust_load_bignum_carrier(
+        &mut self,
+        tcx: TyCtxt<'_>,
+    ) -> Result<CrateNum, TrustBignumLoadRefusal> {
+        if let Some(cached) = &self.trust_bignum_carrier {
+            return cached.clone();
+        }
+        let result = self.trust_load_bignum_carrier_uncached(tcx);
+        self.trust_bignum_carrier = Some(result.clone());
+        result
+    }
+
+    fn trust_load_bignum_carrier_uncached(
+        &mut self,
+        tcx: TyCtxt<'_>,
+    ) -> Result<CrateNum, TrustBignumLoadRefusal> {
+        info!("loading the trust_bignum carrier runtime");
+        self.used_extern_options.insert(sym::trust_bignum);
+        let cnum = match self.maybe_resolve_crate(
+            tcx,
+            sym::trust_bignum,
+            CrateDepKind::Unconditional,
+            CrateOrigin::Injected,
+        ) {
+            Ok(cnum) => cnum,
+            Err(err) => {
+                // Render the locator's error without reporting it (the whole
+                // point of taking `maybe_resolve_crate`). The two common
+                // shapes get a human sentence; anything rarer keeps its Debug
+                // form, which is ugly but names the actual failure.
+                let details = match &err {
+                    CrateError::NotFound(name) | CrateError::FullMetadataNotFound(name, _) => {
+                        format!(
+                            "no `lib{name}-*.rlib` could be located in this compiler's \
+                             search paths"
+                        )
+                    }
+                    CrateError::LocatorCombined(_) => {
+                        "a candidate was found but every copy was rejected (wrong target, \
+                         wrong compiler version, or unreadable metadata); rerun with \
+                         `RUSTC_LOG=rustc_metadata=info` for the per-candidate reasons"
+                            .to_string()
+                    }
+                    other => format!("{other:?}"),
+                };
+                return Err(TrustBignumLoadRefusal::NotFound { details });
+            }
+        };
+        // Mirror `resolve_crate`'s success path: the crate is genuinely used.
+        self.set_used_recursively(cnum);
+
+        // Sysroot residency (see the method docs for what this refuses and
+        // the accepted `-Zbuild-std` residual).
+        let expected_dir = tcx.sess.target_tlib_path.dir.clone();
+        let expected_canonical =
+            try_canonicalize(&expected_dir).unwrap_or_else(|_| expected_dir.clone());
+        let cdata = self.get_crate_data(cnum);
+        for path in cdata.source().paths() {
+            let dir = path.parent().unwrap_or(path);
+            let dir = try_canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            if dir != expected_canonical {
+                return Err(TrustBignumLoadRefusal::NotFromSysroot {
+                    path: path.clone(),
+                    expected_dir,
+                });
+            }
+        }
+        Ok(cnum)
     }
 
     fn inject_profiler_runtime(&mut self, tcx: TyCtxt<'_>) {

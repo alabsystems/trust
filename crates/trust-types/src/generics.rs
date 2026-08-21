@@ -403,7 +403,9 @@ impl Substitution {
                     })
                     .collect(),
             },
-            // Primitive types pass through unchanged.
+            // Primitive types pass through unchanged. `BignumNat` (Trust I6) is
+            // a parameter-free leaf like the scalars: the carrier type has no
+            // type arguments to substitute through.
             Ty::Bool
             | Ty::Int { .. }
             | Ty::Float { .. }
@@ -411,6 +413,7 @@ impl Substitution {
             | Ty::Unit
             | Ty::Never
             | Ty::Str
+            | Ty::BignumNat
             | Ty::Unsupported { .. } => ty.clone(),
         }
     }

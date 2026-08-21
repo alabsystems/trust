@@ -15,6 +15,44 @@
 #   scripts/seal_driver.sh selftest --control <tc> --subject <tc> [--class C]
 #   scripts/seal_driver.sh verify <sealed-dir>
 #   scripts/seal_driver.sh guardtest            (mutation-proves `guard` itself)
+#   scripts/seal_driver.sh sysrootcheck [<sealed-dir>|<trustc>] [--sysroot DIR]
+#
+# ===========================================================================
+# WHY `sysrootcheck` EXISTS (the 2026-08-20 blocker, made cheap)
+# ===========================================================================
+# METADATA_VERSION was bumped 11 -> 12 by 631d86898a. The only std on this
+# machine was built at v11, so EVERY driver built from a tree containing that
+# commit dies with
+#     error[E0514]: found crate `std` compiled by an incompatible version of
+#                   rustc ... compiled by <unknown rustc version>
+# The `<unknown rustc version>` is the tell: the reader could not even find a
+# version string, because the metadata HEADER version differs -- it is not a
+# stale-rebuild problem and `cargo clean` does nothing for it.
+#
+# A lane used to discover this by burning a 24 GB, ~22-minute driver build and
+# then staring at a confusing E0514. `sysrootcheck` costs about a second: it
+# reads the sysroot's own METADATA_VERSION out of libcore's .rmeta header,
+# reads the DRIVER's out of a `#![no_core]` probe rlib (which needs no sysroot
+# at all), and then actually resolves `std`. It states both numbers and the
+# real reason. `seal` runs it and records the verdict in SYSROOT_COMPAT;
+# `verify` runs it again; `guard` refuses -- for free -- on a recorded FAIL.
+#
+# ===========================================================================
+# WHY A SEAL MUST NOT TAKE ITS REV FROM $TRUST_REPO_ROOT
+# ===========================================================================
+# `seal` used to record `git -C $ROOT rev-parse HEAD`, where $ROOT is the
+# SHARED repo -- not the worktree the driver was compiled from. Every lane
+# builds in a detached worktree, so wave-W3b's seal read 4854cf3a9c while its
+# sources were 36cbb1130d+W3+W3b, and two lanes independently hand-patched the
+# REV file afterwards. A snapshot that misreports its own provenance is worse
+# than one that admits it does not know.
+#
+# The identity of a seal is its DYLIB DIGEST (SHA256, always recorded). The rev
+# is provenance ABOUT that identity and now comes only from the build tree:
+# `--worktree DIR` if stated, else the cargo dep-file under `--from`, else the
+# literal string `undetermined` -- never $ROOT's HEAD. What $ROOT's HEAD was is
+# kept, clearly labelled, in SHARED_ROOT_REV, where it cannot be mistaken for
+# the seal's own rev. REV_SOURCE records which of the three applied.
 #
 # ===========================================================================
 # WHY A CONTROL STOPS BEING A CONTROL (the defect this exists to prevent)
@@ -309,6 +347,20 @@ cmd_guard() {
 
   [ -x "$bin" ] || { echo "guard: REFUSING: no driver at $bin" >&2; return 97; }
 
+  # Free fail-closed on a recorded metadata-incompatibility. `seal` writes this
+  # file; one file read per spawn, no compiler involved. A lane that ignores
+  # `verify` still cannot measure through a driver that cannot read its sysroot.
+  if [ -n "$snaproot" ] && [ "$(head -1 "$snaproot/SYSROOT_COMPAT" 2>/dev/null)" = FAIL ]; then
+    cat >&2 <<EOF
+guard: REFUSING — this sealed driver was recorded as UNABLE to read its sysroot.
+guard:   snapshot   $snaproot
+guard:   verdict    $snaproot/SYSROOT_COMPAT
+EOF
+    sed -n '2,8p' "$snaproot/SYSROOT_COMPAT" 2>/dev/null | sed 's/^/guard:   /' >&2
+    echo "guard:   re-check with: scripts/seal_driver.sh sysrootcheck $snaproot" >&2
+    return 96
+  fi
+
   # --- C. observability ----------------------------------------------------
   local env_visible=0
   dyld_env_visible && env_visible=1
@@ -446,6 +498,171 @@ DEPS
 }
 
 # ---------------------------------------------------------------------------
+# sysrootcheck — is this driver's metadata format readable against that sysroot?
+#
+# Three independent facts, cheapest first, so a failure names its own cause:
+#   1. the SYSROOT's METADATA_VERSION  — byte 8 of libcore's .rmeta header
+#      (`rust\0\0\0<version>`); a pure file read, no compiler needed.
+#   2. the DRIVER's METADATA_VERSION   — the same byte of a probe rlib built
+#      from a `#![no_core]` source, which touches no sysroot crate at all, so
+#      it still answers when std is unreadable.
+#   3. whether `std` actually RESOLVES  — `--emit=metadata` on `fn main(){}`.
+# 3 is the verdict; 1 and 2 turn "incompatible version of rustc" into two
+# numbers and a remedy.
+# ---------------------------------------------------------------------------
+meta_version_of_file() {
+  # First `rust\0\0\0<v>` in the file; prints the version byte, or nothing.
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, re
+try:
+    d = open(sys.argv[1], 'rb').read()
+except OSError:
+    raise SystemExit(1)
+m = re.search(rb'rust\x00\x00\x00', d)
+if m and m.end() < len(d):
+    print(d[m.end()])
+PY
+}
+
+sysroot_meta_version() {
+  local sysroot="$1" f
+  for f in "$sysroot/lib/rustlib/$HOST/lib"/libcore-*.rmeta \
+           "$sysroot/lib/rustlib/$HOST/lib"/libstd-*.rmeta; do
+    [ -f "$f" ] || continue
+    meta_version_of_file "$f"
+    return 0
+  done
+  return 1
+}
+
+driver_meta_version() {
+  # A `#![no_core]` rlib: no sysroot crate is read, so this answers even when
+  # every crate in the sysroot is unreadable. If the lang-item set this needs
+  # ever drifts, the probe simply prints nothing and the caller says "unknown"
+  # -- it must never be the reason a build is refused.
+  local drv="$1" tmp; tmp=$(scratch)
+  cat > "$tmp/mv.rs" <<'RS'
+#![no_std]
+#![no_core]
+#![allow(internal_features)]
+#![feature(no_core, lang_items)]
+#[lang = "pointee_sized"] pub trait PointeeSized {}
+#[lang = "meta_sized"] pub trait MetaSized: PointeeSized {}
+#[lang = "sized"] pub trait Sized: MetaSized {}
+#[lang = "copy"] pub trait Copy {}
+#[lang = "legacy_receiver"] pub trait LegacyReceiver {}
+pub struct Probe;
+RS
+  rm -f "$tmp/mv.rlib"
+  "$drv" --edition 2021 -Zno-trust-verify --crate-type rlib \
+         -o "$tmp/mv.rlib" "$tmp/mv.rs" >/dev/null 2>&1 || true
+  [ -f "$tmp/mv.rlib" ] || return 1
+  meta_version_of_file "$tmp/mv.rlib"
+}
+
+# The --sysroot a generated wrapper hard-codes, but only when the literal names
+# a directory that exists: these wrappers are shell, so the field may be `$VAR`,
+# and reporting an unexpanded variable as "the sysroot" is worse than unknown.
+wrapper_sysroot() {
+  local f="$1" cand
+  cand=$(sed -n 's/.*--sysroot "\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
+  [ -n "$cand" ] && [ -d "$cand" ] && printf '%s\n' "$cand"
+  return 0
+}
+
+# Resolve a caller-supplied target into (driver binary, sysroot, dyld path).
+# Accepts a sealed directory, a generated `tc` wrapper, or a bare rustc-main.
+cmd_sysrootcheck() {
+  local target="" sysroot="" dyld="" drv=""
+  target="${1:-}"; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sysroot) sysroot="$2"; shift 2 ;;
+      --dyld)    dyld="$2";    shift 2 ;;
+      *) die "sysrootcheck: unknown argument $1" ;;
+    esac
+  done
+  [ -n "$target" ] || target="$DEFAULT_FROM/rustc-main"
+
+  # A wrapper script supplies its OWN --sysroot; passing a second one makes
+  # rustc refuse with "Option 'sysroot' given more than once". So: only add the
+  # flag for a bare binary, or when the caller stated one explicitly.
+  local sysroot_given=0 pass_sysroot=1
+  [ -n "$sysroot" ] && sysroot_given=1
+  if [ -d "$target" ]; then
+    drv="$target/rustc-main"
+    [ $sysroot_given -eq 1 ] || sysroot=$(wrapper_sysroot "$target/tc")
+  elif [ -x "$target" ]; then
+    drv="$target"
+    if [ "$(head -c 2 "$target" 2>/dev/null)" = '#!' ]; then
+      # A wrapper. It sets its own sysroot; do not add ours unless told to.
+      [ $sysroot_given -eq 1 ] || { sysroot=$(wrapper_sysroot "$target"); pass_sysroot=0; }
+    fi
+  else
+    die "sysrootcheck: no such driver or sealed directory: $target"
+  fi
+  [ -x "$drv" ] || die "sysrootcheck: not executable: $drv"
+  # Only default to the stage1 sysroot when we are the one choosing it. For a
+  # wrapper we are NOT: it has already chosen, and naming a different one here
+  # would both duplicate the flag and attribute the wrong sysroot to the result.
+  if [ -z "$sysroot" ] && [ $pass_sysroot -eq 1 ]; then sysroot="$STAGE1_SYSROOT"; fi
+  [ -n "$dyld" ] || dyld="$STAGE1_SYSROOT/lib"
+  export DYLD_LIBRARY_PATH="$dyld${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+
+  local sv dv tmp rc=0
+  sv=$(sysroot_meta_version "$sysroot" || true); [ -n "$sv" ] || sv=unknown
+  [ -n "$sysroot" ] || sysroot="(the wrapper's own — not a literal in $target)"
+  dv=$(driver_meta_version "$drv" || true);      [ -n "$dv" ] || dv=unknown
+
+  tmp=$(scratch)
+  printf 'fn main() {}\n' > "$tmp/hello.rs"
+  local out
+  if [ $pass_sysroot -eq 1 ]; then
+    out=$("$drv" --sysroot "$sysroot" --edition 2021 -Zno-trust-verify \
+                  --emit=metadata --crate-type bin \
+                  -o "$tmp/hello.rmeta" "$tmp/hello.rs" 2>&1) || rc=$?
+  else
+    out=$("$drv" --edition 2021 -Zno-trust-verify \
+                  --emit=metadata --crate-type bin \
+                  -o "$tmp/hello.rmeta" "$tmp/hello.rs" 2>&1) || rc=$?
+  fi
+  [ -s "$tmp/hello.rmeta" ] || rc=${rc:-1}
+
+  echo "sysrootcheck: driver   $drv"
+  echo "sysrootcheck: sysroot  $sysroot"
+  echo "sysrootcheck: METADATA_VERSION  driver=$dv  sysroot=$sv"
+  if [ "$rc" = 0 ]; then
+    echo "sysrootcheck: OK — std resolves; this driver can compile against this sysroot."
+    return 0
+  fi
+
+  cat >&2 <<EOF
+sysrootcheck: REFUSING — THIS DRIVER CANNOT READ THIS SYSROOT.
+sysrootcheck:   driver            $drv
+sysrootcheck:   sysroot           $sysroot
+sysrootcheck:   METADATA_VERSION  driver=$dv  sysroot=$sv
+EOF
+  if [ "$dv" != unknown ] && [ "$sv" != unknown ] && [ "$dv" != "$sv" ]; then
+    cat >&2 <<EOF
+sysrootcheck:   The metadata FORMAT versions differ, so every crate in the
+sysrootcheck:   sysroot is unreadable to this driver. rustc reports this as
+sysrootcheck:     error[E0514]: found crate \`std\` compiled by an incompatible
+sysrootcheck:                   version of rustc ... by <unknown rustc version>
+sysrootcheck:   which reads like a stale rebuild and is not one: \`cargo clean\`
+sysrootcheck:   cannot help, and the version STRINGS may match exactly.
+sysrootcheck:   The sysroot must be rebuilt by a driver that writes version $dv.
+sysrootcheck:   Doing that WITHOUT x.py — which must never run here, it destroys
+sysrootcheck:   the seed trustc — is documented in
+sysrootcheck:   docs/CRYSTAL_STATUS.md (§0.3a) and reports/metadata-v12-sysroot.md.
+EOF
+  else
+    echo "sysrootcheck:   first errors from the resolution probe:" >&2
+    echo "$out" | grep -E '^(error|warning: unused)' | head -6 | sed 's/^/sysrootcheck:     /' >&2
+  fi
+  return 96
+}
+
+# ---------------------------------------------------------------------------
 # seal — snapshot into a SELF-CONTAINED pair (binary + uniquely-named dylib).
 #
 # A leaf name that exists nowhere else cannot be substituted by leaf-name
@@ -453,16 +670,17 @@ DEPS
 # DYLD_LIBRARY_PATH, closes the channel structurally rather than by convention.
 # ---------------------------------------------------------------------------
 cmd_seal() {
-  local tag="" from="$DEFAULT_FROM" out=""
+  local tag="" from="$DEFAULT_FROM" out="" worktree=""
   tag="${1:-}"; shift || true
   while [ $# -gt 0 ]; do
     case "$1" in
-      --from) from="$2"; shift 2 ;;
-      --out)  out="$2";  shift 2 ;;
+      --from)     from="$2"; shift 2 ;;
+      --out)      out="$2";  shift 2 ;;
+      --worktree) worktree="$2"; shift 2 ;;
       *) die "seal: unknown argument $1" ;;
     esac
   done
-  [ -n "$tag" ] || die "usage: seal_driver.sh seal <tag> [--from DIR] [--out DIR]"
+  [ -n "$tag" ] || die "usage: seal_driver.sh seal <tag> [--from DIR] [--out DIR] [--worktree DIR]"
   case "$tag" in
     *[!A-Za-z0-9_-]*) die "seal: tag must be [A-Za-z0-9_-]+ (it becomes a dylib leaf name)" ;;
   esac
@@ -500,14 +718,64 @@ exec "\$SEAL_DIR/rustc-main" --sysroot "$STAGE1_SYSROOT" "\$@"
 EOF
   chmod +x "$out/tc"
 
-  # Provenance, so a snapshot can never be confused about what it is.
-  ( cd "$ROOT" && git rev-parse HEAD ) > "$out/REV" 2>/dev/null || echo unknown > "$out/REV"
-  ( cd "$ROOT" && git status --porcelain | head -1 | grep -q . && echo dirty || echo clean ) > "$out/TREE" 2>/dev/null || true
+  # ---- provenance -------------------------------------------------------
+  # IDENTITY is the dylib digest. REV is provenance about that identity and
+  # may come ONLY from the tree these artifacts were compiled from: stated
+  # (--worktree), inferred from the cargo dep-file beside them, or admitted
+  # unknown. $ROOT's HEAD is a DIFFERENT repo state and is recorded separately.
   shasum -a 256 "$new" "$out/rustc-main" > "$out/SHA256"
+
+  local src="" rev_source=""
+  if [ -n "$worktree" ]; then
+    src="$worktree"; rev_source="stated (--worktree)"
+  else
+    local depfile
+    depfile=$(ls "$from"/rustc-main.d "$from"/deps/rustc_main*.d 2>/dev/null | head -1)
+    if [ -n "$depfile" ]; then
+      # First absolute source path in the dep-file, then its git worktree root.
+      local srcfile
+      srcfile=$(tr ' ' '\n' < "$depfile" | grep -m1 '^/.*\.rs$' || true)
+      if [ -n "$srcfile" ] && [ -e "$srcfile" ]; then
+        src=$(git -C "$(dirname "$srcfile")" rev-parse --show-toplevel 2>/dev/null || true)
+        [ -n "$src" ] && rev_source="inferred (dep-file $depfile)"
+      fi
+    fi
+  fi
+
+  if [ -n "$src" ] && git -C "$src" rev-parse HEAD >/dev/null 2>&1; then
+    git -C "$src" rev-parse HEAD > "$out/REV"
+    git -C "$src" status --porcelain | head -1 | grep -q . && echo dirty > "$out/TREE" || echo clean > "$out/TREE"
+    printf '%s\n' "$src" > "$out/SRC_ROOT"
+  else
+    echo undetermined > "$out/REV"
+    echo undetermined > "$out/TREE"
+    printf '%s\n' "${src:-none}" > "$out/SRC_ROOT"
+    rev_source="undetermined"
+    note "seal: REV is UNDETERMINED for $out."
+    note "seal: the build tree could not be identified from --from $from, and"
+    note "seal: \$TRUST_REPO_ROOT's HEAD is NOT this driver's rev. Pass"
+    note "seal:     --worktree <the tree you compiled>"
+    note "seal: to record it. The seal is still usable: its identity is its"
+    note "seal: dylib digest, which SHA256 always carries."
+  fi
+  printf '%s\n' "$rev_source" > "$out/REV_SOURCE"
+  ( cd "$ROOT" && git rev-parse HEAD ) > "$out/SHARED_ROOT_REV" 2>/dev/null || echo unknown > "$out/SHARED_ROOT_REV"
+
   cmd_classes "$out/tc" > "$out/PERTURB_CLASSES" 2>/dev/null || true
 
+  # The metadata-compatibility verdict, recorded WHERE THE BUILD ENDS — so a
+  # 24 GB build that produced an unusable driver says so now, not 20 minutes
+  # later inside a confusing E0514. `guard` reads this file for free.
+  local compat_verdict=OK
+  cmd_sysrootcheck "$out" > "$out/SYSROOT_COMPAT.detail" 2>&1 || compat_verdict=FAIL
+  { echo "$compat_verdict"; cat "$out/SYSROOT_COMPAT.detail"; } > "$out/SYSROOT_COMPAT"
+  rm -f "$out/SYSROOT_COMPAT.detail"
+  [ "$compat_verdict" = FAIL ] && note "seal: SYSROOT_COMPAT = FAIL for $out — see $out/SYSROOT_COMPAT"
+
   echo "sealed $tag -> $out"
-  echo "  rev            $(cat "$out/REV")"
+  echo "  rev            $(cat "$out/REV")  [$(cat "$out/REV_SOURCE")]"
+  echo "  shared-root rev $(cat "$out/SHARED_ROOT_REV")  (NOT this seal's rev)"
+  echo "  sysroot compat $(head -1 "$out/SYSROOT_COMPAT")"
   echo "  perturb classes $(tr '\n' ' ' < "$out/PERTURB_CLASSES")"
   otool -L "$out/rustc-main" | sed -n '2p'
 }
@@ -727,7 +995,8 @@ cmd_verify() {
   [ -f "$dir/SHA256" ] || die "verify: no SHA256 manifest in $dir — not a sealed directory"
   ( cd "$dir" && shasum -a 256 -c SHA256 ) || die "verify: the sealed pair no longer matches its manifest"
   cmd_guard "$dir/rustc-main" --dyld "$STAGE1_SYSROOT/lib" --snapshot-root "$dir" || return 97
-  echo "verify OK: $dir (rev $(cat "$dir/REV" 2>/dev/null || echo unknown))"
+  cmd_sysrootcheck "$dir" || return 96
+  echo "verify OK: $dir (rev $(cat "$dir/REV" 2>/dev/null || echo unknown) [$(cat "$dir/REV_SOURCE" 2>/dev/null || echo pre-REV_SOURCE-seal)])"
 }
 
 case "${1:-}" in
@@ -737,8 +1006,9 @@ case "${1:-}" in
   selftest) shift; cmd_selftest "$@" ;;
   verify)   shift; cmd_verify   "$@" ;;
   guardtest) shift; cmd_guardtest "$@" ;;
+  sysrootcheck) shift; cmd_sysrootcheck "$@" ;;
   # The whole header block, however long it grows -- not a hard-coded line
   # range that silently truncates the moment someone documents a new fact.
   -h|--help|"") sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d'; exit 0 ;;
-  *) die "unknown subcommand: $1 (seal|guard|classes|selftest|verify|guardtest)" ;;
+  *) die "unknown subcommand: $1 (seal|guard|classes|selftest|verify|guardtest|sysrootcheck)" ;;
 esac

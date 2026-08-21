@@ -38,6 +38,19 @@ pub fn api(x: u32) -> u32 {
 // The poison trigger: mere PRESENCE of a coroutine body in the crate. Its own
 // strict-lane refusal is the expected error below — and must stay the ONLY one.
 //
+// RE-PIN 2026-08-20 (D2), STRICTLY STRONGER. The ERROR — the strict coroutine
+// refusal this file pins — is RESTORED and still the only error. `ca53846043`
+// had suppressed it by publishing a CONTRACT row in the fail-closed lane, and
+// never measured the flip.
+//
+// The two WARN pins were deleted and REPLACED by the RAW assumption pin below,
+// which is a tighter guarantee. Their "1 obligation(s)" counts described the
+// inventory from when the coroutine body's sole row was the authority-less
+// panic-freedom aggregate; sentinels are now separate rows, so no correct
+// behaviour reproduces that count. Measured for this body now: "2 conditionally
+// discharged (NOT proved), … 1 skipped out of 3 obligation(s)" — the word
+// "proved" does not appear — plus the assumption row pinned below.
+//
 // RE-PIN 2026-08-15, STRICTLY STRONGER: the two WARN rows are new, and they
 // disclose a proof this compiler deliberately no longer mints. The coroutine
 // body's ONLY obligation row is the synthesized whole-function
@@ -53,7 +66,6 @@ pub fn api(x: u32) -> u32 {
 // vacuous proof was withdrawn and the gap is now stated out loud.
 pub async fn helper(x: u32) -> u32 {
     //~^ ERROR coroutine executor-protocol premise is unproved
-    //~| WARN Trust Level 0 safety verification incomplete for `flip_with_async_present::helper::{closure#0}`: 1 obligation(s) were not proved
-    //~| WARN Trust verification advisory for `flip_with_async_present::helper::{closure#0}`: 1 obligation(s) were not fully verified
     x
 }
+//~? RAW Trust: ASSUMPTION [coroutine]

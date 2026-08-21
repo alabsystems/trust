@@ -296,18 +296,31 @@ impl<'a> State<'a> {
                 self.end(ib);
                 self.end(cb);
             }
-            ast::ItemKind::CleanIsland(_) => {
-                // Trust: the island body is deliberately NOT reproduced (same
-                // policy as opaque contract clauses); print a placeholder that
-                // is NOT valid vanilla Rust so elision is visible rather than
-                // silently round-trippable. The payload does now carry the
-                // island text (ruling v7/D1), so faithful printing has become
-                // possible — it is withheld as a policy choice, not a
-                // limitation.
-                let (cb, ib) = self.head("clean");
-                self.word(" { /* Clean island (span-only) */ }");
-                self.end(ib);
-                self.end(cb);
+            ast::ItemKind::CleanIsland(island) => {
+                if let Some(unit) = island.unloaded_unit {
+                    // Trust (I8): the PENDING out-of-line form prints exactly
+                    // as authored — `clean mod name;` — so token round-trips
+                    // (attr proc-macros via `fake_token_stream_for_item`)
+                    // re-parse to the same pending unit rather than to the
+                    // elided placeholder below.
+                    let (cb, ib) = self.head("clean mod");
+                    self.print_ident(unit);
+                    self.word(";");
+                    self.end(ib);
+                    self.end(cb);
+                } else {
+                    // Trust: the island body is deliberately NOT reproduced
+                    // (same policy as opaque contract clauses); print a
+                    // placeholder that is NOT valid vanilla Rust so elision is
+                    // visible rather than silently round-trippable. The
+                    // payload does now carry the island text (ruling v7/D1),
+                    // so faithful printing has become possible — it is
+                    // withheld as a policy choice, not a limitation.
+                    let (cb, ib) = self.head("clean");
+                    self.word(" { /* Clean island (span-only) */ }");
+                    self.end(ib);
+                    self.end(cb);
+                }
             }
             ast::ItemKind::TyAlias(ast::TyAlias {
                 defaultness,

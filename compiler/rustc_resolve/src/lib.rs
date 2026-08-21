@@ -92,6 +92,10 @@ mod imports;
 mod late;
 mod macros;
 pub mod rustdoc;
+// Trust (I5): the Clean-origin mint decision. Named `trust_clean_mint` rather
+// than `trust_clean_origin` so it does not shadow the CRATE of that name, which
+// it uses.
+mod trust_clean_mint;
 
 type Res = def::Res<NodeId>;
 
@@ -1477,6 +1481,27 @@ pub struct Resolver<'ra, 'tcx> {
     delegation_fn_sigs: LocalDefIdMap<DelegationFnSig> = Default::default(),
     delegation_infos: FxIndexMap<LocalDefId, DelegationInfo>,
 
+    /// Trust (I5): which `clean { … }` island declarations may acquire a
+    /// `DefId`, decided once for the whole crate at the ROOT-fragment seam in
+    /// [`Resolver::visit_ast_fragment_with_placeholders`]. Empty — and free —
+    /// for every crate with no island. See `trust_clean_mint`.
+    clean_origin_mints: trust_clean_mint::CleanOriginMints =
+        trust_clean_mint::CleanOriginMints::new(),
+
+    /// Trust (I5): the defs that were actually minted for Clean declarations,
+    /// with the declaration name and the span inside the island.
+    ///
+    /// This is an ENUMERATION carried to MIR time through
+    /// `ResolverGlobalCtxt`, not a predicate: `rustc_mir_transform`'s
+    /// `mir_keys` has to *find* these defs, and every `tcx`-side inventory
+    /// available there is derived from HIR — which a Clean-origin def has none
+    /// of. A predicate over any of them would be vacuously false forever while
+    /// looking like a working filter.
+    clean_origin_defs: Vec<(LocalDefId, Symbol, Span)> = Vec::new(),
+    /// Trust (I6): `Nat`-carrying grants whose `fn_sig` is deferred to the
+    /// provider arm — see `ResolverGlobalCtxt::clean_origin_deferred_sigs`.
+    clean_origin_deferred_sigs: Vec<(LocalDefId, Vec<ty::TrustCleanCarrier>, ty::TrustCleanCarrier)> = Vec::new(),
+
     main_def: Option<MainDefinition> = None,
     trait_impls: FxIndexMap<DefId, Vec<LocalDefId>>,
     /// A list of proc macro LocalDefIds, written out in the order in which
@@ -1931,6 +1956,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     }
 
     pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+        // Trust (I6): read the carrier DefId of record FIRST — `self.cstore()`
+        // borrows all of `self`, and every statement below partially moves it.
+        let trust_bignum_nat = self.cstore().trust_bignum_nat();
         let proc_macros = self.proc_macros;
         let expn_that_defined = self.expn_that_defined;
         let extern_crate_map = self.extern_crate_map;
@@ -1973,6 +2001,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             all_macro_rules: self.all_macro_rules,
             stripped_cfg_items,
             delegation_infos: self.delegation_infos,
+            // Trust (I5).
+            clean_origin_defs: self.clean_origin_defs,
+            // Trust (I6): read from the CStore field of record, for the
+            // MIR-time carrier mapping (`carrier_to_rustc_ty`).
+            trust_bignum_nat,
+            clean_origin_deferred_sigs: self.clean_origin_deferred_sigs,
         };
         let ast_lowering = ty::ResolverAstLowering {
             partial_res_map: self.partial_res_map,

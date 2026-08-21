@@ -78,7 +78,11 @@ fn recognizes_corpus_noncapturing_map() {
     assert_eq!(shape.call_variant, 1, "Some is variant 1");
     assert_eq!(shape.none_variant, 0, "None is variant 0");
     assert_eq!(shape.callee, "map_add1::{closure#0}");
-    assert_eq!(shape.callee_id, 0);
+    assert_eq!(
+        shape.callee_id,
+        super::call_lift::stable_callee_id("map_add1::{closure#0}"),
+        "the id is the stable content key of the resolved def-path, not a registry position"
+    );
     assert_eq!(shape.env_operand, SemOperand::Var(1), "the FnOnce env is closure param _2 = Var(1)");
     assert_eq!(shape.kind, super::ComposeReturn::MapWrap, "map is the Some-rewrap mode");
 }

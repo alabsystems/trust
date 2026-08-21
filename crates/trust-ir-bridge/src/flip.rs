@@ -3855,22 +3855,449 @@ mod missing_obligation_ratchet {
     /// the spine's generator walks `Terminator::Assert` and NOTHING ELSE, while
     /// trust-vcgen also derives obligations from place projections and from panic
     /// calls:
-    ///  * `BoundsCheck` (38) — from a `ConstantIndex` / `Index` PLACE PROJECTION
-    ///    with no assert anywhere in the body. `core::slice::<impl [i32]>::first`
-    ///    is the clean example: its entire body is `PtrMetadata`, a `Ge` compare, a
-    ///    `SwitchInt`, and `&(*_1)[0]` — no `Assert` terminator exists to walk.
-    ///  * `Assertion` (22) — user `assert!`/`assert_eq!`, which lower to a PANIC
-    ///    CALL rather than an assert terminator (all 22 span
-    ///    `core/src/macros/mod.rs`, from byteorder's
-    ///    `assert_eq!(dst.len() * 8, src.len())`). trust-vcgen recovers these in
-    ///    `generate/panic_calls.rs`; the spine has no counterpart.
+    ///  * `BoundsCheck` (24, was 38 before the C1/C1b slice range-index lanes) —
+    ///    non-range shapes: arrayvec truncate, BigNat limbs, ascii,
+    ///    `SliceIndex::get`, plus range calls whose receiver or endpoint falls
+    ///    outside the modeled scope. The 4 projection-derived rows
+    ///    (`slice::first`/`last`/`get`) remain blocked by the guard-formula port.
+    ///  * `Assertion` (22, IDENTITY-PINNED below) — panic calls, and the
+    ///    population is HETEROGENEOUS, not one macro: 17 `assert_failed` sites at
+    ///    `macros/mod.rs:51` (16 byteorder `assert_eq!` preludes + arrayvec
+    ///    `into_inner_unchecked`), 4 `panic_fmt` sites at `panic.rs:62`, and 1
+    ///    sentinel at `panic.rs:73`. trust-vcgen derives these through
+    ///    `overflow_vc.rs::v2_build_terminator_vc` via safety.rs lane 1b — NOT
+    ///    `generate/panic_calls.rs`, which holds the div/rem + slice-method
+    ///    recognizers only. The module side ALREADY mints the real check at every
+    ///    site (the diverging panic-call arm: `Assert(const false)` + NoPanic +
+    ///    `Unreachable` + a PanicFreedom obligation), so this gap is ACCOUNTING —
+    ///    see `EXPECTED_ASSERTION_VCGEN_ONLY_ROWS` for the defer rationale.
     ///  * `ArithmeticOverflow(Add)` (37) — concentrated in probe fixtures.
     ///
     /// Lowering this is progress; raising it means coverage was retired. Note the
     /// asymmetry with the zero-gate above: ADDING spine derivation is the risky
     /// direction now, because anything the spine derives that trust-vcgen does not
     /// lands in `native_only` and fail-closes the compiler.
-    const VCGEN_ONLY_CEILING: usize = 139;
+    const VCGEN_ONLY_CEILING: usize = 125;
+
+    /// Trust (#63): the spine's DECLINE CENSUS — the pinned set of dump instances
+    /// whose `generate_native_safety_vcs` returns `None`, keyed
+    /// `(def_path, content-hash)`.
+    ///
+    /// A PINNED SET REPLACES A CARDINALITY, and the replacement is the whole
+    /// point: `SPINE_DECLINED_CEILING: usize = 225` used to stand here, and a
+    /// count cannot express the invariant its own doc claimed.
+    ///
+    /// WHAT THE CEILING MEASURED vs WHAT IT CLAIMED. It claimed that raising it
+    /// "requires explaining which functions stopped being comparable", and its
+    /// assertion message read "functions that used to be COMPARED now decline …
+    /// This is the laundering channel, not progress." Neither sentence is
+    /// something `set.len() <= N` can see. A cardinality moves for three
+    /// different reasons and reports all three identically:
+    ///   1. a COMPARED function starts declining — the regression it guards;
+    ///   2. a NEW function enters the corpus already declining — INTAKE, which
+    ///      retires no coverage because there was none to retire;
+    ///   3. a declining function leaves the corpus — pure deletion.
+    /// It fired on (2). Measured at `77e6ab164d`: 227 against a ceiling of 225,
+    /// and the +2 are the two rows named at the bottom of this table, both of
+    /// which ENTERED the corpus already un-comparable in `41189ffd76`. The
+    /// message therefore accused a regression that had not happened — and,
+    /// being an `assert!`, it aborted the test before `NATIVE_DISPATCH_FLOOR`,
+    /// the Assertion identity pin, and `VCGEN_ONLY_CLASS_CEILINGS` ever ran. A
+    /// gate that fires first and aborts hides every gate behind it; see the
+    /// failure-accumulation note in the test body for why nothing aborts now.
+    ///
+    /// WHY NOT BARE-RAISE 225 → 227. The constant's stated meaning is "coverage
+    /// was retired". Writing 227 into that slot records corpus INTAKE in a
+    /// number that means the opposite, and the next reader inherits the same
+    /// false claim with a larger figure and no way to tell which rows caused it.
+    ///
+    /// THE KEY, AND BOTH DIRECTIONS OF ITS IDENTITY HAZARD.
+    ///  * NOT `def_path` alone. The 2334 parseable shipped dumps carry only 2092
+    ///    distinct def_paths — 242 dumps share a key with another dump, and
+    ///    `std::option::Option::<i32>::is_some` alone appears 6 times. Under a
+    ///    def_path key a pinned decliner whose OTHER, currently-COMPARED instance
+    ///    later declines moves nothing at all: the def_path is already present.
+    ///    That is exactly the regression this gate exists for, slept through.
+    ///  * NOT `(def_path, dump path)`. A fixture rename or a directory reshuffle
+    ///    would read as one closure plus one phantom intake, and a gate that
+    ///    cries wolf on `git mv` gets widened until it means nothing.
+    ///  * SO: `(def_path, content-hash)` — the first 16 hex digits of
+    ///    [`trust_types::VerifiableFunction::content_hash`], the repo's
+    ///    designated content identity (SHA-256 over `stable_model_json` of body,
+    ///    contracts, pre/postconditions and spec; `BTreeMap` throughout so the
+    ///    rendering is a function of contents, and documented stable across Rust
+    ///    versions, unlike `DefaultHasher`). It EXCLUDES `name` and `span`, so a
+    ///    rename cannot fake an intake; it SEPARATES same-def_path instances, so
+    ///    the erasure above is gone. 64 bits is ample because a truncation
+    ///    collision could only mask a change WITHIN one def_path group, and the
+    ///    largest such group in the corpus is 6.
+    ///
+    /// TRUST (#62) IS NOT REVERSED BY THIS. #62 ruled that the ceiling must count
+    /// UNIQUE def_paths rather than instances, because a rebase adding three more
+    /// dumps of already-declining functions read as a regression. That is a
+    /// defect of COUNTING instances, not of IDENTIFYING them. A set difference
+    /// NAMES the newcomer, so an extra dump of an already-declining function
+    /// surfaces as one line to acknowledge instead of an unexplained `+3`.
+    ///
+    /// BOTH DIRECTIONS ARE RED, deliberately — this is a census, not a ceiling.
+    /// An unpinned decliner is a finding (regression or intake; the failure
+    /// prints the rows so a human can say which). A pinned row that is no longer
+    /// observed is PROGRESS and still fails, because a census that silently rots
+    /// stops being evidence: the fix is to delete the line, the same discipline
+    /// `scripts/hooks-pin/pin-waivers.txt` applies to a waiver whose subject has
+    /// gone coherent again.
+    ///
+    /// TRANSCRIBED FROM THE RATCHET'S OWN RENDERING. On failure this test prints
+    /// the entire census in source syntax; paste that. A hand-derived key reads
+    /// as a phantom identity, exactly as it would for the Assertion pin below.
+    ///
+    /// PROVEN LIVE IN BOTH DIRECTIONS (2026-08-19). "A gate that cannot go red is
+    /// not a gate" — the rule the controls module below states — applies to the
+    /// replacement as much as to the thing replaced, and a repaired instrument
+    /// that cannot fail is worse than a broken one because it reads as green. The
+    /// mutations cannot live as checked-in tests (each one edits this constant),
+    /// so they were driven by hand against the unmutated green baseline and are
+    /// recorded here to be re-runnable:
+    ///
+    ///  * FORCE ONE PINNED DECLINER OUT — delete
+    ///    `("<[T] as lib::BitArray<T>>::bit_length", "0d044330f8215218")`.
+    ///    Result: one NEW finding, `UNPINNED spine decline(s): 1 dump
+    ///    instance(s) …`, naming exactly that row and nothing else.
+    ///  * FORCE ONE COMPARED INSTANCE IN — add
+    ///    `("arrayvec::ArrayVec::<T, CAP>::len", "489f98929f02a9df")`.
+    ///    Result: one NEW finding, `STALE SPINE_DECLINED_PIN row(s): 1 pinned
+    ///    decline(s) are no longer observed`, naming exactly that row.
+    ///
+    /// The second control is also the KEY's own proof. That def_path is ALREADY
+    /// in this table — as `ae6144ec175edbda`, a different dump of the same
+    /// function that DOES decline — so a `def_path`-keyed gate would have stayed
+    /// green while a compared instance was pinned as a decliner. Seven of the 227
+    /// census def_paths have further dumps in the corpus that are compared today;
+    /// those are exactly the slots where a real regression would have been silent
+    /// under the old key.
+    const SPINE_DECLINED_PIN: &[(&str, &str)] = &[
+        // The 225 declines that predate the two INTAKE rows below.
+        ("<[T] as lib::BitArray<T>>::bit_length", "0d044330f8215218"),
+        ("<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::fold::<i32, {closure@<i32 as core::iter::traits::accum::Sum<&i32>>::sum<core::slice::iter::Iter<'_, i32>>::{closure#0}}>", "a14702a23ca07be2"),
+        ("<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::next", "571566dc7d3e162a"),
+        ("<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt", "7739181a02c2e548"),
+        ("<expr::types::BigNat as std::cmp::Ord>::cmp", "6706700503686cad"),
+        ("<i128 as lib::BitField>::get_bit", "a90e8b292f0b1b3c"),
+        ("<i128 as lib::BitField>::set_bit", "1500dc5cdbe22d1f"),
+        ("<i16 as lib::BitField>::get_bit", "fcf619f56e35d6e4"),
+        ("<i16 as lib::BitField>::set_bit", "352b34d4110d673b"),
+        ("<i32 as lib::BitField>::get_bit", "346ac3cc94dccea9"),
+        ("<i32 as lib::BitField>::set_bit", "60feff0319dbb3a6"),
+        ("<i64 as lib::BitField>::get_bit", "a3aae1256c865deb"),
+        ("<i64 as lib::BitField>::set_bit", "fcf1b617bd729110"),
+        ("<i8 as lib::BitField>::get_bit", "fa3a40285a5c73ea"),
+        ("<i8 as lib::BitField>::set_bit", "6d936455a53ba065"),
+        ("<isize as lib::BitField>::get_bit", "a3aae1256c865deb"),
+        ("<isize as lib::BitField>::set_bit", "fcf1b617bd729110"),
+        ("<lib::ByteSize as core::ops::arith::AddAssign<T>>::add_assign", "cb718900716fe662"),
+        ("<lib::ByteSize as core::ops::arith::AddAssign>::add_assign", "ba11eff572fca004"),
+        ("<lib::ByteSize as core::ops::arith::MulAssign<T>>::mul_assign", "89e625c04ed6e72e"),
+        ("<lib::Either<L, R> as core::clone::Clone>::clone_from", "137b8b62b1e6d970"),
+        ("<lib::Either<L, R> as core::cmp::Ord>::cmp", "1c1d4461fc7391c1"),
+        ("<lib::Either<L, R> as core::cmp::PartialEq>::eq", "9a2acfa7543aa11b"),
+        ("<lib::Either<L, R> as core::cmp::PartialOrd>::partial_cmp", "ddee88df4b5a2c53"),
+        ("<lib::Either<L, R> as core::convert::AsMut<[Target]>>::as_mut", "0aca333e806a657b"),
+        ("<lib::Either<L, R> as core::convert::AsMut<str>>::as_mut", "c407541f2d916b80"),
+        ("<lib::Either<L, R> as core::convert::AsMut<Target>>::as_mut", "80d8855f15a8d438"),
+        ("<lib::Either<L, R> as core::convert::AsRef<[Target]>>::as_ref", "cfc6f6a0b5deadd9"),
+        ("<lib::Either<L, R> as core::convert::AsRef<str>>::as_ref", "7400c569777e0e4b"),
+        ("<lib::Either<L, R> as core::convert::AsRef<Target>>::as_ref", "4c64add06d6e1bf3"),
+        ("<lib::Either<L, R> as core::fmt::Debug>::fmt", "de27a7c507a3b99d"),
+        ("<lib::Either<L, R> as core::fmt::Display>::fmt", "3698658e3b6a049b"),
+        ("<lib::Either<L, R> as core::fmt::Write>::write_char", "a53017bd293b5e86"),
+        ("<lib::Either<L, R> as core::fmt::Write>::write_fmt", "733844c970226402"),
+        ("<lib::Either<L, R> as core::fmt::Write>::write_str", "3fd48bdcd7346292"),
+        ("<lib::Either<L, R> as core::hash::Hash>::hash", "116c4e9c975f460e"),
+        ("<lib::Either<L, R> as core::ops::deref::Deref>::deref", "de706be0682cd15b"),
+        ("<lib::Either<L, R> as core::ops::deref::DerefMut>::deref_mut", "640cc5d67f42803c"),
+        ("<lib::errors::AsciiError as core::cmp::PartialEq>::eq", "71b02bd7870210b7"),
+        ("<lib::errors::AsciiError as core::fmt::Debug>::fmt", "0cc53abc29bea0c2"),
+        ("<lib::iterator::IterEither<L, R> as core::iter::traits::double_ended::DoubleEndedIterator>::next_back", "3a8a6b96b69c2727"),
+        ("<lib::iterator::IterEither<L, R> as core::iter::traits::double_ended::DoubleEndedIterator>::nth_back", "cb4ae4caf80d2139"),
+        ("<lib::iterator::IterEither<L, R> as core::iter::traits::exact_size::ExactSizeIterator>::len", "012d85606fd2c6b4"),
+        ("<lib::iterator::IterEither<L, R> as core::iter::traits::iterator::Iterator>::next", "0ecb5446538ae8f9"),
+        ("<lib::iterator::IterEither<L, R> as core::iter::traits::iterator::Iterator>::nth", "b504196cf67470f3"),
+        ("<lib::iterator::IterEither<L, R> as core::iter::traits::iterator::Iterator>::size_hint", "db265b9d214f3329"),
+        ("<std::slice::Iter<'_, i32> as std::iter::Iterator>::fold::<i32, {closure@<i32 as std::iter::Sum<&i32>>::sum<std::slice::Iter<'_, i32>>::{closure#0}}>", "d634fc6633dd9fb1"),
+        ("<std::slice::Iter<'_, i32> as std::iter::Iterator>::next", "e9555c1150946b2e"),
+        ("<u128 as lib::BitField>::get_bit", "4776e281ee1645e0"),
+        ("<u128 as lib::BitField>::set_bit", "9f37adad28cd8170"),
+        ("<u16 as lib::BitField>::get_bit", "de28c2a68d28190c"),
+        ("<u16 as lib::BitField>::set_bit", "7243767db11abf0e"),
+        ("<u32 as lib::BitField>::get_bit", "7be0bd8698ac992a"),
+        ("<u32 as lib::BitField>::set_bit", "d4b14ff3801d5de2"),
+        ("<u64 as lib::BitField>::get_bit", "57765eb4aef85a0e"),
+        ("<u64 as lib::BitField>::set_bit", "24952898207a587b"),
+        ("<u8 as lib::BitField>::get_bit", "ddd9f2576e070c37"),
+        ("<u8 as lib::BitField>::set_bit", "ced99f1a056eda70"),
+        ("<usize as lib::BitField>::get_bit", "57765eb4aef85a0e"),
+        ("<usize as lib::BitField>::set_bit", "24952898207a587b"),
+        ("arrayvec::ArrayVec::<T, CAP>::len", "ae6144ec175edbda"),
+        ("avg_floor", "0135e2eb8439ebbe"),
+        ("b", "850c6dfe3eb52479"),
+        ("box_inner", "242787d59b08c788"),
+        ("C1_dangling_local", "9fc6d25a51ed3b25"),
+        ("ceil_div7", "f983e85d75451618"),
+        ("cmp::impls::<impl cmp::Ord for i128>::cmp", "58378b3af1e3a82e"),
+        ("cmp::impls::<impl cmp::Ord for i16>::cmp", "c0b13dee71617f71"),
+        ("cmp::impls::<impl cmp::Ord for i32>::cmp", "f75fc366444f8ae5"),
+        ("cmp::impls::<impl cmp::Ord for i64>::cmp", "f13eb17e5b9388d8"),
+        ("cmp::Ord::clamp", "84ec0c0555f9bbb7"),
+        ("cmp::Ordering::as_raw", "3b636abbcd039f4a"),
+        ("cmp::Ordering::reverse", "9d024ecd874f203b"),
+        ("cmp::Ordering::then", "fd99e14c993c1b4c"),
+        ("core::num::<impl i32>::checked_pow", "87bf1dbc0d40e528"),
+        ("core::num::<impl i32>::div_ceil", "674c1762325c18eb"),
+        ("core::num::<impl i32>::div_floor", "9785e303f2ae7270"),
+        ("core::num::<impl i32>::isqrt", "7408c5ad8e999cd3"),
+        ("core::num::<impl i32>::midpoint", "4da22b893f2a6895"),
+        ("core::num::<impl i32>::overflowing_pow", "f52f3d0d63b69a8e"),
+        ("core::num::<impl i32>::signum", "2a94ab8a996ea30c"),
+        ("core::num::<impl i32>::strict_pow", "12c899fd00b1bc6c"),
+        ("core::num::<impl i32>::unchecked_shl", "801ac3e2adc3eeaa"),
+        ("core::num::<impl i64>::signum", "a706b36f70b4fcc4"),
+        ("core::num::<impl i8>::signum", "fd3e6b548c4d063f"),
+        ("core::num::<impl u32>::ilog2", "4afc3fbe281e68f6"),
+        ("core::num::<impl u32>::one_less_than_next_power_of_two", "850239fc54396aaf"),
+        ("core::num::<impl usize>::unchecked_add::precondition_check", "06cbcafd82e8f840"),
+        ("core::num::imp::int_sqrt::u16_stages", "0124a32c981fb95b"),
+        ("core::num::imp::int_sqrt::u16", "0d1657aba5d9a480"),
+        ("core::num::imp::int_sqrt::u32_stages", "30ea145049ec3224"),
+        ("core::num::imp::int_sqrt::u32", "43305e7a3c0f00de"),
+        ("core::num::nonzero::NonZero::<i32>::new", "9ae2a447689915ce"),
+        ("core::num::nonzero::NonZero::<u16>::new", "ec7ddd9022838164"),
+        ("core::num::nonzero::NonZero::<u32>::get", "cd339629a015cd5f"),
+        ("core::num::nonzero::NonZero::<u32>::ilog2", "094ddab65ab2a993"),
+        ("core::num::nonzero::NonZero::<u32>::new", "00893d35b7537777"),
+        ("core::num::nonzero::NonZero::<u8>::new", "57464d39eb9c9486"),
+        ("core::slice::iter::<impl core::iter::traits::collect::IntoIterator for &[i32]>::into_iter", "2738df63c73099d9"),
+        ("core::slice::iter::<impl std::iter::IntoIterator for &[i32]>::into_iter", "83df2ef4de83877c"),
+        ("core::slice::iter::Iter::<'_, i32>::new", "08b9f642e295a020"),
+        ("crate::exp_bump", "f3fd4d05d65aa8be"),
+        ("crate::vec_get", "1aed8bb5b637a0c1"),
+        ("deref", "a51e6d29ed470ab3"),
+        ("direct_call", "58d03eb8c010a621"),
+        ("expr::meta::ExprMeta::approx_depth", "84be72a9fd24cd8f"),
+        ("expr::meta::ExprMeta::has_expr_mvar", "2011094b879e562f"),
+        ("expr::meta::ExprMeta::has_fvar", "1bbac65a6d5d443b"),
+        ("expr::meta::ExprMeta::has_level_mvar", "86f9a5218139c5f5"),
+        ("expr::meta::ExprMeta::has_level_param", "6a2a780bd93ecaa4"),
+        ("expr::meta::ExprMeta::loose_bvar_range", "80919b00caf4864f"),
+        ("expr::meta::ExprMeta::mk_app_meta", "7b4b5d877ab41c14"),
+        ("expr::meta::ExprMeta::pack", "c0a97d45bf67a1db"),
+        ("expr::meta::mix_hash", "ab6fc9de9c2134c8"),
+        ("expr::subst::FoldMemo::get", "a4c3803052d33642"),
+        ("expr::subst::FoldMemo::put", "ecd0c309faac4292"),
+        ("expr::types::BigNat::mul_big_capped", "92a0ec34d32f899e"),
+        ("expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions", "4379341969a517f3"),
+        ("expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full", "7964b898062aa383"),
+        ("expr::visitor::opt::ExprFolderOpt::fold_expr_opt_zfc", "f96f666fba151e4d"),
+        ("expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt", "1e8fe4d93bc462e6"),
+        ("extract_foldmemo::level::Level::collect_params_impl", "7dfa6207401f04bb"),
+        ("extract_foldmemo::level::Level::has_params_impl", "682d5d8bc85f3596"),
+        ("extract_foldmemo::level::Level::is_nonzero", "ad5fe2f6abd9803c"),
+        ("extract_foldmemo::level::Level::is_zero", "17e1ac8503a00bad"),
+        ("extract_foldmemo::level::Level::substitute_map_impl_opt", "08ea49111feb4fe9"),
+        ("extract_foldmemo::level::Level::substitute_slice_impl_opt", "98f0715eba1cf8e2"),
+        ("forgery::F1_dangling_local", "49aca9324254bd29"),
+        ("forgery::G1_signum_cmp_rhs_nonzero", "338e7b99a60d55a1"),
+        ("forgery::G2_signum_wrong_disc_mapping", "9bf7a3e13d6de9ff"),
+        ("forgery::G3_signum_non_ordering_enum", "8b58c86dff167a4d"),
+        ("forgery::G4_signum_flipped_operands", "c02c77180c31c533"),
+        ("forgery::G5_signum_unsigned_cast_dest", "46ff64ec5ed631ae"),
+        ("forgery::G6_signum_valid_control", "5257042c509017bf"),
+        ("halve", "421cc391197e0d14"),
+        ("is_even", "065e6e084961b13e"),
+        ("is_leap_year", "99ab05fb39368650"),
+        ("lib::<impl lib::private::Sealed for i16>::write", "cba51fd9d1450d7d"),
+        ("lib::<impl lib::private::Sealed for i32>::write", "fff1aa5f48a223e4"),
+        ("lib::<impl lib::private::Sealed for i64>::write", "3c6debc0a174e2e9"),
+        ("lib::<impl lib::private::Sealed for i8>::write", "406c4860d8ab0df6"),
+        ("lib::<impl lib::private::Sealed for u16>::write", "fb83f1f1fda7b751"),
+        ("lib::<impl lib::private::Sealed for u32>::write", "c19b2635d5b8e918"),
+        ("lib::<impl lib::private::Sealed for u64>::write", "c01859ab01a2bf2c"),
+        ("lib::<impl lib::private::Sealed for u8>::write", "09f8feb3c6fa0cff"),
+        ("lib::arch::all::memchr::One::find_raw", "b67924cda44ffdcb"),
+        ("lib::arch::all::memchr::One::rfind_raw", "9e71868623106510"),
+        ("lib::arrayvec::ArrayVec::<T, CAP>::new_const", "5cb39681c865bcce"),
+        ("lib::arrayvec::ArrayVec::<T, CAP>::retain::process_one", "a294277d217166b0"),
+        ("lib::Either::<L, R>::as_mut", "193f1e970107f46a"),
+        ("lib::Either::<L, R>::as_pin_mut", "77ebeab62aae1152"),
+        ("lib::Either::<L, R>::as_pin_ref", "62afec6094bdefc5"),
+        ("lib::Either::<L, R>::as_ref", "6a484295825b0d06"),
+        ("lib::Either::<L, R>::factor_iter_mut", "d7587065b0549597"),
+        ("lib::Either::<L, R>::factor_iter", "d228da658638fcd5"),
+        ("lib::Either::<L, R>::iter_mut", "2174e4015f8ac340"),
+        ("lib::Either::<L, R>::iter", "6c0f810ec3612f94"),
+        ("lib::iterator::<impl core::iter::traits::double_ended::DoubleEndedIterator for lib::Either<L, R>>::next_back", "e5bba6dea997cae2"),
+        ("lib::iterator::<impl core::iter::traits::double_ended::DoubleEndedIterator for lib::Either<L, R>>::nth_back", "4e1a8db959b4167f"),
+        ("lib::iterator::<impl core::iter::traits::exact_size::ExactSizeIterator for lib::Either<L, R>>::len", "79f9ce62cad1a37a"),
+        ("lib::iterator::<impl core::iter::traits::iterator::Iterator for lib::Either<L, R>>::next", "68c0693cd077eaf1"),
+        ("lib::iterator::<impl core::iter::traits::iterator::Iterator for lib::Either<L, R>>::nth", "4cb8d6c494e8e9b7"),
+        ("lib::iterator::<impl core::iter::traits::iterator::Iterator for lib::Either<L, R>>::size_hint", "0a82710858cad45b"),
+        ("lib::udiv128::u128_mulhi", "6a1ddb48fc755c70"),
+        ("lib::udiv128::udivmod_1e19", "97ca8cd00a333e35"),
+        ("main::S::bump", "82ddd980b90eba58"),
+        ("num::<impl i16>::signum", "9f57b91fe371e13d"),
+        ("num::<impl i32>::signum", "5257042c509017bf"),
+        ("num::<impl i64>::signum", "d21cb3a9d4117f84"),
+        ("num::<impl i8>::signum", "9b94922315bb2245"),
+        ("p_even_branch", "c8afaa804174c262"),
+        ("p_is_even_usize", "eae681e3a08fe311"),
+        ("p_is_odd_usize", "8871b08537049c17"),
+        ("p_leap", "0b8e562cb0723332"),
+        ("p_match_even", "c2de142dfd5c5d74"),
+        ("p_mod2", "b7a1ba0c91fbeec8"),
+        ("p_parity", "f9ee2693bddaf0d7"),
+        ("parser::_convert_classic_tokens", "3946b6e8bb58891f"),
+        ("parser::_get_ast", "4d87e1b2ddecae3f"),
+        ("parser::fold_exprs", "4552e591288ce004"),
+        ("reduction::<impl term::Term>::_apply", "0ea7fea8071b1e8c"),
+        ("reduction::<impl term::Term>::beta_app", "3927a2e33007b13a"),
+        ("reduction::<impl term::Term>::beta_hap", "135c24788b0bc509"),
+        ("reduction::<impl term::Term>::beta_hno", "08e33d72aec2510b"),
+        ("reduction::<impl term::Term>::beta_hsp", "784f28195b1d00a8"),
+        ("reduction::<impl term::Term>::beta_nor", "aa8ba1bf1d0b6e49"),
+        ("reduction::<impl term::Term>::eval", "545451318d8118f0"),
+        ("reduction::<impl term::Term>::update_free_variables", "19e4420136a5900b"),
+        ("rem2", "c3ca9d0bce4946e2"),
+        ("std::num::NonZero::<i64>::get", "c949768fc9f0fe03"),
+        ("std::num::NonZero::<i64>::new", "1c022513d4e6bd54"),
+        ("std::num::NonZero::<u32>::get", "5e23789181280118"),
+        ("std::num::NonZero::<u32>::new", "5a8b2f4ea66eb1fa"),
+        ("std::option::Option::<i32>::and_then::<i32, {closure@main.rs:15:16: 15:19}>", "fef0eff00cb2375b"),
+        ("std::option::Option::<i32>::and_then::<i32, {closure@main.rs:17:16: 17:24}>", "7915268a1a16bdcb"),
+        ("std::option::Option::<i32>::expect", "76538a8b0171e834"),
+        ("std::option::Option::<i32>::filter::<{closure@main.rs:20:14: 20:17}>", "4690500e691d8abc"),
+        ("std::option::Option::<i32>::map::<i32, {closure@main.rs:10:11: 10:19}>", "07927a68806ad347"),
+        ("std::option::Option::<i32>::map::<i32, {closure@main.rs:26:11: 26:19}>", "0f99f183a4037aa0"),
+        ("std::option::Option::<i32>::map::<i32, {closure@main.rs:5:11: 5:14}>", "bd02b317d3060711"),
+        ("std::option::Option::<i32>::unwrap", "f8103e479a2fdf99"),
+        ("std::option::Option::<u8>::map::<u8, {closure@main.rs:12:11: 12:19}>", "ca3e5e3f7bade044"),
+        ("std::option::Option::<u8>::map::<u8, {closure@main.rs:7:11: 7:19}>", "1861a0ab16376266"),
+        ("std::option::Option::<u8>::unwrap", "1ae34b3770614960"),
+        ("std::ptr::const_ptr::<impl *const T>::offset_from_unsigned::precondition_check", "ca730a2a0ecc740a"),
+        ("std::ptr::mut_ptr::<impl *mut T>::add::precondition_check", "ad2acde7927b3952"),
+        ("std::result::Result::<i32, u8>::unwrap", "0ae7f1429a408aac"),
+        ("std::slice::Iter::<'_, i32>::new", "367323a6cc2c82ca"),
+        ("term::base26_encode", "edc44e94d2a3ad5d"),
+        ("term::show_precedence_cla", "d56ff62387007af3"),
+        ("term::show_precedence_dbr", "0409cc642697f3aa"),
+        ("term::Term::has_free_variables_helper", "f2b3e0374fc46358"),
+        ("term::Term::is_isomorphic_to", "7312c772f07ff9bf"),
+        ("term::Term::is_supercombinator", "4c3bcd1cba5fa4d9"),
+        ("term::Term::max_depth", "2ad6084c2a052417"),
+        ("term::Term::max_free_index_helper", "355013a93dc3d74a"),
+        ("term::Term::unabs_mut", "094a093924bd0a9c"),
+        ("term::Term::unabs_ref", "9fc9376ae90cc947"),
+        ("term::Term::unabs", "e7a32086998f8b6f"),
+        ("term::Term::unapp_mut", "d0f727ed5ec19b98"),
+        ("term::Term::unapp_ref", "d3c141518ee9456c"),
+        ("term::Term::unapp", "ab4b67e896872a8f"),
+        ("term::Term::unvar_mut", "6562b41e2c499085"),
+        ("term::Term::unvar_ref", "9f2f87141a2bae14"),
+        ("version_meta_for", "f7673ce8a9c97de3"),
+
+        // ------------------------------------------------------------------
+        // Trust (#63): THE TWO ROWS THAT MADE THE OLD CEILING FIRE. These are
+        // INTAKE, not retired coverage, and separating them from the 225 above
+        // is the whole reason this table is a set and not the number 227.
+        //
+        // Both dump files were ADDED by `41189ffd76` ("r4: local mono dumps +
+        // FS-CALL-RHS — the bytesize chain closes"), which created
+        // `fixtures/mutator-harvest-2026-08-19/bytesize-mono/dumps/`. They have
+        // never been comparable: they entered the corpus already declining, so
+        // no cross-check existed to retire. The old `SPINE_DECLINED_CEILING`
+        // counted them, read 227 against 225, and reported "functions that used
+        // to be COMPARED now decline" — a regression that never happened.
+        //
+        // WHY THEY DECLINE, precisely, so a future closure is recognizable:
+        // each body's checked arithmetic reads the receiver through a
+        // projection —
+        //     Assign { place: _4, rvalue: CheckedBinaryOp(Add|Mul,
+        //              Copy(_1.[Deref, Field(0)]), Copy(_3)) }
+        //     Assert { cond: Move(_4.[Field(1)]), msg: Overflow(Add|Mul) }
+        // — and `native_operand_ty` (crates/trust-ir-bridge/src/lower.rs:9352)
+        // admits a local operand ONLY when `p.projections.is_empty()`. The lhs
+        // carries `[Deref, Field(0)]`, so it falls to that function's `_ => None`
+        // arm; `reconstruct_assert_vc_kind`'s `ArithmeticOverflow` arm propagates
+        // the `?`, and `generate_native_safety_vcs` declines the whole body.
+        //
+        // These two rows are NOT uncovered, and the census is not the reason to
+        // hurry: their faithfulness is carried by the trust-clean walk lanes
+        // (FS-CALL-RHS certifies them fully faithful). What is missing is
+        // SPINE-SIDE call/projection envelope growth, which is separate future
+        // work — so the pin records an envelope gap, not a coverage hole.
+        //
+        // Closing the projection lane retires BOTH rows at once, and the census
+        // will then go red as STALE — which is correct, and the fix is to delete
+        // these two lines.
+        ("<main::bytesize::ByteSize as core::ops::arith::AddAssign<u64>>::add_assign", "e2743b9eca40d162"),
+        ("<main::bytesize::ByteSize as core::ops::arith::MulAssign<u64>>::mul_assign", "18f7529d9044c241"),
+    ];
+
+    /// Trust (#61, C0): functions dispatching the spine's own VC set — measured
+    /// 1809 at pin time. Must never silently fall.
+    const NATIVE_DISPATCH_FLOOR: usize = 1809;
+
+    /// Trust (#61, C0): per-class ceilings inside `vcgen_only`, so a campaign that
+    /// claims to close one class must move THAT class's number — the aggregate
+    /// alone can hide a swap (one class up, another down, total flat). Only the
+    /// two campaign-relevant classes are pinned; the aggregate ceiling bounds the
+    /// rest.
+    const VCGEN_ONLY_CLASS_CEILINGS: &[(&str, usize)] = &[("BoundsCheck", 24)];
+
+    /// Trust (#62, C-D0): the Assertion class is IDENTITY-PINNED, not count-bounded.
+    ///
+    /// A count ceiling cannot see a lateral swap — one known row closing while a
+    /// NEW unknown identity appears reads as "unchanged". These 22 rows were the
+    /// judged DEFER verdict of the Assertion-row design panel (2026-08-20): the
+    /// module side already mints the real check at every site (the diverging
+    /// panic-call arm, lower.rs — `Assert(const false)`+NoPanic, `Unreachable`, and
+    /// a PanicFreedom obligation), the guard-formula blocker makes closure
+    /// enumeration-only under EVERY design, and the per-site rows are documented
+    /// dead in production. So the honest artifact is this pin: any NEW identity
+    /// goes red and demands a fresh look; downward motion stays green.
+    ///
+    /// TRANSCRIBED FROM THE RATCHET'S OWN RENDERING (never from a report — the
+    /// span keys are the run's `ObligationKey` Display, and a hand-derived key
+    /// reads as a phantom new identity). Census: 16 byteorder `assert_eq!`
+    /// preludes + arrayvec `into_inner_unchecked` at `macros/mod.rs:51`; 4
+    /// `panic_fmt` sites at `panic.rs:62`; 1 sentinel at `panic.rs:73`.
+    ///
+    /// PRE-AUTHORIZED GROWTH (do not re-litigate): the panel named three LATENT
+    /// identities that may surface as the corpus/vcgen shift — memchr
+    /// `One::{find_raw,rfind_raw}` and itoa `udivmod_1e19`. Adding EXACTLY those,
+    /// with this comment updated, is approved; anything else is a finding.
+    const EXPECTED_ASSERTION_VCGEN_ONLY_ROWS: &[(&str, &str)] = &[
+        ("core::cmp::impls::<impl core::cmp::Ord for i32>::clamp", "Assertion@core/src/panic.rs:62:8"),
+        ("<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt", "Assertion@library/core/src/panic.rs:62:8"),
+        ("lib::arrayvec::ArrayVec::<T, CAP>::into_inner_unchecked", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("lib::arrayvec::ArrayVec::<T, CAP>::new", "Assertion@core/src/panic.rs:62:8"),
+        ("lib::arrayvec::extend_panic", "Assertion@core/src/panic.rs:62:8"),
+        ("<lib::BigEndian as lib::ByteOrder>::read_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::read_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::read_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::read_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::write_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::write_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::write_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::BigEndian as lib::ByteOrder>::write_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("lib::check_ascii_printable", "Assertion@core/src/panic.rs:73:8"),
+        ("<lib::LittleEndian as lib::ByteOrder>::read_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::read_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::read_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::read_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::write_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::write_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::write_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        ("<lib::LittleEndian as lib::ByteOrder>::write_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
+    ];
 
     fn dump_dirs(root: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(root) else { return };
@@ -3905,6 +4332,28 @@ mod missing_obligation_ratchet {
         )
     }
 
+    /// Trust (#63): the decline census's identity key for ONE dump instance.
+    ///
+    /// `content_hash()` is the repo's designated content identity and excludes
+    /// `name`/`span` — which is what makes this key survive a fixture rename and
+    /// still separate two dumps that share a `def_path`. Truncated to 16 hex
+    /// digits for a readable pin; see [`SPINE_DECLINED_PIN`] for why 64 bits is
+    /// ample when the key is the PAIR.
+    fn declined_key(func: &VerifiableFunction) -> (String, String) {
+        let hash = func.try_content_hash().expect(
+            "a VerifiableFunction that just deserialized must re-serialize; a failure here \
+             is a model bug, and hashing a fallback would give two different bodies one \
+             census identity",
+        );
+        (func.def_path.clone(), hash.chars().take(16).collect())
+    }
+
+    /// Render a census in the exact source syntax of [`SPINE_DECLINED_PIN`], so a
+    /// red run is repaired by pasting rather than by hand-deriving a key.
+    fn render_census(rows: &std::collections::BTreeSet<(String, String)>) -> String {
+        rows.iter().map(|(d, h)| format!("        ({d:?}, {h:?}),\n")).collect()
+    }
+
     #[test]
     fn no_obligation_is_derived_by_the_spine_and_checked_by_nobody() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-clean/fixtures");
@@ -3916,6 +4365,17 @@ mod missing_obligation_ratchet {
         let mut native_only: Vec<String> = Vec::new();
         let mut vcgen_only_total = 0usize;
         let mut unsafe_model_total = 0usize;
+        // Trust (#61, C0): the tripwire counters. The two-sided bound above cannot
+        // see a function that silently stops being COMPARED: a spine edit that makes
+        // `generate_native_safety_vcs` decline (return None) flips the outcome from
+        // Disagreed to FlippedFallback, the diff is never computed, and vcgen_only
+        // DROPS under its ceiling while cross-check coverage was retired -- the
+        // metric launders. Measured against the campaign this exists to guard: one
+        // stray `?` in a new lowering arm converts compared functions into declines.
+        let mut spine_declined: std::collections::BTreeSet<(String, String)> = Default::default();
+        let mut native_generated = 0usize;
+        let mut vcgen_only_by_class: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut assertion_rows_observed: Vec<(String, String)> = Vec::new();
 
         for dir in &dirs {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
@@ -3928,41 +4388,74 @@ mod missing_obligation_ratchet {
                 let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
                 functions += 1;
                 let (vcgen, discharged) = vcgen_vcs_for(&func);
+                // Trust (#61, C0): count spine declines DIRECTLY, not via the outcome
+                // -- FlippedFallback conflates "spine declined" with "spine agreed
+                // byte-for-byte after the formula check", and only the first is the
+                // laundering hazard.
+                if crate::lower::generate_native_safety_vcs(&func).is_none() {
+                    spine_declined.insert(declined_key(&func));
+                }
                 let (_dispatched, outcome) = generate_native_or_flip_safety_vcs_with_discharged(
                     &func,
                     vcgen,
                     discharged.iter(),
                 );
-                if let NativeGenOutcome::Disagreed { diff, .. } = outcome {
-                    for k in &diff.vcgen_only {
-                        if k.class == "Assertion(unsafe-model)" {
-                            unsafe_model_total += 1;
-                        } else {
-                            vcgen_only_total += 1;
+                match outcome {
+                    NativeGenOutcome::NativeGenerated(_) => native_generated += 1,
+                    NativeGenOutcome::Disagreed { diff, .. } => {
+                        for k in &diff.vcgen_only {
+                            if k.class == "Assertion(unsafe-model)" {
+                                unsafe_model_total += 1;
+                            } else {
+                                vcgen_only_total += 1;
+                                *vcgen_only_by_class.entry(k.class.clone()).or_insert(0) += 1;
+                                if k.class == "Assertion" {
+                                    assertion_rows_observed
+                                        .push((func.def_path.clone(), k.to_string()));
+                                }
+                            }
                         }
+                        native_only.extend(
+                            diff.native_only.iter().map(|k| format!("{} :: {k}", func.def_path)),
+                        );
                     }
-                    native_only
-                        .extend(diff.native_only.iter().map(|k| format!("{} :: {k}", func.def_path)));
+                    NativeGenOutcome::FlippedFallback(_) => {}
                 }
             }
         }
 
         assert!(functions > 2_000, "expected the full corpus, saw {functions} functions");
 
+        // Trust (#63): EVERY GATE BELOW REPORTS; NONE ABORTS. These used to be a
+        // run of bare `assert!`s, and the first one to fire ended the test — so
+        // when the decline ceiling went red at 227/225, the dispatch floor, the
+        // Assertion identity pin and the per-class ceilings behind it were not
+        // "green", they were UNRUN, and nothing in the output said so. A gate
+        // that fires first and aborts hides every gate behind it, and an
+        // instrument that reports one finding per run takes as many runs as it
+        // has defects. Each check now pushes onto `findings` and the single
+        // assertion at the end prints all of them at once.
+        //
+        // The corpus precondition above stays a hard `assert!` on purpose: if the
+        // fixtures did not load, every measurement below is vacuous and reporting
+        // them as findings would be noise about nothing.
+        let mut findings: Vec<String> = Vec::new();
+
         // THE GATE, at zero. Each row here is an obligation the trust-ir spine
         // derived that trust-vcgen neither dispatched nor discharged — a
         // proposition nothing in the pipeline verifies. Whitelisting a row is not
         // a fix; either the spine should not be deriving it (make the two
         // producers agree, as the div/rem fold did) or trust-vcgen has a hole.
-        assert!(
-            native_only.is_empty(),
-            "UNCHECKED OBLIGATION(S): the trust-ir spine derived {} obligation(s) that \
-             trust-vcgen neither emitted nor discharged. Each is a proposition nothing \
-             verifies — an obligation that is never emitted produces silence, and silence \
-             is indistinguishable from success everywhere downstream:\n  {}",
-            native_only.len(),
-            native_only.join("\n  "),
-        );
+        if !native_only.is_empty() {
+            findings.push(format!(
+                "UNCHECKED OBLIGATION(S): the trust-ir spine derived {} obligation(s) that \
+                 trust-vcgen neither emitted nor discharged. Each is a proposition nothing \
+                 verifies — an obligation that is never emitted produces silence, and silence \
+                 is indistinguishable from success everywhere downstream:\n  {}",
+                native_only.len(),
+                native_only.join("\n  "),
+            ));
+        }
 
         // THE OTHER DIRECTION, and it needs its own bound. The zero-gate above only
         // catches the spine deriving TOO MUCH. A fold that is too AGGRESSIVE fails
@@ -3974,19 +4467,135 @@ mod missing_obligation_ratchet {
         // coverage, and cross-checking is the entire value of running two
         // producers. Pinning a ceiling here means the div/rem fold cannot quietly
         // grow into obligations it was never meant to cover.
-        assert!(
-            vcgen_only_total <= VCGEN_ONLY_CEILING,
-            "the spine's coverage gap GREW to {vcgen_only_total} (ceiling \
-             {VCGEN_ONLY_CEILING}). Nothing is unchecked — trust-vcgen still dispatches \
-             these — but the spine stopped cross-checking obligations it used to, which \
-             is how an over-aggressive fold hides.",
-        );
+        if vcgen_only_total > VCGEN_ONLY_CEILING {
+            findings.push(format!(
+                "the spine's coverage gap GREW to {vcgen_only_total} (ceiling \
+                 {VCGEN_ONLY_CEILING}). Nothing is unchecked — trust-vcgen still dispatches \
+                 these — but the spine stopped cross-checking obligations it used to, which \
+                 is how an over-aggressive fold hides.",
+            ));
+        }
 
+        // Trust (#61, C0) -- the tripwires, pinned to measured values. Each guards a
+        // laundering channel the two-sided bound above cannot see:
+        //
+        //  * SPINE_DECLINED_PIN: a regression that makes compared functions
+        //    DECLINE drops their rows from vcgen_only without closing anything.
+        //    The census makes that drop red instead of green -- and, unlike the
+        //    cardinality it replaced, it NAMES the rows so intake can be told
+        //    apart from retired coverage.
+        //  * NATIVE_DISPATCH_FLOOR: the count of functions where the spine IS the
+        //    dispatched producer must never silently fall.
+        //  * per-class sub-ceilings: a campaign that claims to close one class must
+        //    move THAT class's number; the aggregate alone can hide a swap.
+        let pinned_declined: std::collections::BTreeSet<(String, String)> = SPINE_DECLINED_PIN
+            .iter()
+            .map(|(d, h)| ((*d).to_string(), (*h).to_string()))
+            .collect();
+        let unpinned_declines: std::collections::BTreeSet<(String, String)> =
+            spine_declined.difference(&pinned_declined).cloned().collect();
+        let vanished_declines: std::collections::BTreeSet<(String, String)> =
+            pinned_declined.difference(&spine_declined).cloned().collect();
+        if !unpinned_declines.is_empty() {
+            findings.push(format!(
+                "UNPINNED spine decline(s): {} dump instance(s) whose \
+                 `generate_native_safety_vcs` returns None are absent from \
+                 SPINE_DECLINED_PIN:\n{}\
+                 Classify each before pinning it, because the two causes are opposite. \
+                 If the dump FILE is new to the corpus, this is INTAKE and retires no \
+                 cross-check coverage — pin it with the reason and the decline site. If \
+                 the dump was already here, a COMPARED function has stopped being \
+                 comparable: that is the laundering channel, because its rows leave \
+                 vcgen_only and the coverage gap reads as improvement.\n\
+                 The full census, in source syntax, paste-ready:\n{}",
+                unpinned_declines.len(),
+                render_census(&unpinned_declines),
+                render_census(&spine_declined),
+            ));
+        }
+        if !vanished_declines.is_empty() {
+            findings.push(format!(
+                "STALE SPINE_DECLINED_PIN row(s): {} pinned decline(s) are no longer \
+                 observed:\n{}\
+                 This is PROGRESS (the spine can compare them now) or a fixture deletion, \
+                 and it is red on purpose — delete the line(s) so the census keeps \
+                 matching the corpus. A census nobody prunes stops being evidence.\n\
+                 The full census, in source syntax, paste-ready:\n{}",
+                vanished_declines.len(),
+                render_census(&vanished_declines),
+                render_census(&spine_declined),
+            ));
+        }
+        if native_generated < NATIVE_DISPATCH_FLOOR {
+            findings.push(format!(
+                "native dispatch FELL to {native_generated} (floor {NATIVE_DISPATCH_FLOOR}): \
+                 fewer functions dispatch the spine's own VC set than before.",
+            ));
+        }
+        // Trust (#62, C-D0): identity pin — observed must be a SUBSET of pinned.
+        // A new identity is a real finding (a function stopped agreeing, or a new
+        // shape entered the corpus) and must be looked at, not absorbed by a count.
+        let unexpected_assertion_rows: Vec<&(String, String)> = assertion_rows_observed
+            .iter()
+            .filter(|(d, k)| {
+                !EXPECTED_ASSERTION_VCGEN_ONLY_ROWS
+                    .iter()
+                    .any(|(pd, pk)| pd == d && pk == k)
+            })
+            .collect();
+        if !unexpected_assertion_rows.is_empty() {
+            findings.push(format!(
+                "NEW Assertion-class vcgen_only identit{} (not in the 2026-08-20 pin):\n  {:?}\n\
+                 A new identity means a function stopped agreeing or a new shape entered \
+                 the corpus — investigate; do not widen the pin without naming why.",
+                if unexpected_assertion_rows.len() == 1 { "y" } else { "ies" },
+                unexpected_assertion_rows,
+            ));
+        }
+        for (pd, pk) in EXPECTED_ASSERTION_VCGEN_ONLY_ROWS {
+            if !assertion_rows_observed.iter().any(|(d, k)| d == pd && k == pk) {
+                eprintln!("pinned Assertion row no longer observed (downward motion): {pd} :: {pk}");
+            }
+        }
+        for (class, ceiling) in VCGEN_ONLY_CLASS_CEILINGS {
+            let n = vcgen_only_by_class.get(*class).copied().unwrap_or(0);
+            if n > *ceiling {
+                findings.push(format!("vcgen_only class `{class}` GREW to {n} (ceiling {ceiling})"));
+            }
+        }
+
+        assert!(
+            findings.is_empty(),
+            "{} ratchet finding(s), ALL of them — this instrument no longer stops at the \
+             first:\n\n{}",
+            findings.len(),
+            findings
+                .iter()
+                .enumerate()
+                .map(|(i, f)| format!("[{}/{}] {f}", i + 1, findings.len()))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
         eprintln!(
             "alarm: {functions} functions, native_only=0, vcgen_only={vcgen_only_total} \
              (spine-derivable coverage gap, ceiling {VCGEN_ONLY_CEILING}), \
              unsafe_model={unsafe_model_total} (not a gap — never spine-derived)"
         );
+        // Both figures, because they answer different questions and the pin is
+        // keyed on the first: INSTANCES is what the census pins (242 of the 2334
+        // dumps share a def_path with another, so the two counts must differ),
+        // UNIQUE def_paths is what the retired `SPINE_DECLINED_CEILING` counted
+        // and is kept only so older measurements remain comparable.
+        let declined_unique: std::collections::BTreeSet<&String> =
+            spine_declined.iter().map(|(d, _)| d).collect();
+        eprintln!(
+            "tripwires: spine_declined={} instances / {} unique def_paths (census pinned at \
+             {} rows), native_generated={native_generated} (floor {NATIVE_DISPATCH_FLOOR})",
+            spine_declined.len(),
+            declined_unique.len(),
+            SPINE_DECLINED_PIN.len(),
+        );
+        eprintln!("vcgen_only by class: {vcgen_only_by_class:?}");
     }
 }
 

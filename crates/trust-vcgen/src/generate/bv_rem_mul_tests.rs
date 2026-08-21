@@ -149,3 +149,82 @@ fn zero_divisor_rem_adds_no_bound() {
         "a zero divisor must contribute no rem bound; formula: {f:?}"
     );
 }
+
+/// Trust: UMUL RECORD, RE-LANDED (2026-08-20) — the unsigned `var*var` mul VC
+/// carries an AUTHENTICATED Or-range record, and `reconstruct(record)` equals
+/// the emitted formula BIT-FOR-BIT (the invariant `authenticated_record`
+/// checks downstream).
+///
+/// THE HISTORY MATTERS, because this exact conjunct was retracted once. Adding
+/// the Int core makes the query a mixed QF_BV + NIA problem that ay answers
+/// with `internal-error`, which cost the class its refutation: an unguarded
+/// overflowing `a*b` went from `Failed` WITH A COUNTEREXAMPLE to `Unknown`.
+/// What makes it safe now is `trust-router`'s DISJOINT-COMPONENT REFUTATION
+/// lane, which refutes such a query component-wise. The pair is held together
+/// by `trust_router::in_process_ay_backend::tests::
+/// umul_bare_bv_unguarded_refutes_with_counterexample` — if that pin ever goes
+/// red, this conjunct must come back out.
+#[test]
+fn unsigned_var_var_mul_vc_carries_authenticated_record() {
+    use trust_types::ObligationWrapper;
+    for (l, r, label) in
+        [(None, None, "unguarded"), (Some(100u128), Some(50u128), "rem-clamped")]
+    {
+        let func = mod_mul_func(l, r);
+        let vcs = generate_vcs(&func);
+        let vc = vcs
+            .iter()
+            .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. }))
+            .expect("the checked mul emits an overflow VC");
+        let rec = vc.obligation.as_ref().unwrap_or_else(|| {
+            panic!("{label}: the umul VC must carry a record")
+        });
+        // The body is the Or-range core over a Mul term, at the operand width.
+        let Formula::Or(disjuncts) = &rec.body else {
+            panic!("{label}: body must be the Or core")
+        };
+        let [Formula::Lt(under_t, min_f), Formula::Gt(over_t, max_f)] = disjuncts.as_slice()
+        else {
+            panic!("{label}: body must be [Lt, Gt]")
+        };
+        assert!(matches!(&**under_t, Formula::Mul(..)), "{label}: operator is Mul");
+        assert_eq!(under_t, over_t, "{label}: both disjuncts over the same a*b");
+        assert_eq!(&**min_f, &Formula::Int(0));
+        assert_eq!(&**max_f, &Formula::Int(4_294_967_295));
+        assert_eq!(rec.width, Some(32));
+        // Reconstruction, innermost-first, mirroring the checker's semantics.
+        let mut cur = rec.body.clone();
+        for w in &rec.wrappers {
+            cur = match w {
+                ObligationWrapper::ConjoinFactsLast { facts } => {
+                    let mut v = facts.clone();
+                    v.push(cur);
+                    Formula::And(v)
+                }
+                ObligationWrapper::PathGuardOr { paths } => {
+                    use trust_types::PathGuardTerm as P;
+                    let terms: Vec<Formula> = paths
+                        .iter()
+                        .map(|p| match p {
+                            P::Raw => cur.clone(),
+                            P::Guarded { guards } => {
+                                let mut c = guards.clone();
+                                match cur.clone() {
+                                    Formula::And(inner) => c.extend(inner),
+                                    other => c.push(other),
+                                }
+                                Formula::And(c)
+                            }
+                        })
+                        .collect();
+                    match terms.len() {
+                        0 => cur,
+                        1 => terms.into_iter().next().expect("len checked == 1"),
+                        _ => Formula::Or(terms),
+                    }
+                }
+            };
+        }
+        assert_eq!(cur, vc.formula, "{label}: reconstruct(record) must equal the formula");
+    }
+}

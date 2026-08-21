@@ -471,6 +471,22 @@ pub fn provide(providers: &mut Providers) {
     };
     providers.fn_arg_idents = |tcx, def_id| {
         let node = tcx.hir_node_by_def_id(def_id);
+        // Trust (#64, 2026-08-20): a Clean-origin minted def carries SYNTHETIC HIR
+        // (`feed_hir()` plants `OwnerNode::Synthetic`, the RPITIT idiom), so it has
+        // no body and no HIR fn item — the fallthrough would `span_bug!`, and the
+        // bug's own `hir_span` call panics FIRST on the synthetic node, which is
+        // exactly how this surfaced: the metadata encoder's def walk
+        // (`encode_def_ids → fn_arg_idents`) on an island-carrying crate.
+        // All-`None` at the signature's arity is the honest answer — "no
+        // source-level parameter names" — and every consumer (diagnostics hints,
+        // rustdoc, cross-crate arg-name suggestions) handles `None` per argument.
+        // The real Clean binder names live in the island declaration, which this
+        // crate cannot see; carrying them here would need a feedable query, which
+        // is an upgrade for the mint lane, not a correctness requirement.
+        if let Node::Synthetic = node {
+            let arity = tcx.fn_sig(def_id).skip_binder().skip_binder().inputs().len();
+            return tcx.arena.alloc_from_iter((0..arity).map(|_| None));
+        }
         if let Some(body_id) = node.body_id() {
             tcx.arena.alloc_from_iter(tcx.hir_body_param_idents(body_id))
         } else if let Node::TraitItem(&TraitItem {

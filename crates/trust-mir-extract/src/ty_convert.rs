@@ -718,6 +718,49 @@ pub(crate) fn collected_datatype_defs() -> trust_types::DatatypeDefs {
     DATATYPE_DEFS.with(|c| c.borrow().defs.clone())
 }
 
+thread_local! {
+    static OWNER_DEF_PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Trust (vtable slice 17): RAII scope carrying the def path of the body currently
+/// being extracted, for the BODY-SCOPED half of the faithful principal key.
+///
+/// A trait object whose principal carries a bare generic PARAMETER (`dyn A<T>`) has no
+/// body-independent identity — `T` means "this body's first type parameter" — so the key
+/// must name the owner or two bodies' `dyn A<T>` merge into one `trait_id` for two
+/// distinct types. The producer reads its owner from `LowerCx::body_def`; the extractor
+/// has no such field on the recursive type walk, so it reads it here.
+///
+/// BOTH sides render the owner with `safe_def_path_str` of the SAME `DefId`
+/// (`body.source.def_id()` here, `self.body_def` there), so they render one string.
+/// Thread-local and RAII for the `DatatypeDefScope` reasons above: rustc runs
+/// `mir_built` in parallel and each worker owns its own extraction.
+///
+/// An UNSET scope renders the empty string, which fail-closes the param arm (never a
+/// guessed owner). That is visible, not silent: the producer would sign `FatPtr` where
+/// the oracle signs thin `Ptr`, which the differential reports as a signature
+/// disagreement rather than a merge.
+pub(crate) struct OwnerDefPathScope(String);
+
+impl OwnerDefPathScope {
+    pub(crate) fn begin(def_path: &str) -> Self {
+        let prev = OWNER_DEF_PATH.with(|c| c.replace(def_path.to_string()));
+        OwnerDefPathScope(prev)
+    }
+}
+
+impl Drop for OwnerDefPathScope {
+    fn drop(&mut self) {
+        let prev = std::mem::take(&mut self.0);
+        OWNER_DEF_PATH.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// The def path of the body currently being extracted (empty when unscoped).
+pub(crate) fn current_owner_def_path() -> String {
+    OWNER_DEF_PATH.with(|c| c.borrow().clone())
+}
+
 /// The full definitional `Ty` a cut point stands for: `ty` expanded EXACTLY ONE
 /// level, with every cut-point occurrence inside it — `ty` itself included —
 /// left as the by-name marker.
@@ -1959,6 +2002,20 @@ fn convert_ty_inner<'tcx>(
                 .principal_def_id()
                 .map(|def_id| crate::sysroot_authenticated_def_path_str(tcx, def_id))
                 .unwrap_or_else(|| "dyn".to_string()),
+            // Trust (vtable slice 17, SOUNDNESS): `trait_name` above is GENERICS-ERASED
+            // (`dyn Convert<u32>` and `dyn Convert<u64>` render one string), so anything
+            // that keys a shared IDENTITY on it merges two distinct trait objects. This
+            // is the ORACLE half of the fix: stamp the faithful, injective key from the
+            // ONE shared renderer — the same function the THIR producer's
+            // `trait_object_id` calls — so the bridge, which holds no `tcx`, can hash a
+            // string it did not have to re-derive. `None` (not injectively renderable)
+            // makes every identity consumer fail closed.
+            principal_key: crate::faithful_principal_key(
+                tcx,
+                predicates,
+                &current_owner_def_path(),
+            )
+            .ok(),
         },
         TyKind::Closure(def_id, args) => {
             let clo = args.as_closure();
@@ -2586,6 +2643,12 @@ fn lower_enum_adt<'tcx>(
     // faithful first-class spelling — the def would not be structurally equal
     // to the producer's.
     let mut compacted = false;
+    // Trust (vtable slice 16): per-variant-field admissibility for the FAITHFUL
+    // first-class spelling, accumulated in the walk (where the GROUND-TRUTH rustc
+    // field type is still in hand — the producer's own wave-EF rule: the mapped
+    // spelling alone cannot key admission). See
+    // `extractor_enum_variant_field_admissible` for the producer-mirror argument.
+    let mut fields_admissible = true;
 
     // 2. Flatten all variants (existing union view) + populate per-variant defs.
     for (v_idx, variant) in adt_def.variants().iter_enumerated() {
@@ -2650,6 +2713,19 @@ fn lower_enum_adt<'tcx>(
             } else {
                 field_ty
             };
+            // Trust (vtable slice 16): admission is tested on the PER-VARIANT
+            // spelling (post the drop-free-ZST respell above) plus the rustc
+            // ground truth; only under the faithful lane (`eligible` requires
+            // `faithful_scalars()` anyway — skipping the walk off-lane keeps the
+            // verifier lanes byte-identical in work as well as output).
+            if faithful_scalars() {
+                fields_admissible &= extractor_enum_variant_field_admissible(
+                    tcx,
+                    field.ty(tcx, args).skip_normalization(),
+                    &variant_field_ty,
+                    ctx,
+                );
+            }
             // Per-variant constructor field, named by the field's own name.
             variant_fields.push((field.name.to_string(), variant_field_ty));
         }
@@ -2694,34 +2770,35 @@ fn lower_enum_adt<'tcx>(
     // `Some` ONLY on the differential's faithful extraction AND for enums
     // ELIGIBLE for the format's EnumDef spelling — mirroring the THIR
     // producer's `register_enum` gates so both sides register structurally
-    // EQUAL defs: every variant field a seedable scalar (ints incl.
-    // pointer-width / bool / float — the producer's seed_constant set), no
-    // compacted field, a DIRECT tag encoding (`disc_index_safe` — the G1/G2
-    // fail-close: niche `Option<&T>`, untagged and layout-exotic enums keep
-    // the flat spelling), and a mappable repr hint (`repr(i128)` declines,
-    // exactly like the producer's `enum_repr_hint`). The hint itself is
-    // CARRIED (as `Some(inner)`) because the producer pins it on its EnumDef —
-    // omitting it would make structurally-equal enums disagree on
+    // EQUAL defs. B3-1 froze the mirror at the producer's THEN-current
+    // admission (seedable scalars + Direct tag); the producer has since
+    // widened (wave-EP thin `Ty::Ptr`, #174 sized `Ty::Struct`, wave-EF
+    // `FatPtr(Str)`, B3-3 nested `Ty::Enum` — and registration was NEVER
+    // Direct-tag-gated there), which left every pointer/struct-payload and
+    // niche/Variants::Single enum flat on THIS side only — the slice-11
+    // "flat enum-model" oracle-havoc family.
+    //
+    // Trust (vtable slice 16): the mirror is RE-SYNCED. Field admission is the
+    // walk-accumulated `fields_admissible` (see
+    // `extractor_enum_variant_field_admissible` — the per-field producer
+    // mirror, incl. the sized-pointee wall that keeps the producer's fat-pair
+    // spellings out). The `disc_index_safe` conjunct is GONE from eligibility
+    // — it was a proxy for the B3-1-era producer, not a producer gate; the
+    // layout question the first-class spelling actually has is answered by
+    // the DESCRIPTOR fill below (Direct/Niche/Untagged lockstep twins, absent-
+    // fill fail-safe) and by `canonical_tag_repr` at the bridge (the
+    // producer's own registration gate, mirrored there since B3-1). The flag
+    // itself is still computed and carried — the native bridge's
+    // `Discriminant` Assume is its consumer and is UNCHANGED.
+    //
+    // Remaining conjuncts as before: no compacted field, non-empty variants,
+    // and a mappable repr hint (`repr(i128)` declines, exactly like the
+    // producer's `enum_repr_hint`). The hint itself is CARRIED (as
+    // `Some(inner)`) because the producer pins it on its EnumDef — omitting
+    // it would make structurally-equal enums disagree on
     // `canonical_tag_repr` (a false NotRun). The legacy lane and every
     // ineligible enum get `None` — byte-identical historical behavior.
-    let eligible = faithful_scalars()
-        && !compacted
-        && disc_index_safe
-        && !variants.is_empty()
-        && variants.iter().all(|v| {
-            v.fields.iter().all(|(_, t)| {
-                matches!(
-                    t,
-                    TrustTy::Int { .. }
-                        | TrustTy::Bool
-                        | TrustTy::Float { .. }
-                        | TrustTy::PtrSizedInt { .. }
-                        // Trust (B3-2c E6): the canonical drop-free-ZST collapse —
-                        // only ever minted by the faithful-lane respell above.
-                        | TrustTy::Unit
-                )
-            })
-        });
+    let eligible = faithful_scalars() && !compacted && !variants.is_empty() && fields_admissible;
     let faithful_enum_repr = if eligible { extractor_enum_repr_hint(adt_def) } else { None };
     // Trust (B3-3): the concrete enum layout twin — filled ONLY alongside the
     // faithful first-class spelling (an ineligible enum keeps the flat view,
@@ -2949,6 +3026,100 @@ fn extractor_drop_free_zst<'tcx>(
         return false;
     };
     layout.is_zst() && !ty.needs_drop(tcx, typing_env)
+}
+
+/// Trust (vtable slice 16): may this field appear in a FAITHFUL first-class
+/// `EnumDef` — the extractor mirror of the THIR producer's
+/// `enum_variant_field_admissible` (trust-thir-lower), re-synced from the
+/// frozen B3-1 scalar wall to the producer's CURRENT admission. Tested on the
+/// PER-VARIANT TrustTy spelling (`t`, post the drop-free-ZST → `Unit` respell)
+/// PLUS the GROUND-TRUTH rustc field type — the producer's own wave-EF rule:
+/// the mapped spelling alone is many-to-one and cannot key admission.
+///
+/// The producer-mirror, arm by arm (each names the trust-ir spelling BOTH
+/// sides reach, which is what `tys_agree` compares):
+///  * scalars — `seed_constant`'s set: ints (all widths incl. 128),
+///    bool, f32/f64 (f16/f128 fail closed on the producer via `map_ty`'s
+///    float-width wall, so they must NOT admit here), isize/usize, char, and
+///    the E1 drop-free-ZST `Unit` respell.
+///  * shared `&str` (wave-EF) — `Ref{mutable:false, inner:Str}`; the bridge
+///    spells it `FatPtr(Str)`, exactly the producer. `&mut str` is EXCLUDED
+///    (falls to the sized-pointee arm below and `str` is unsized): the
+///    producer spells it thin `Ty::Ptr` while the bridge's mutability-blind
+///    `Str` arm would spell it fat — admitting it would mint a permanent
+///    (Ptr, FatPtr) coverage Err on every such signature.
+///  * thin references / raw pointers (wave-EP) — admitted ONLY for a SIZED
+///    rustc pointee. Sizedness is the load-bearing wall, not a convenience:
+///    the producer spells a ref-to-DST-tail CONTAINER (`&ArcInner<str>`) as
+///    the anonymous fat pair `Tuple([Ptr, I64])` (its T5 rule) and its enum
+///    wall then declines the whole def (Tuple is inadmissible there) — so a
+///    sized-pointee test here reaches exactly the producer's `Ty::Ptr` set,
+///    and every fat-spelled pointee (slice/str/dyn, DST-tail containers,
+///    `*const [T]`) stays out. A `dyn` pointee is also correctly excluded:
+///    `FatPtr(TraitObject)` is NOT producer-admissible as an enum field.
+///  * SIZED struct payloads (#174) — a struct-kind `Adt` carrying its
+///    faithful-lane layout twin (`layout: Some`), the extractor's analogue of
+///    the producer's `registered_struct_size(sid).is_some()` gate: the
+///    interpreter sizes a `Ty::Struct` variant field from the DEF's recorded
+///    size at the enum's FIRST construction, so an unsized def would trap
+///    bodies that never touch the struct. Unions keep declining (producer:
+///    unions are not admissible anywhere in an enum def).
+///  * nested first-class enums (B3-3) — an enum-kind `Adt` that is ITSELF
+///    eligible (`faithful_enum_repr: Some`); the bridge maps it
+///    `TrustIrTy::Enum`, the producer's `Ty::Enum(inner)` twin. A nested
+///    INELIGIBLE enum declines the outer def (fail-closed default), exactly
+///    like the producer's `map_ty` collapse does there.
+///
+/// Fail-closed by default: a spelling this function has not been taught about
+/// declines the whole enum, exactly as before — tuples, arrays, fn pointers
+/// (`Option<fn()>` — the producer declines `Ty::Func` fields), `Datatype`
+/// markers, `Never` (unreachable here: a monomorphic `!` field is a drop-free
+/// ZST and respells `Unit` upstream — see the issue-54378 probe dump), and
+/// every generic/opaque leaf.
+fn extractor_enum_variant_field_admissible<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    rust_fty: ty::Ty<'tcx>,
+    t: &TrustTy,
+    ctx: &TyLoweringCtx<'tcx>,
+) -> bool {
+    match t {
+        TrustTy::Int { .. }
+        | TrustTy::Bool
+        | TrustTy::Float { width: 32 | 64 }
+        | TrustTy::PtrSizedInt { .. }
+        | TrustTy::Char
+        // Trust (B3-2c E6): the canonical drop-free-ZST collapse — only ever
+        // minted by the faithful-lane respell in the variant walk.
+        | TrustTy::Unit => true,
+        // Shared `&str` — wave-EF's `FatPtr(Str)` on both sides.
+        TrustTy::Ref { mutable: false, inner } if matches!(inner.as_ref(), TrustTy::Str) => true,
+        // Thin pointer — wave-EP's `Ty::Ptr` on both sides, gated on the RUSTC
+        // pointee being SIZED (see the doc: the wall that keeps every
+        // fat-spelled pointee out). Fail-closed without a typing env or with
+        // a generic pointee.
+        TrustTy::Ref { .. } | TrustTy::RawPtr { .. } => {
+            let Some(typing_env) = ctx.typing_env else {
+                return false;
+            };
+            let pointee = match rust_fty.kind() {
+                TyKind::Ref(_, pointee, _) => *pointee,
+                TyKind::RawPtr(pointee, _) => *pointee,
+                // The mapped spelling says pointer but the ground truth does
+                // not (an alias/normalization gap) — refuse rather than guess.
+                _ => return false,
+            };
+            !pointee.has_non_region_param() && pointee.is_sized(tcx, typing_env)
+        }
+        // SIZED struct payload (#174 mirror).
+        TrustTy::Adt { adt_kind: Some(trust_types::AdtKind::Struct), layout, variants, .. } => {
+            variants.is_empty() && layout.is_some()
+        }
+        // Nested first-class enum (B3-3 mirror).
+        TrustTy::Adt { adt_kind: Some(trust_types::AdtKind::Enum), faithful_enum_repr, .. } => {
+            faithful_enum_repr.is_some()
+        }
+        _ => false,
+    }
 }
 
 fn enum_discriminant_index_safe<'tcx>(

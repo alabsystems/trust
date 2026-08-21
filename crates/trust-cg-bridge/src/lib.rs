@@ -45,6 +45,11 @@ pub mod binary_conversion;
 // slice (Const/BinOp/ICmp/Return over integer scalars).
 pub mod module_to_lir;
 
+// Trust: function-entry register bindings for binary-lifted bodies — the
+// per-block write-freedom certificate and the byte-assembled load recognizer
+// behind the real Opcode::Load lowering.
+pub mod entry_binding;
+
 // Trust: #948 — split monolithic lib.rs into focused modules.
 mod lift;
 mod lower;
@@ -91,7 +96,11 @@ pub use binary_conversion::{
     BinaryTrustCgSymbolicFormulaEvidence, BinaryTrustCgTargetProofBinding,
     BinaryTrustCgUnsupportedLedgerEvidence, BinaryTrustCgValidationBlocker,
     BinaryTrustCgValidationStatus, CanonicalTrustCgConversion, lower_binary_decompiled_function_to_lir,
-    lower_binary_trust_ir_to_lir, lower_canonical_trust_ir_to_lir,
+    lower_binary_decompiled_function_to_lir_with_entry_bindings, lower_binary_trust_ir_to_lir,
+    lower_binary_trust_ir_to_lir_with_entry_bindings, lower_canonical_trust_ir_to_lir,
+};
+pub use entry_binding::{
+    BinaryEntryBindings, BinaryEntryParam, BindingArch, ConsumedSymbolicLowering,
 };
 pub use lift::lift_from_lir;
 pub use lower::{

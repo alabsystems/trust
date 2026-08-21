@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 
 use arg_file_command::ArgFileCommand;
 use shared_helpers::{
-    activate_cargo_test_shim_environment, cargo_test_no_verify_requested,
-    compile_uses_trust_bootstrap_no_verify, dylib_path, dylib_path_var, expand_rustc_argfiles,
+    RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV, activate_cargo_test_shim_environment,
+    cargo_test_no_verify_requested, dylib_path, dylib_path_var, expand_rustc_argfiles,
     finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
-    parse_rustc_verbose, parse_value_from_args, trust_bootstrap_shim_marker_enabled,
+    parse_rustc_verbose, parse_value_from_args, retired_trust_bootstrap_shim_target_only_refusal,
+    trust_bootstrap_no_verify_applies, trust_bootstrap_shim_marker_enabled,
 };
 
 #[path = "../utils/shared_helpers.rs"]
@@ -24,6 +25,14 @@ mod arg_file_command;
 mod tests;
 
 fn main() {
+    // Refuse the retired marker on the AMBIENT environment, before the
+    // Cargo-test sidecar can rewrite anything. Same guard as the rustc shim.
+    if let Some(message) = retired_trust_bootstrap_shim_target_only_refusal(
+        env::var_os(RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV).as_deref(),
+    ) {
+        panic!("{message}");
+    }
+
     let authenticated_targo_frontend =
         env::var_os("TRUST_TARGO_FRONTEND").is_some_and(|value| value == "1");
     let mut isolated_shim_environment = activate_cargo_test_shim_environment()
@@ -65,13 +74,19 @@ fn main() {
             })
     };
 
-    let rustdoc_bootstrap_no_verify_applies = rustdoc_bootstrap_no_verify_applies(
+    // ONE no-verify policy, shared with the rustc shim. rustdoc has a single
+    // driver, so the same capability answer covers both the targeted and the
+    // untargeted arm — which is exactly what rustdoc's own former copy of this
+    // predicate computed, minus the risk of the two drifting again.
+    let rustdoc_bootstrap_no_verify_applies = trust_bootstrap_no_verify_applies(
+        target.is_some(),
         cargo_test_no_verify_requested(
             trust_bootstrap_shim_marker_enabled(
                 env::var_os("TRUST_BOOTSTRAP_SHIM_NO_VERIFY").as_deref(),
             ),
             authenticated_targo_frontend,
         ),
+        rustdoc_supports_trust_no_verify,
         rustdoc_supports_trust_no_verify,
         &args,
         parse_value_from_args(&args, "--crate-name"),
@@ -183,13 +198,4 @@ fn main() {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => panic!("\n\nfailed to run {cmd:?}: {e}\n\n"),
     })
-}
-
-fn rustdoc_bootstrap_no_verify_applies(
-    requested: bool,
-    rustdoc_supports_no_verify: bool,
-    args: &[std::ffi::OsString],
-    _crate_name: Option<&str>,
-) -> bool {
-    requested && rustdoc_supports_no_verify && compile_uses_trust_bootstrap_no_verify(args)
 }

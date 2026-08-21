@@ -35,6 +35,7 @@ EXPECTED_HEAD="${TRUST_CERTIFIED_MONITOR_EXPECTED_HEAD:-}"
 TESTS=(
     "tests::real_targo_test_instruments_library_used_by_integration_test"
     "tests::real_targo_test_executes_loop_invariant_violation"
+    "tests::real_targo_test_executes_e5_tailcall_and_extended_carriers"
     "tests::real_targo_test_executes_authorized_satisfying_integration_test"
     "tests::real_targo_test_rejects_unharnessed_test_target_before_execution"
 )
@@ -63,8 +64,9 @@ identify the current repository HEAD, and the committed checkout (including subm
 and untracked inputs) must remain clean. Cargo runs with private
 HOME/TMPDIR/CARGO_HOME directories seeded only
 from TRUST_CERTIFIED_MONITOR_E2E_CACHE_HOME's checksummed archives and a plain,
-symlink-free registry-index snapshot. Git-sourced lock entries fail closed until
-an authenticated Git-cache snapshot boundary exists. There is no allow-skip
+symlink-free registry-index snapshot. Git-sourced lock entries fail closed: the
+consuming workspace must redirect every first-party Git edge to the exact local
+checkout through committed path patches. There is no allow-skip
 mode: an absent or stale toolchain, reusable output directory, missing ignored
 test, zero-test selection, or unsupported platform is a payload failure.
 
@@ -455,7 +457,6 @@ seed_private_cargo_home() {
     local source_cache
     local source_index
     local registry_rows
-    local git_source_count
     local name
     local version
     local expected_digest
@@ -487,10 +488,7 @@ seed_private_cargo_home() {
     # before copying, then recheck the isolated destination to close replacement
     # races that materialize as a non-plain copied entry.
     require_plain_tree "$source_index" "Cargo registry index seed" || return 1
-    [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] || {
-        echo "error: targo-trust Cargo.lock is not one exact regular file: $LOCK_FILE" >&2
-        return 1
-    }
+    "$SCRIPT_DIR/check_lockfile_no_git_sources.sh" "$LOCK_FILE" || return 1
 
     mkdir -m 700 -- \
         "$private_home" \
@@ -565,17 +563,6 @@ seed_private_cargo_home() {
     done <<< "$registry_rows"
     if [[ "$seeded_archives" -eq 0 ]]; then
         echo "error: Cargo cache seed contains none of Cargo.lock's checksummed registry archives" >&2
-        return 1
-    fi
-
-    git_source_count="$(awk '/^source = "git\+/{count++} END {print count + 0}' "$LOCK_FILE")" || return 1
-    if [[ "$git_source_count" -gt 0 ]]; then
-        # A symlink to Cargo's caller-owned bare DB is not a snapshot: refs,
-        # config, and objects can change while the gate runs. Copying the whole
-        # DB without independently authenticating its config/objects is not an
-        # evidence boundary either. Refuse Git sources until that format is
-        # designed and regression-sealed.
-        echo "error: Cargo.lock contains $git_source_count Git-sourced package(s), but certified-monitor E2E admits only checksummed registry archives" >&2
         return 1
     fi
 
@@ -809,7 +796,7 @@ esac
 IDENTITY_LOG="$LOG_DIR/gate-identity.txt"
 EVIDENCE_FILES=()
 {
-    printf 'schema=trust.certified-monitor-e2e-payload-identity.v4\n'
+    printf 'schema=trust.certified-monitor-e2e-payload-identity.v5\n'
     printf 'result_scope=payload-only\n'
     printf 'source_authority=unverified\n'
     printf 'head=%s\n' "$CURRENT_HEAD"
@@ -910,7 +897,7 @@ done
 
 # The prefix is the reviewed release-boundary namespace. Require equality,
 # not merely inclusion: otherwise a newly added real-Targo monitor regression
-# could remain ignored forever while this gate continued to report 3/3.
+# could remain ignored forever while this gate continued to report 5/5.
 INVENTORIED_RELEASE_TESTS=()
 while IFS= read -r inventory_name; do
     INVENTORIED_RELEASE_TESTS+=("$inventory_name")

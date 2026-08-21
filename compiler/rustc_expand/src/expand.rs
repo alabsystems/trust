@@ -44,7 +44,8 @@ use crate::diagnostics::{
 };
 use crate::mbe::diagnostics::annotate_err_with_kind;
 use crate::module::{
-    DirOwnership, ParsedExternalMod, mod_dir_path, mod_file_path_from_attr, parse_external_mod,
+    DirOwnership, ParsedExternalMod, load_clean_unit, mod_dir_path, mod_file_path_from_attr,
+    parse_external_mod,
 };
 use crate::placeholders::{PlaceholderExpander, placeholder};
 use crate::stats::*;
@@ -1320,6 +1321,48 @@ impl InvocationCollectorNode for Box<ast::Item> {
         collector: &mut InvocationCollector<'_, '_>,
         walk_flat_map: impl FnOnce(Self, &mut InvocationCollector<'_, '_>) -> Self::OutputTy,
     ) -> Result<Self::OutputTy, Self> {
+        // Trust (I8): out-of-line `clean mod name;` — load `name.clean` HERE,
+        // at the exact seam where out-of-line `mod name;` bodies load (the
+        // `ModKind::Unloaded` arm below). Two properties of this seam are
+        // load-bearing and neither exists at parse time:
+        //
+        //  * cfg runs FIRST. `flat_map_node` strips a `#[cfg]`'d-out item
+        //    before this function is reached, so a unit behind a false cfg is
+        //    never demanded from disk — parity with `mod`.
+        //  * everything loaded during the ROOT fragment's collector walk is
+        //    still inside the root `AstFragment::Crate` when
+        //    `trust_clean_mint::decide` runs (`collect_invocations` calls
+        //    `visit_ast_fragment_with_placeholders` only after this walk), so
+        //    a `.clean` unit reaches the mint decision, def collection,
+        //    lowering, the verify pass and the I7 source export as the SAME
+        //    node shape an inline island has — identical graph entries by
+        //    construction, not by translation.
+        //
+        // A unit introduced by a LATER macro expansion loads here too, but in
+        // a non-root fragment: it mints nothing and fails closed, exactly
+        // like a macro-introduced inline island. Its declarations are still
+        // elaborated and kernel-checked by the verify pass, also identically.
+        if matches!(&node.kind, ItemKind::CleanIsland(island) if island.unloaded_unit.is_some())
+        {
+            let (span, attrs) = (node.span, mem::take(&mut node.attrs));
+            let ItemKind::CleanIsland(ref mut island) = node.kind else { unreachable!() };
+            let unit_ident = island.unloaded_unit.take().expect("checked `is_some` just above");
+            let ecx = &mut collector.cx;
+            let loaded = load_clean_unit(
+                ecx.sess,
+                unit_ident,
+                span,
+                &ecx.current_expansion.module,
+                ecx.current_expansion.dir_ownership,
+                &attrs,
+                &mut ecx.trust_clean_units_loaded,
+            );
+            island.content_span = loaded.content_span;
+            island.text = loaded.text;
+            island.decls = loaded.decls;
+            node.attrs = attrs;
+            return Ok(walk_flat_map(node, collector));
+        }
         if !matches!(node.kind, ItemKind::Mod(..)) {
             return Ok(walk_flat_map(node, collector));
         }

@@ -61,6 +61,7 @@ macro_rules! trivially_parameterized_over_tcx {
 
 trivially_parameterized_over_tcx! {
     bool,
+    u8, // Trust: (I7) — for `Vec<u8>` rows (`trust_clean_verdict_digest` wire bytes).
     u64,
     usize,
     std::string::String,

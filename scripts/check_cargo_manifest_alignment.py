@@ -2,7 +2,7 @@
 """Read-only alignment checks for Trust Cargo manifests.
 
 The Trust repository has several Cargo entry points for different developer
-workflows. Three separate jobs live here, and only the second is about drift:
+workflows. Four separate jobs live here, and only the second is about drift:
 
 1. Patch-table equality across the root, `crates/` and `targo-trust`
    manifests. Cargo patches are per-workspace and not transitive, so a source
@@ -23,6 +23,13 @@ workflows. Three separate jobs live here, and only the second is about drift:
    `--fanout-tree-proof` proves it against a real `cargo tree` rather than the
    manifest text. This policy is independent of how many workspaces exist and
    outlives any consolidation of them.
+
+4. Local patch integrity and the standalone temporal boundary. Every local
+   patch must resolve inside this checkout to a manifest declaring the expected
+   package. The fabric fixture must remain an unpatched external consumer, and
+   every Git revision in its committed lock must still be declared by the local
+   path-dependency closure. This catches stale locks without pretending a
+   hard-coded list of optional first-party crates proves Cargo resolution.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +59,22 @@ MANIFESTS = {
     "crates": REPO_ROOT / "crates" / "Cargo.toml",
     "targo-trust": REPO_ROOT / "targo-trust" / "Cargo.toml",
 }
+
+TEMPORAL_MANIFEST = REPO_ROOT / "crates" / "trust-spec-temporal" / "Cargo.toml"
+TEMPORAL_FABRIC_MANIFEST = (
+    REPO_ROOT / "targo-trust" / "tests" / "fixtures" / "fabric" / "Cargo.toml"
+)
+TEMPORAL_FABRIC_LOCK = TEMPORAL_FABRIC_MANIFEST.with_name("Cargo.lock")
+
+LOCAL_PATCH_MANIFESTS = {
+    **MANIFESTS,
+    "trust-spec-temporal": TEMPORAL_MANIFEST,
+}
+
+LOCK_GIT_SOURCE_RE = re.compile(
+    r'^source = "git\+(?P<url>[^"?#]+)\?rev=(?P<requested>[0-9a-f]{7,40})'
+    r'#(?P<resolved>[0-9a-f]{40})"$'
+)
 
 FANOUT_POLICY_MANIFESTS = {
     "trust-bmc": REPO_ROOT / "crates" / "trust-bmc" / "Cargo.toml",
@@ -379,6 +403,279 @@ def patch_entries(name: str, manifest_path: Path, manifest: dict[str, Any]) -> s
     return entries
 
 
+def relative_display(path: Path) -> str:
+    try:
+        return path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def check_local_patch_targets(
+    manifests: dict[str, dict[str, Any]], manifest_paths: dict[str, Path]
+) -> list[str]:
+    """Validate every local patch, without freezing a hand-written crate list."""
+    errors: list[str] = []
+    package_name_cache: dict[Path, str | None] = {}
+
+    for manifest_name, manifest in manifests.items():
+        patches = manifest.get("patch", {})
+        if not isinstance(patches, dict):
+            errors.append(f"{manifest_name} [patch] must be a table")
+            continue
+
+        for source, table in patches.items():
+            if not isinstance(table, dict):
+                errors.append(f"{manifest_name} patch table for {source} must be a table")
+                continue
+            for patch_name, value in table.items():
+                if not isinstance(value, dict) or "path" not in value:
+                    continue
+                raw_path = value.get("path")
+                if not isinstance(raw_path, str):
+                    errors.append(
+                        f"{manifest_name} {source} {patch_name} has no literal local path"
+                    )
+                    continue
+
+                target = (manifest_paths[manifest_name].parent / raw_path).resolve()
+                try:
+                    target.relative_to(REPO_ROOT)
+                except ValueError:
+                    errors.append(
+                        f"{manifest_name} {source} {patch_name} path escapes the checkout: "
+                        f"{target}"
+                    )
+                    continue
+
+                target_manifest = target / "Cargo.toml"
+                if not target_manifest.is_file():
+                    errors.append(
+                        f"{manifest_name} {source} {patch_name} path has no Cargo.toml: "
+                        f"{relative_display(target)}"
+                    )
+                    continue
+
+                if target_manifest not in package_name_cache:
+                    target_data = load_manifest(target_manifest)
+                    target_package = target_data.get("package", {})
+                    package_name_cache[target_manifest] = (
+                        str(target_package.get("name"))
+                        if isinstance(target_package, dict) and "name" in target_package
+                        else None
+                    )
+
+                expected_name = value.get("package", patch_name)
+                found_name = package_name_cache[target_manifest]
+                if not isinstance(expected_name, str) or found_name != expected_name:
+                    errors.append(
+                        f"{manifest_name} {source} {patch_name} path declares package "
+                        f"{found_name!r}, expected {expected_name!r}"
+                    )
+
+    return errors
+
+
+def dependency_tables(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    tables: list[dict[str, Any]] = []
+    for section in ("dependencies", "build-dependencies"):
+        values = manifest.get(section, {})
+        if isinstance(values, dict):
+            tables.append(values)
+
+    targets = manifest.get("target", {})
+    if isinstance(targets, dict):
+        for target in targets.values():
+            if not isinstance(target, dict):
+                continue
+            for section in ("dependencies", "build-dependencies"):
+                values = target.get(section, {})
+                if isinstance(values, dict):
+                    tables.append(values)
+    return tables
+
+
+def workspace_dependency(
+    dependency_name: str,
+    manifest_path: Path,
+    manifest_cache: dict[Path, dict[str, Any]],
+) -> tuple[Any | None, Path | None]:
+    """Resolve one `workspace = true` dependency at its nearest workspace root."""
+    for directory in (manifest_path.parent, *manifest_path.parent.parents):
+        candidate = directory / "Cargo.toml"
+        if not candidate.is_file():
+            if directory == REPO_ROOT:
+                break
+            continue
+        if candidate not in manifest_cache:
+            manifest_cache[candidate] = load_manifest(candidate)
+        candidate_data = manifest_cache[candidate]
+        if "workspace" not in candidate_data:
+            if directory == REPO_ROOT:
+                break
+            continue
+        return workspace_table(candidate_data, "dependencies").get(dependency_name), candidate
+    return None, None
+
+
+def reachable_git_revisions(start_manifest: Path) -> tuple[set[tuple[str, str]], list[str]]:
+    """Collect pinned Git identities reachable through local path dependencies.
+
+    Optional dependencies are included deliberately: a lock may record them, and
+    accepting their current declared revision is conservative without accepting
+    an obsolete revision that no reachable manifest names anymore.
+    """
+    allowed: set[tuple[str, str]] = set()
+    errors: list[str] = []
+    pending = [start_manifest.resolve()]
+    visited: set[Path] = set()
+    manifest_cache: dict[Path, dict[str, Any]] = {}
+
+    while pending:
+        manifest_path = pending.pop()
+        if manifest_path in visited:
+            continue
+        visited.add(manifest_path)
+        if not manifest_path.is_file():
+            errors.append(
+                f"reachable path dependency has no Cargo.toml: {relative_display(manifest_path)}"
+            )
+            continue
+        if manifest_path not in manifest_cache:
+            manifest_cache[manifest_path] = load_manifest(manifest_path)
+        manifest = manifest_cache[manifest_path]
+
+        for table in dependency_tables(manifest):
+            for dependency_name, raw_value in table.items():
+                value = raw_value
+                value_manifest = manifest_path
+                if isinstance(value, dict) and value.get("workspace") is True:
+                    inherited, workspace_manifest = workspace_dependency(
+                        str(dependency_name), manifest_path, manifest_cache
+                    )
+                    if inherited is None or workspace_manifest is None:
+                        errors.append(
+                            f"{relative_display(manifest_path)} inherits undefined workspace "
+                            f"dependency {dependency_name}"
+                        )
+                        continue
+                    if isinstance(inherited, dict):
+                        merged = dict(inherited)
+                        merged.update(
+                            {
+                                key: item
+                                for key, item in value.items()
+                                if key != "workspace"
+                            }
+                        )
+                        value = merged
+                    else:
+                        value = inherited
+                    value_manifest = workspace_manifest
+
+                if not isinstance(value, dict):
+                    continue
+                git_url = value.get("git")
+                if git_url is not None:
+                    revision = value.get("rev")
+                    if not isinstance(git_url, str) or not isinstance(revision, str):
+                        errors.append(
+                            f"{relative_display(value_manifest)} dependency {dependency_name} "
+                            "must pin its Git source with one literal rev"
+                        )
+                        continue
+                    if re.fullmatch(r"[0-9a-f]{7,40}", revision) is None:
+                        errors.append(
+                            f"{relative_display(value_manifest)} dependency {dependency_name} "
+                            f"has non-canonical Git rev {revision!r}"
+                        )
+                        continue
+                    allowed.add((git_url, revision))
+                    continue
+
+                raw_path = value.get("path")
+                if not isinstance(raw_path, str):
+                    continue
+                target_manifest = (value_manifest.parent / raw_path / "Cargo.toml").resolve()
+                try:
+                    target_manifest.relative_to(REPO_ROOT)
+                except ValueError:
+                    errors.append(
+                        f"{relative_display(manifest_path)} dependency {dependency_name} "
+                        f"escapes the checkout: {target_manifest}"
+                    )
+                    continue
+                pending.append(target_manifest)
+
+    return allowed, errors
+
+
+def check_temporal_fabric_boundary(manifest: dict[str, Any]) -> list[str]:
+    """Keep the fixture an external consumer rather than a patched twin."""
+    errors: list[str] = []
+    patches = manifest.get("patch")
+    if patches is not None:
+        errors.append(
+            "temporal fabric fixture must omit all [patch] tables; its external-consumer "
+            "boundary depends on observing non-transitive source patches"
+        )
+
+    if "workspace" not in manifest or not isinstance(manifest.get("workspace"), dict):
+        errors.append("temporal fabric fixture must remain its own workspace")
+
+    dependency = dependency_value(manifest, "trust-spec-temporal")
+    if not isinstance(dependency, dict) or not isinstance(dependency.get("path"), str):
+        errors.append("temporal fabric fixture must use one local trust-spec-temporal path")
+    else:
+        resolved = (TEMPORAL_FABRIC_MANIFEST.parent / dependency["path"]).resolve()
+        if resolved != TEMPORAL_MANIFEST.parent.resolve():
+            errors.append(
+                "temporal fabric fixture trust-spec-temporal path does not resolve to the "
+                "canonical engine"
+            )
+    return errors
+
+
+def check_temporal_fabric_lock_source_revs(lock_text: str | None = None) -> list[str]:
+    """Reject a fixture lock whose Git identities disappeared from its path closure."""
+    allowed, errors = reachable_git_revisions(TEMPORAL_FABRIC_MANIFEST)
+    if lock_text is None:
+        if not TEMPORAL_FABRIC_LOCK.is_file() or TEMPORAL_FABRIC_LOCK.is_symlink():
+            errors.append("temporal fabric Cargo.lock must be one exact regular file")
+            return errors
+        lock_text = TEMPORAL_FABRIC_LOCK.read_text(encoding="utf-8")
+
+    git_source_rows = 0
+    for line_number, line in enumerate(lock_text.splitlines(), start=1):
+        if not re.match(r"^\s*source\s*=", line) or "git+" not in line:
+            continue
+        git_source_rows += 1
+        match = LOCK_GIT_SOURCE_RE.fullmatch(line)
+        if match is None:
+            errors.append(
+                f"temporal fabric Cargo.lock:{line_number} has a malformed or unpinned "
+                "Git source row"
+            )
+            continue
+        identity = (match.group("url"), match.group("requested"))
+        if identity not in allowed:
+            errors.append(
+                f"temporal fabric Cargo.lock:{line_number} uses Git revision "
+                f"{identity[0]}@{identity[1]} not declared by its reachable manifest closure"
+            )
+        if not match.group("resolved").startswith(match.group("requested")):
+            errors.append(
+                f"temporal fabric Cargo.lock:{line_number} resolved commit does not match "
+                "its requested rev"
+            )
+
+    if git_source_rows == 0:
+        errors.append(
+            "temporal fabric Cargo.lock has no Git source rows; the unpatched external-consumer "
+            "boundary is no longer being exercised"
+        )
+    return errors
+
+
 def workspace_list(manifest: dict[str, Any], key: str) -> set[str]:
     workspace = manifest.get("workspace", {})
     if not isinstance(workspace, dict):
@@ -676,6 +973,32 @@ def self_check_error_contains(
 
 def run_self_check() -> list[str]:
     failures: list[str] = []
+    local_patch_manifests = {
+        name: load_manifest(path)
+        for name, path in LOCAL_PATCH_MANIFESTS.items()
+    }
+    local_patch_errors = check_local_patch_targets(
+        local_patch_manifests, LOCAL_PATCH_MANIFESTS
+    )
+    if local_patch_errors:
+        failures.append(
+            "current local patch targets should pass: " + "; ".join(local_patch_errors)
+        )
+
+    fabric_manifest = load_manifest(TEMPORAL_FABRIC_MANIFEST)
+    fabric_boundary_errors = check_temporal_fabric_boundary(fabric_manifest)
+    if fabric_boundary_errors:
+        failures.append(
+            "current temporal fabric boundary should pass: "
+            + "; ".join(fabric_boundary_errors)
+        )
+
+    fabric_lock_errors = check_temporal_fabric_lock_source_revs()
+    if fabric_lock_errors:
+        failures.append(
+            "current temporal fabric lock should pass: " + "; ".join(fabric_lock_errors)
+        )
+
     fanout_manifests = {
         name: load_manifest(path)
         for name, path in FANOUT_POLICY_MANIFESTS.items()
@@ -684,6 +1007,75 @@ def run_self_check() -> list[str]:
     baseline_errors = check_dependency_fanout_policy(fanout_manifests)
     if baseline_errors:
         failures.append("current fanout policy should pass: " + "; ".join(baseline_errors))
+
+    case = copy.deepcopy(local_patch_manifests)
+    case["root"]["patch"]["https://github.com/alabsystems/ay"]["ay"] = {
+        "path": "first-party/ay/crates/ay-core"
+    }
+    self_check_error_contains(
+        check_local_patch_targets(case, LOCAL_PATCH_MANIFESTS),
+        "declares package 'ay-core', expected 'ay'",
+        failures,
+        "local patch wrong-package target",
+    )
+
+    case = copy.deepcopy(local_patch_manifests)
+    case["root"]["patch"]["https://github.com/alabsystems/ay"]["ay"] = {
+        "path": "first-party/ay/crates/does-not-exist"
+    }
+    self_check_error_contains(
+        check_local_patch_targets(case, LOCAL_PATCH_MANIFESTS),
+        "path has no Cargo.toml",
+        failures,
+        "local patch missing target",
+    )
+
+    case = copy.deepcopy(fabric_manifest)
+    case["patch"] = {
+        "https://github.com/alabsystems/ay.git": {
+            "ay": {"path": "../../../../first-party/ay/crates/ay"}
+        }
+    }
+    self_check_error_contains(
+        check_temporal_fabric_boundary(case),
+        "must omit all [patch] tables",
+        failures,
+        "temporal fabric patch regression",
+    )
+
+    case = copy.deepcopy(fabric_manifest)
+    case["dependencies"]["trust-spec-temporal"] = {
+        "path": "../../../../crates/trust-temporal"
+    }
+    self_check_error_contains(
+        check_temporal_fabric_boundary(case),
+        "does not resolve to the canonical engine",
+        failures,
+        "temporal fabric engine shadow regression",
+    )
+
+    lock_text = TEMPORAL_FABRIC_LOCK.read_text(encoding="utf-8")
+    stale_lock = re.sub(
+        r"\?rev=[0-9a-f]{40}#[0-9a-f]{40}",
+        "?rev=0000000000000000000000000000000000000000"
+        "#0000000000000000000000000000000000000000",
+        lock_text,
+        count=1,
+    )
+    self_check_error_contains(
+        check_temporal_fabric_lock_source_revs(stale_lock),
+        "not declared by its reachable manifest closure",
+        failures,
+        "temporal fabric stale Git revision",
+    )
+
+    malformed_lock = lock_text.replace('source = "git+', ' source = "git+', 1)
+    self_check_error_contains(
+        check_temporal_fabric_lock_source_revs(malformed_lock),
+        "malformed or unpinned Git source row",
+        failures,
+        "temporal fabric malformed Git source",
+    )
 
     required_proof_fragments = (
         "cargo tree --manifest-path crates/Cargo.toml -p trust-bmc",
@@ -905,6 +1297,16 @@ def main() -> int:
     }
 
     patch_errors = check_patch_alignment(manifests)
+    local_patch_manifests = {
+        name: load_manifest(path)
+        for name, path in LOCAL_PATCH_MANIFESTS.items()
+    }
+    local_patch_errors = check_local_patch_targets(
+        local_patch_manifests, LOCAL_PATCH_MANIFESTS
+    )
+    fabric_manifest = load_manifest(TEMPORAL_FABRIC_MANIFEST)
+    fabric_boundary_errors = check_temporal_fabric_boundary(fabric_manifest)
+    fabric_lock_errors = check_temporal_fabric_lock_source_revs()
     membership_errors = check_workspace_membership(
         manifests, advisory_summary=args.workspace_drift_advisory
     )
@@ -913,16 +1315,35 @@ def main() -> int:
         for name, path in FANOUT_POLICY_MANIFESTS.items()
     }
     fanout_errors = check_dependency_fanout_policy(fanout_manifests)
-    errors = [*patch_errors, *membership_errors, *fanout_errors]
+    errors = [
+        *patch_errors,
+        *local_patch_errors,
+        *fabric_boundary_errors,
+        *fabric_lock_errors,
+        *membership_errors,
+        *fanout_errors,
+    ]
 
     if errors:
-        advisory_only = args.workspace_drift_advisory and not patch_errors and not fanout_errors
+        advisory_only = (
+            args.workspace_drift_advisory
+            and not patch_errors
+            and not local_patch_errors
+            and not fabric_boundary_errors
+            and not fabric_lock_errors
+            and not fanout_errors
+        )
         if advisory_only:
             print("Cargo manifest alignment advisory:")
         else:
             print("Cargo manifest alignment check failed:")
-        if not patch_errors:
-            print("patch tables are aligned across root, crates, and targo-trust.")
+        if not patch_errors and not local_patch_errors:
+            print(
+                "patch tables are aligned across root, crates, and targo-trust, "
+                "and local targets are valid."
+            )
+        if not fabric_boundary_errors and not fabric_lock_errors:
+            print("temporal fabric external boundary and lock revisions are coherent.")
         if not fanout_errors:
             print("dependency fanout manifest policy is preserved.")
         if not membership_errors:
@@ -931,7 +1352,10 @@ def main() -> int:
             print(error)
         return 0 if advisory_only else 1
 
-    print("Cargo manifest alignment and dependency fanout policy check passed.")
+    print(
+        "Cargo manifest alignment, local patch integrity, temporal fabric boundary, "
+        "and dependency fanout policy check passed."
+    )
     return 0
 
 

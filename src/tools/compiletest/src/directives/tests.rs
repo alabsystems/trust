@@ -946,6 +946,45 @@ fn test_needs_trust_verify_wiring_check() {
         "//@ needs-trust-verify\n//@ compile-flags: -Ztrust-verify=on\n",
     );
     assert!(directives::do_early_directives_check(TestMode::Ui, &wired).is_ok());
+
+    let explicitly_off = FileDirectives::from_file_contents(
+        path,
+        "//@ needs-trust-verify\n//@ compile-flags: -Ztrust-verify=off\n",
+    );
+    assert!(directives::do_early_directives_check(TestMode::Ui, &explicitly_off).is_ok());
+}
+
+#[test]
+fn trust_ui_needs_trust_verify_fixtures_select_a_mode() {
+    let trust_ui = Utf8Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/ui/trust");
+    let mut wiring_errors = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&trust_ui).sort_by_file_name() {
+        let entry = entry.unwrap_or_else(|error| panic!("failed to walk {trust_ui}: {error}"));
+        if entry.path().extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let path = Utf8Path::from_path(entry.path())
+            .unwrap_or_else(|| panic!("non-UTF-8 Trust UI path: {:?}", entry.path()));
+        let contents = std::fs::read_to_string(entry.path())
+            .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+        let file_directives = FileDirectives::from_file_contents(path, &contents);
+        let needs_trust_verify =
+            file_directives.lines.iter().any(|line| line.name == "needs-trust-verify");
+        if needs_trust_verify
+            && let Err(error) =
+                directives::do_early_directives_check(TestMode::Ui, &file_directives)
+        {
+            wiring_errors.push(error);
+        }
+    }
+
+    assert!(
+        wiring_errors.is_empty(),
+        "Trust UI fixtures with invalid `needs-trust-verify` wiring:\n{}",
+        wiring_errors.join("\n")
+    );
 }
 
 #[test]

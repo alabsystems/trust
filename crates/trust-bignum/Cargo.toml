@@ -1,0 +1,79 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-bignum — the Trust-owned arbitrary-precision natural number, the
+# runtime half of increment I6 of
+# docs/design/2026-08-04-two-language-compiler-architecture.md.
+#
+# WHY THIS CRATE EXISTS.
+# §5b: the default carrier for an UNBOUNDED Clean type is a Trust-owned bignum,
+# and trust-clean-carrier refuses `Nat` today precisely because "there is no
+# Trust-owned bignum to be a carrier". This crate is that runtime: a Rust value
+# type with Lean `Nat` semantics, exactly — because it is the carrier for
+# kernel `Nat`, and a semantic mismatch here is not a failed proof, it is a
+# WRONG BINARY.
+#
+# THE EMPTY DEPENDENCY LIST IS PART OF THE ARGUMENT.
+# Owning the supply chain is a design principle (docs/DESIGN_PHILOSOPHY.md).
+# No num-bigint, no vendored foreign code, no proc-macro helpers — every limb
+# of arithmetic that ends up inside a verified binary is authored here, in one
+# auditable crate, with the Lean definition each operation matches cited at the
+# operation. It is also deliberately NOT a dependency of clean-kernel and does
+# not depend on it AT RUNTIME: the kernel's BigNat and this runtime are two
+# independent implementations of the same semantics, and the tests that pin
+# their agreement are evidence precisely because the code is not shared.
+#
+# The ONE exception is a DEV-dependency (below): tests/kernel_differential.rs
+# links the real clean-kernel and drives its whnf reduction lanes
+# (`Nat.add/sub/mul/div/mod/beq/ble` on literal operands) against this runtime
+# on randomized multi-limb values. Nothing that ships links the kernel — the
+# differential is evidence BECAUSE the two sides stay independently authored,
+# and executing it is what upgrades "transcribed the semantics" to "measured
+# agreement with the kernel that checks the proofs".
+#
+# The crate is #![no_std] (alloc only): a carrier runtime that every Clean-
+# calling user program links must not force std onto a no_std target, for the
+# same reason compiler_builtins does not.
+
+[package]
+name = "trust-bignum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned arbitrary-precision unsigned integer with Lean Nat semantics, exactly (I6): the bignum carrier runtime. Zero dependencies, no_std."
+
+[lints]
+workspace = true
+
+[dependencies]
+# NONE at default features, by design. Read the header before adding one.
+#
+# The two entries below do not weaken that: they are the standard
+# `rustc-dep-of-std` remapping (the exact shape cfg-if and libc use), optional
+# and INERT in every ordinary build of this crate. They exist so
+# `library/sysroot` can build this crate INTO the shipped sysroot (I6: the
+# compiler injects `trust_bignum` when a Clean-origin mint carries `Nat`, so
+# the rlib must be there). In that build `core`/`alloc` must resolve to the
+# in-tree crates being built alongside — which is what the
+# `rustc-std-workspace-*` stubs plus `library/Cargo.toml`'s `[patch]` table
+# arrange. In this workspace the stubs resolve to the empty crates.io
+# placeholder packages and are never activated or compiled.
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
+
+[features]
+# Activated ONLY by library/sysroot's dependency declaration. Gates the
+# core/alloc remapping above and every stability attribute in src/ (the std
+# build passes -Zforce-unstable-if-unmarked; the attributes keep user
+# `extern crate trust_bignum` off the rustc_private gate). All of it is
+# cfg_attr-gated so the plain-cargo fast lane of this crate stays green on a
+# stock toolchain.
+rustc-dep-of-std = ["dep:core", "dep:alloc"]
+
+[dev-dependencies]
+# TEST-ONLY, and the header explains why it may never move up a table: the
+# executed kernel differential (tests/kernel_differential.rs). The shipped
+# runtime stays zero-dependency.
+clean-kernel = { workspace = true }

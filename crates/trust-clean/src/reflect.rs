@@ -218,15 +218,6 @@ pub const CARRIER_NEVER: &str = "Trust.Sort.Never";
 /// recursor `axiom_deps` EMPTY — NO 4th axiom). Uninhabited by construction.
 pub const NEVER_INDUCTIVE: &str = "Trust.Never";
 
-/// TYPE-ZOO #2 (impl Trait, RPIT/TAIT) — prefix for an OPAQUE return type
-/// `impl Trait`. Like `dyn Trait`, an `impl Trait` opaque return is an EXISTENTIAL
-/// "∃ a concrete carrier `T : Type` together with the trait-method witness for `T`",
-/// so it reflects to the SAME `Sigma (T:Type), Vtable_<trait> T` existential a `dyn`
-/// does (`reflect_dyn` / `register_dyn_carriers`), under a distinct stable name so an
-/// `impl Trait` and a `dyn Trait` over the same trait do not collide. The DIFFERENCE
-/// from `dyn` is only erasure-site (return vs. dispatch); the dependent-type model is
-/// identical (the existential), rooted in the 3.
-pub const IMPL_TRAIT_PREFIX: &str = "Trust.Impl.";
 
 // --- GOAL-ITEM #3: structured IEEE-754 float carriers -----------------------
 //
@@ -440,8 +431,17 @@ pub const PARAM_KIND: &str = "TyKind::Param";
 /// const everywhere in one function, so `Π(T) … Π(x : T)` binds correctly.
 pub const PARAM_PREFIX: &str = "Trust.Param.";
 
-/// Prefix for a reflected TRAIT-OBJECT (`dyn Trait`) opaque type variable. A
-/// `Ty::Dynamic { trait_name }` reflects as the free const `Trust.Dyn.<trait_name>`,
+/// Prefix for a reflected TRAIT-OBJECT (`dyn Trait`) carrier.
+///
+/// SUPERSEDED NARRATIVE — read [`dyn_const_name`] for what this actually is today. A
+/// trait object is no longer a free, universally-quantified opaque type variable but a
+/// CLOSED existential (`Sigma (T:Type), Vtable T`) registered modulo 3, which is why
+/// `is_type_var_const` deliberately EXCLUDES `Trust.Dyn.*`. The identity it is keyed on
+/// is `Ty::Dynamic::principal_key` — the faithful, injective key — and NEVER the
+/// generics-erased `trait_name` that the paragraph below still names.
+///
+/// The original over-approximation argument, retained for history: a
+/// `Ty::Dynamic` reflected as the free const `Trust.Dyn.<key>`,
 /// collected + Pi-wrapped OUTERMOST as `Π(<dyn> : Type)` EXACTLY like a generic
 /// param. This is SOUND as an over-approximation: the contract becomes
 /// `∀ (D : Type), …` (a fresh opaque type variable per distinct trait), and proving
@@ -533,17 +533,44 @@ pub fn datatype_backref_const_name(name: &str) -> String {
     param_const_name(&format!("{DATATYPE_BACKREF_IDENT_PREFIX}{name}"))
 }
 
-/// The carrier const name for the trait object over `trait_name` (`Trust.Dyn.<name>`).
+/// The carrier const name for the trait object identified by `principal_key`
+/// (`Trust.Dyn.<mangled>_<digest>`).
 ///
-/// A `dyn Trait` reflects to THIS const, which now names a REGISTERED Clean
+/// A `dyn Trait` reflects to THIS const, which names a REGISTERED Clean
 /// **definition** — a genuine closed dependent type
-/// `Trust.Dyn.<trait> := Sigma Type (Trust.Dyn.Vtable.<trait>)` — NOT a free opaque
-/// type variable. The trait path is sanitized so the name is a stable, kernel-legal
-/// `Name` (same mangling as [`adt_inductive_name`]); two `dyn Trait` occurrences of
-/// the SAME trait share the const (and the registered existential).
+/// `Trust.Dyn.<key> := Sigma Type (Trust.Dyn.Vtable.<key>)` — NOT a free opaque
+/// type variable. Two occurrences of the SAME trait object share the const (and the
+/// registered existential).
+///
+/// # SOUNDNESS: the argument is the FAITHFUL key, never the erased `trait_name`
+///
+/// `Ty::Dynamic::trait_name` is the principal trait's generics-ERASED def path and
+/// nothing else, so `dyn Convert<u32>` and `dyn Convert<u64>` — and `dyn Debug` and
+/// `dyn Debug + Send` — render ONE string. Keying this carrier on it merged two
+/// genuinely different trait objects into one Lean constant. That merge is latent only
+/// while [`DynCarrier::methods`] is empty (a field-less record is information-free);
+/// the moment method signatures are supplied, `clean_ground::register_dyn_carriers`
+/// becomes first-wins-by-name — the second type finds the name already present in the
+/// `Environment`, passes the axiom gate (which re-checks only the ALREADY-REGISTERED
+/// name), and lands in the registry while the env still holds the FIRST type's vtable.
+/// Registry and env then disagree silently: a kernel-checked proof about one trait
+/// object, applied to another.
+///
+/// So the caller must pass `Ty::Dynamic::principal_key` — the string minted by the ONE
+/// renderer `trust_mir_extract::faithful_principal_key`, which participates the whole
+/// existential predicate list (principal path, non-lifetime args, associated-type
+/// bindings, auto traits). `principal_key: None` means NOT injectively renderable, and
+/// every caller here fails closed on it rather than falling back to `trait_name` —
+/// that fallback IS the defect. This crate holds no `tcx` and must never acquire one;
+/// it only ever consumes the string it was handed, which is what makes producer/
+/// consumer drift impossible by construction rather than by discipline.
+///
+/// The key is treated as ONE OPAQUE STRING. It is deliberately not split on `+`: in
+/// this grammar `+` introduces an associated-type binding (`+[Item=u32]`) or an auto
+/// trait (`+core::marker::Send`), NOT a second principal bound to conjoin.
 #[must_use]
-pub fn dyn_const_name(trait_name: &str) -> String {
-    sanitize_dotted_segment(DYN_PREFIX, trait_name)
+pub fn dyn_const_name(principal_key: &str) -> String {
+    injective_dotted_segment(DYN_PREFIX, principal_key)
 }
 
 /// Sanitize `name` into a single dotted kernel-`Name` segment under `prefix`
@@ -573,6 +600,45 @@ fn sanitize_dotted_segment(prefix: &str, name: &str) -> String {
     s
 }
 
+/// How many hex characters of the raw key's SHA-256 are appended by
+/// [`injective_dotted_segment`]. 16 hex chars = 64 bits.
+const KEY_DIGEST_HEX_LEN: usize = 16;
+
+/// Sanitize `key` into a kernel-legal `Name` segment under `prefix` **without losing
+/// injectivity** — the readable mangled stem PLUS a digest of the RAW key.
+///
+/// # The trap this exists to close
+///
+/// [`sanitize_dotted_segment`] collapses every run of non-alphanumerics to a single
+/// `_`, so it is many-to-one:
+///
+/// ```text
+/// "krate::Convert<u32>"  ->  "krate_Convert_u32"
+/// "krate::Convert_u32"   ->  "krate_Convert_u32"     // COLLISION
+/// ```
+///
+/// That was harmless while the input was a bare def path (no `<`, `>`, `,`, ` `, `=`
+/// could appear). It is NOT harmless for a `faithful_principal_key`, whose whole point
+/// is to carry exactly those metacharacters — so re-keying the carrier on the faithful
+/// key while keeping the collapsing mangler would close one direction of the identity
+/// hazard (two types -> one key) and RE-OPEN the other (two keys -> one Lean constant),
+/// reproducing the very defect this family of fixes is about, inside its own repair.
+///
+/// `faithful_principal_key`'s injectivity obligation is over the RAW string, so the
+/// digest is taken over the RAW string too, and it is what carries injectivity here;
+/// the mangled stem is retained only so the constant stays readable in kernel output
+/// and error messages. Two distinct keys therefore yield two distinct constants modulo
+/// SHA-256 collision — the same assumption `trust_types::stable_sha256_hex` already
+/// carries for the authenticated-fixture digests in `prove.rs`.
+///
+/// DETERMINISTIC: SHA-256 of the key bytes, so a given key names the same constant in
+/// every process and every run. Pinned by `dyn_const_name_is_deterministic_across_runs`.
+fn injective_dotted_segment(prefix: &str, key: &str) -> String {
+    let stem = sanitize_dotted_segment(prefix, key);
+    let digest = trust_types::stable_sha256_hex(key.as_bytes());
+    format!("{stem}_{}", &digest[..KEY_DIGEST_HEX_LEN])
+}
+
 /// Prefix for the reflected VTABLE RECORD of a trait object — the single-constructor
 /// Clean inductive `Trust.Dyn.Vtable.<trait>(T : Type)` whose fields are the trait's
 /// method signatures over the (existentially-quantified) carrier `T`. The existential
@@ -580,11 +646,16 @@ fn sanitize_dotted_segment(prefix: &str, name: &str) -> String {
 /// carrier `T : Type` together with the trait-method implementations for `T`".
 pub const DYN_VTABLE_PREFIX: &str = "Trust.Dyn.Vtable.";
 
-/// The vtable-record inductive name for the trait object over `trait_name`
-/// (`Trust.Dyn.Vtable.<name>`), sanitized into a single kernel-legal `Name` segment.
+/// The vtable-record inductive name for the trait object identified by `principal_key`
+/// (`Trust.Dyn.Vtable.<mangled>_<digest>`).
+///
+/// Keyed on the FAITHFUL key through the SAME [`injective_dotted_segment`] as
+/// [`dyn_const_name`], so the existential and its vtable record carry the identical
+/// digest and stay in correspondence for one trait object — and so two different trait
+/// objects can share neither. See [`dyn_const_name`] for the soundness argument.
 #[must_use]
-pub fn dyn_vtable_record_name(trait_name: &str) -> String {
-    sanitize_dotted_segment(DYN_VTABLE_PREFIX, trait_name)
+pub fn dyn_vtable_record_name(principal_key: &str) -> String {
+    injective_dotted_segment(DYN_VTABLE_PREFIX, principal_key)
 }
 
 /// The constructor name of a vtable record (`<vtable>.mk`).
@@ -644,9 +715,13 @@ impl DynCarrier {
     }
 }
 
-/// Reflect a trait object `dyn Trait` (named `trait_name`, with the optionally-known
-/// method signatures `methods`) into a [`DynCarrier`] — the existential
-/// `Sigma (T : Type), Vtable_<trait> T` and its vtable record.
+/// Reflect a trait object `dyn Trait` (identified by its FAITHFUL `principal_key`, with
+/// the optionally-known method signatures `methods`) into a [`DynCarrier`] — the
+/// existential `Sigma (T : Type), Vtable_<key> T` and its vtable record.
+///
+/// The identity argument is `Ty::Dynamic::principal_key`, NEVER the generics-erased
+/// `trait_name`; [`dyn_const_name`] carries the full soundness argument, including why
+/// the merge is latent exactly while `methods` is empty and what arms it.
 ///
 /// Each method `(name, FnSig)` reflects to a vtable-record field whose carrier is the
 /// curried arrow `reflect(args) -> reflect(ret)` ([`reflect_fn_sig`]); a method whose
@@ -659,15 +734,15 @@ impl DynCarrier {
 /// a free const). Richer per-method modeling is deferred pending extractor support
 /// (see the crate-level honesty note).
 #[must_use]
-pub fn reflect_dyn(trait_name: &str, methods: &[(String, FnSig)]) -> DynCarrier {
-    let vtable_name = dyn_vtable_record_name(trait_name);
+pub fn reflect_dyn(principal_key: &str, methods: &[(String, FnSig)]) -> DynCarrier {
+    let vtable_name = dyn_vtable_record_name(principal_key);
     let vtable_ctor_name = dyn_vtable_ctor_name(&vtable_name);
     let reflected_methods = methods
         .iter()
         .filter_map(|(m, sig)| reflect_fn_sig(sig).ok().map(|carrier| (m.clone(), carrier)))
         .collect();
     DynCarrier {
-        name: dyn_const_name(trait_name),
+        name: dyn_const_name(principal_key),
         vtable_name,
         vtable_ctor_name,
         methods: reflected_methods,
@@ -729,7 +804,16 @@ fn bare_type_var(ty: &Ty) -> Option<String> {
 /// existential as a bare `dyn Write`.
 fn dyn_object_const(ty: &Ty) -> Option<String> {
     match ty {
-        Ty::Dynamic { trait_name } => Some(dyn_const_name(trait_name)),
+        // Keyed on the FAITHFUL identity, never the generics-erased `trait_name`
+        // ([`dyn_const_name`] carries the argument).
+        Ty::Dynamic { principal_key: Some(key), .. } => Some(dyn_const_name(key)),
+        // FAIL CLOSED. A trait object whose faithful key did not render has an UNKNOWN
+        // type identity, and there is no name that can be minted for an unknown identity
+        // without risking a merge with a different one. `None` here means "not a keyable
+        // trait-object value", which is the conservative answer at every call site: the
+        // Sink shim declines to absorb the field and the binder declines to bind, so the
+        // body fails closed instead of binding at a possibly-shared existential.
+        Ty::Dynamic { principal_key: None, .. } => None,
         Ty::Ref { inner, .. } => dyn_object_const(inner),
         _ => None,
     }
@@ -2676,110 +2760,25 @@ pub fn reflect_array_indexed(elem: &Ty, len: u64) -> Result<ProofTerm, ReflectEr
     Ok(app(app(cst(CARRIER_ARRAYN), elem_code), nat(len)))
 }
 
-/// TYPE-ZOO #2 (impl Trait, RPIT/TAIT) — the stable existential const name for an
-/// `impl Trait` opaque type over `trait_name` (`Trust.Impl.<trait>`), the
-/// `impl Trait` analogue of [`dyn_const_name`]. Distinct prefix so an `impl Trait`
-/// and a `dyn Trait` over the same trait register as separate existentials.
-#[must_use]
-pub fn impl_trait_const_name(trait_name: &str) -> String {
-    sanitize_dotted_segment(IMPL_TRAIT_PREFIX, trait_name)
-}
-
-/// TYPE-ZOO #2 (impl Trait) — the vtable-record inductive name for an `impl Trait`
-/// existential over `trait_name` (`Trust.Impl.Vtable.<trait>`).
-#[must_use]
-pub fn impl_trait_vtable_record_name(trait_name: &str) -> String {
-    sanitize_dotted_segment("Trust.Impl.Vtable.", trait_name)
-}
-
-/// TYPE-ZOO #2 (impl Trait, RPIT/TAIT) — reflect an OPAQUE return type `impl Trait`
-/// into the EXISTENTIAL `Sigma (T:Type), Vtable_<trait> T` — the SAME dependent-pair
-/// model a `dyn Trait` uses ([`reflect_dyn`]), under the distinct `Trust.Impl.<trait>`
-/// name. An `impl Trait` is "∃ a concrete carrier `T` with the trait witness"; the
-/// only difference from `dyn` is the erasure site (a return-position opaque vs. a
-/// dispatch object), and the dependent-type is identical — so this reuses the
-/// `DynCarrier` machinery wholesale (registered modulo 3 by
-/// `register_dyn_carriers`, axiom_deps EMPTY, NO free const, NO 4th axiom). With no
-/// method signatures available from the extractor the record is the best-sound
-/// `Sigma (T:Type) Unit` (an existential over an opaque-but-QUANTIFIED carrier).
-#[must_use]
-pub fn reflect_impl_trait(trait_name: &str, methods: &[(String, FnSig)]) -> DynCarrier {
-    let vtable_name = impl_trait_vtable_record_name(trait_name);
-    let vtable_ctor_name = dyn_vtable_ctor_name(&vtable_name);
-    let reflected_methods = methods
-        .iter()
-        .filter_map(|(m, sig)| reflect_fn_sig(sig).ok().map(|carrier| (m.clone(), carrier)))
-        .collect();
-    DynCarrier {
-        name: impl_trait_const_name(trait_name),
-        vtable_name,
-        vtable_ctor_name,
-        methods: reflected_methods,
-    }
-}
-
-/// TYPE-ZOO #3 (MULTI-BOUND trait objects, `dyn A + B + Send`) — split a `+`-joined
-/// multi-bound trait-object name into its component trait paths, in source order. A
-/// single-bound `dyn Trait` returns `["Trait"]`. Whitespace around each `+` is
-/// trimmed. Used by [`reflect_multi_dyn`] to build the CONJOINED vtable record.
-#[must_use]
-pub fn split_multi_bound(trait_name: &str) -> Vec<String> {
-    trait_name
-        .split('+')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// TYPE-ZOO #3 (MULTI-BOUND trait objects) — whether a trait-bound component is a
-/// value-LESS MARKER trait (`Send`/`Sync`/`Sized`/`Unpin`/`Copy`-shaped auto traits).
-/// A marker contributes NO vtable methods (an EMPTY obligation), so it adds nothing to
-/// the conjoined record — exactly the goal's "marker traits contribute an empty/unit
-/// obligation". Keyed on the leaf name (last `::` segment).
-#[must_use]
-pub fn is_marker_trait(trait_name: &str) -> bool {
-    let leaf = trait_name.rsplit("::").next().unwrap_or(trait_name).trim();
-    matches!(leaf, "Send" | "Sync" | "Sized" | "Unpin" | "Copy" | "RefUnwindSafe" | "UnwindSafe")
-}
-
-/// TYPE-ZOO #3 (MULTI-BOUND trait objects, `dyn A + B + Send`) — reflect a multi-bound
-/// trait object into the EXISTENTIAL `Sigma (T:Type), Vtable_<A+B…> T` whose vtable
-/// record CONJOINS the methods of every non-marker component trait (`A` AND `B`),
-/// while a MARKER trait (`Send`/`Sync`/…) contributes an EMPTY obligation (no field).
-/// This extends [`reflect_dyn`] from a single trait to the conjunction: the record's
-/// fields are the union of each component's reflected method signatures (`methods`
-/// keyed per component trait), so the existential is "∃ a carrier `T` together with the
-/// implementations of EVERY bound trait for `T`". With no method signatures from the
-/// extractor (the common case) the conjoined record is the best-sound field-less
-/// `Sigma (T:Type) Unit` — an existential over the opaque-but-QUANTIFIED carrier,
-/// rooted in the 3. Registered modulo 3 by `register_dyn_carriers` (NO 4th axiom).
-///
-/// The existential's NAME is the sanitized whole multi-bound string (so `dyn A + B`
-/// and `dyn A` are distinct existentials), and a marker-only adjustment is invisible
-/// to soundness (it only drops empty obligations).
-#[must_use]
-pub fn reflect_multi_dyn(trait_name: &str, methods: &[(String, FnSig)]) -> DynCarrier {
-    // The existential / vtable names key on the WHOLE multi-bound string (sanitized),
-    // so `dyn A + B + Send` is one stable existential distinct from `dyn A`.
-    let vtable_name = dyn_vtable_record_name(trait_name);
-    let vtable_ctor_name = dyn_vtable_ctor_name(&vtable_name);
-    // Drop any method that names a MARKER-trait component (markers contribute the
-    // empty obligation); reflect the remaining methods' signatures into record fields.
-    // (With today's extractor `methods` is empty, so the conjoined record is field-less
-    // `Sigma Type Unit` — the sound minimal existential.)
-    let reflected_methods = methods
-        .iter()
-        .filter(|(m, _)| !is_marker_trait(m))
-        .filter_map(|(m, sig)| reflect_fn_sig(sig).ok().map(|carrier| (m.clone(), carrier)))
-        .collect();
-    DynCarrier {
-        name: dyn_const_name(trait_name),
-        vtable_name,
-        vtable_ctor_name,
-        methods: reflected_methods,
-    }
-}
+// Trust (vtable slice 19): the `impl Trait` (`Trust.Impl.*`) and MULTI-BOUND
+// (`dyn A + B`) carrier machinery that used to live here is DELETED, together with the
+// `trait_name`-tag dispatch in `reflect_ty` and `clean_ground::reachable_dyn_carriers`
+// that selected it. Two independent checks showed the dispatch was unreachable in
+// production: the extractor's sole `TyKind::Dynamic` arm (`ty_convert.rs`) renders the
+// principal def path or the literal `"dyn"` and can emit neither an `@impl::` prefix nor
+// a `+`, and no `Ty::Dynamic` in the checked-in dump corpus carries either spelling. Its
+// only producers were hand-written fixture rows.
+//
+// It is deleted rather than revived for two reasons beyond deadness. First, the
+// multi-bound model described a type Rust cannot express: only AUTO traits may be
+// additional bounds, so `dyn Debug + Clone + Send` is rejected by rustc, and the real
+// shape (`dyn Debug + Send`) is now carried faithfully by the ONE `reflect_dyn` path
+// because auto traits are part of `principal_key`. Second, the dispatch keyed on a
+// string tag inside the generics-ERASED `trait_name`; identity now comes from
+// `principal_key`, whose grammar gives `+` a different meaning entirely (an
+// associated-type binding or an auto trait, never a second principal bound), so the same
+// branch would be actively WRONG on the new key. Reviving `impl Trait` should introduce a
+// first-class discriminator on `Ty`, not a tag smuggled through a def-path string.
 
 /// TYPE-ZOO #6 (COROUTINE / async state-machines) — prefix for the NAMED record
 /// inductive a coroutine `Ty::Coroutine { name, upvars }` reflects to
@@ -3572,34 +3571,32 @@ pub fn reflect_ty(ty: &Ty) -> Result<ProofTerm, ReflectError> {
         // const and NOT a universally-abstracted `∀ D` over-approximation. Reflecting
         // it as a scalar would be unsound; the existential is faithful and carries no
         // integer content, so an integer fact about a `dyn` value stays unprovable.
-        // TYPE-ZOO #2/#3 + base dyn — PRODUCTION-WIRED trait-object dispatch by the
-        // extractor's trait_name convention (the SAME tags the impl/multi corpus probes
-        // carry):
-        //   * `@impl::<trait>` (an RPIT/TAIT opaque return) → the `Trust.Impl.<trait>`
-        //     existential const ([`reflect_impl_trait`] / [`impl_trait_const_name`]) — the
-        //     `dyn` analogue under the DISTINCT `Trust.Impl.*` name, so an `impl Trait` and a
-        //     `dyn Trait` over the same trait are separate existentials. `clean_ground::
-        //     register_dyn_carriers` registers it as `Sigma (T:Type) Vtable_<trait> T`.
-        //   * `<A> + <B> + …` (a MULTI-BOUND trait object) → the CONJOINED existential, whose
-        //     const NAME is `dyn_const_name(trait_name)` keyed on the WHOLE `+`-joined string
-        //     ([`reflect_multi_dyn`]) — so `dyn A + B` is a distinct existential from `dyn A`,
-        //     and the conjoined vtable (methods of every non-marker bound) registers modulo 3.
-        //   * a single-bound `dyn Trait` → the existing closed existential const
-        //     `Trust.Dyn.<trait>` ([`dyn_const_name`]).
-        // Every branch is an `El`-free `Type` const that `to_clean_expr` passes through as a
-        // kernel const and `register_dyn_carriers` grounds to the registered `Sigma` Definition
+        // The const is an `El`-free `Type` that `to_clean_expr` passes through as a kernel
+        // const and `register_dyn_carriers` grounds to the registered `Sigma` Definition
         // (axiom_deps EMPTY — NO 4th axiom, NO free const). An env that did not register the
         // carrier fails closed at `infer_type` — sound, never a false proof.
-        Ty::Dynamic { trait_name } => {
-            if let Some(bare) = trait_name.strip_prefix("@impl::") {
-                Ok(cst(&impl_trait_const_name(bare)))
-            } else {
-                // Single- AND multi-bound trait objects share the `dyn_const_name` keying
-                // (multi keys on the whole `+`-joined string); the multi-bound vtable is the
-                // conjoined record `reflect_multi_dyn` builds at registration time.
-                Ok(cst(&dyn_const_name(trait_name)))
-            }
-        }
+        //
+        // KEYED ON THE FAITHFUL IDENTITY. `trait_name` is the generics-erased principal def
+        // path, so keying here merged `dyn Convert<u32>` with `dyn Convert<u64>` and
+        // `dyn Debug` with `dyn Debug + Send` — see [`dyn_const_name`] for the full argument
+        // and for the change that arms it. The key is consumed as ONE OPAQUE STRING, exactly
+        // as `trust-ir-bridge`'s `lower.rs` consumes it: this crate has no `tcx` and must
+        // never acquire one.
+        //
+        // NO `@impl::` / `+` DISPATCH. It used to branch on those two spellings of
+        // `trait_name`. Both are unreachable from the extractor — `ty_convert.rs`'s sole
+        // `TyKind::Dynamic` arm renders the principal def path or the literal `"dyn"`, and a
+        // scan of every `Ty::Dynamic` in the checked-in dump corpus finds neither spelling —
+        // and on the KEY the branch would be actively wrong, because `+` is this grammar's
+        // separator for an associated-type binding (`+[Item=u32]`) or an auto trait
+        // (`+core::marker::Send`), never a second principal bound to conjoin.
+        Ty::Dynamic { principal_key, .. } => match principal_key {
+            Some(key) => Ok(cst(&dyn_const_name(key))),
+            // FAIL CLOSED, never fall back to `trait_name`: that fallback IS the defect.
+            None => Err(ReflectError::UnsupportedType(
+                "Ty::Dynamic without a faithful principal_key has no keyable type identity",
+            )),
+        },
         // Trust: a generic type parameter `T` reflects as a FREE const
         // `Trust.Param.<id>` (stable per-param within a function). It is NOT a
         // scalar carrier of `Trust.SortTy` — it is a genuine type variable that a
@@ -5973,37 +5970,30 @@ mod tests {
         assert!(reflect_array_indexed(&Ty::Never, 4).is_err(), "never element fails closed");
     }
 
-    /// TYPE-ZOO #2 — an `impl Trait` opaque return reflects to the existential
-    /// `DynCarrier` (the `dyn` analogue) under the distinct `Trust.Impl.<trait>` name,
-    /// so an `impl Trait` and a `dyn Trait` over the same trait do not collide.
+    /// TYPE-ZOO #3 — an AUTO-TRAIT-BEARING trait object (`dyn Debug + Send`) is a
+    /// DIFFERENT existential from the bare `dyn Debug`, even though both carry the same
+    /// generics-erased `trait_name`.
+    ///
+    /// This replaces two tests that exercised the deleted `Trust.Impl.*` / multi-bound
+    /// machinery. Their subjects were unreachable from the extractor, and the multi-bound
+    /// one described a type Rust cannot express (only AUTO traits may be additional
+    /// bounds). The real shape is this one, and it is now carried by the single
+    /// `reflect_dyn` path because auto traits are part of `principal_key`.
     #[test]
-    fn reflect_impl_trait_is_existential_under_distinct_name() {
-        let c = reflect_impl_trait("core::iter::Iterator", &[]);
-        assert!(c.name.starts_with(IMPL_TRAIT_PREFIX), "impl Trait uses the Trust.Impl.* name");
-        assert_eq!(c.name, "Trust.Impl.core_iter_Iterator");
-        assert!(c.vtable_name.starts_with("Trust.Impl.Vtable."));
-        // Distinct from the `dyn` existential over the SAME trait.
-        let d = reflect_dyn("core::iter::Iterator", &[]);
-        assert_ne!(c.name, d.name, "impl Trait and dyn Trait are separate existentials");
-        // No methods from the extractor → the best-sound `Sigma Type Unit` form.
-        assert!(!c.has_methods(), "field-less existential (Sigma Type Unit)");
-    }
-
-    /// TYPE-ZOO #3 — a multi-bound trait object `dyn A + B + Send` reflects to the
-    /// CONJOINED existential: the trait list splits on `+`, a MARKER (`Send`) is
-    /// recognized as contributing the empty obligation, and the existential name keys on
-    /// the whole multi-bound string (distinct from a single-bound `dyn A`).
-    #[test]
-    fn reflect_multi_dyn_conjoins_and_drops_markers() {
-        let bounds = split_multi_bound("core::fmt::Debug + core::clone::Clone + Send");
-        assert_eq!(bounds, vec!["core::fmt::Debug", "core::clone::Clone", "Send"]);
-        assert!(is_marker_trait("Send") && is_marker_trait("core::marker::Sync"));
-        assert!(!is_marker_trait("core::fmt::Debug"), "Debug is not a marker");
-        let multi = reflect_multi_dyn("core::fmt::Debug + core::clone::Clone + Send", &[]);
-        let single = reflect_multi_dyn("core::fmt::Debug", &[]);
-        assert_ne!(multi.name, single.name, "the multi-bound existential is distinct");
-        // A single-bound list is just `[Trait]`.
-        assert_eq!(split_multi_bound("Trait"), vec!["Trait"]);
+    fn auto_trait_bearing_dyn_is_a_distinct_existential() {
+        let bare = reflect_dyn("core::fmt::Debug", &[]);
+        let with_send = reflect_dyn("core::fmt::Debug+core::marker::Send", &[]);
+        assert_ne!(bare.name, with_send.name, "an auto trait is part of the identity");
+        assert_ne!(bare.vtable_name, with_send.vtable_name, "the records split too");
+        assert!(!bare.has_methods() && !with_send.has_methods());
+        // Both are reached through the ONE production path, keyed on the faithful key.
+        assert_eq!(
+            reflect_ty(&Ty::Dynamic {
+                trait_name: "core::fmt::Debug".into(),
+                principal_key: Some("core::fmt::Debug+core::marker::Send".into()),
+            }),
+            Ok(cst(&with_send.name)),
+        );
     }
 
     /// TYPE-ZOO #4 — an HRTB `for<'a> fn(&'a u8) -> bool` reflects to a real kernel `Pi`
@@ -6153,7 +6143,7 @@ mod tests {
         // And the dyn-parameter fn-ptr now SUCCEEDS via the existential's El carrier —
         // the merged, more-faithful behavior (dyn is a real carrier, not a type var).
         let sig_dyn = FnSig {
-            params: vec![Ty::Dynamic { trait_name: "Tr".into() }],
+            params: vec![Ty::Dynamic { trait_name: "Tr".into(), principal_key: Some("Tr".into()) }],
             ret: Box::new(Ty::Bool),
         };
         assert!(
@@ -7720,23 +7710,125 @@ mod tests {
     #[test]
     fn reflect_ty_dynamic_is_closed_existential_const() {
         // `dyn Trait` reflects as the CLOSED existential dependent-type const
-        // `Trust.Dyn.<trait>` — a REGISTERED type (`Sigma (T:Type), Vtable_<trait> T`),
-        // NOT a free opaque type variable. The trait path is SANITIZED into a single
-        // kernel-legal `Name` segment (so `core::fmt::Write` → `Trust.Dyn.core_fmt_Write`,
-        // NOT raw `::`). Stable per-trait (the same trait shares the const; distinct
-        // traits differ).
+        // `Trust.Dyn.<key>` — a REGISTERED type (`Sigma (T:Type), Vtable_<key> T`),
+        // NOT a free opaque type variable. The FAITHFUL key is mangled into a single
+        // kernel-legal `Name` segment and carries a digest of the raw key
+        // ([`injective_dotted_segment`]). Stable per trait OBJECT (the same key shares the
+        // const; distinct keys differ).
         assert_eq!(
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
-            Ok(cst("Trust.Dyn.core_fmt_Write"))
+            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+            Ok(cst(&dyn_const_name("core::fmt::Write")))
         );
         assert_eq!(
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into() })
+            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) })
         );
         assert_ne!(
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
-            reflect_ty(&Ty::Dynamic { trait_name: "core::hash::Hasher".into() })
+            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+            reflect_ty(&Ty::Dynamic { trait_name: "core::hash::Hasher".into(), principal_key: Some("core::hash::Hasher".into()) })
         );
+    }
+
+    /// SOUNDNESS (vtable slice 19): two trait objects differing ONLY in their principal
+    /// ARGUMENTS must not share a Lean carrier.
+    ///
+    /// Under the erased keying they did: `trait_name` is the principal's def path and
+    /// nothing else, so both of these rendered `Trust.Dyn.krate_Convert` and the second
+    /// type registered against the first one's vtable.
+    #[test]
+    fn args_differing_dyn_types_get_distinct_lean_constants() {
+        let erased = "krate::Convert";
+        let u32_dyn = Ty::Dynamic {
+            trait_name: erased.into(),
+            principal_key: Some("krate::Convert<u32>".into()),
+        };
+        let u64_dyn = Ty::Dynamic {
+            trait_name: erased.into(),
+            principal_key: Some("krate::Convert<u64>".into()),
+        };
+        // Precondition: the field the old keying used really is identical for both.
+        assert_eq!(
+            dyn_const_name(erased),
+            dyn_const_name(erased),
+            "precondition: the erased name cannot tell these two types apart",
+        );
+        assert_ne!(reflect_ty(&u32_dyn), reflect_ty(&u64_dyn));
+        // The vtable RECORD must split with the existential, or a carrier and its record
+        // would disagree about which trait object they describe.
+        assert_ne!(
+            dyn_vtable_record_name("krate::Convert<u32>"),
+            dyn_vtable_record_name("krate::Convert<u64>"),
+        );
+        // Auto traits and associated-type bindings are identity too.
+        assert_ne!(
+            dyn_const_name("core::fmt::Debug"),
+            dyn_const_name("core::fmt::Debug+core::marker::Send"),
+        );
+        assert_ne!(
+            dyn_const_name("core::iter::Iterator+[core::iter::Iterator::Item=u32]"),
+            dyn_const_name("core::iter::Iterator+[core::iter::Iterator::Item=u64]"),
+        );
+    }
+
+    /// SOUNDNESS: the MANGLER must not re-open the merge the re-keying just closed.
+    ///
+    /// [`sanitize_dotted_segment`] collapses every run of non-alphanumerics to a single
+    /// `_`. That was harmless for a bare def path, but a faithful key carries `<`, `>`,
+    /// `,`, ` ` and `=` on purpose — so mangling it would close direction (2) of the
+    /// identity hazard (two types -> one key) while RE-OPENING direction (1) (two keys ->
+    /// one Lean constant), reproducing the defect inside its own repair.
+    #[test]
+    fn mangler_collision_pair_gets_distinct_lean_constants() {
+        let generic = "krate::Convert<u32>";
+        let literal = "krate::Convert_u32";
+        // Precondition: the bare mangler really does collide on this pair.
+        assert_eq!(
+            sanitize_dotted_segment(DYN_PREFIX, generic),
+            sanitize_dotted_segment(DYN_PREFIX, literal),
+        );
+        // The raw-key digest is what keeps them apart.
+        assert_ne!(dyn_const_name(generic), dyn_const_name(literal));
+        assert_ne!(dyn_vtable_record_name(generic), dyn_vtable_record_name(literal));
+    }
+
+    /// A trait object with no faithful key has an UNKNOWN type identity, and declining an
+    /// unknown identity is the whole point: never fall back to the erased `trait_name`.
+    #[test]
+    fn dyn_without_principal_key_fails_closed() {
+        let unkeyed = Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: None };
+        assert!(matches!(reflect_ty(&unkeyed), Err(ReflectError::UnsupportedType(_))));
+        assert_ne!(
+            reflect_ty(&unkeyed),
+            Ok(cst(&dyn_const_name("core::fmt::Write"))),
+            "must NOT fall back to the erased name",
+        );
+        // Same refusal behind a reference — the canonical `&mut dyn Write` shape.
+        let behind_ref = Ty::Ref { mutable: true, inner: Box::new(unkeyed) };
+        assert_eq!(dyn_object_const(&behind_ref), None);
+    }
+
+    /// The carrier name must be DETERMINISTIC: the same key names the same Lean constant
+    /// in every process and every run. Pinned to literals, which can only hold if the
+    /// digest is a fixed function of the key (SHA-256) and never a per-process hash.
+    #[test]
+    fn dyn_const_name_is_deterministic_across_runs() {
+        assert_eq!(
+            dyn_const_name("core::fmt::Write"),
+            "Trust.Dyn.core_fmt_Write_138c667487ba80f2",
+        );
+        assert_eq!(
+            dyn_vtable_record_name("core::fmt::Write"),
+            "Trust.Dyn.Vtable.core_fmt_Write_138c667487ba80f2",
+        );
+        // The existential and its vtable record carry the SAME digest, so they stay in
+        // correspondence for one trait object.
+        let digest = dyn_const_name("core::fmt::Write")
+            .rsplit('_')
+            .next()
+            .expect("a digest suffix")
+            .to_string();
+        assert!(dyn_vtable_record_name("core::fmt::Write").ends_with(&digest));
+        assert_eq!(dyn_const_name("core::fmt::Write"), dyn_const_name("core::fmt::Write"));
     }
 
     #[test]
@@ -7746,14 +7838,17 @@ mod tests {
         // `Trust.Dyn.<trait>` name + a FIELD-LESS vtable record `Trust.Dyn.Vtable.<trait>`
         // (`Sigma Type Unit` shape — an existential over an opaque-but-quantified carrier).
         let carrier = reflect_dyn("core::fmt::Write", &[]);
-        assert_eq!(carrier.name, "Trust.Dyn.core_fmt_Write");
-        assert_eq!(carrier.vtable_name, "Trust.Dyn.Vtable.core_fmt_Write");
-        assert_eq!(carrier.vtable_ctor_name, "Trust.Dyn.Vtable.core_fmt_Write.mk");
+        assert_eq!(carrier.name, dyn_const_name("core::fmt::Write"));
+        assert_eq!(carrier.vtable_name, dyn_vtable_record_name("core::fmt::Write"));
+        assert_eq!(
+            carrier.vtable_ctor_name,
+            format!("{}.mk", dyn_vtable_record_name("core::fmt::Write"))
+        );
         assert!(!carrier.has_methods(), "no extractor method info → field-less vtable record");
         // The existential name is exactly what `reflect_ty(dyn)` / `dyn_const_name` use,
         // so a `dyn`-typed value and its registered existential agree.
         assert_eq!(
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
+            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
             Ok(cst(&carrier.name))
         );
     }
@@ -7766,7 +7861,7 @@ mod tests {
         // (`Sigma (T:Type), Vtable_Write T`) — NOT a universally-abstracted `Π(D:Type)`
         // variable. So the FIRST binder is the value param `w` itself, at the
         // existential const, and there is NO outer type-variable binder.
-        let dyn_write = Ty::Dynamic { trait_name: "Write".into() };
+        let dyn_write = Ty::Dynamic { trait_name: "Write".into(), principal_key: Some("Write".into()) };
         let contract = reflect_contract(
             &[("w", &dyn_write)],
             &Formula::Bool(true),
@@ -7779,7 +7874,7 @@ mod tests {
             ProofTerm::Pi { domain, .. } => {
                 assert_eq!(
                     **domain,
-                    cst("Trust.Dyn.Write"),
+                    cst(&dyn_const_name("Write")),
                     "the first binder is the value param `w` at the closed existential"
                 );
             }
@@ -7799,7 +7894,7 @@ mod tests {
         // binds at the SAME closed existential `Trust.Dyn.Write` as a bare `dyn`,
         // with NO outer type-variable binder.
         let ref_mut_dyn =
-            Ty::Ref { mutable: true, inner: Box::new(Ty::Dynamic { trait_name: "Write".into() }) };
+            Ty::Ref { mutable: true, inner: Box::new(Ty::Dynamic { trait_name: "Write".into(), principal_key: Some("Write".into()) }) };
         let contract = reflect_contract(
             &[("w", &ref_mut_dyn)],
             &Formula::Bool(true),
@@ -7810,7 +7905,7 @@ mod tests {
         .expect("&mut dyn Write reflects at the closed existential");
         match &contract {
             ProofTerm::Pi { domain, .. } => {
-                assert_eq!(**domain, cst("Trust.Dyn.Write"), "binds at the same existential");
+                assert_eq!(**domain, cst(&dyn_const_name("Write")), "binds at the same existential");
             }
             other => panic!("expected an outer Π(w : Trust.Dyn.Write), got {other:?}"),
         }
@@ -7822,7 +7917,7 @@ mod tests {
         // fn g(a: dyn Write, b: dyn Write) -> i32 : two `dyn Write` parameters BOTH bind
         // at the SAME closed existential `Trust.Dyn.Write` (keyed by trait path), and
         // NEITHER introduces a universal type-variable binder.
-        let dw = || Ty::Dynamic { trait_name: "Write".into() };
+        let dw = || Ty::Dynamic { trait_name: "Write".into(), principal_key: Some("Write".into()) };
         let a = dw();
         let b = dw();
         let contract = reflect_contract(
@@ -7840,9 +7935,9 @@ mod tests {
         // Both value binders are at the same existential const (the two outermost Πs).
         match &contract {
             ProofTerm::Pi { domain: d1, codomain, .. } => {
-                assert_eq!(**d1, cst("Trust.Dyn.Write"));
+                assert_eq!(**d1, cst(&dyn_const_name("Write")));
                 match &**codomain {
-                    ProofTerm::Pi { domain: d2, .. } => assert_eq!(**d2, cst("Trust.Dyn.Write")),
+                    ProofTerm::Pi { domain: d2, .. } => assert_eq!(**d2, cst(&dyn_const_name("Write"))),
                     other => panic!("expected inner Π(b : Trust.Dyn.Write), got {other:?}"),
                 }
             }
@@ -7870,7 +7965,7 @@ mod tests {
                 "inner".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "Write".into() }),
+                    inner: Box::new(Ty::Dynamic { trait_name: "Write".into(), principal_key: Some("Write".into()) }),
                 },
             )],
             disc_index_safe: false,
@@ -7928,7 +8023,7 @@ mod tests {
                     "buf".into(),
                     Ty::Ref {
                         mutable: true,
-                        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
+                        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
                     },
                 ),
             ],
@@ -7945,8 +8040,8 @@ mod tests {
         // existential const `Trust.Dyn.<trait>` (sanitized) — the Sink shim only
         // collapses a `dyn` FIELD, never a standalone `dyn` value.
         assert_eq!(
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into() }),
-            Ok(cst("Trust.Dyn.core_fmt_Write")),
+            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+            Ok(cst(&dyn_const_name("core::fmt::Write"))),
             "a bare dyn parameter reflects to the closed existential const (sanitized)"
         );
         // And the reflected sink carrier is the dedicated nullary opaque inductive.
@@ -8849,7 +8944,7 @@ mod tests {
         }
         // The explicit goal gate: the carrier's `axiom_closure` has NO `Trust.Dyn`
         // free const — it resolves to the registered Definition, not an opaque const.
-        let dyn_ty = reflect_ty(&Ty::Dynamic { trait_name: trait_name.into() }).ok()?;
+        let dyn_ty = reflect_ty(&Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }).ok()?;
         let mut ctx = KernelContext::new();
         for ax in THE_THREE {
             ctx.add_axiom(ax, ProofTerm::Sort(0)).ok()?;
@@ -8981,72 +9076,6 @@ mod tests {
             "length-indexed `Trust.ArrayN (T:Type) : Nat → Type` registered modulo 3 \
              (inductive + recursor axiom_deps EMPTY); `[T; {len}]` grounds to `ArrayN \
              (decode T) (Nat.lit {len})` — the const generic `N={len}` is a REAL `Nat` INDEX"
-        ))
-    }
-
-    /// TYPE-ZOO #2 — REAL-KERNEL modulo-3 gate for an `impl Trait` (RPIT/TAIT) opaque
-    /// return: the SAME existential `Sigma (T:Type), Vtable T` a `dyn` uses, under the
-    /// `Trust.Impl.<trait>` name ([`reflect_impl_trait`] + `register_dyn_carriers`).
-    /// Confirm the vtable record, its recursor, AND the existential definition all have
-    /// EMPTY `axiom_deps`. Returns `Some(detail)` on success.
-    fn impl_trait_grounds_modulo_3_real_kernel(trait_name: &str) -> Option<String> {
-        use clean_kernel::{Environment, Name};
-        let carrier = reflect_impl_trait(trait_name, &[]);
-        let mut env = Environment::with_prelude();
-        let registry =
-            crate::clean_ground::register_dyn_carriers(&mut env, std::slice::from_ref(&carrier));
-        registry.get(&carrier.name)?;
-        for n in [carrier.vtable_name.as_str(), carrier.name.as_str()] {
-            if !env.axiom_deps(&Name::from_string(n))?.is_empty() {
-                return None;
-            }
-        }
-        let vinfo = env.inductive_info(&Name::from_string(&carrier.vtable_name))?;
-        if let Some(rec) = vinfo.recursor_name.as_ref() {
-            if !env.axiom_deps(rec)?.is_empty() {
-                return None;
-            }
-        }
-        Some(format!(
-            "impl Trait → existential `{} := Σ(T:Type) {} T` registered modulo 3 \
-             (the `dyn` analogue under the `Trust.Impl.*` name; axiom_deps EMPTY)",
-            carrier.name, carrier.vtable_name
-        ))
-    }
-
-    /// TYPE-ZOO #3 — REAL-KERNEL modulo-3 gate for a MULTI-BOUND trait object
-    /// `dyn A + B + Send`: the existential `Sigma (T:Type), Vtable_<A+B…> T` over the
-    /// CONJOINED vtable record (markers contribute the empty obligation),
-    /// [`reflect_multi_dyn`] + `register_dyn_carriers`. Confirm the vtable record, its
-    /// recursor, AND the existential have EMPTY `axiom_deps`. Returns `Some(detail)`.
-    fn multi_dyn_grounds_modulo_3_real_kernel(trait_name: &str) -> Option<String> {
-        use clean_kernel::{Environment, Name};
-        let carrier = reflect_multi_dyn(trait_name, &[]);
-        let mut env = Environment::with_prelude();
-        let registry =
-            crate::clean_ground::register_dyn_carriers(&mut env, std::slice::from_ref(&carrier));
-        registry.get(&carrier.name)?;
-        for n in [carrier.vtable_name.as_str(), carrier.name.as_str()] {
-            if !env.axiom_deps(&Name::from_string(n))?.is_empty() {
-                return None;
-            }
-        }
-        let vinfo = env.inductive_info(&Name::from_string(&carrier.vtable_name))?;
-        if let Some(rec) = vinfo.recursor_name.as_ref() {
-            if !env.axiom_deps(rec)?.is_empty() {
-                return None;
-            }
-        }
-        let bounds = split_multi_bound(trait_name);
-        let markers: Vec<&String> = bounds.iter().filter(|b| is_marker_trait(b)).collect();
-        Some(format!(
-            "multi-bound `dyn {}` → CONJOINED existential `{} := Σ(T:Type) {} T` modulo 3 \
-             ({} bound(s), {} marker(s) → empty obligation; axiom_deps EMPTY)",
-            bounds.join(" + "),
-            carrier.name,
-            carrier.vtable_name,
-            bounds.len(),
-            markers.len()
         ))
     }
 
@@ -9311,25 +9340,10 @@ mod tests {
                     ),
                 };
             }
-            // #2 impl Trait — tagged `@impl::<trait>` (an RPIT/TAIT existential).
-            Ty::Dynamic { trait_name } if trait_name.starts_with("@impl::") => {
-                let bare = trait_name.strip_prefix("@impl::").unwrap_or(trait_name);
-                return match impl_trait_grounds_modulo_3_real_kernel(bare) {
-                    Some(d) => TypeVerdict::Structural(d),
-                    None => {
-                        TypeVerdict::Opaque("impl Trait existential did NOT ground modulo 3".into())
-                    }
-                };
-            }
-            // #3 MULTI-BOUND dyn — a `+`-joined trait_name (`dyn A + B + Send`).
-            Ty::Dynamic { trait_name } if trait_name.contains('+') => {
-                return match multi_dyn_grounds_modulo_3_real_kernel(trait_name) {
-                    Some(d) => TypeVerdict::Structural(d),
-                    None => TypeVerdict::Opaque(
-                        "multi-bound dyn existential did NOT ground modulo 3".into(),
-                    ),
-                };
-            }
+            // Trust (vtable slice 19): the `@impl::` and `+`-joined arms are GONE with the
+            // machinery they dispatched to. Every trait object — including the
+            // auto-trait-bearing `dyn_auto_bound` probe — now falls through to the single
+            // `Ty::Dynamic` arm below, which grounds the ONE faithful-keyed existential.
             // #5 GAT family — an Adt tagged `@gat::<Trait>::<Assoc>` with a generic param
             // field (a PARAMETERIZED associated-type family / type-level function).
             Ty::Adt { name, fields, .. } if name.starts_with("@gat::") => {
@@ -9388,7 +9402,7 @@ mod tests {
         //    the LOCAL checker cannot resolve (dyn / fn-ptr / closure), so the
         //    measurement reflects the REAL kernel verdict, not the predicative one.
         match ty {
-            Ty::Dynamic { trait_name } => {
+            Ty::Dynamic { trait_name, .. } => {
                 return match dyn_grounds_modulo_3_real_kernel(trait_name) {
                     Some(d) => TypeVerdict::Structural(d),
                     None => TypeVerdict::Opaque(
@@ -9595,9 +9609,15 @@ mod tests {
             "assoc_type",
             // TYPE-ZOO CLOSE — the six remaining families as REAL Clean dependent types:
             "const_generic_indexed", // #1 length-indexed Trust.ArrayN (N a real Nat index)
-            "impl_trait",            // #2 impl Trait → existential Σ(T:Type) Vtable T
-            "dyn_multi_bound",       // #3 dyn A + B + Send → conjoined-vtable existential
-            "hrtb_fn",               // #4 for<'a> Fn → Π(r : Trust.Region) over the fn arrow
+            // Trust (vtable slice 19): `impl_trait` (#2) is REMOVED — it probed an
+            // `@impl::`-tagged spelling the extractor cannot emit, so it measured a
+            // hand-written convention rather than production coverage. `dyn_multi_bound`
+            // (#3) is REPLACED by `dyn_auto_bound`: the old probe was `dyn Debug + Clone +
+            // Send`, which Rust rejects outright (only AUTO traits may be additional
+            // bounds), whereas `dyn Debug + Send` is real and must be STRUCTURAL under a
+            // carrier distinct from bare `dyn Debug`.
+            "dyn_auto_bound", // #3 dyn Debug + Send → its own faithful-keyed existential
+            "hrtb_fn",        // #4 for<'a> Fn → Π(r : Trust.Region) over the fn arrow
             "gat_family",            // #5 GAT → parameterized type-level-function family
             "coroutine",             // #6 coroutine → state record (env + resume : S → Y)
         ];
@@ -9622,7 +9642,7 @@ mod tests {
 
     /// PRODUCTION-WIRING GATE — the six TYPE-ZOO carriers are emitted by the MAIN
     /// `reflect_ty` grounding pipeline (the one mirsem/§6/the prover consume), NOT only by
-    /// the dedicated `reflect_array_indexed`/`reflect_impl_trait`/… entry points. For EACH
+    /// the dedicated `reflect_array_indexed`/`reflect_dyn`/… entry points. For EACH
     /// type-zoo corpus probe, the PRODUCTION `reflect_ty(probe_ty)` output is asserted to be
     /// EXACTLY the carrier the dedicated entry point builds — so the 54/55 coverage is
     /// ACTUAL in production, not merely measured through a side channel. A regression that
@@ -9655,33 +9675,27 @@ mod tests {
         assert!(head_is(&arr_carrier, CARRIER_ARRAYN), "array head is Trust.ArrayN");
         assert!(!head_is(&arr_carrier, CARRIER_VEC), "array head is NOT the erased Trust.Sort.Vec");
 
-        // #2 impl Trait — `@impl::Iterator` reflects to the DISTINCT `Trust.Impl.*` existential
-        // const, NOT a `Trust.Dyn.*`.
-        let imp = by_name("impl_trait");
-        let imp_carrier = reflect_ty(&imp).expect("impl Trait reflects");
+        // #2/#3 — the `impl Trait` (`Trust.Impl.*`) and multi-bound probes are GONE with the
+        // machinery they wired; what replaces them is the AUTO-TRAIT-BEARING trait object,
+        // which is the shape that actually occurs. PRODUCTION `reflect_ty` must key it on the
+        // faithful `principal_key`, so it is a DIFFERENT existential from bare `dyn Debug`
+        // even though both carry the identical generics-erased `trait_name`. Under the old
+        // keying these two were one constant — this assertion is the regression gate.
+        let auto = by_name("dyn_auto_bound");
+        let auto_carrier = reflect_ty(&auto).expect("auto-bound dyn reflects");
         assert_eq!(
-            imp_carrier,
-            cst(&impl_trait_const_name("core::iter::Iterator")),
-            "PRODUCTION reflect_ty(@impl::Iterator) must be the Trust.Impl.* existential const"
+            auto_carrier,
+            cst(&reflect_dyn("core::fmt::Debug+core::marker::Send", &[]).name),
+            "PRODUCTION reflect_ty(dyn Debug + Send) must be the faithful-keyed existential"
         );
-        assert!(
-            matches!(&imp_carrier, ProofTerm::Const(n) if n.starts_with(IMPL_TRAIT_PREFIX)),
-            "impl Trait uses the Trust.Impl.* name, not Trust.Dyn.*"
-        );
-
-        // #3 MULTI-BOUND dyn — keyed on the WHOLE `+`-joined string (distinct from `dyn A`).
-        let multi = by_name("dyn_multi_bound");
-        let multi_carrier = reflect_ty(&multi).expect("multi-bound dyn reflects");
-        assert_eq!(
-            multi_carrier,
-            cst(&reflect_multi_dyn("core::fmt::Debug + core::clone::Clone + Send", &[]).name),
-            "PRODUCTION reflect_ty(dyn A + B + Send) must be the conjoined existential const"
-        );
-        // Distinct from the single-bound `dyn core::fmt::Debug`.
         assert_ne!(
-            reflect_ty(&multi).unwrap(),
-            reflect_ty(&Ty::Dynamic { trait_name: "core::fmt::Debug".into() }).unwrap(),
-            "the multi-bound existential is keyed on the whole `+`-joined string"
+            auto_carrier,
+            reflect_ty(&Ty::Dynamic {
+                trait_name: "core::fmt::Debug".into(),
+                principal_key: Some("core::fmt::Debug".into()),
+            })
+            .unwrap(),
+            "an auto trait is part of the trait object's identity"
         );
 
         // #4 HRTB — a fn-ptr with a reference param reflects to `Π(r : Trust.Region) → arrow`.

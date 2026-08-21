@@ -1,0 +1,174 @@
+{
+ "name": "bitrev_u8_one_wrong",
+ "def_path": "fx::bitrev_u8_one_wrong",
+ "span": {
+  "file": "<dump-root>/fx.rs",
+  "line_start": 36,
+  "col_start": 0,
+  "line_end": 39,
+  "col_end": 20
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": false
+     }
+    },
+    "name": "x"
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "@trust-rustc-intrinsic::core::intrinsics::bitreverse::<u8>",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "<dump-root>/fx.rs",
+       "line_start": 39,
+       "col_start": 2,
+       "line_end": 39,
+       "col_end": 18
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Int": {
+    "width": 8,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [
+  {
+   "kind": "Requires",
+   "span": {
+    "file": "<dump-root>/fx.rs",
+    "line_start": 37,
+    "col_start": 13,
+    "line_end": 37,
+    "col_end": 19
+   },
+   "body": "__trust_lowered_compiler_contract__:x == 1"
+  },
+  {
+   "kind": "Ensures",
+   "span": {
+    "file": "<dump-root>/fx.rs",
+    "line_start": 38,
+    "col_start": 12,
+    "line_end": 38,
+    "col_end": 23
+   },
+   "body": "__trust_lowered_compiler_contract__:(result) == (1)"
+  }
+ ],
+ "preconditions": [
+  {
+   "Eq": [
+    {
+     "Var": [
+      "x",
+      "Int"
+     ]
+    },
+    {
+     "Int": 1
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 255
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [
+  {
+   "Eq": [
+    {
+     "Var": [
+      "_0",
+      "Int"
+     ]
+    },
+    {
+     "Int": 1
+    }
+   ]
+  }
+ ],
+ "spec": {
+  "requires": [
+   "x == 1"
+  ],
+  "ensures": [
+   "(result) == (1)"
+  ],
+  "invariants": []
+ }
+}

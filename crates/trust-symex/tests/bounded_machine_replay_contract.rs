@@ -46,7 +46,12 @@ const AARCH64_HVC0_BYTES: [u8; 4] = [0x02, 0x00, 0x00, 0xd4];
 const AARCH64_BRK1_ENCODING: u32 = 0xd420_0020;
 const AARCH64_BRK1_BYTES: [u8; 4] = [0x20, 0x00, 0x20, 0xd4];
 const AARCH64_DMB_ISH_ENCODING: u32 = 0xd503_3bbf;
-const AARCH64_DMB_ISH_BYTES: [u8; 4] = [0x9f, 0x3b, 0x03, 0xd5];
+// LE bytes of 0xd503_3bbf (`dmb ish`, assembler-derived per decode_barrier's
+// table). [0x9f, ...] here would be 0xd5033b9f = `dsb ish` — a different
+// barrier that also emits Aarch64SyncBoundary, so the mismatch surfaced only
+// as the replay encoding guard reporting Spurious, not as a wrong-instruction
+// failure.
+const AARCH64_DMB_ISH_BYTES: [u8; 4] = [0xbf, 0x3b, 0x03, 0xd5];
 const AARCH64_CBZ_WZR_PLUS_8_ENCODING: u32 = 0x3400_005f;
 const AARCH64_CBZ_WZR_PLUS_8_BYTES: [u8; 4] = [0x5f, 0x00, 0x00, 0x34];
 const AARCH64_CBNZ_WZR_PLUS_8_ENCODING: u32 = 0x3500_005f;

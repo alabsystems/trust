@@ -212,3 +212,5 @@ tests/trust-falsification/*.mir
 publish/.out/
 .buildlogs/
 crates/trust-disasm/harness/x86-decode-differential/target/
+crates/trust-disasm/harness/x86-semantic-differential/target/
+crates/trust-disasm/harness/x86-semantic-differential/natsem86

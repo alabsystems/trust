@@ -152,4 +152,3 @@ allowed_patterns = [
 classification = "precision_regression_from_soundness_fix"
 compatibility_status = "accepted_narrow_divergence"
 required_action = "Precision follow-ups scheduled BEHIND the soundness fix, never as a rollback: (a) per-argument reachability refinement (skip havocing pointees no call argument can reach — sound under &mut noalias), (b) arg-pointee non-mutation callee summaries in modular.rs (currently dest-only), (c) wire the snapshot rewrite into trust-backprop so the flywheel auto-repairs regressed sites."
-

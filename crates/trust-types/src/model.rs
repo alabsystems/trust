@@ -5827,6 +5827,37 @@ pub enum Ty {
     // Trust: #828 — represent trait objects as dynamic dispatch types.
     Dynamic {
         trait_name: String,
+        /// Trust (vtable slice 17, SOUNDNESS): the FAITHFUL, INJECTIVE principal key —
+        /// the string every shared trait-object IDENTITY must be derived from.
+        ///
+        /// `trait_name` is the principal trait's GENERICS-ERASED def path and nothing
+        /// else, so `dyn Convert<u32>` and `dyn Convert<u64>` render ONE string. Keying
+        /// an identity on it merges two genuinely different trait objects, and that was
+        /// a live fail-open in TWO consumers: `stable_vtable_global_name` (one global
+        /// name for two vtables — a false `Load`-equality) and, worse,
+        /// `stable_trait_object_id` -> `FatPtrKind::TraitObject { trait_id }`, which IS
+        /// the type identity, so `tys_agree` returned TRUE for two different types — a
+        /// path to a false Agreed.
+        ///
+        /// This field carries the whole existential predicate list rendered injectively
+        /// (principal path + non-lifetime args + associated-type bindings + auto
+        /// traits), minted by the ONE renderer
+        /// `trust_mir_extract::faithful_principal_key`. The extractor stamps it (it has
+        /// the `tcx`); the bridge, which has none and must never acquire one, only ever
+        /// HASHES the string it was handed. One renderer, two tcx callers, one
+        /// consumer — the producer/oracle drift that bit `trait_object_id` once already
+        /// is impossible here by construction rather than prevented by discipline.
+        ///
+        /// LIFETIMES ARE DELIBERATELY EXCLUDED from the rendering: regions are erased
+        /// everywhere else in this pipeline, so admitting them would manufacture
+        /// divergences between two spellings of one type.
+        ///
+        /// `None` = NOT injectively renderable (a param/placeholder/opaque argument, a
+        /// binding outside the closed grammar, a `$` in a rendered component). Every
+        /// identity consumer MUST fail closed on `None` — falling back to `trait_name`
+        /// is precisely the bug this field exists to close.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal_key: Option<String>,
     },
     // Trust: #828 — preserve coroutine captures for full MIR type coverage.
     Coroutine {
@@ -5841,6 +5872,19 @@ pub enum Ty {
         kind: String,
         detail: String,
     },
+    /// Trust (I6, ADDITIVE like `PtrSizedInt`/`Str`/`SymArray`): the
+    /// trust-bignum arbitrary-precision `Nat` carrier — `trust_bignum::Nat`.
+    /// Unbounded; NOT `Copy` (heap-carried limbs). This is the
+    /// **carrier-decision** spelling only: it is emitted solely by the carrier
+    /// map (`trust-clean-carrier`, whose `CleanType::Nat::exact_carrier` is its
+    /// one producer) and consumed by the Clean-origin mint/emission lane. It is
+    /// NEVER produced by extraction — `trust-mir-extract` renders the genuine
+    /// sysroot ADT as `Ty::Adt { name: "trust_bignum::Nat", .. }`, and that
+    /// independence is load-bearing for the frozen-R argument. Every
+    /// extraction/verifier consumer keeps its wildcard fail-closed arm;
+    /// deliberately placed LAST so every pre-existing variant's bincode index
+    /// is unperturbed (serde JSON is name-tagged and unaffected either way).
+    BignumNat,
 }
 
 /// Trust (R3, generics): the EXACT `kind` / `detail` pair `trust-mir-extract`'s
@@ -6273,6 +6317,77 @@ impl Ty {
                 pointee.vtable_source_type_key()?
             )),
             _ => None,
+        }
+    }
+
+    /// Trust (vtable slice 17): the BODY-SCOPED source-type key — exactly
+    /// [`Self::vtable_source_type_key`] on every concrete arm, plus the ONE arm that
+    /// renderer cannot have: a bare generic PARAMETER.
+    ///
+    /// Every concrete leaf DELEGATES to the owner-less renderer, so a param-free type
+    /// renders BYTE-IDENTICALLY and no already-minted global name can churn (the three
+    /// slice-3 globals key off `i32`/`usize` sources and are unaffected by construction,
+    /// not by inspection). The composite arms recurse into THIS function rather than the
+    /// owner-less one, so a param nested under a ref/tuple/array is admitted too.
+    ///
+    /// WHY A PARAM IS KEYABLE AT ALL. `T` is not a concrete type and has no global
+    /// identity — but WITHIN ONE BODY it is a single, fixed (if unknown) type, so two
+    /// `T as dyn Tr` coercions in one body really do share one vtable, which is exactly
+    /// the equality this identity asserts. `owner` (the body's def path) is what makes
+    /// the key globally injective, so two different bodies' `T/#0` can never merge if a
+    /// future name-preserving splice admits these.
+    ///
+    /// REFUSED, and why — each is a real merge hazard, not conservatism:
+    ///   * any `Unsupported` other than the param marker — in particular
+    ///     [`PRE_MONO_ALIAS_KIND`]/[`PRE_MONO_ALIAS_DETAIL`], which is stamped
+    ///     IDENTICALLY on EVERY param-bearing projection, so admitting `Unsupported`
+    ///     generically would merge `<T as A>::X` with `<U as B>::Y`.
+    ///   * a param whose detail is not the exact expected spelling. The parse is STRICT
+    ///     and never falls back to the whole detail string — a fallback would key two
+    ///     different unparseable details to one string.
+    ///   * a `$` in either component: the vtable mint splits at the LAST `$` and refuses
+    ///     one in the source key, so the refusal is asserted HERE rather than left as a
+    ///     downstream surprise.
+    ///
+    /// Emitted alphabet adds `param()@` plus whatever a def path contains (`:`, `#`,
+    /// `{}`, `<>`), and NEVER `$` — checked, not assumed.
+    pub fn vtable_source_type_key_in_body(&self, owner: &str) -> Option<String> {
+        match self {
+            Ty::Unsupported { kind, detail } if kind == "TyKind::Param" => {
+                // The owner is required ONLY here — a concrete type is body-independent
+                // and must keep rendering with no owner at all, so this check must not
+                // sit at the top of the function.
+                if owner.is_empty() || owner.contains('$') {
+                    return None;
+                }
+                let ident = detail
+                    .strip_prefix("generic parameter ")?
+                    .strip_suffix(" needs monomorphization")?;
+                if ident.is_empty() || ident.contains('$') {
+                    return None;
+                }
+                Some(format!("param({ident})@{owner}"))
+            }
+            Ty::Tuple(elems) => {
+                let parts: Option<Vec<String>> =
+                    elems.iter().map(|e| e.vtable_source_type_key_in_body(owner)).collect();
+                Some(format!("({})", parts?.join(", ")))
+            }
+            Ty::Array { elem, len } => {
+                Some(format!("[{}; {len}]", elem.vtable_source_type_key_in_body(owner)?))
+            }
+            Ty::Ref { mutable, inner } => Some(format!(
+                "&{}{}",
+                if *mutable { "mut " } else { "" },
+                inner.vtable_source_type_key_in_body(owner)?
+            )),
+            Ty::RawPtr { mutable, pointee } => Some(format!(
+                "*{} {}",
+                if *mutable { "mut" } else { "const" },
+                pointee.vtable_source_type_key_in_body(owner)?
+            )),
+            // Every concrete leaf — DELEGATED, so the two renderers cannot drift.
+            other => other.vtable_source_type_key(),
         }
     }
 
@@ -6818,6 +6933,36 @@ pub enum Rvalue {
     Use(Operand),
     BinaryOp(BinOp, Operand, Operand),
     CheckedBinaryOp(BinOp, Operand, Operand),
+    /// A binary op whose rustc MIR form was the arithmetic `*Unchecked`
+    /// variant — **UB on overflow**, NOT the wrapping semantics plain MIR
+    /// `Add`/`Sub`/`Mul` are defined with.
+    ///
+    /// Trust (R2/C4): preserved as its own variant instead of collapsing into
+    /// [`Rvalue::BinaryOp`], because the collapse destroys exactly the
+    /// provenance a DEFINITIONAL import must see. For the verification lane
+    /// the collapse was sound — vcgen demands an overflow VC either way, and
+    /// under a proved absence of overflow the unchecked, wrapping and
+    /// mathematical results coincide. But any consumer that treated a bare
+    /// `BinaryOp(Add)` as KERNEL WRAPPING arithmetic *unconditionally*, with
+    /// no overflow obligation in front of it — the natural reading, since MIR
+    /// integer `Add` IS wrapping-defined — would be poisoned by it: under
+    /// `-O`, `unsafe { a.unchecked_add(b) }` lowers to MIR `AddUnchecked`,
+    /// which the old collapse made indistinguishable from the wrapping op.
+    /// That is a false definitional import in waiting: the kernel would
+    /// believe `f(MAX, 1) = 0` about a function whose overflow is UB. Today
+    /// no admitter reads the binop spelling (the C4 emitter emits the
+    /// marker-authenticated call form, and `control_5`'s natural-lowering
+    /// trap plus `binop_provenance_pins_never_admit` pin the binop spelling
+    /// refused) — this variant removes the ambiguity at the ROOT, so a future
+    /// binop-form widening starts from a faithful extraction instead of
+    /// rediscovering this hazard.
+    ///
+    /// Consumers that want the old behaviour opt in per match arm (vcgen does,
+    /// keeping its overflow obligation and value encoding identical); every
+    /// consumer that does not name this variant fails closed through its
+    /// `#[non_exhaustive]` wildcard — which is the direction that matters.
+    // Trust: R2/C4 — preserve UB-on-overflow provenance; never collapse into BinaryOp.
+    UncheckedBinaryOp(BinOp, Operand, Operand),
     UnaryOp(UnOp, Operand),
     Ref {
         mutable: bool,
@@ -7867,6 +8012,291 @@ pub enum AssertMessage {
     NullPointerDereference,
     InvalidEnumConstruction,
     Custom(String),
+}
+
+/// Trust (vtable slice 17): name the SHAPE that pushed a principal argument outside the
+/// closed grammar, walking to the first offending LEAF.
+///
+/// Per-shape, deliberately: a single anonymous "not renderable" bucket is how a whole
+/// wave becomes unplannable (a prior lane's `_ => "Other"` arm hid the corpus's
+/// second-largest blocker until it was re-attributed). In particular `dyn Fn(String)`
+/// — `Fn<(String,)>`, a nominal leaf under a tuple — must land in a tag the nominal-key
+/// chain can count directly, because this slice adds measurable population to it.
+pub fn principal_arg_refusal_tag(ty: &Ty) -> &'static str {
+    principal_arg_refusal_tag_for(closed_grammar_refusal_shape(ty))
+}
+
+/// Trust (vtable slice 18): the same tag keyed on an ALREADY-CLASSIFIED shape.
+///
+/// Slice 18's renderer walks a `tcx`-level tree, so the leaf that refuses is often not
+/// reachable from the converted `trust_types::Ty` the slice-17 entry point classifies
+/// (a nominal's generic ARGUMENT has no representation there at all). The shape travels
+/// out of the recursion instead, and the two entry points stay one function apart so the
+/// principal/binding split cannot drift.
+pub fn principal_arg_refusal_tag_for(shape: RefusalShape) -> &'static str {
+    match shape {
+        RefusalShape::Nominal => "Ty(dyn principal arg: nominal)",
+        RefusalShape::Unsized => "Ty(dyn principal arg: unsized)",
+        RefusalShape::FnLike => "Ty(dyn principal arg: fn-like)",
+        RefusalShape::Opaque => "Ty(dyn principal arg: opaque/param)",
+        RefusalShape::Other => "Ty(dyn principal arg: other)",
+        RefusalShape::NominalConstArg => "Ty(dyn principal arg: nominal const-generic)",
+        RefusalShape::UnkeyablePath => "Ty(dyn principal arg: unkeyable nominal path)",
+        RefusalShape::SymbolicArrayLen => "Ty(dyn principal arg: symbolic array len)",
+        RefusalShape::TooDeep => "Ty(dyn principal arg: nesting too deep)",
+        RefusalShape::Ambiguous => "Ty(dyn principal arg: ambiguous rendering)",
+    }
+}
+
+/// The associated-type-binding twin of [`principal_arg_refusal_tag`].
+pub fn assoc_binding_refusal_tag(ty: &Ty) -> &'static str {
+    assoc_binding_refusal_tag_for(closed_grammar_refusal_shape(ty))
+}
+
+/// The associated-type-binding twin of [`principal_arg_refusal_tag_for`].
+pub fn assoc_binding_refusal_tag_for(shape: RefusalShape) -> &'static str {
+    match shape {
+        RefusalShape::Nominal => "Ty(dyn assoc binding: nominal)",
+        RefusalShape::Unsized => "Ty(dyn assoc binding: unsized)",
+        RefusalShape::FnLike => "Ty(dyn assoc binding: fn-like)",
+        RefusalShape::Opaque => "Ty(dyn assoc binding: opaque/param)",
+        RefusalShape::Other => "Ty(dyn assoc binding: other)",
+        RefusalShape::NominalConstArg => "Ty(dyn assoc binding: nominal const-generic)",
+        RefusalShape::UnkeyablePath => "Ty(dyn assoc binding: unkeyable nominal path)",
+        RefusalShape::SymbolicArrayLen => "Ty(dyn assoc binding: symbolic array len)",
+        RefusalShape::TooDeep => "Ty(dyn assoc binding: nesting too deep)",
+        RefusalShape::Ambiguous => "Ty(dyn assoc binding: ambiguous rendering)",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalShape {
+    Nominal,
+    Unsized,
+    FnLike,
+    Opaque,
+    Other,
+    /// Trust (vtable slice 18): a CONST generic argument of a nominal type. Dropping it
+    /// would merge `Foo<3>` with `Foo<4>`; there is no canonical const spelling in this
+    /// grammar yet, so it refuses — the same disposition the principal's own const args
+    /// already had, one level in.
+    NominalConstArg,
+    /// Trust (vtable slice 18): a nominal def path this grammar cannot embed
+    /// unambiguously — see [`nominal_path_is_keyable`].
+    UnkeyablePath,
+    /// Trust (vtable slice 18): `[T; N]` whose length is not a concrete target `usize`.
+    SymbolicArrayLen,
+    /// Trust (vtable slice 18): the type nests deeper than the renderer's bound.
+    TooDeep,
+    /// Trust (vtable slice 18): a rendered component that is not unambiguously
+    /// delimited — see [`key_component_is_unambiguous`]. Asserted, never assumed.
+    Ambiguous,
+}
+
+/// Walk the closed grammar's COMPOSITE arms to the first leaf that refuses, so the tag
+/// names the real blocker (`dyn Fn(String)` reports `nominal`, not `Tuple`).
+pub fn closed_grammar_refusal_shape(ty: &Ty) -> RefusalShape {
+    use crate::Ty as T;
+    match ty {
+        T::Tuple(elems) => elems
+            .iter()
+            .find(|e| e.vtable_source_type_key().is_none())
+            .map_or(RefusalShape::Other, closed_grammar_refusal_shape),
+        T::Array { elem, .. } => closed_grammar_refusal_shape(elem),
+        T::Ref { inner, .. } => closed_grammar_refusal_shape(inner),
+        T::RawPtr { pointee, .. } => closed_grammar_refusal_shape(pointee),
+        T::Adt { .. } | T::Datatype { .. } => RefusalShape::Nominal,
+        T::Slice { .. } | T::Str | T::Dynamic { .. } => RefusalShape::Unsized,
+        T::Closure { .. } | T::Coroutine { .. } | T::FnDef { .. } | T::FnPtr { .. } => {
+            RefusalShape::FnLike
+        }
+        T::Unsupported { .. } => RefusalShape::Opaque,
+        _ => RefusalShape::Other,
+    }
+}
+
+/// Trust (vtable slice 18): the RENDERABLE SKELETON of one type inside a trait object's
+/// principal key — a `tcx`-free tree that `trust-mir-extract` builds from a rustc type and
+/// that THIS module renders.
+///
+/// # What it recovers, and why it has to exist
+///
+/// Slice 17 rendered principal arguments and associated-type binding terms through
+/// [`Ty::vtable_source_type_key_in_body`], whose closed grammar REFUSES `Ty::Adt` because
+/// `Ty::Adt`'s `name` is a GENERICS-ERASED def path: `Vec<i32>` and `Vec<u64>` share one
+/// name. Refusing was correct — admitting them under the erased name would have re-opened
+/// the exact merge slice 17 closed — and it cost six clean rows.
+///
+/// A def path plus RECURSIVELY RENDERED generic arguments IS injective over nominal types,
+/// which the erased name is not. Only a `tcx` holder can produce it, so the `tcx` side
+/// supplies the facts (path + argument trees) and the RENDERING, together with its
+/// injectivity obligation, stays here where it can be tested at all:
+/// `trust-mir-extract` is workspace-EXCLUDED (`rustc_private`) and its unit tests cannot
+/// run under `targo`. That is slice 17's own precedent — it relocated the refusal
+/// classifier into this crate for the same reason.
+///
+/// # Still ONE renderer — the non-negotiable
+///
+/// Both `tcx`-holding callers reach this through
+/// `trust_mir_extract::faithful_principal_key`, and the MIR-side bridge (no `tcx`, and it
+/// must never acquire one) only ever HASHES the finished string. There is no second
+/// implementation for a hand-copy to drift from, which is the property slice 17
+/// established and this slice is required to preserve.
+///
+/// # Zero churn, BY CONSTRUCTION
+///
+/// [`VtableKeyTy::Closed`] delegates VERBATIM to [`Ty::vtable_source_type_key_in_body`],
+/// and the `tcx` walk tries that renderer FIRST at every node — so every key admitted
+/// before slice 18 (the three shipped slice-3 vtable globals, every argless principal,
+/// every scalar/`()`/tuple/array/ref/raw-ptr arg and every `param(T/#0)@{owner}`) renders
+/// byte-identically because the pre-existing code path is the one that produced it.
+///
+/// # Injectivity, and where it bottoms out
+///
+/// The grammar is unambiguously parseable, which is what makes rendering injective given
+/// injective leaves:
+///   * a nominal path is required to be crate-qualified (`::`) and free of every
+///     metacharacter of this grammar ([`nominal_path_is_keyable`]), so `PATH` can collide
+///     with no scalar keyword and no `&`/`*`/`(`/`[`/`param(` production;
+///   * every composite rendering is bracket-balanced with no TOP-LEVEL comma
+///     ([`key_component_is_unambiguous`]), so an argument list splits at exactly the
+///     commas that separate arguments. Both are CHECKED per component, not assumed — a
+///     def path is not this crate's to guarantee.
+/// The residual assumption is that `sysroot_authenticated_def_path_str` is injective over
+/// ADT `DefId`s. That is not a NEW assumption: it is the same one the principal trait's
+/// own path already rests on, and the same renderer, with the same cross-namespace
+/// disambiguation and the same sysroot-impersonation stamp.
+///
+/// # Regions
+///
+/// Lifetime arguments never enter the tree, at ANY depth. Regions are erased everywhere
+/// else in this pipeline, so admitting them would manufacture divergences between two
+/// spellings of one type — and slice 17 measured the concrete cost
+/// (`&'a V -> &'a dyn T` is a real shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VtableKeyTy {
+    /// A type slice 17's CLOSED grammar already spells. Rendered by delegating to
+    /// [`Ty::vtable_source_type_key_in_body`], so its spelling is not merely equal to the
+    /// pre-slice-18 one — it IS the pre-slice-18 one.
+    Closed(Ty),
+    /// A nominal type: its def path plus its NON-LIFETIME generic arguments, in
+    /// declaration order.
+    Nominal { path: String, args: Vec<VtableKeyTy> },
+    /// A tuple with at least one element the closed grammar refuses — `dyn Fn(&Path)`
+    /// desugars to `Fn<(&Path,)>`, so this arm is what carries the whole `Fn`-family.
+    Tuple(Vec<VtableKeyTy>),
+    Array { elem: Box<VtableKeyTy>, len: u128 },
+    Ref { mutable: bool, inner: Box<VtableKeyTy> },
+    RawPtr { mutable: bool, pointee: Box<VtableKeyTy> },
+}
+
+impl VtableKeyTy {
+    /// Render this skeleton, or name the SHAPE that refused.
+    ///
+    /// `owner` is threaded for one purpose only: a bare generic PARAMETER leaf is
+    /// body-scoped (`param(T/#0)@{owner}`), because `T` is one fixed type within one body
+    /// but not across bodies. A CONCRETE nominal is body-INDEPENDENT and must not be
+    /// scoped — scoping it would be churn and would refuse nothing — so no arm below
+    /// consults `owner` except through the delegated [`VtableKeyTy::Closed`] leaf.
+    pub fn render_in_body(&self, owner: &str) -> Result<String, RefusalShape> {
+        let rendered = match self {
+            // The pre-slice-18 renderer, called verbatim. NOT re-checked by
+            // `key_component_is_unambiguous` below: it produces exactly the strings slice
+            // 17 already ships, and subjecting them to a NEW predicate is how a "zero
+            // churn" slice silently drops a shipped key. Nested occurrences ARE covered —
+            // the enclosing composite's own check sees the whole rendered string.
+            VtableKeyTy::Closed(ty) => {
+                return ty
+                    .vtable_source_type_key_in_body(owner)
+                    .ok_or_else(|| closed_grammar_refusal_shape(ty));
+            }
+            VtableKeyTy::Nominal { path, args } => {
+                if !nominal_path_is_keyable(path) {
+                    return Err(RefusalShape::UnkeyablePath);
+                }
+                if args.is_empty() {
+                    path.clone()
+                } else {
+                    let mut parts = Vec::with_capacity(args.len());
+                    for a in args {
+                        parts.push(a.render_in_body(owner)?);
+                    }
+                    format!("{path}<{}>", parts.join(", "))
+                }
+            }
+            VtableKeyTy::Tuple(elems) => {
+                let mut parts = Vec::with_capacity(elems.len());
+                for e in elems {
+                    parts.push(e.render_in_body(owner)?);
+                }
+                format!("({})", parts.join(", "))
+            }
+            VtableKeyTy::Array { elem, len } => {
+                format!("[{}; {len}]", elem.render_in_body(owner)?)
+            }
+            VtableKeyTy::Ref { mutable, inner } => {
+                format!("&{}{}", if *mutable { "mut " } else { "" }, inner.render_in_body(owner)?)
+            }
+            VtableKeyTy::RawPtr { mutable, pointee } => format!(
+                "*{} {}",
+                if *mutable { "mut" } else { "const" },
+                pointee.render_in_body(owner)?
+            ),
+        };
+        if !key_component_is_unambiguous(&rendered) {
+            return Err(RefusalShape::Ambiguous);
+        }
+        Ok(rendered)
+    }
+}
+
+/// Trust (vtable slice 18): may this def path be embedded in a principal key as a NOMINAL
+/// type's head?
+///
+/// Two conditions, both structural, both load-bearing:
+///   * **crate-qualified** (`::`). This is what separates a rendered nominal from every
+///     other production of the grammar: no scalar keyword, `()`, `param(..)@..`, `&`,
+///     `*const`, `(`- or `[`-led form starts with a `::`-bearing bare path, so a path that
+///     had lost its crate root could otherwise be read as — or collide with — one of them.
+///   * **metacharacter-free**. The argument list is delimited by `<`/`>` and separated by
+///     `", "`, so a path carrying any of those would make the split ambiguous; `$` is the
+///     vtable mint's own separator (`stable_vtable_global_name` splits at the LAST `$`).
+///     Def paths are rustc's to render, not this crate's to guarantee — so this is
+///     asserted per path, not assumed once.
+///
+/// The sysroot-impersonation stamp (`__trust_crate@<id>::…`) passes both, deliberately: an
+/// impersonating crate's ADT must keep a DISTINCT key, not lose one.
+#[must_use]
+pub fn nominal_path_is_keyable(path: &str) -> bool {
+    path.contains("::") && !path.contains(['$', ',', '<', '>', '(', ')', '[', ']', ';', '&', '*'])
+}
+
+/// Trust (vtable slice 18): is this rendered component unambiguously delimited?
+///
+/// Bracket-balanced with NO top-level comma, non-empty, and `$`-free. That is exactly the
+/// property an argument list needs: `A<x, y>` splits at the commas that separate ITS
+/// arguments and nowhere else, so two distinct argument vectors can never join to one
+/// string. `<`/`>` count as brackets because the nominal arm introduces them.
+#[must_use]
+pub fn key_component_is_unambiguous(s: &str) -> bool {
+    if s.is_empty() || s.contains('$') {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' | '>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            ',' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -11611,5 +12041,514 @@ mod tests {
         };
         *targets = vec![(0, BlockId(1)), (3, BlockId(1))];
         assert_eq!(coroutine_resume_state_contract(&body), None);
+    }
+
+    // ================= Trust (vtable slice 17) =================
+
+    /// The ZERO-CHURN pin. Every concrete type must render BYTE-IDENTICALLY through the
+    /// body-scoped renderer, because the three shipped slice-3 vtable globals key off
+    /// concrete scalar sources (`i32`, `usize`) and their NAMES must not move.
+    #[test]
+    fn in_body_key_is_byte_identical_for_every_concrete_type() {
+        let concrete = vec![
+            Ty::Bool,
+            Ty::Char,
+            Ty::Int { width: 32, signed: true },
+            Ty::Int { width: 64, signed: false },
+            Ty::PtrSizedInt { signed: true },
+            Ty::PtrSizedInt { signed: false },
+            Ty::Float { width: 64 },
+            Ty::Unit,
+            Ty::Tuple(vec![Ty::Bool, Ty::Int { width: 8, signed: false }]),
+            Ty::Array { elem: Box::new(Ty::Int { width: 32, signed: true }), len: 4 },
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Int { width: 32, signed: true }) },
+            Ty::Ref { mutable: true, inner: Box::new(Ty::Bool) },
+            Ty::RawPtr { mutable: false, pointee: Box::new(Ty::PtrSizedInt { signed: false }) },
+            Ty::RawPtr { mutable: true, pointee: Box::new(Ty::Char) },
+            Ty::Tuple(vec![Ty::Ref {
+                mutable: false,
+                inner: Box::new(Ty::Array { elem: Box::new(Ty::Bool), len: 2 }),
+            }]),
+        ];
+        for t in &concrete {
+            assert_eq!(
+                t.vtable_source_type_key_in_body("krate::f"),
+                t.vtable_source_type_key(),
+                "concrete type must render identically in both renderers: {t:?}"
+            );
+        }
+        // and the exact spellings the shipped globals depend on
+        assert_eq!(
+            Ty::Int { width: 32, signed: true }.vtable_source_type_key_in_body("krate::f").as_deref(),
+            Some("i32")
+        );
+        assert_eq!(
+            Ty::Int { width: 64, signed: false }
+                .vtable_source_type_key_in_body("krate::f")
+                .as_deref(),
+            Some("u64")
+        );
+    }
+
+    /// Trust (vtable slice 17): a CONCRETE type is body-INDEPENDENT and must render the
+    /// same under any owner, including none. This is what keeps `dyn A<i32>`'s principal
+    /// key — and every already-minted `trait_id` and vtable global name — byte-identical
+    /// while `dyn A<T>` becomes body-scoped.
+    #[test]
+    fn in_body_key_is_owner_independent_for_concrete_types() {
+        for t in [
+            Ty::Int { width: 32, signed: true },
+            Ty::Bool,
+            Ty::Unit,
+            Ty::Tuple(vec![Ty::Int { width: 32, signed: true }]),
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Char) },
+            Ty::Array { elem: Box::new(Ty::Bool), len: 2 },
+        ] {
+            assert_eq!(
+                t.vtable_source_type_key_in_body("krate::f"),
+                t.vtable_source_type_key_in_body("krate::g"),
+                "a concrete type must not depend on the owner: {t:?}"
+            );
+            assert_eq!(
+                t.vtable_source_type_key_in_body(""),
+                t.vtable_source_type_key(),
+                "a concrete type must render with NO owner at all: {t:?}"
+            );
+        }
+    }
+
+    fn param_ty(name_idx: &str) -> Ty {
+        Ty::Unsupported {
+            kind: "TyKind::Param".to_string(),
+            detail: format!("generic parameter {name_idx} needs monomorphization"),
+        }
+    }
+
+    #[test]
+    fn in_body_key_admits_a_bare_param_scoped_to_its_owner() {
+        assert_eq!(
+            param_ty("T/#0").vtable_source_type_key_in_body("krate::make_bar").as_deref(),
+            Some("param(T/#0)@krate::make_bar")
+        );
+        // the owner-less renderer must STILL refuse it — it has no body to scope to
+        assert_eq!(param_ty("T/#0").vtable_source_type_key(), None);
+    }
+
+    /// The injectivity pins: a param key must separate on BOTH components.
+    #[test]
+    fn in_body_param_key_separates_on_param_and_on_owner() {
+        let a = param_ty("T/#0").vtable_source_type_key_in_body("krate::f");
+        let b = param_ty("U/#1").vtable_source_type_key_in_body("krate::f");
+        let c = param_ty("T/#0").vtable_source_type_key_in_body("krate::g");
+        assert!(a.is_some());
+        assert_ne!(a, b, "two DIFFERENT params in one body must not merge");
+        assert_ne!(a, c, "the SAME param in two different bodies must not merge");
+    }
+
+    #[test]
+    fn in_body_key_admits_params_nested_under_composites() {
+        assert_eq!(
+            Ty::Ref { mutable: false, inner: Box::new(param_ty("T/#0")) }
+                .vtable_source_type_key_in_body("krate::f")
+                .as_deref(),
+            Some("&param(T/#0)@krate::f")
+        );
+        assert_eq!(
+            Ty::RawPtr { mutable: true, pointee: Box::new(param_ty("T/#0")) }
+                .vtable_source_type_key_in_body("krate::f")
+                .as_deref(),
+            Some("*mut param(T/#0)@krate::f")
+        );
+        assert_eq!(
+            Ty::Array { elem: Box::new(param_ty("T/#0")), len: 3 }
+                .vtable_source_type_key_in_body("krate::f")
+                .as_deref(),
+            Some("[param(T/#0)@krate::f; 3]")
+        );
+    }
+
+    /// THE MERGED-SENTINEL TRAP. `PRE_MONO_ALIAS_{KIND,DETAIL}` is stamped IDENTICALLY on
+    /// EVERY param-bearing projection, so admitting `Unsupported` generically would key
+    /// `<T as A>::X` and `<U as B>::Y` to ONE string — exactly the merge this slice closes.
+    #[test]
+    fn in_body_key_refuses_the_merged_pre_mono_alias_sentinel() {
+        let alias = Ty::Unsupported {
+            kind: PRE_MONO_ALIAS_KIND.to_string(),
+            detail: PRE_MONO_ALIAS_DETAIL.to_string(),
+        };
+        assert_eq!(alias.vtable_source_type_key_in_body("krate::f"), None);
+        assert_eq!(alias.vtable_source_type_key(), None);
+    }
+
+    /// The param parse is STRICT: a fallback to the whole detail string would key two
+    /// different unparseable details to one string.
+    #[test]
+    fn in_body_key_param_parse_is_strict() {
+        for bad in [
+            Ty::Unsupported {
+                kind: "TyKind::Param".to_string(),
+                detail: "T/#0".to_string(),
+            },
+            Ty::Unsupported {
+                kind: "TyKind::Param".to_string(),
+                detail: "generic parameter T/#0".to_string(),
+            },
+            Ty::Unsupported {
+                kind: "TyKind::Param".to_string(),
+                detail: " needs monomorphization".to_string(),
+            },
+            // right detail, WRONG kind — must not be mistaken for a param
+            Ty::Unsupported {
+                kind: "TyKind::Placeholder".to_string(),
+                detail: "generic parameter T/#0 needs monomorphization".to_string(),
+            },
+        ] {
+            assert_eq!(
+                bad.vtable_source_type_key_in_body("krate::f"),
+                None,
+                "strict parse must refuse {bad:?}"
+            );
+        }
+    }
+
+    /// `$`-SAFETY: the vtable mint splits at the LAST `$` and refuses one in the source
+    /// key, so the refusal is asserted here rather than left as a downstream surprise.
+    #[test]
+    fn in_body_key_refuses_dollar_in_either_component() {
+        assert_eq!(param_ty("T/#0").vtable_source_type_key_in_body("krate::f$g"), None);
+        assert_eq!(param_ty("T$X/#0").vtable_source_type_key_in_body("krate::f"), None);
+        assert_eq!(param_ty("T/#0").vtable_source_type_key_in_body(""), None);
+        // a rendered param key never contains `$`
+        let k = param_ty("T/#0").vtable_source_type_key_in_body("krate::f").unwrap();
+        assert!(!k.contains('$'), "rendered key must be $-free: {k}");
+    }
+
+    /// NOMINAL sources stay refused in BOTH renderers — `Ty::Adt.name` is generics-erased,
+    /// so `PhantomData<i32>` and `PhantomData<u64>` render identically. Part B did not
+    /// widen this; it is format work.
+    #[test]
+    fn in_body_key_still_refuses_nominal_sources() {
+        let adt = Ty::adt("core::marker::PhantomData", vec![]);
+        assert_eq!(adt.vtable_source_type_key_in_body("krate::f"), None);
+        assert_eq!(adt.vtable_source_type_key(), None);
+    }
+
+    /// Trust (vtable slice 17): the refusal reasons must be PER-SHAPE, not one anonymous
+    /// bucket — a lumped "not renderable" tag is how a whole wave becomes unplannable.
+    /// `dyn Fn(String)` in particular — `Fn<(String,)>`, a NOMINAL leaf under a tuple —
+    /// must report `nominal`, because that is the population the nominal-key follow-up
+    /// counts.
+    #[test]
+    fn principal_arg_refusal_tag_names_the_first_offending_leaf() {
+        let string_adt = Ty::adt("alloc::string::String", vec![]);
+        // `dyn Fn(String)` — the argument is the tuple `(String,)`.
+        assert_eq!(
+            principal_arg_refusal_tag(&Ty::Tuple(vec![string_adt.clone()])),
+            "Ty(dyn principal arg: nominal)",
+            "a nominal leaf under a tuple must report `nominal`, not `Tuple`"
+        );
+        assert_eq!(principal_arg_refusal_tag(&string_adt), "Ty(dyn principal arg: nominal)");
+        assert_eq!(principal_arg_refusal_tag(&Ty::Str), "Ty(dyn principal arg: unsized)");
+        assert_eq!(
+            principal_arg_refusal_tag(&Ty::FnPtr {
+                sig: Box::new(FnSig { params: vec![], ret: Box::new(Ty::Unit) })
+            }),
+            "Ty(dyn principal arg: fn-like)"
+        );
+        assert_eq!(
+            principal_arg_refusal_tag(&Ty::Unsupported {
+                kind: "TyKind::Param".to_string(),
+                detail: "generic parameter T/#0 needs monomorphization".to_string(),
+            }),
+            "Ty(dyn principal arg: opaque/param)"
+        );
+        // nested through a reference too
+        assert_eq!(
+            principal_arg_refusal_tag(&Ty::Ref { mutable: false, inner: Box::new(string_adt) }),
+            "Ty(dyn principal arg: nominal)"
+        );
+    }
+
+    /// The associated-type-binding twin reports the SAME shapes under its own prefix, so
+    /// the two populations stay separately countable in the reason-tag histogram.
+    #[test]
+    fn assoc_binding_refusal_tag_is_the_distinguishable_twin() {
+        assert_eq!(
+            assoc_binding_refusal_tag(&Ty::adt("alloc::string::String", vec![])),
+            "Ty(dyn assoc binding: nominal)"
+        );
+        assert_eq!(assoc_binding_refusal_tag(&Ty::Str), "Ty(dyn assoc binding: unsized)");
+        assert_ne!(
+            assoc_binding_refusal_tag(&Ty::Str),
+            principal_arg_refusal_tag(&Ty::Str),
+            "binding and principal-arg refusals must never collapse into one bucket"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Trust (vtable slice 18): the NOMINAL key. The obligation is INJECTIVITY OVER THE
+    // TYPE, so it is proven here per shape rather than asserted in prose.
+    // ---------------------------------------------------------------------------------
+
+    const OWNER: &str = "krate::f";
+
+    fn closed(t: Ty) -> VtableKeyTy {
+        VtableKeyTy::Closed(t)
+    }
+    fn i32_k() -> VtableKeyTy {
+        closed(Ty::Int { width: 32, signed: true })
+    }
+    fn u64_k() -> VtableKeyTy {
+        closed(Ty::Int { width: 64, signed: false })
+    }
+    fn nom(path: &str, args: Vec<VtableKeyTy>) -> VtableKeyTy {
+        VtableKeyTy::Nominal { path: path.to_string(), args }
+    }
+    fn render(k: &VtableKeyTy) -> String {
+        k.render_in_body(OWNER).expect("must render")
+    }
+
+    /// THE HEADLINE PROPERTY, and the one the erased `Ty::Adt.name` did not have.
+    #[test]
+    fn nominal_key_separates_vec_i32_from_vec_u64() {
+        let vec_i32 = nom("alloc::vec::Vec", vec![i32_k()]);
+        let vec_u64 = nom("alloc::vec::Vec", vec![u64_k()]);
+        assert_eq!(render(&vec_i32), "alloc::vec::Vec<i32>");
+        assert_eq!(render(&vec_u64), "alloc::vec::Vec<u64>");
+        assert_ne!(render(&vec_i32), render(&vec_u64));
+    }
+
+    /// Recursively, so the separation is not a one-level trick.
+    #[test]
+    fn nominal_key_separates_nested_vec_vec_i32_from_vec_vec_u64() {
+        let a = nom("alloc::vec::Vec", vec![nom("alloc::vec::Vec", vec![i32_k()])]);
+        let b = nom("alloc::vec::Vec", vec![nom("alloc::vec::Vec", vec![u64_k()])]);
+        assert_eq!(render(&a), "alloc::vec::Vec<alloc::vec::Vec<i32>>");
+        assert_ne!(render(&a), render(&b));
+    }
+
+    /// Two DISTINCT ADTs sharing a last path segment. The WHOLE def path is in the key —
+    /// a leaf-name key would merge these, which is the same class of merge as the erased
+    /// generics.
+    #[test]
+    fn nominal_key_separates_two_adts_sharing_a_last_segment() {
+        let a = nom("krate::a::Foo", vec![]);
+        let b = nom("krate::b::Foo", vec![]);
+        assert_eq!(render(&a), "krate::a::Foo");
+        assert_ne!(render(&a), render(&b));
+    }
+
+    /// The ASSOCIATED-TYPE BINDING half: `dyn It<Item = Vec<i32>>` and `<Item = Vec<u64>>`
+    /// are different types sharing one principal path AND one binding NAME, so the term
+    /// is the only thing that can separate them. (`faithful_principal_key` composes the
+    /// binding as `name=term`; this pins the composition too.)
+    #[test]
+    fn nominal_key_separates_assoc_binding_terms() {
+        let name = "core::iter::traits::iterator::Iterator::Item";
+        let a = format!("{name}={}", render(&nom("alloc::vec::Vec", vec![i32_k()])));
+        let b = format!("{name}={}", render(&nom("alloc::vec::Vec", vec![u64_k()])));
+        assert_eq!(a, "core::iter::traits::iterator::Iterator::Item=alloc::vec::Vec<i32>");
+        assert_ne!(a, b);
+    }
+
+    /// Argument-list splitting must be unambiguous: two args can never join into a string
+    /// a single arg could also produce. This is what `key_component_is_unambiguous`
+    /// guarantees, exercised end to end.
+    #[test]
+    fn nominal_key_arg_list_is_unambiguously_delimited() {
+        let two = nom("krate::Pair", vec![i32_k(), u64_k()]);
+        let one_tuple = nom("krate::Pair", vec![closed(Ty::Tuple(vec![
+            Ty::Int { width: 32, signed: true },
+            Ty::Int { width: 64, signed: false },
+        ]))]);
+        assert_eq!(render(&two), "krate::Pair<i32, u64>");
+        assert_eq!(render(&one_tuple), "krate::Pair<(i32, u64)>");
+        assert_ne!(render(&two), render(&one_tuple), "arity must be recoverable from the key");
+        // and no rendered component ever carries a TOP-LEVEL comma
+        for k in [&two, &one_tuple] {
+            assert!(key_component_is_unambiguous(&render(k)));
+        }
+    }
+
+    /// ZERO CHURN, the strong form: for every shape slice 17 already admitted, the slice-18
+    /// renderer returns the SAME BYTES — because `Closed` delegates to the very function
+    /// that produced them. A churned key silently re-mints a shipped vtable global.
+    #[test]
+    fn slice_18_renders_every_previously_admitted_shape_byte_identically() {
+        let previously_admitted = vec![
+            Ty::Bool,
+            Ty::Char,
+            Ty::Int { width: 32, signed: true },
+            Ty::Int { width: 64, signed: false },
+            Ty::PtrSizedInt { signed: true },
+            Ty::PtrSizedInt { signed: false },
+            Ty::Float { width: 64 },
+            Ty::Unit,
+            Ty::Tuple(vec![Ty::Bool, Ty::Int { width: 8, signed: false }]),
+            Ty::Array { elem: Box::new(Ty::Int { width: 32, signed: true }), len: 4 },
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Int { width: 32, signed: true }) },
+            Ty::Ref { mutable: true, inner: Box::new(Ty::Bool) },
+            Ty::RawPtr { mutable: false, pointee: Box::new(Ty::PtrSizedInt { signed: false }) },
+            Ty::RawPtr { mutable: true, pointee: Box::new(Ty::Char) },
+            param_ty("T/#0"),
+            Ty::Ref { mutable: false, inner: Box::new(param_ty("T/#0")) },
+            Ty::Array { elem: Box::new(param_ty("T/#0")), len: 3 },
+            Ty::Tuple(vec![param_ty("T/#0"), Ty::Bool]),
+        ];
+        for t in previously_admitted {
+            let before = t.vtable_source_type_key_in_body(OWNER);
+            let after = closed(t.clone()).render_in_body(OWNER).ok();
+            assert_eq!(before, after, "slice 18 must not move an already-admitted key: {t:?}");
+            assert!(before.is_some(), "fixture must actually be admitted: {t:?}");
+        }
+        // the exact spellings the three shipped slice-3 globals depend on
+        assert_eq!(render(&i32_k()), "i32");
+        assert_eq!(render(&closed(Ty::PtrSizedInt { signed: false })), "usize");
+    }
+
+    /// BODY-SCOPING RULE, unchanged: the `param` leaf is owner-scoped, a concrete nominal
+    /// is NOT. Scoping a nominal would be churn AND would merge nothing — it is
+    /// body-independent by construction.
+    #[test]
+    fn nominal_key_is_owner_independent_but_the_param_leaf_is_not() {
+        let v = nom("alloc::vec::Vec", vec![i32_k()]);
+        assert_eq!(v.render_in_body("krate::f"), v.render_in_body("krate::g"));
+        assert_eq!(v.render_in_body(""), v.render_in_body("krate::f"));
+
+        // a param NESTED inside a nominal keeps its owner scope, so two bodies' `Vec<T>`
+        // do not merge.
+        let vt = nom("alloc::vec::Vec", vec![closed(param_ty("T/#0"))]);
+        assert_eq!(
+            vt.render_in_body("krate::f").unwrap(),
+            "alloc::vec::Vec<param(T/#0)@krate::f>"
+        );
+        assert_ne!(vt.render_in_body("krate::f"), vt.render_in_body("krate::g"));
+    }
+
+    /// THE NEGATIVE PIN, and the bug class it forecloses: anything that cannot be rendered
+    /// injectively must REFUSE with its own per-shape tag. Falling back to an erased
+    /// spelling is the defect, so there must be no fallback at all.
+    #[test]
+    fn unrenderable_shapes_still_refuse_with_a_per_shape_tag() {
+        // a path with no crate root cannot be told apart from the grammar's own keywords
+        assert_eq!(
+            nom("Foo", vec![]).render_in_body(OWNER),
+            Err(RefusalShape::UnkeyablePath)
+        );
+        // metacharacters would make the argument split ambiguous
+        for bad in ["krate::Fo,o", "krate::Fo<o", "krate::Fo$o", "krate::Fo(o", "krate::Fo[o"] {
+            assert_eq!(
+                nom(bad, vec![]).render_in_body(OWNER),
+                Err(RefusalShape::UnkeyablePath),
+                "must refuse unkeyable path {bad}"
+            );
+        }
+        // an unrenderable ARGUMENT poisons the whole nominal — never a partial key
+        let alias = Ty::Unsupported {
+            kind: PRE_MONO_ALIAS_KIND.to_string(),
+            detail: PRE_MONO_ALIAS_DETAIL.to_string(),
+        };
+        assert_eq!(
+            nom("alloc::vec::Vec", vec![closed(alias)]).render_in_body(OWNER),
+            Err(RefusalShape::Opaque),
+            "the merged PRE_MONO_ALIAS sentinel stays refused at every depth"
+        );
+        assert_eq!(
+            nom("alloc::boxed::Box", vec![closed(Ty::Str)]).render_in_body(OWNER),
+            Err(RefusalShape::Unsized)
+        );
+        // every new shape has its OWN tag under BOTH prefixes — no anonymous bucket
+        for shape in [
+            RefusalShape::NominalConstArg,
+            RefusalShape::UnkeyablePath,
+            RefusalShape::SymbolicArrayLen,
+            RefusalShape::TooDeep,
+            RefusalShape::Ambiguous,
+            RefusalShape::Nominal,
+            RefusalShape::Unsized,
+            RefusalShape::FnLike,
+            RefusalShape::Opaque,
+            RefusalShape::Other,
+        ] {
+            let p = principal_arg_refusal_tag_for(shape);
+            let b = assoc_binding_refusal_tag_for(shape);
+            assert_ne!(p, b, "principal and binding refusals must stay countable apart");
+            assert!(p.starts_with("Ty(dyn principal arg: "), "{p}");
+            assert!(b.starts_with("Ty(dyn assoc binding: "), "{b}");
+        }
+    }
+
+    /// `$`-SAFETY, asserted rather than assumed: the vtable mint splits at the LAST `$`
+    /// and a rendered nominal arg carries arbitrary def-path bytes.
+    #[test]
+    fn nominal_key_is_dollar_safe() {
+        assert_eq!(
+            nom("krate::Fo$o", vec![]).render_in_body(OWNER),
+            Err(RefusalShape::UnkeyablePath)
+        );
+        // a `$` reaching the composition through a nested owner is caught too
+        assert_eq!(
+            nom("alloc::vec::Vec", vec![closed(param_ty("T/#0"))]).render_in_body("krate::f$g"),
+            Err(RefusalShape::Opaque),
+        );
+        let k = render(&nom("alloc::vec::Vec", vec![i32_k()]));
+        assert!(!k.contains('$'), "rendered nominal key must be $-free: {k}");
+    }
+
+    /// The impersonation stamp must SEPARATE, not disappear: an ADT from a crate rustc
+    /// declined to authenticate keeps a distinct key.
+    #[test]
+    fn nominal_key_keeps_the_sysroot_impersonation_stamp() {
+        let honest = nom("alloc::string::String", vec![]);
+        let stamped = nom("__trust_crate@0123456789abcdef::alloc::string::String", vec![]);
+        assert!(nominal_path_is_keyable("__trust_crate@0123456789abcdef::alloc::string::String"));
+        assert_ne!(render(&honest), render(&stamped));
+    }
+
+    /// Composites over nominals — `dyn Fn(&Path)` is `Fn<(&Path,)>`, the shape that
+    /// carries the whole `Fn` family into this lane.
+    #[test]
+    fn nominal_key_renders_under_every_composite() {
+        let path = nom("krate::Path", vec![]);
+        assert_eq!(render(&VtableKeyTy::Tuple(vec![path.clone()])), "(krate::Path)");
+        assert_eq!(
+            render(&VtableKeyTy::Ref { mutable: false, inner: Box::new(path.clone()) }),
+            "&krate::Path"
+        );
+        assert_eq!(
+            render(&VtableKeyTy::Ref { mutable: true, inner: Box::new(path.clone()) }),
+            "&mut krate::Path"
+        );
+        assert_eq!(
+            render(&VtableKeyTy::RawPtr { mutable: false, pointee: Box::new(path.clone()) }),
+            "*const krate::Path"
+        );
+        assert_eq!(
+            render(&VtableKeyTy::Array { elem: Box::new(path), len: 3 }),
+            "[krate::Path; 3]"
+        );
+        // the composite spellings match the closed grammar's, so a hybrid key stays in
+        // ONE language
+        assert_eq!(
+            render(&VtableKeyTy::Tuple(vec![
+                VtableKeyTy::Ref { mutable: false, inner: Box::new(i32_k()) },
+                nom("krate::Path", vec![]),
+            ])),
+            "(&i32, krate::Path)"
+        );
+    }
+
+    /// The unambiguity predicate itself, since every new rendering is gated on it.
+    #[test]
+    fn key_component_unambiguity_predicate() {
+        assert!(key_component_is_unambiguous("i32"));
+        assert!(key_component_is_unambiguous("(i32, u64)"));
+        assert!(key_component_is_unambiguous("alloc::vec::Vec<alloc::vec::Vec<i32>>"));
+        assert!(key_component_is_unambiguous("param(T/#0)@krate::{impl#0}::m"));
+        assert!(!key_component_is_unambiguous(""));
+        assert!(!key_component_is_unambiguous("i32, u64"), "a TOP-LEVEL comma is the hazard");
+        assert!(!key_component_is_unambiguous("Vec<i32"), "unbalanced");
+        assert!(!key_component_is_unambiguous("i32>"), "unbalanced");
+        assert!(!key_component_is_unambiguous("a$b"));
     }
 }

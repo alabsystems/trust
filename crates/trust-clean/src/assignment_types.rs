@@ -615,6 +615,116 @@ fn pointer_pointee_coercion(source: &Ty, destination: &Ty) -> bool {
         )
 }
 
+/// The components of a `trust_mir_extract::faithful_principal_key`, split at the
+/// separators that renderer emits.
+///
+/// The grammar (see `faithful_principal_key`, which is its ONLY producer) is
+/// `PATH` optionally followed by `<arg, …>`, then a sorted run of `+[Assoc=Term]`
+/// associated-type bindings, then a sorted run of `+AutoTraitPath` auto traits. Every
+/// rendered component is bracket-balanced and free of this grammar's metacharacters
+/// (`trust_types::key_component_is_unambiguous` / `nominal_path_is_keyable` enforce
+/// exactly that, per component, at mint time), so a `+` at bracket depth 0 is always a
+/// separator and never part of a component — which is what makes this split well-defined.
+struct PrincipalKeyParts<'a> {
+    /// Principal trait path plus its non-lifetime arguments — e.g. `krate::Convert<u32>`.
+    principal: &'a str,
+    /// Associated-type bindings, each the inner text of a `+[…]` group (e.g. `Item=u32`),
+    /// in the renderer's sorted order.
+    bindings: Vec<&'a str>,
+    /// Auto-trait paths, each a trailing `+`-separated segment, in the renderer's sorted
+    /// order.
+    autos: Vec<&'a str>,
+}
+
+/// Split a faithful principal key into [`PrincipalKeyParts`], or `None` if it does not
+/// parse in the renderer's grammar.
+///
+/// FAIL-CLOSED, deliberately: `None` makes the only caller reject the cast. This also
+/// declines the historical hand-written multi-bound spelling `"A + B + Send"` (spaces
+/// around the separator), which `faithful_principal_key` never emits — refusing to guess
+/// at a spelling outside the grammar is preferable to parsing it as an auto-trait list.
+fn parse_principal_key(key: &str) -> Option<PrincipalKeyParts<'_>> {
+    let mut depth: i32 = 0;
+    let mut cuts: Vec<usize> = Vec::new();
+    for (i, c) in key.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' | '>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            '+' if depth == 0 => cuts.push(i),
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let principal = &key[..cuts.first().copied().unwrap_or(key.len())];
+    if principal.is_empty() {
+        return None;
+    }
+    let (mut bindings, mut autos) = (Vec::new(), Vec::new());
+    for (n, start) in cuts.iter().enumerate() {
+        let end = cuts.get(n + 1).copied().unwrap_or(key.len());
+        let segment = &key[start + 1..end];
+        if let Some(inner) = segment.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if inner.is_empty() {
+                return None;
+            }
+            bindings.push(inner);
+        } else {
+            // An auto trait renders as a bare def path: non-empty, no whitespace, no
+            // bracket. Anything else is outside the grammar.
+            if segment.is_empty()
+                || segment.contains(|c: char| c.is_whitespace() || "[]<>()".contains(c))
+            {
+                return None;
+            }
+            autos.push(segment);
+        }
+    }
+    Some(PrincipalKeyParts { principal, bindings, autos })
+}
+
+/// Whether a raw-pointer pointee cast between two trait objects is reconstructable:
+/// principal (path + args + associated-type bindings) EXACTLY equal, auto traits by
+/// SUBSET (the destination's must be a subset of the source's).
+///
+/// # Why not blanket key equality
+///
+/// Keying this on the erased `trait_name` was loose in the args/bindings direction, but
+/// that direction turns out to be INERT BY UPSTREAM ROUTING:
+/// `rustc_hir_typeck/src/cast.rs` reconstructs both objects and runs a full `eq` on
+/// principal + args + projections, so an args-differing pointer cast is a HARD ERROR at
+/// HIR typeck (`tests/ui/cast/ptr-to-trait-obj-different-args.rs`) and never reaches MIR.
+///
+/// What DOES reach MIR is auto-trait REMOVAL — `*mut (dyn Trait + Send) as *mut dyn Trait`
+/// is legal Rust and appears in the `//@ check-pass` file
+/// `tests/ui/cast/ptr-to-trait-obj-ok.rs`. Auto traits ARE part of the faithful key, so a
+/// blanket key comparison would reject that cast: a pure coverage loss on valid code, and
+/// over-rejecting legal Rust is a drop-in-compatibility defect, not a soundness win.
+/// Hence subset rather than equality — removal is a legal upcast, ADDITION is not, and
+/// rustc likewise rejects addition (`cast.rs`, the "adding an auto trait" arm).
+///
+/// `None` on either side fails closed: an unrenderable identity cannot be shown equal to
+/// anything, and falling back to the erased `trait_name` is the defect this closes.
+fn dyn_pointee_cast_compatible(source: Option<&str>, destination: Option<&str>) -> bool {
+    let (Some(source), Some(destination)) = (source, destination) else {
+        return false;
+    };
+    let (Some(source), Some(destination)) =
+        (parse_principal_key(source), parse_principal_key(destination))
+    else {
+        return false;
+    };
+    source.principal == destination.principal
+        && source.bindings == destination.bindings
+        && destination.autos.iter().all(|auto| source.autos.contains(auto))
+}
+
 fn raw_pointer_cast_supported(source: &Ty, destination: &Ty) -> bool {
     match destination {
         // Length-metadata pointers may retain compatible length metadata or be
@@ -623,11 +733,13 @@ fn raw_pointer_cast_supported(source: &Ty, destination: &Ty) -> bool {
             matches!(source, Ty::Slice { .. } | Ty::Str)
                 || pointer_pointee_coercion(source, destination)
         }
-        // Vtable metadata is identity-bearing; the schema cannot prove trait
-        // upcasting or a concrete implementation, so only the exact trait stays.
-        Ty::Dynamic { trait_name: destination_trait } => {
-            matches!(source, Ty::Dynamic { trait_name: source_trait }
-                if source_trait == destination_trait)
+        // Vtable metadata is identity-bearing; the schema cannot prove trait upcasting or
+        // a concrete implementation. Keyed on the FAITHFUL `principal_key`, never the
+        // generics-erased `trait_name` — but NOT by blanket equality, because auto-trait
+        // removal is legal Rust that reaches MIR. See `dyn_pointee_cast_compatible`.
+        Ty::Dynamic { principal_key: destination_key, .. } => {
+            matches!(source, Ty::Dynamic { principal_key: source_key, .. }
+                if dyn_pointee_cast_compatible(source_key.as_deref(), destination_key.as_deref()))
         }
         Ty::Unsupported { .. } => false,
         // A destination with unit metadata is thin. Rust raw-pointer casts may
@@ -2318,6 +2430,119 @@ mod tests {
         assert_eq!(
             trust_types::resolve_datatype_marker(&defs, &marker(alpha)),
             Some(def(alpha, u8_ty())),
+        );
+    }
+
+    // --- trait-object raw-pointer casts (vtable slice 19) ---------------------
+    //
+    // Every case below holds `trait_name` CONSTANT and varies only `principal_key`, so
+    // each assertion is about the faithful identity alone. Under the old erased keying
+    // all of them compared equal, which is the defect.
+
+    fn dyn_pointee(principal_key: &str) -> Ty {
+        Ty::Dynamic {
+            trait_name: "krate::Trait".into(),
+            principal_key: Some(principal_key.into()),
+        }
+    }
+
+    fn unkeyed_dyn_pointee() -> Ty {
+        Ty::Dynamic { trait_name: "krate::Trait".into(), principal_key: None }
+    }
+
+    /// The `remove_auto` case from `tests/ui/cast/ptr-to-trait-obj-ok.rs`, a `//@ check-pass`
+    /// file: `*mut (dyn Trait + Send) as *mut dyn Trait`. The keys DIFFER (auto traits are
+    /// in the key) but the cast is LEGAL RUST that reaches MIR, so a blanket key comparison
+    /// would be a pure coverage loss on valid code — a drop-in-compatibility defect.
+    #[test]
+    fn raw_ptr_dyn_cast_accepts_auto_trait_removal() {
+        let source = dyn_pointee("krate::Trait+core::marker::Send");
+        let destination = dyn_pointee("krate::Trait");
+        assert_ne!(source, destination, "precondition: the two keys really do differ");
+        assert!(raw_pointer_cast_supported(&source, &destination));
+        // Dropping ONE of several autos is equally legal.
+        assert!(raw_pointer_cast_supported(
+            &dyn_pointee("krate::Trait+core::marker::Send+core::marker::Sync"),
+            &dyn_pointee("krate::Trait+core::marker::Send"),
+        ));
+        // The identity cast is of course still accepted.
+        assert!(raw_pointer_cast_supported(
+            &dyn_pointee("krate::Trait+core::marker::Send"),
+            &dyn_pointee("krate::Trait+core::marker::Send"),
+        ));
+    }
+
+    /// The converse direction is NOT a legal upcast — rustc rejects adding an auto trait
+    /// in `rustc_hir_typeck/src/cast.rs` — so the subset check must be directional.
+    #[test]
+    fn raw_ptr_dyn_cast_rejects_auto_trait_addition() {
+        assert!(!raw_pointer_cast_supported(
+            &dyn_pointee("krate::Trait"),
+            &dyn_pointee("krate::Trait+core::marker::Send"),
+        ));
+        assert!(!raw_pointer_cast_supported(
+            &dyn_pointee("krate::Trait+core::marker::Send"),
+            &dyn_pointee("krate::Trait+core::marker::Sync"),
+        ));
+    }
+
+    /// Principal arguments and associated-type bindings get EXACT equality, not subset:
+    /// `dyn Convert<u32>` and `dyn Convert<u64>` are different types with different
+    /// vtables. (Upstream HIR typeck already rejects these before MIR; this is the
+    /// fail-closed backstop, not the primary gate.)
+    #[test]
+    fn raw_ptr_dyn_cast_rejects_differing_args_and_bindings() {
+        assert!(!raw_pointer_cast_supported(
+            &dyn_pointee("krate::Convert<u32>"),
+            &dyn_pointee("krate::Convert<u64>"),
+        ));
+        assert!(!raw_pointer_cast_supported(
+            &dyn_pointee("core::iter::Iterator+[core::iter::Iterator::Item=u32]"),
+            &dyn_pointee("core::iter::Iterator+[core::iter::Iterator::Item=u64]"),
+        ));
+        // A binding may not be dropped the way an auto trait may.
+        assert!(!raw_pointer_cast_supported(
+            &dyn_pointee("core::iter::Iterator+[core::iter::Iterator::Item=u32]"),
+            &dyn_pointee("core::iter::Iterator"),
+        ));
+    }
+
+    /// An unrenderable identity cannot be shown equal to anything, including itself:
+    /// falling back to the erased `trait_name` is exactly the defect being closed.
+    #[test]
+    fn raw_ptr_dyn_cast_without_principal_key_fails_closed() {
+        assert!(!raw_pointer_cast_supported(&unkeyed_dyn_pointee(), &unkeyed_dyn_pointee()));
+        assert!(!raw_pointer_cast_supported(&unkeyed_dyn_pointee(), &dyn_pointee("krate::Trait")));
+        assert!(!raw_pointer_cast_supported(&dyn_pointee("krate::Trait"), &unkeyed_dyn_pointee()));
+    }
+
+    /// The parser admits the renderer's grammar and refuses everything else, including the
+    /// historical hand-written `"A + B + Send"` spelling (spaces around the separator) that
+    /// `faithful_principal_key` never emits.
+    #[test]
+    fn principal_key_parser_admits_the_grammar_and_refuses_the_rest() {
+        let parsed = parse_principal_key(
+            "krate::Convert<u32>+[core::iter::Iterator::Item=u64]+core::marker::Send",
+        )
+        .expect("the renderer's grammar parses");
+        assert_eq!(parsed.principal, "krate::Convert<u32>");
+        assert_eq!(parsed.bindings, vec!["core::iter::Iterator::Item=u64"]);
+        assert_eq!(parsed.autos, vec!["core::marker::Send"]);
+
+        // A `+` nested inside brackets is part of a component, never a separator.
+        let nested = parse_principal_key("krate::F<krate::G<a+b>>").expect("balanced");
+        assert_eq!(nested.principal, "krate::F<krate::G<a+b>>");
+        assert!(nested.autos.is_empty());
+
+        assert!(parse_principal_key("").is_none(), "empty key");
+        assert!(parse_principal_key("+core::marker::Send").is_none(), "empty principal");
+        assert!(parse_principal_key("krate::Trait<u32").is_none(), "unbalanced");
+        assert!(parse_principal_key("krate::Trait>").is_none(), "unbalanced");
+        assert!(parse_principal_key("krate::Trait+").is_none(), "empty trailing segment");
+        assert!(parse_principal_key("krate::Trait+[]").is_none(), "empty binding");
+        assert!(
+            parse_principal_key("core::fmt::Debug + core::clone::Clone + Send").is_none(),
+            "the legacy spaced multi-bound spelling is outside the grammar and fails closed",
         );
     }
 }

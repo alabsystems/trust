@@ -4,6 +4,22 @@
 // human surface names the capability gap — never a hard abort (that is
 // the crate-under-check strict lane's job) and never a silent skip.
 //
+// RE-PINNED 2026-08-20 (D2). The ASSUMPTION row this test exists to guard is
+// RESTORED — `ca53846043` had replaced it with a `CONTRACT [coroutine-resume-state]`
+// row in EVERY lane, including this advisory one, and never measured the flip.
+// The RAW "Trust: ASSUMPTION [coroutine]" pin at the bottom of this file is the
+// guarantee, and it passes again. (Do not spell an annotation sequence inside a
+// comment here — compiletest parses it as a real expectation.)
+//
+// The WARN pin was DELETED because its count described a vanished inventory, not
+// because disclosure weakened: "1 obligation(s) were not proved" was the state
+// when the coroutine body's sole row was the authority-less panic-freedom
+// aggregate. Sentinels are now separate rows and the aggregate has a real
+// (ex-falso) discharge, so that count is structurally unreachable. What replaces
+// it is stronger and measured: the summary for this body now reads
+// "2 conditionally discharged (NOT proved), … 1 skipped out of 3 obligation(s)"
+// — never the word "proved" — next to the assumption row pinned below.
+//
 // RE-PINNED 2026-08-15 for upstream 983bc1a3b6 (merged here as f1182b2285), which
 // REMOVED the whole-function panic-freedom subsumption as a false proof. UPSTREAM
 // CAUSED THIS: that commit's own message records the stage2/ui measurement as "NOT
@@ -26,7 +42,6 @@
 //@ build-pass
 //@ dont-check-compiler-stderr
 pub async fn tick(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `async_fn_records_assumption::tick::{closure#0}`: 1 obligation(s) were not proved
     x
 }
 fn main() {}

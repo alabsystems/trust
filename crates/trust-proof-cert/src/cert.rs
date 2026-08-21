@@ -318,3 +318,39 @@ impl ProofCertificate {
             .map_err(|e| crate::CertError::SerializationFailed { reason: e.to_string() })
     }
 }
+
+/// Tripwire for [`VcSnapshot::vc_hash`]'s domain.
+///
+/// `from_vc` raw-serdes `vc.formula` into `formula_json`, and `vc_hash` covers
+/// those bytes. Raw and canonical model bytes
+/// (`trust_types::stable_model_json_bytes`) agree for formula material today;
+/// the next additive `#[serde(default)] Option<_>` field inside `Formula`
+/// makes them diverge — the drift class that moved the VC digest when
+/// `VerificationCondition::obligation` landed. When this test fails, every
+/// persisted certificate's `vc_hash` is about to move: route `formula_json`
+/// through the canonicalizer (and decide the migration for existing
+/// certificates) rather than letting the identity move silently.
+#[cfg(test)]
+mod vc_hash_domain_tripwire {
+    use trust_types::{Formula, Sort};
+
+    #[test]
+    fn raw_and_canonical_formula_bytes_agree() {
+        let formula = Formula::Ite(
+            Box::new(Formula::Eq(
+                Box::new(Formula::Var("x".to_string(), Sort::BitVec(64))),
+                Box::new(Formula::BitVec { value: 0, width: 64 }),
+            )),
+            Box::new(Formula::Bool(false)),
+            Box::new(Formula::Bool(true)),
+        );
+        let raw = serde_json::to_vec(&formula).expect("raw serde");
+        let canonical =
+            trust_types::stable_model_json_bytes(&formula).expect("canonical serde");
+        assert_eq!(
+            raw, canonical,
+            "raw and canonical Formula bytes diverged: an additive model field is \
+             about to silently move every certificate's vc_hash"
+        );
+    }
+}

@@ -365,6 +365,7 @@ dependencies = [
  "profiler_builtins",
  "std",
  "test",
+ "trust-bignum",
 ]
 
 [[package]]
@@ -375,6 +376,14 @@ dependencies = [
  "getopts",
  "libc",
  "std",
+]
+
+[[package]]
+name = "trust-bignum"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-alloc",
+ "rustc-std-workspace-core",
 ]
 
 [[package]]

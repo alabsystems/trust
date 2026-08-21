@@ -30,6 +30,17 @@ Honesty rules baked in:
   * Bodies are counted from the per-body differential event: one event == one THIR
     body reached (closures / nested consts included, when the producer survives them).
   * Every filter and flag is recorded in the JSON provenance block.
+  * Campaign regression tests under tests/ui/trust/ are held OUT of the sampling
+    population by `scripts/trust_ir_producer_ui_pins.txt`, so a slice may leave its
+    pin in the tree without reshuffling the seeded sample. Adding one file to the
+    population moves ~180-230 of the 2000 sampled files, which silently destroys
+    comparability with every recorded sweep; that manifest replaces the hand-move
+    procedure that used to be needed before each run. An eligible tests/ui/trust
+    file classified in NEITHER manifest section is a HARD ERROR, so the next slice
+    cannot forget. Audit it in ~1s without sweeping:
+
+        python3 scripts/trust_ir_producer_scorecard.py --check-ui-pins
+        python3 scripts/trust_ir_producer_scorecard.py --selftest-ui-pins
 
 Usage (defaults reproduce the 2026-07-01 baseline):
   python3 scripts/trust_ir_producer_scorecard.py \
@@ -235,6 +246,96 @@ UI_CONTENT_FILTERS = [
     ("ignore-directive", re.compile(r"ignore-")),
 ]
 
+# The campaign-pin manifest. `random.sample` is a function of the population LENGTH,
+# so ONE new file under tests/ui/trust reshuffles the whole seeded sample (measured:
+# 179 of 2000 moved once; a slice-16 sweep was discarded after 233 shifted). The
+# historical workaround was to hand-move the campaign's own pins out of tests/ui
+# before every sweep — a count that went 8 -> 9 -> 13 -> 14 -> 15 -> 16 and was
+# remembered nowhere mechanical. This manifest replaces it: [excluded] paths are
+# dropped from the population BEFORE sampling, so the pins can live in the tree.
+# The manifest's own header carries the rule and the measured identity claim.
+UI_PIN_MANIFEST = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "trust_ir_producer_ui_pins.txt"
+)
+# The directory whose files the manifest is a CENSUS of. Every eligible .rs under it
+# must be classified; an unclassified one is a hard error, so the next slice cannot
+# silently widen the population.
+UI_PIN_DIR = os.path.join("tests", "ui", "trust")
+
+
+class UiPinManifestError(RuntimeError):
+    """The manifest and the tree disagree. Fail closed: a sweep run against an
+    unclassified population is not comparable to any recorded sweep, and that is
+    invisible in the output — which is exactly how the tax was paid in silence."""
+
+
+def load_ui_pin_manifest(path=UI_PIN_MANIFEST):
+    """Parse the two-section manifest into (excluded, in_pool) path lists."""
+    excluded, in_pool, section = [], [], None
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError as e:
+        raise UiPinManifestError(f"cannot read the campaign-pin manifest {path}: {e}") from e
+    with fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip().lower()
+                if section not in ("excluded", "in-pool"):
+                    raise UiPinManifestError(
+                        f"{path}:{lineno}: unknown section [{section}];"
+                        " expected [excluded] or [in-pool]"
+                    )
+                continue
+            if section is None:
+                raise UiPinManifestError(
+                    f"{path}:{lineno}: entry {line!r} appears before any [section] header"
+                )
+            (excluded if section == "excluded" else in_pool).append(line)
+    return excluded, in_pool
+
+
+def audit_ui_pin_manifest(repo, eligible_rel, excluded, in_pool):
+    """Cross-check the manifest against the tree. Returns (errors, notes).
+
+    The load-bearing check is the LAST one: an eligible tests/ui/trust file in
+    neither section would silently join the sampling population and reshuffle the
+    seeded sample, which is the defect this whole mechanism exists to prevent."""
+    errors, notes = [], []
+    seen = {}
+    for sect, paths in (("excluded", excluded), ("in-pool", in_pool)):
+        for p in paths:
+            if p in seen:
+                errors.append(
+                    f"{p}: listed twice ([{seen[p]}] and [{sect}]) — one entry per file"
+                )
+            seen[p] = sect
+            if not os.path.isfile(os.path.join(repo, p)):
+                errors.append(
+                    f"{p}: listed in [{sect}] but does not exist —"
+                    f" delete the stale line from {os.path.relpath(UI_PIN_MANIFEST, repo)}"
+                )
+    pin_prefix = UI_PIN_DIR + os.sep
+    for p in eligible_rel:
+        if not p.startswith(pin_prefix):
+            continue
+        if p not in seen:
+            errors.append(
+                f"{p}: eligible for the ui sample but classified in NEITHER section of"
+                f" {os.path.relpath(UI_PIN_MANIFEST, repo)}. Admitting it would reshuffle the"
+                " seeded sample and make this sweep incomparable to every recorded one."
+                " Add it to [excluded] if it is a campaign pin minted after the baseline"
+                " (the default for a slice regression test), or to [in-pool] only if it is"
+                " genuinely part of the measured corpus."
+            )
+    eligible_set = set(eligible_rel)
+    for p in in_pool:
+        if p not in eligible_set and os.path.isfile(os.path.join(repo, p)):
+            notes.append(f"{p}: listed [in-pool] but no longer passes the content filters")
+    return errors, notes
+
 
 def classify_note(mode: str, note: str) -> str:
     """Map a differential-event (mode, note) pair to a stable class name."""
@@ -286,6 +387,14 @@ def classify_note(mode: str, note: str) -> str:
         return "clean-skip-param-cap"
     if "non-scalar parameter" in note:
         return "clean-skip-nonscalar-param"
+    # Trust (Q1, Slice B ceiling probe): a READ pointer param whose AGGREGATE referent was proven
+    # to have an agreeing byte layout on both sides — materializable, but the aggregate referent
+    # sampler is the follow-on lane, so it is still a coverage-only skip today. Checked BEFORE the
+    # `param-read` rule below because that rule's substring would otherwise claim it, and this
+    # class exists precisely to MEASURE the follow-on's yield on the corpus rather than estimate
+    # it. Both notes say "is READ"; only this one says the referent is layout-agreeing.
+    if "layout-agreeing AGGREGATE referent" in note:
+        return "clean-skip-ptr-pointee-aggregate"
     # Slice 3 (opaque-param widening) skip classes: a Ptr/Unit param that is actually READ
     # (opaque sampling refused, fail-closed), and an opacity-scan infrastructure failure.
     if "opaque sampling refused" in note:
@@ -304,6 +413,14 @@ def classify_note(mode: str, note: str) -> str:
         return "clean-skip-unrevealed-opaque"
     if "oracle lowering failed" in note:
         return "clean-skip-oracle-lowering-failed"
+    # Trust (slice 20): the pending-const re-adjudication's own fail-close. A body deferred to
+    # the seam because it carried const placeholders, whose `resolve_pending_consts` then FAILED
+    # and marked it unsupported — so the seam refused to interpret a body still holding a
+    # placeholder. Its own class rather than `clean-skip-other`: this is the population that
+    # measures how often finalizer const evaluation does not deliver, which is the only number
+    # that says whether the lane's ceiling is the gate or the evaluator.
+    if "finalizer const resolution failed" in note:
+        return "clean-skip-pending-const-unresolved"
     if "could not build sample argument" in note:
         return "clean-skip-sample-arg"
     # Wave-5 documented model split: producer-canonical first-class Ty::Enum vs the oracle's
@@ -348,8 +465,27 @@ def parse_bodies(stderr: str):
             dup_unsup += 1
         unsup[p] = max(unsup.get(p, 0), int(m.group("count")))
     reasons = collections.defaultdict(list)
+    # Trust (slice 20 ride-along a): the per-tag DETAIL, captured in lockstep with the tag.
+    #
+    # The compiler already computes this and the artifact threw it away. `SHAPE_RE` has always
+    # captured group `at` — the span, plus `[masking: <leaf>]` for an aggregator tag whose real
+    # cause is a subtree leaf (trust-thir-lower/src/lib.rs, `lower_call_args`) — and this loop
+    # dropped it on the floor, so `grep -c "masking:" data.json` returned 0 and every lane
+    # attribution in this campaign has been a guess reconstructed by hand from the source.
+    #
+    # BLIND SPOT, stated because it bounds what this can answer: `COLLECT_RE` carries no `at`
+    # field, so the collect-all pass populates `collect_primary`/`collect_cascade` with tags
+    # ONLY. This detail channel therefore covers `reasons` alone — the strict first-fail prefix
+    # — and is blind to the non-sole bodies whose full leaf demand only the collect-all pass
+    # sees. Widening it means adding `at` to the collect-all event, not reading it from here.
+    reason_details = collections.defaultdict(list)
     for m in SHAPE_RE.finditer(stderr):
         reasons[m.group("path")].append(m.group("what"))
+        at = m.group("at")
+        # `None`, never `""`. An empty string is a real value the compiler can emit for a
+        # span-less tag; conflating it with "no detail recorded" would make the absent case
+        # invisible in exactly the artifact built to make it visible.
+        reason_details[m.group("path")].append(at if at else None)
     symbolic = {}
     opaque = {}
     for m in CLASS_RE.finditer(stderr):
@@ -370,16 +506,27 @@ def parse_bodies(stderr: str):
         note = m.group("note")
         mode = m.group("mode")
         body_reasons = reasons.get(p, [])
+        body_details = reason_details.get(p, [])
         # Dedup the duplicated event pairs (same pattern-inline-const anomaly as the
         # count event): a body's reason list longer than its count is trimmed to count.
+        #
+        # Trust (slice 20 ride-along a): the detail list is trimmed IN LOCKSTEP, by the same
+        # slice, in the same branch. The two lists are positionally paired — `reason_details[i]`
+        # is the detail for `reasons[i]` — so trimming one without the other silently desyncs
+        # tag from detail and every attribution read off the artifact afterwards points at the
+        # wrong span. That is worse than not shipping the detail at all, because it is wrong
+        # rather than absent.
         cnt = unsup.get(p, 0)
         if len(body_reasons) > cnt:
             body_reasons = body_reasons[:cnt]
+            body_details = body_details[:cnt]
         bodies[p] = {
             "def": p,
             "kind": body_kind(p),
             "unsupported": cnt,
             "reasons": body_reasons,
+            # Positionally paired with `reasons`; see the lockstep trim above.
+            "reason_details": body_details,
             "equal": m.group("equal") == "true",
             "samples": int(m.group("samples")),
             "mode": mode,
@@ -475,10 +622,12 @@ def measure_file(trustc: str, src: str, edition: str, timeout: int, scratch: str
     return {"file": src, "outcome": "compile_fail", "bodies": []}
 
 
-def collect_ui_sample(repo: str, seed: int, size: int):
-    """size <= 0 means FULL POPULATION: every eligible file, no sampling.
-    (size >= len(eligible) also degenerates to the full population — the
-    seeded sample of the whole set, sorted, is the whole set.)"""
+def _eligible_ui_files(repo: str):
+    """Walk tests/ui and apply the content filters. Returns (all_files, eligible,
+    filter_stats), all absolute and sorted.
+
+    ONE implementation, shared by the sweep and by `--check-ui-pins`: the check is
+    worthless if it audits a population the sweep does not actually sample."""
     ui_root = os.path.join(repo, "tests", "ui")
     all_files = []
     for dirpath, _dirnames, filenames in os.walk(ui_root):
@@ -505,6 +654,35 @@ def collect_ui_sample(repo: str, seed: int, size: int):
             filter_stats[hit] += 1
         else:
             eligible.append(p)
+    return all_files, eligible, filter_stats
+
+
+def collect_ui_sample(repo: str, seed: int, size: int):
+    """size <= 0 means FULL POPULATION: every eligible file, no sampling.
+    (size >= len(eligible) also degenerates to the full population — the
+    seeded sample of the whole set, sorted, is the whole set.)"""
+    ui_root = os.path.join(repo, "tests", "ui")
+    all_files, eligible, filter_stats = _eligible_ui_files(repo)
+    # Trust (UI-pin tax paydown): drop the campaign pins from the population BEFORE
+    # sampling. This is applied to the CONTENT-FILTERED list and by exact path, so the
+    # surviving list is element-for-element what it would be if the pins were not in
+    # the tree at all — which is what makes the sample identical to the hand-move
+    # procedure's rather than merely the same size. The audit runs first and fails
+    # closed: measuring a silently-widened population is worse than not measuring.
+    excluded_pins, in_pool_pins = load_ui_pin_manifest()
+    eligible_rel = [os.path.relpath(p, repo) for p in eligible]
+    errors, notes = audit_ui_pin_manifest(repo, eligible_rel, excluded_pins, in_pool_pins)
+    if errors:
+        raise UiPinManifestError(
+            "campaign-pin manifest is out of sync with the tree"
+            f" ({os.path.relpath(UI_PIN_MANIFEST, repo)}):\n  - "
+            + "\n  - ".join(errors)
+        )
+    pin_set = set(excluded_pins)
+    kept = [p for p, rel in zip(eligible, eligible_rel) if rel not in pin_set]
+    pins_removed = len(eligible) - len(kept)
+    eligible = kept
+
     if size <= 0:
         sample = list(eligible)  # full population (already sorted)
     else:
@@ -514,11 +692,92 @@ def collect_ui_sample(repo: str, seed: int, size: int):
         "ui_root": os.path.relpath(ui_root, repo),
         "total_rs_files_excl_auxiliary_dirs": len(all_files),
         "excluded_by_content_filter": dict(filter_stats),
+        "campaign_pins_manifest": os.path.relpath(UI_PIN_MANIFEST, repo),
+        "campaign_pins_listed": len(excluded_pins),
+        "campaign_pins_excluded_from_pool": pins_removed,
+        "campaign_pins_in_pool_classified": len(in_pool_pins),
+        "campaign_pin_notes": notes,
         "eligible": len(eligible),
         "sampled": len(sample),
         "seed": seed,
         "filters": [f"{n}: /{r.pattern}/" for n, r in UI_CONTENT_FILTERS],
     }
+
+
+def check_ui_pins(repo):
+    """Standalone audit of the campaign-pin manifest (`--check-ui-pins`).
+
+    Runs the sampler's file-selection path only — no compilation, no built trustc,
+    about a second. This is the gate a slice runs after adding its regression test,
+    instead of discovering at the end of a 40-minute sweep that the sample moved."""
+    try:
+        excluded, in_pool = load_ui_pin_manifest()
+    except UiPinManifestError as e:
+        print(f"UI-PIN MANIFEST: FAIL\n  {e}", file=sys.stderr)
+        return 1
+    eligible_rel = [os.path.relpath(p, repo) for p in _eligible_ui_files(repo)[1]]
+    eligible_rel.sort()
+    errors, notes = audit_ui_pin_manifest(repo, eligible_rel, excluded, in_pool)
+    pin_prefix = UI_PIN_DIR + os.sep
+    in_dir = [p for p in eligible_rel if p.startswith(pin_prefix)]
+    removed = sum(1 for p in eligible_rel if p in set(excluded))
+    print(f"manifest:  {os.path.relpath(UI_PIN_MANIFEST, repo)}")
+    print(f"eligible:  {len(eligible_rel)} total · {len(in_dir)} under {UI_PIN_DIR}")
+    print(f"excluded:  {len(excluded)} listed · {removed} of them in the eligible population")
+    print(f"in-pool:   {len(in_pool)} classified")
+    print(f"sampling population after exclusion: {len(eligible_rel) - removed}")
+    for note in notes:
+        print(f"note: {note}")
+    if errors:
+        print("UI-PIN MANIFEST: FAIL", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+    print("UI-PIN MANIFEST: OK")
+    return 0
+
+
+def selftest_ui_pins(repo):
+    """Mutation proof that the manifest audit is not decorative (`--selftest-ui-pins`).
+
+    An audit that always returns no errors would pass every check above and silently
+    reinstate the whole defect. Each case below breaks the manifest in one way and
+    REQUIRES an error; a "simplification" that neuters the audit fails here instead of
+    being discovered by a sweep whose numbers are quietly incomparable."""
+    excluded, in_pool = load_ui_pin_manifest()
+    eligible = sorted(os.path.relpath(p, repo) for p in _eligible_ui_files(repo)[1])
+    if not excluded:
+        print("SELFTEST: FAIL — [excluded] is empty, nothing to mutate", file=sys.stderr)
+        return 1
+    victim = excluded[-1]
+    cases = [
+        ("a pin dropped from [excluded]",
+         [p for p in excluded if p != victim], in_pool),
+        ("a stale entry naming a file that does not exist",
+         excluded + [os.path.join(UI_PIN_DIR, "__selftest_absent__.rs")], in_pool),
+        ("one file listed in both sections",
+         excluded, in_pool + [excluded[0]]),
+    ]
+    # Each mutation must produce an error the UNMUTATED manifest does not already
+    # produce. Comparing against the baseline rather than against "no errors at all"
+    # keeps this proof independent of ambient tree state — an unrelated unclassified
+    # file (another lane's new test) is `--check-ui-pins`' business, not the audit's
+    # own correctness — while still refuting an audit that errors unconditionally.
+    baseline, _ = audit_ui_pin_manifest(repo, eligible, excluded, in_pool)
+    base_set = set(baseline)
+    print(f"  baseline: the unmutated manifest reports {len(baseline)} error(s)"
+          " (unrelated to this proof; run --check-ui-pins to act on them)")
+    ok = True
+    for label, exc, pool in cases:
+        errors, _ = audit_ui_pin_manifest(repo, eligible, exc, pool)
+        new = [e for e in errors if e not in base_set]
+        if not new:
+            ok = False
+        print(f"  [{'ok ' if new else 'BAD'}] {label}: "
+              + (f"audit raises a new error — {new[0].split(':')[0]}" if new
+                 else "audit is SILENT about it"))
+    print("UI-PIN SELFTEST: " + ("OK" if ok else "FAIL"), file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def aggregate(results):
@@ -542,22 +801,60 @@ def aggregate(results):
             "lowered_clean_pct": round(100.0 * len(clean) / len(bs), 1) if bs else None,
             # Trust (measurement honesty): split the clean population. A SYMBOLIC clean body
             # lowered without a fail-closed tag but carries an opaque, value-less placeholder,
-            # so it is excluded from the interpretation differential AND from the executable
-            # splice — it can never be `Agreed` and can never run. Converting a tag into an
-            # opaque spelling therefore moves a body between these two lines without closing
-            # a gap; reporting only the sum would make that read as progress.
+            # so it is refused by the executable SPLICE (`crate_module.rs`: `symbolic` gates
+            # `splice_ok`; `opaque_collapse`, deliberately, does not) — it can never run.
+            # Converting a tag into an opaque spelling therefore moves a body between these
+            # lines without closing a gap; reporting only the sum would make that read as
+            # progress.
+            #
+            # CORRECTED 2026-08-19 — this comment, and the SCORECARD.md line it fed, both said
+            # a SYMBOLIC body "can never be `Agreed`". That is FALSE and was false before it
+            # was written: measured on `postbuild-slice20-control`, 64 of 440 clean SYMBOLIC
+            # bodies are `Agreed`. The differential is not categorically closed to them — where
+            # it can ENUMERATE the placeholder (the vtable-slice-10 const-param/assoc-const
+            # sample column: `usize`/`u32`/`u8`/`bool` sampled at N values) or PROVE it is never
+            # read ("proven-never-read opaque param(s) as placeholders"), the row is sampled and
+            # can Agree. What is true of SYMBOLIC is the splice refusal, not an Agreed refusal.
+            # The companion asymmetry is real and worth stating: 0 of 370 OPAQUE-COLLAPSE bodies
+            # are Agreed (0 of the 115 clean ones), because a COLLAPSED LIVE VALUE cannot be
+            # enumerated the way an absent one can.
+            #
+            # So the renderer now prints the MEASURED per-class Agreed split instead of a prose
+            # claim about what is possible. A wrong label is how this propagated into three
+            # lanes' rankings; a measured number cannot go stale in the same way.
+            #
             # Trust (#173): three-way, most-dishonest-wins. A body can be BOTH symbolic and
             # opaque-collapsed; it is counted once, under symbolic, so the three lines sum to
             # `lowered_clean`. MODELLED is now the residual: tag-free AND no opaque carrier AND
             # no collapsed live value.
             "lowered_clean_symbolic": sum(1 for b in clean if b.get("symbolic") is True),
+            "lowered_clean_symbolic_agreed": sum(
+                1 for b in clean if b.get("symbolic") is True and b["mode"] == "Agreed"
+            ),
             "lowered_clean_opaque": sum(
                 1 for b in clean
                 if b.get("symbolic") is False and b.get("opaque_collapse") is True
             ),
+            "lowered_clean_opaque_agreed": sum(
+                1 for b in clean
+                if b.get("symbolic") is False and b.get("opaque_collapse") is True
+                and b["mode"] == "Agreed"
+            ),
             "lowered_clean_modelled": sum(
                 1 for b in clean
                 if b.get("symbolic") is False and b.get("opaque_collapse") is False
+            ),
+            "lowered_clean_modelled_agreed": sum(
+                1 for b in clean
+                if b.get("symbolic") is False and b.get("opaque_collapse") is False
+                and b["mode"] == "Agreed"
+            ),
+            # The whole-body opaque-collapse population, clean or not — the denominator the
+            # "0 Agreed" asymmetry above is stated over. `lowered_clean_opaque` is its
+            # clean-and-not-also-symbolic subset and answers a different question.
+            "opaque_collapse_all": sum(1 for b in bs if b.get("opaque_collapse") is True),
+            "opaque_collapse_all_agreed": sum(
+                1 for b in bs if b.get("opaque_collapse") is True and b["mode"] == "Agreed"
             ),
             "lowered_clean_class_unmeasured": sum(1 for b in clean if b.get("symbolic") is None),
             "by_kind": dict(collections.Counter(b["kind"] for b in bs)),
@@ -676,20 +973,66 @@ def render_markdown(data):
         agg = corpus["aggregate"]
         b = agg["bodies"]
         out.append(f"\n## corpus: {name}\n")
+        meta = corpus.get("sample_meta") or {}
+        if "campaign_pins_excluded_from_pool" in meta:
+            # Self-describing: the sampling population is the whole basis of
+            # cross-sweep comparability, so state it in the artifact itself.
+            out.append(
+                f"- sampling population: **{meta['eligible']}** eligible"
+                f" (of {meta['total_rs_files_excl_auxiliary_dirs']} .rs files),"
+                f" sampled **{meta['sampled']}** at seed {meta['seed']}"
+            )
+            out.append(
+                f"- campaign UI pins held out of the population:"
+                f" **{meta['campaign_pins_excluded_from_pool']}**"
+                f" (of {meta['campaign_pins_listed']} listed in"
+                f" `{meta['campaign_pins_manifest']}`;"
+                f" the rest are already removed by the content filters)"
+            )
         out.append(f"- file outcomes: `{agg['file_outcomes']}`")
         out.append(f"- bodies reached (in files that fully compiled under the flag): **{b['total']}**")
         out.append(f"- lowered clean (0 unsupported shapes): **{b['lowered_clean']}"
                    f" ({b['lowered_clean_pct']}%)**")
         if b.get("lowered_clean_symbolic") is not None:
             unm = b.get("lowered_clean_class_unmeasured", 0)
-            unm_s = f", class-unmeasured {unm}" if unm else ""
+            unm_s = f" · class-unmeasured {unm}" if unm else ""
+
+            # MEASURED, not asserted. The previous text claimed a SYMBOLIC body "can never be
+            # Agreed"; 64 of 440 were, in the artifact that sentence was last printed over. A
+            # per-class `n Agreed` is checkable against data.json and cannot rot into a rule.
+            def _cls(name, n, agreed, gloss):
+                r = f" ({agreed} Agreed, {round(100.0 * agreed / n, 1)}%)" if n else ""
+                return f"{name} {n}{r} — {gloss}"
+
             out.append(
-                f"  - of which MODELLED {b['lowered_clean_modelled']}"
-                f" · SYMBOLIC (value-less opaque carrier — excluded from the differential and"
-                f" the splice, can never be Agreed) {b['lowered_clean_symbolic']}"
-                f" · OPAQUE-COLLAPSE (a live value typed as a placeholder; the differential"
-                f" refuses to sample it) {b.get('lowered_clean_opaque', 0)}{unm_s}"
+                "  - of which "
+                + _cls("MODELLED", b["lowered_clean_modelled"],
+                       b.get("lowered_clean_modelled_agreed", 0),
+                       "no opaque carrier, no collapsed live value; the only class that is "
+                       "both spliceable and freely sampleable")
+                + "\n    · "
+                + _cls("SYMBOLIC", b["lowered_clean_symbolic"],
+                       b.get("lowered_clean_symbolic_agreed", 0),
+                       "carries a value-less opaque placeholder. REFUSED BY THE SPLICE "
+                       "(`symbolic` gates `splice_ok`) — it can never run. NOT refused by the "
+                       "differential: where the placeholder can be enumerated (const-param / "
+                       "assoc-const sample column) or proven never read, the row is sampled "
+                       "and can Agree")
+                + "\n    · "
+                + _cls("OPAQUE-COLLAPSE", b.get("lowered_clean_opaque", 0),
+                       b.get("lowered_clean_opaque_agreed", 0),
+                       "a LIVE value typed as a placeholder; the differential refuses to "
+                       "sample it, and a collapsed live value cannot be enumerated the way an "
+                       "absent one can")
+                + unm_s
             )
+            oc_n = b.get("opaque_collapse_all")
+            if oc_n is not None:
+                out.append(
+                    f"  - opaque-collapse population (clean or not): {oc_n},"
+                    f" of which Agreed {b.get('opaque_collapse_all_agreed', 0)}"
+                    f" — the asymmetry against SYMBOLIC above is the measurement, not a rule"
+                )
         v = agg.get("validation")
         if v and (v["modules_measured"] or v["modules_unmeasured"]):
             unm = f", {v['modules_unmeasured']} UNMEASURED" if v["modules_unmeasured"] else ""
@@ -729,11 +1072,61 @@ def render_markdown(data):
     return "\n".join(out)
 
 
+def rerender(out_dir: str, check_only: bool = False) -> int:
+    """Recompute the aggregate + SCORECARD.md from an artifact's stored per-body rows.
+
+    Every number on the scorecard is a pure function of `corpora[*].files`, which data.json
+    already stores in full. So a reporting change — a corrected label, a new split, a fixed
+    denominator — is verifiable on the artifacts already on disk, at zero compile cost. It
+    does not re-run the producer and cannot change what was measured; it only changes how the
+    measurement is stated.
+    """
+    path = out_dir if out_dir.endswith(".json") else os.path.join(out_dir, "data.json")
+    with open(path) as fh:
+        data = json.load(fh)
+    diffs = []
+
+    def walk(path, old, new):
+        # Compare only keys the STORED artifact already has, recursively: a key this build
+        # ADDS is a reporting improvement, not a disagreement about the measured rows.
+        if isinstance(old, dict) and isinstance(new, dict):
+            for k in sorted(old):
+                if k not in new:
+                    diffs.append(f"{path}.{k}: stored key DROPPED by this build")
+                else:
+                    walk(f"{path}.{k}", old[k], new[k])
+        elif old != new:
+            diffs.append(f"{path}: stored {old!r} != recomputed {new!r}")
+
+    for name, corpus in data.get("corpora", {}).items():
+        new = aggregate(corpus["files"])
+        walk(name, corpus.get("aggregate", {}), new)
+        corpus["aggregate"] = new
+    if check_only:
+        for d in diffs:
+            print("MISMATCH " + d)
+        print(f"rerender-check: {len(diffs)} disagreement(s) between stored and recomputed"
+              f" aggregate keys")
+        return 1 if diffs else 0
+    if diffs:
+        # A recomputation that CHANGES an existing key means the artifact and this script
+        # disagree about the stored rows — say so loudly rather than overwrite in silence.
+        for d in diffs:
+            print("WARNING recomputed value differs: " + d)
+    d = os.path.dirname(path) or "."
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=1)
+    with open(os.path.join(d, "SCORECARD.md"), "w") as fh:
+        fh.write(render_markdown(data))
+    print(f"re-rendered {path} and {os.path.join(d, 'SCORECARD.md')} from stored rows")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--trustc", required=True)
+    ap.add_argument("--trustc", help="required unless --check-ui-pins")
     ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--out-dir", help="required unless --check-ui-pins")
     ap.add_argument("--seed", type=int, default=20260701)
     ap.add_argument("--sample-size", type=int, default=2000,
                     help="seeded ui-sample size; 0 = FULL population (all eligible)")
@@ -745,7 +1138,37 @@ def main():
                     metavar="NAME=PATH", help="extra single-file corpus (repeatable)")
     ap.add_argument("--scratch", default=None,
                     help="scratch dir for per-run --out-dir temp dirs (default: mkdtemp)")
+    ap.add_argument("--check-ui-pins", action="store_true",
+                    help="audit the tests/ui/trust campaign-pin manifest against the tree and "
+                         "exit; runs the sampler's file-selection path only (no compilation, "
+                         "no --trustc needed, ~1s)")
+    ap.add_argument("--selftest-ui-pins", action="store_true",
+                    help="mutation proof that the manifest audit actually fails on a broken "
+                         "manifest (does not modify anything on disk)")
+    ap.add_argument("--rerender", metavar="DIR",
+                    help="recompute `aggregate` and rewrite SCORECARD.md from an EXISTING "
+                         "postbuild dir's data.json per-body rows. No compiler, no corpus "
+                         "sweep. This is how a reporting fix is verified: the wrong SYMBOLIC "
+                         "label shipped in every artifact for weeks partly because correcting "
+                         "it appeared to cost a full sweep.")
+    ap.add_argument("--rerender-check", action="store_true",
+                    help="with --rerender: do not write, only report whether the stored "
+                         "aggregate differs from the recomputed one (exit 1 if it does, "
+                         "ignoring keys this build newly adds)")
     args = ap.parse_args()
+
+    # These are standalone gates: they must be runnable without a built compiler,
+    # so --trustc is validated here rather than by argparse.
+    if args.check_ui_pins:
+        return check_ui_pins(os.path.abspath(args.repo))
+    if args.selftest_ui_pins:
+        return selftest_ui_pins(os.path.abspath(args.repo))
+    if args.rerender:
+        return rerender(args.rerender, check_only=args.rerender_check)
+    if not args.trustc:
+        ap.error("the following arguments are required: --trustc")
+    if not args.out_dir:
+        ap.error("the following arguments are required: --out-dir")
 
     trustc = os.path.abspath(args.trustc)
     repo = os.path.abspath(args.repo)
@@ -765,6 +1188,19 @@ def main():
         corpora.append((name, [os.path.abspath(path)], None))
     if not args.no_ui_sample:
         sample, sample_meta = collect_ui_sample(repo, args.seed, args.sample_size)
+        # Self-describing run: a sweep that silently sampled a different population is
+        # the failure mode this line exists to make visible in the log.
+        print(
+            f"[ui_sample] eligible {sample_meta['eligible']}"
+            f" · sampled {sample_meta['sampled']}"
+            f" · campaign pins excluded from the pool"
+            f" {sample_meta['campaign_pins_excluded_from_pool']}"
+            f" of {sample_meta['campaign_pins_listed']} listed"
+            f" ({sample_meta['campaign_pins_manifest']})",
+            flush=True,
+        )
+        for note in sample_meta.get("campaign_pin_notes", []):
+            print(f"[ui_sample] note: {note}", flush=True)
         corpora.append(("ui_sample", sample, sample_meta))
 
     for name, files, meta in corpora:

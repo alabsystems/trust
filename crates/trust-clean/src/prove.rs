@@ -9581,6 +9581,17 @@ pub(crate) fn field_post_mutator_ir_cfgs(
         return None;
     }
     let mut recv = None;
+    // Trust: FS-RHS-FIELD (2026-08-19, the bytesize intake) — by-value scalar-field
+    // struct params are admitted as FIELD-READ SOURCES: `self.0 += rhs.0` stages
+    // `_t := Copy(rhs.Field(0))` and adds `_t`, the exact `AddAssign<ByteSize>`
+    // lowering. Each admitted read denotes `Index(Var(param), Const(k))` — the
+    // opaque `idxElem` reading, so DISTINCT fields of one param get DISTINCT
+    // denotations (denoting them all as the bare param `Var` would forge an
+    // equality between different fields). Gates on the param: the struct stamp,
+    // no variants, and EVERY field scalar (the families' pointer-free doctrine,
+    // conservative — only the read field enters the model).
+    let mut struct_params: std::collections::BTreeMap<usize, Vec<(String, Ty)>> =
+        std::collections::BTreeMap::new();
     for l in 1..=arg_count {
         let ty = &body.locals.get(l)?.ty;
         if let Ty::Ref { mutable: true, inner } = ty {
@@ -9596,6 +9607,15 @@ pub(crate) fn field_post_mutator_ir_cfgs(
                 return None;
             }
             recv = Some((l, fields.clone()));
+        } else if let Ty::Adt { adt_kind, fields, variants, .. } = ty {
+            if *adt_kind != Some(AdtKind::Struct)
+                || !variants.is_empty()
+                || fields.is_empty()
+                || !fields.iter().all(|(_, fty)| matches!(fty, Ty::Int { .. } | Ty::Bool))
+            {
+                return None;
+            }
+            struct_params.insert(l, fields.clone());
         } else if !matches!(ty, Ty::Int { .. } | Ty::Bool) {
             return None;
         }
@@ -9640,19 +9660,53 @@ pub(crate) fn field_post_mutator_ir_cfgs(
         }
     }
 
-    let xlate = |op: &Operand| -> Option<IrOperand> {
+    // Trust: FS-RHS-FIELD — a struct-param FIELD read as `idxElem(param, k)`.
+    // Shared by the STAGED form (`_t := Copy(rhs.0)` then `_t` consumed) and the
+    // DIRECT form (`self.0 = rhs.0`). Fails closed unless the base is an admitted
+    // struct param with a scalar field at `k` and the param is never rebound.
+    let param_field_ir = |p: &trust_types::Place| -> Option<IrOperand> {
+        let [Projection::Field(k)] = p.projections.as_slice() else { return None };
+        let fields = struct_params.get(&p.local)?;
+        if !fields.get(*k).is_some_and(|(_, fty)| matches!(fty, Ty::Int { .. } | Ty::Bool)) {
+            return None;
+        }
+        if crate::mirsem::param_reassigned_by_stmt(body, p.local) {
+            return None;
+        }
+        let slot = param_index(p.local)?;
+        Some(IrOperand::Index(
+            Box::new(IrOperand::Var(slot)),
+            Box::new(IrOperand::Const(i128::try_from(*k).ok()?)),
+        ))
+    };
+    // `staged`: temp local -> the Index operand its single staging def denotes.
+    let xlate = |op: &Operand,
+                 staged: &std::collections::BTreeMap<usize, IrOperand>|
+     -> Option<IrOperand> {
         match op {
             Operand::Constant(trust_types::ConstValue::Int(k)) => Some(IrOperand::Const(*k)),
             Operand::Constant(trust_types::ConstValue::Uint(k, _)) => {
                 i128::try_from(*k).ok().map(IrOperand::Const)
             }
             Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+                if let Some(ir) = staged.get(&p.local) {
+                    return Some(ir.clone());
+                }
+                // A BARE read of an admitted struct param must never denote the
+                // scalar `Var(slot)` — that slot is the Index denotation's opaque
+                // struct handle, not a number. Unreachable on well-typed MIR
+                // (round hardening, 2026-08-19).
+                if struct_params.contains_key(&p.local) {
+                    return None;
+                }
                 let idx = param_index(p.local)?;
                 if p.local == recv || crate::mirsem::param_reassigned_by_stmt(body, p.local) {
                     return None;
                 }
                 Some(IrOperand::Var(idx))
             }
+            // The DIRECT param-field read (no staging temp).
+            Operand::Copy(p) | Operand::Move(p) => param_field_ir(p),
             _ => None,
         }
     };
@@ -9668,6 +9722,13 @@ pub(crate) fn field_post_mutator_ir_cfgs(
 
     // The linear walk: collect per-field writes (store or checked spine).
     let recv_slot = u64::try_from(recv - 1).ok()?;
+    // Trust: FS-CALL-RHS (2026-08-19, the bytesize mono intake) — the fresh
+    // universally-quantified slot for an entry call's result (the call-RMW
+    // convention: the value never enters the model except as this opaque slot;
+    // the route adds the `mutator_entry_callee_established` clause). Reserved
+    // AHEAD of the per-field post slots so the two ranges never collide.
+    let call_slot = u64::try_from(body.locals.len()).ok()?;
+    let mut call_dest: Option<usize> = None;
     let mut cur = trust_types::BlockId(0);
     let mut visited: std::collections::HashSet<trust_types::BlockId> =
         std::collections::HashSet::new();
@@ -9682,6 +9743,12 @@ pub(crate) fn field_post_mutator_ir_cfgs(
     // existence requirement as ".1 consumed only by the assert").
     let mut checked: Option<(usize, usize, TrustIrBinOp, bool)> = None;
     let mut checked_rhs: Option<IrOperand> = None;
+    // Trust: FS-RHS-FIELD — the staged param-field temps walked so far. A temp
+    // enters ONLY via the single-assignment staging def; a `StorageDead` of a
+    // staged temp anywhere later on the walked path declines (the M1 dead_at
+    // discipline, conservative form).
+    let mut staged: std::collections::BTreeMap<usize, IrOperand> =
+        std::collections::BTreeMap::new();
     loop {
         if !visited.insert(cur) {
             return None;
@@ -9701,15 +9768,35 @@ pub(crate) fn field_post_mutator_ir_cfgs(
                                 return None;
                             }
                         }
+                        // Trust: FS-RHS-FIELD — a marker on a staged temp after
+                        // its def is indeterminate territory; decline.
+                        if staged.contains_key(l) {
+                            return None;
+                        }
                         continue;
                     }
                     _ => return None,
                 }
             };
             if place.projections.is_empty() {
-                // Only the checked tuple temp is an admitted bare def.
+                // Admitted bare defs: the checked tuple temp, or an FS-RHS-FIELD
+                // staging read. Neither may open inside an in-flight spine.
                 if checked.is_some() {
                     return None;
+                }
+                // Trust: FS-RHS-FIELD — `_t := Use(Copy|Move(param.Field(k)))`:
+                // stage the temp as `idxElem(param, k)`. Single-assignment, a
+                // genuine temp (never a param), staged at most once.
+                if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rvalue {
+                    let ir = param_field_ir(p)?;
+                    if param_index(place.local).is_some()
+                        || !local_has_only_n_bare_assignments(body, place.local, 1)
+                        || staged.contains_key(&place.local)
+                    {
+                        return None;
+                    }
+                    staged.insert(place.local, ir);
+                    continue;
                 }
                 let Rvalue::CheckedBinaryOp(op, a, b) = rvalue else { return None };
                 let ir_op = match op {
@@ -9721,7 +9808,7 @@ pub(crate) fn field_post_mutator_ir_cfgs(
                 // FS4/FS5 — the pre-read: `Copy((*recv).k)`, the spine's own field.
                 let Operand::Copy(ra) = a else { return None };
                 let k = field_of_place(ra)?;
-                let rhs = xlate(b)?;
+                let rhs = xlate(b, &staged)?;
                 if !local_has_only_n_bare_assignments(body, place.local, 1)
                     || param_index(place.local).is_some()
                 {
@@ -9765,7 +9852,7 @@ pub(crate) fn field_post_mutator_ir_cfgs(
                         checked = None;
                     }
                     (Rvalue::Use(v), None) => {
-                        writes.push((k, IrRvalue::Use(xlate(v)?)));
+                        writes.push((k, IrRvalue::Use(xlate(v, &staged)?)));
                     }
                     _ => return None,
                 }
@@ -9801,6 +9888,78 @@ pub(crate) fn field_post_mutator_ir_cfgs(
                     return None;
                 }
                 break;
+            }
+            // Trust: FS-CALL-RHS — the ENTRY call (bb0 only, the call-RMW pin:
+            // "both walks pin the call as bb0's terminator"). The result is an
+            // opaque fresh slot; the value model never computes on it, so the
+            // only soundness obligations are (a) the dest is a genuine
+            // once-written scalar temp, (b) NO argument carries the receiver
+            // (moving `&mut self` into a callee would let it write recv fields
+            // behind the frame facts — W3 bars creating refs to recv, this bars
+            // handing over the one that already exists), and (c) the route's
+            // `mutator_entry_callee_established` clause (registered +
+            // requires-known-empty), exactly as in call-RMW/adt-cell. An
+            // unwinding exit is outside the partial-correctness claim;
+            // `body_has_cleanup_unwind_edge` already declined in-CFG cleanup.
+            Terminator::Call { args, dest, target, is_foreign, is_unsafe_sig, atomic, .. } => {
+                if cur != trust_types::BlockId(0) || call_dest.is_some() || checked.is_some() {
+                    return None;
+                }
+                // Sibling parity (round finding, 2026-08-19): the same flag gate
+                // call-RMW and adt-cell apply at this position. The registry
+                // premise already fails closed on foreign/atomic callees (no MIR
+                // body ever certifies into the registry), but the walk should
+                // not lean on that premise alone — an FFI callee can reach the
+                // recv cell with no argument path.
+                if *is_foreign || *is_unsafe_sig || atomic.is_some() {
+                    return None;
+                }
+                let Some(target) = target else { return None };
+                if !dest.projections.is_empty()
+                    || dest.local == 0
+                    || dest.local == recv
+                    || param_index(dest.local).is_some()
+                    || staged.contains_key(&dest.local)
+                {
+                    return None;
+                }
+                // The dest's ONLY def is this call. `local_complete_bare_
+                // assignment_count` is `None` for any call dest BY CONTRACT
+                // (the class-2 blind spot), so the no-other-writes half is a
+                // direct global scan, as in call-RMW's C3: any statement write
+                // rooted at the dest, or a SECOND call-dest write, declines —
+                // unreachable blocks included (conservative).
+                let dest_written_elsewhere = body.blocks.iter().any(|b| {
+                    b.stmts.iter().any(|st| {
+                        matches!(st, Statement::Assign { place, .. } if place.local == dest.local)
+                    }) || (b.id != cur
+                        && matches!(&b.terminator,
+                            Terminator::Call { dest: d2, .. } if d2.local == dest.local))
+                });
+                if dest_written_elsewhere {
+                    return None;
+                }
+                if !body
+                    .locals
+                    .get(dest.local)
+                    .is_some_and(|l| matches!(l.ty, Ty::Int { .. } | Ty::Bool))
+                {
+                    return None;
+                }
+                for a in args {
+                    match a {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            if p.local == recv || p.local == 0 {
+                                return None;
+                            }
+                        }
+                        Operand::Constant(_) => {}
+                        _ => return None,
+                    }
+                }
+                staged.insert(dest.local, IrOperand::Var(call_slot));
+                call_dest = Some(dest.local);
+                cur = *target;
             }
             _ => return None,
         }
@@ -9859,8 +10018,11 @@ pub(crate) fn field_post_mutator_ir_cfgs(
         }
     }
 
-    // The per-field models: 1-block cfgs, W6 fresh slots.
-    let post_base = u64::try_from(body.locals.len()).ok()?;
+    // The per-field models: 1-block cfgs, W6 fresh slots. `call_slot + 1`, not
+    // `locals.len()`: the entry call's opaque slot occupies `locals.len()`, and
+    // a post slot colliding with it would make the model SELF-REFERENTIAL
+    // (`_s := Bin(op, pre, Var(s))`), which the denotation inliner declines.
+    let post_base = call_slot + 1;
     let mut out = Vec::with_capacity(writes.len());
     for (i, (k, rv)) in writes.into_iter().enumerate() {
         let post = post_base + u64::try_from(i).ok()?;
@@ -12706,7 +12868,17 @@ fn call_then_pureop_fully_faithful_via_trustir(
     // (b) the per-call trust-ir `callThenPureOpInstance` kernel-checks modulo 3.
     let op_ir = match call_then_op.op {
         crate::mirsem::CallThenOp::Bin(op) => {
-            let Some(ir_op) = sem_binop_to_ir(op) else { return false };
+            // Trust: NONMAX CHAIN (2026-08-19) — the BITWISE trio joins via the
+            // leaf mapper (`Int.land`/`Int.lor`/`Int.xor`, the opaque int
+            // carriers — parity with the MirSem lane's own grounding of this
+            // exact shape), gated Int-RETURN: a Bool-typed bitwise result is the
+            // bool-as-int encoding, a different carrier, and stays declined.
+            // `sem_binop_to_ir` keeps declining bitwise BY DESIGN — its scope
+            // note is the trust-ir LOOP fragment, which this does not touch.
+            // The live body: `NonMaxU8::get`'s `NonZero::get(..) ^ 255`.
+            let bitwise = sem_leaf_bitwise_binop_to_ir(op)
+                .filter(|_| matches!(func.body.return_ty, trust_types::Ty::Int { .. }));
+            let Some(ir_op) = sem_binop_to_ir(op).or(bitwise) else { return false };
             crate::trustir_call::TrustIrCallThenOp::Bin(ir_op)
         }
         crate::mirsem::CallThenOp::Cmp(op) => {
@@ -13198,12 +13370,19 @@ fn mutator_cell_post_fully_faithful_via_trustir(
     // certify (the conjunction is the verdict; one uncertified field fails the whole
     // function — never a partial claim).
     if let Some(cfgs) = field_post_mutator_ir_cfgs(func) {
-        return cfgs.iter().all(|(_, cfg)| {
-            matches!(
-                crate::trustir_anchor::check_cell_post_branch_model(cfg),
-                RefinementVerdict::ProvenModulo3
-            )
-        }) && mutator_safety_vcs_discharged_modulo_spine_asserts(func);
+        // Trust: FS-CALL-RHS — a minted walk with a bb0 Call terminator has
+        // CONSUMED that call (the walk starts at bb0: a Call either enters the
+        // entry-call arm or declines), so the call-RMW/adt-cell establishment
+        // clause applies: registered + requires-known-empty, else fail closed.
+        return entry_callee()
+            .is_none_or(|name| mutator_entry_callee_established(name, callees))
+            && cfgs.iter().all(|(_, cfg)| {
+                matches!(
+                    crate::trustir_anchor::check_cell_post_branch_model(cfg),
+                    RefinementVerdict::ProvenModulo3
+                )
+            })
+            && mutator_safety_vcs_discharged_modulo_spine_asserts(func);
     }
     // Trust: W19 CALL-RMW — the call-composition sibling: the call result enters
     // the model as a fresh universally-quantified slot (see the walk's doc). This
@@ -26050,6 +26229,220 @@ mod tests {
         }
     }
 
+    /// Trust: FS-RHS-FIELD (2026-08-19, the bytesize intake) — the fixture mirrors
+    /// `<ByteSize as AddAssign>::add_assign` (`self.0 += rhs.0`) from the harvested
+    /// dump: `_3 := Copy(_2.0)` staging, `_4 := CheckedAdd((*_1).0, _3)`, the
+    /// overflow assert (unwind `Continue`, as in the dump), the `.0` store. `BS`
+    /// is a single-`u64`-field struct; `rhs` is BY VALUE. The REAL dump itself is
+    /// pinned end-to-end by `trust_ir_bytesize_harvest_fixtures_certify` — the
+    /// synthetic battery covers the gates, the real-dump test covers the target.
+    fn staged_rmw_fixture(variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            AdtKind, AssertMessage, BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place,
+            Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge,
+            VerifiableBody,
+        };
+        let u64t = || Ty::Int { width: 64, signed: false };
+        let mut fields = vec![("0".to_string(), u64t())];
+        if variant == "ptr_field" {
+            fields.push(("p".into(), Ty::Ref { mutable: false, inner: Box::new(u64t()) }));
+        }
+        let kind = if variant == "enum_stamp" { None } else { Some(AdtKind::Struct) };
+        let bs = |k| Ty::Adt {
+            name: "SYNTH::BS".into(),
+            fields: fields.clone(),
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: k,
+        };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let bare = |l: usize| Place { local: l, projections: vec![] };
+        let pfld = |l: usize, k: usize| Place { local: l, projections: vec![Projection::Field(k)] };
+        let dfld = |l: usize, k: usize| Place {
+            local: l,
+            projections: vec![Projection::Deref, Projection::Field(k)],
+        };
+        let locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Ref { mutable: true, inner: Box::new(bs(Some(AdtKind::Struct))) },
+                name: Some("self".into()),
+            },
+            LocalDecl { index: 2, ty: bs(kind), name: Some("rhs".into()) },
+            LocalDecl { index: 3, ty: u64t(), name: None },
+            LocalDecl { index: 4, ty: Ty::Tuple(vec![u64t(), Ty::Bool]), name: None },
+        ];
+        let stage_src = match variant {
+            "field_oob" => pfld(2, 1),
+            "temp_base" => pfld(3, 0),
+            "multi_hop" => Place {
+                local: 2,
+                projections: vec![Projection::Field(0), Projection::Field(0)],
+            },
+            _ => pfld(2, 0),
+        };
+        let stage = if variant == "ok_move" {
+            assign(bare(3), Rvalue::Use(Operand::Move(stage_src)))
+        } else {
+            assign(bare(3), Rvalue::Use(Operand::Copy(stage_src)))
+        };
+        let mut b0_stmts = vec![stage];
+        if variant == "restaged" {
+            b0_stmts.push(assign(bare(3), Rvalue::Use(Operand::Copy(pfld(2, 0)))));
+        }
+        if variant == "dead_marker" {
+            b0_stmts.push(Statement::StorageDead(3));
+        }
+        b0_stmts.push(assign(
+            bare(4),
+            Rvalue::CheckedBinaryOp(
+                BinOp::Add,
+                Operand::Copy(dfld(1, 0)),
+                Operand::Copy(bare(3)),
+            ),
+        ));
+        let blocks = if variant == "ok_direct" {
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![assign(dfld(1, 0), Rvalue::Use(Operand::Copy(pfld(2, 0))))],
+                terminator: Terminator::Return,
+            }]
+        } else {
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: b0_stmts,
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(pfld(4, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(1),
+                        unwind: UnwindEdge::Continue,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![assign(dfld(1, 0), Rvalue::Use(Operand::Move(pfld(4, 0))))],
+                    terminator: Terminator::Return,
+                },
+            ]
+        };
+        VerifiableFunction {
+            name: "add_assign".into(),
+            def_path: format!("SYNTH::BS::add_assign::{variant}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    /// POSITIVE — the staged param-field RMW (the `bytesize` `AddAssign` lowering)
+    /// mints with rhs `Index(Var(rhs_slot), Const(0))` — the opaque `idxElem`
+    /// reading, structurally pinned so a revert to the bare-param `Var` forgery
+    /// (which would equate DISTINCT fields of one param) fails here — and the
+    /// certificate kernel-checks modulo 3 on the branch lane (the seam
+    /// confirmation: `Index` inside a `Bin` rvalue on `evalCfg`). The value row
+    /// closes both slots and shows the head computes: 7+1 proves 8, rejects 7.
+    /// `ok_move`: Move-staging is the same read. `ok_direct`: the store form
+    /// `self.0 = rhs.0` takes the SAME denotation without a staging temp.
+    #[test]
+    fn trust_ir_staged_param_field_rmw_mints_and_certifies() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, RefinementVerdict, TrustIrBinOp, branch_model_refinement_proof,
+            branch_model_refinement_statement, check_cell_post_branch_model,
+            check_refinement_decl, int_lit,
+        };
+        let rhs_index = || {
+            IrOperand::Index(Box::new(IrOperand::Var(1)), Box::new(IrOperand::Const(0)))
+        };
+        for variant in ["ok", "ok_move"] {
+            let f = staged_rmw_fixture(variant);
+            let certs = field_post_mutator_ir_cfgs(&f).expect("the staged RMW must mint");
+            assert_eq!(certs.len(), 1);
+            assert_eq!(certs[0].0, 0);
+            assert_eq!(
+                certs[0].1.blocks[0].stmts[0].rvalue,
+                IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(0), rhs_index()),
+                "{variant}: the rhs must denote idxElem(rhs_param, 0), never the bare param"
+            );
+            assert_eq!(
+                check_cell_post_branch_model(&certs[0].1),
+                RefinementVerdict::ProvenModulo3,
+                "{variant}: the Index-rhs certificate must kernel-check"
+            );
+            assert!(mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()));
+        }
+        // The direct store form.
+        let f = staged_rmw_fixture("ok_direct");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("the direct field store must mint");
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].1.blocks[0].stmts[0].rvalue, IrRvalue::Use(rhs_index()));
+        assert_eq!(check_cell_post_branch_model(&certs[0].1), RefinementVerdict::ProvenModulo3);
+        // The value row: close pre=7 and the staged rhs=1; the head computes.
+        let f = staged_rmw_fixture("ok");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("mints");
+        let mut closed = certs[0].1.clone();
+        for st in &mut closed.blocks[0].stmts {
+            if let IrRvalue::Bin(_, a, b) = &mut st.rvalue {
+                *a = IrOperand::Const(7);
+                *b = IrOperand::Const(1);
+            }
+        }
+        let claim = |cfg: &crate::trustir_anchor::IrCfg, val: i128| {
+            check_refinement_decl(
+                "Trust.TrustIr.Refinement.field_post_value_row",
+                branch_model_refinement_statement(cfg, Some(&int_lit(val))),
+                branch_model_refinement_proof(cfg),
+            )
+        };
+        assert_eq!(claim(&closed, 8), RefinementVerdict::ProvenModulo3, "7+1 proves 8");
+        assert!(matches!(claim(&closed, 7), RefinementVerdict::KernelRejected(_)));
+    }
+
+    /// FAIL-CLOSED — the FS-RHS-FIELD gates, one mutation each: a pointer-carrying
+    /// sibling field breaks the all-scalar param gate; a missing struct stamp is
+    /// G-STRUCT-KIND; an out-of-range field index has no denotation; a re-staged
+    /// temp breaks single-assignment; a `StorageDead` on the staged temp inside
+    /// the window is the dead_at class; a non-param staging base is not an
+    /// entry-state read; a multi-hop projection is outside the fragment.
+    #[test]
+    fn trust_ir_staged_param_field_rmw_gates_fail_closed() {
+        for variant in [
+            "ptr_field",
+            "enum_stamp",
+            "field_oob",
+            "restaged",
+            "dead_marker",
+            "temp_base",
+            "multi_hop",
+        ] {
+            let f = staged_rmw_fixture(variant);
+            assert!(
+                field_post_mutator_ir_cfgs(&f).is_none(),
+                "{variant} must decline"
+            );
+            assert!(!mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()));
+        }
+    }
+
     /// THE REAL FIXTURES — the REGENERATED (2026-08-13, stamped) w19-setter dumps
     /// mint and certify end to end: `set_x` one certificate, `set_both` two, `bump`
     /// one, and the full mutator disjunct takes all three. This is inc-1/inc-1.5's
@@ -26084,6 +26477,341 @@ mod tests {
                 .into_iter()
                 .collect(),
             "all three shapes, with set_both carrying TWO per-field certificates"
+        );
+    }
+
+    /// Trust: FS-CALL-RHS (2026-08-19, the bytesize mono intake) — the fixture
+    /// mirrors the MONOMORPHIZED `<ByteSize as AddAssign<u64>>::add_assign`
+    /// (`self.0 += rhs.into() as u64` at T=u64): bb0 is the `Into::into` call
+    /// into a fresh temp, bb1 the checked spine with that temp as rhs, bb2 the
+    /// `.0` store. Post-mono the rhs param is a bare SCALAR.
+    fn call_rhs_rmw_fixture(variant: &str) -> VerifiableFunction {
+        use trust_types::{
+            AdtKind, AssertMessage, BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place,
+            Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge,
+            VerifiableBody,
+        };
+        let u64t = || Ty::Int { width: 64, signed: false };
+        let bs = Ty::Adt {
+            name: "SYNTH::BS".into(),
+            fields: vec![("0".to_string(), u64t())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: Some(AdtKind::Struct),
+        };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let bare = |l: usize| Place { local: l, projections: vec![] };
+        let pfld = |l: usize, k: usize| Place { local: l, projections: vec![Projection::Field(k)] };
+        let dfld = |l: usize, k: usize| Place {
+            local: l,
+            projections: vec![Projection::Deref, Projection::Field(k)],
+        };
+        let locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Ref { mutable: true, inner: Box::new(bs) },
+                name: Some("self".into()),
+            },
+            LocalDecl { index: 2, ty: u64t(), name: Some("rhs".into()) },
+            LocalDecl { index: 3, ty: u64t(), name: None },
+            LocalDecl { index: 4, ty: Ty::Tuple(vec![u64t(), Ty::Bool]), name: None },
+        ];
+        let call_args = if variant == "arg_recv" {
+            vec![Operand::Move(bare(1))]
+        } else {
+            vec![Operand::Copy(bare(2))]
+        };
+        let call_dest = match variant {
+            "dest_recv_field" => dfld(1, 0),
+            "dest_param" => bare(2),
+            _ => bare(3),
+        };
+        let call_target = if variant == "no_target" { None } else { Some(BlockId(1)) };
+        let call_term = |target: Option<BlockId>| Terminator::Call {
+            func: "<u64 as core::convert::Into<u64>>::into".into(),
+            args: call_args.clone(),
+            dest: call_dest.clone(),
+            target,
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            unwind: UnwindEdge::Continue,
+        };
+        let mut spine_stmts = vec![assign(
+            bare(4),
+            Rvalue::CheckedBinaryOp(
+                BinOp::Add,
+                Operand::Copy(dfld(1, 0)),
+                Operand::Copy(bare(3)),
+            ),
+        )];
+        if variant == "dest_rewritten" {
+            spine_stmts.insert(0, assign(bare(3), Rvalue::Use(Operand::Copy(bare(2)))));
+        }
+        let blocks = if variant == "mid_call" {
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: spine_stmts,
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(pfld(4, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(2),
+                        unwind: UnwindEdge::Continue,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(dfld(1, 0), Rvalue::Use(Operand::Move(pfld(4, 0))))],
+                    terminator: Terminator::Return,
+                },
+                BasicBlock { id: BlockId(3), stmts: vec![], terminator: call_term(Some(BlockId(1))) },
+            ]
+        } else {
+            vec![
+                BasicBlock { id: BlockId(0), stmts: vec![], terminator: call_term(call_target) },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: spine_stmts,
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(pfld(4, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(2),
+                        unwind: UnwindEdge::Continue,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(dfld(1, 0), Rvalue::Use(Operand::Move(pfld(4, 0))))],
+                    terminator: Terminator::Return,
+                },
+            ]
+        };
+        VerifiableFunction {
+            name: "add_assign".into(),
+            def_path: format!("SYNTH::BS::call_rhs::{variant}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: trust_types::FunctionSpec::default(),
+        }
+    }
+
+    fn into_u64_registry() -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "<u64 as core::convert::Into<u64>>::into".to_string(),
+            crate::mirsem::CalleeFact {
+                arg_count: 1,
+                param_tys: vec![trust_types::Ty::Int { width: 64, signed: false }],
+                return_ty: trust_types::Ty::Int { width: 64, signed: false },
+                requires: Some(vec![]),
+                param_names: vec![Some("self".into())],
+            },
+        );
+        m
+    }
+
+    /// POSITIVE — the entry-call RMW mints with rhs `Var(call_slot)` (the fresh
+    /// universally-quantified slot, `call_slot = locals.len()`), kernel-checks
+    /// modulo 3, and the FULL disjunct certifies ONLY under the establishment
+    /// clause: registered + requires-known-empty. An empty registry, a missing
+    /// key, and a requires-unknown (`None`) fact each fail closed at the route.
+    #[test]
+    fn trust_ir_call_rhs_rmw_mints_and_certifies() {
+        use crate::trustir_anchor::{
+            IrOperand, IrRvalue, RefinementVerdict, TrustIrBinOp, check_cell_post_branch_model,
+        };
+        let f = call_rhs_rmw_fixture("ok");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("the entry-call RMW must mint");
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].0, 0);
+        assert_eq!(
+            certs[0].1.blocks[0].stmts[0].rvalue,
+            IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(0), IrOperand::Var(5)),
+            "the rhs must be the fresh call slot (locals.len() = 5)"
+        );
+        assert_eq!(check_cell_post_branch_model(&certs[0].1), RefinementVerdict::ProvenModulo3);
+        assert!(
+            mutator_cell_post_fully_faithful_via_trustir(&f, &into_u64_registry()),
+            "established callee: the full disjunct must certify"
+        );
+        assert!(
+            !mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()),
+            "an EMPTY registry must fail the establishment clause"
+        );
+        let mut unknown_requires = into_u64_registry();
+        unknown_requires
+            .get_mut("<u64 as core::convert::Into<u64>>::into")
+            .expect("key")
+            .requires = None;
+        assert!(
+            !mutator_cell_post_fully_faithful_via_trustir(&f, &unknown_requires),
+            "requires-UNKNOWN must fail closed"
+        );
+    }
+
+    /// FAIL-CLOSED — the FS-CALL-RHS gates, one mutation each: handing the
+    /// receiver to the callee (`arg_recv`), a call dest that is a recv field /
+    /// a param / rewritten by a statement, a diverging call (`no_target`), and
+    /// a call anywhere but bb0 (`mid_call`, the entry pin).
+    #[test]
+    fn trust_ir_call_rhs_rmw_gates_fail_closed() {
+        for variant in [
+            "arg_recv",
+            "dest_recv_field",
+            "dest_param",
+            "dest_rewritten",
+            "no_target",
+            "mid_call",
+        ] {
+            let f = call_rhs_rmw_fixture(variant);
+            assert!(
+                field_post_mutator_ir_cfgs(&f).is_none(),
+                "{variant} must decline"
+            );
+            assert!(
+                !mutator_cell_post_fully_faithful_via_trustir(&f, &into_u64_registry()),
+                "{variant}: even an established callee must not rescue the walk"
+            );
+        }
+    }
+
+    /// Trust: FS-RHS-FIELD (2026-08-19) — the HARVESTED bytesize dumps, end to
+    /// end (the round's medium finding: the synthetic battery alone left the
+    /// change's sole real target unpinned). The concrete `AddAssign` body mints
+    /// exactly one certificate for field 0 whose rhs is the Index denotation and
+    /// certifies on the full mutator disjunct; the two GENERIC bodies (unresolved
+    /// `Into::into` calls) decline — the PROVENANCE roles table, executable.
+    #[test]
+    fn trust_ir_bytesize_harvest_fixtures_certify() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue, TrustIrBinOp};
+        let dir = format!(
+            "{}/fixtures/mutator-harvest-2026-08-19/bytesize/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut proven = Vec::new();
+        let mut declined = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("fixture dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("dump");
+            let f: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse");
+            match field_post_mutator_ir_cfgs(&f) {
+                Some(certs) => {
+                    assert_eq!(certs.len(), 1, "{}: one per-field certificate", f.def_path);
+                    assert_eq!(certs[0].0, 0, "{}: field 0", f.def_path);
+                    assert_eq!(
+                        certs[0].1.blocks[0].stmts[0].rvalue,
+                        IrRvalue::Bin(
+                            TrustIrBinOp::Add,
+                            IrOperand::Var(0),
+                            IrOperand::Index(
+                                Box::new(IrOperand::Var(1)),
+                                Box::new(IrOperand::Const(0)),
+                            ),
+                        ),
+                        "{}: the rhs must denote idxElem(rhs, 0)",
+                        f.def_path
+                    );
+                    assert!(
+                        mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()),
+                        "{}: the full mutator disjunct must certify",
+                        f.def_path
+                    );
+                    proven.push(f.def_path.clone());
+                }
+                None => {
+                    assert!(
+                        !mutator_cell_post_fully_faithful_via_trustir(&f, &Default::default()),
+                        "{}: a declined walk must not certify elsewhere on the disjunct",
+                        f.def_path
+                    );
+                    declined.push(f.def_path.clone());
+                }
+            }
+        }
+        assert_eq!(
+            proven,
+            vec!["<lib::ByteSize as core::ops::arith::AddAssign>::add_assign".to_string()],
+            "exactly the concrete AddAssign proves"
+        );
+        declined.sort();
+        assert_eq!(
+            declined,
+            vec![
+                "<lib::ByteSize as core::ops::arith::AddAssign<T>>::add_assign".to_string(),
+                "<lib::ByteSize as core::ops::arith::MulAssign<T>>::mul_assign".to_string(),
+            ],
+            "the two generic bodies stay honest unknowns"
+        );
+    }
+
+    /// Trust: FS-CALL-RHS + UMUL RECORD (2026-08-20) — the HARVESTED bytesize
+    /// MONO chain, end to end through the census driver itself: `from` (identity
+    /// leaf, registry-free) -> `into` (calls `from`) -> `add_assign::<u64>` AND
+    /// `mul_assign::<u64>` (entry-call RMWs, `into` established) — ff 4 /
+    /// via_trustir 4 / fallback 0.
+    ///
+    /// The mul link certifies because the var*var unsigned mul VC carries the
+    /// authenticated Or-range record again. That conjunct was RETRACTED on
+    /// 2026-08-20 (it cost ay the refutation on the mixed QF_BV + NIA query) and
+    /// RE-LANDED the same day once `trust-router`'s disjoint-component refutation
+    /// lane could refute such a query component-wise — measured capability-neutral
+    /// both ways before re-landing. The pin that holds the pair together is
+    /// `trust_router::in_process_ay_backend::tests::
+    /// umul_bare_bv_unguarded_refutes_with_counterexample`.
+    #[test]
+    fn trust_ir_bytesize_mono_chain_end_to_end() {
+        let dir = format!(
+            "{}/fixtures/mutator-harvest-2026-08-19/bytesize-mono/dumps",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let sc = prove_dump_dir(std::path::Path::new(&dir)).expect("census over the fixture");
+        assert_eq!(sc.fully_faithful, 4, "from + into + add_assign + mul_assign");
+        assert_eq!(sc.fully_faithful_via_trustir, 4);
+        assert_eq!(sc.fully_faithful_mirsem_fallback, 0, "teardown criterion");
+        // The mul link, layer by layer: walk mints, model kernel-checks, and the
+        // safety pillar grounds the recorded Or-range core against umulOverflowsU64.
+        let mul_path = format!("{dir}/trust-mir-3317a0241ba502e-3f4a79af0549f6ad.json");
+        let f: VerifiableFunction =
+            serde_json::from_slice(&std::fs::read(&mul_path).expect("read")).expect("parse");
+        let certs = field_post_mutator_ir_cfgs(&f).expect("the mul walk MINTS");
+        assert_eq!(
+            crate::trustir_anchor::check_cell_post_branch_model(&certs[0].1),
+            crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+        );
+        assert!(
+            crate::trustir_safety::function_safety_vcs_faithful_via_trustir(&f),
+            "the recorded umul core must ground against umulOverflowsU64"
         );
     }
 
@@ -26855,6 +27583,70 @@ mod tests {
             spec: trust_types::FunctionSpec::default(),
         }
     }
+
+    /// Trust: THE NONMAX CHAIN, END TO END (2026-08-19) — the retracted call-RMW
+    /// +1 returns through the REAL three-link registry accumulation, exactly the
+    /// census's callees-first order:
+    ///   1. `NonZero::<u8>::get` (the regenerated transparent-unwrap dump, in
+    ///      the nonmax dir since the curation) certifies with NO registry;
+    ///   2. its fact registers → `NonMaxU8::get` certifies via call-then-pureop
+    ///      — the WIDENED opaque-newtype-chain call-arg arm admitting its
+    ///      `(*self).0 : NonZero<u8>` argument (this slice's change);
+    ///   3. its fact registers → the u8-cell `bitand_assign` certifies via
+    ///      call-RMW + `mutator_entry_callee_established` — the row the
+    ///      2026-08-14 UB-free-callee clause retracted, back under the honest
+    ///      bar: every link's callee now IS certified.
+    #[test]
+    fn nonmax_chain_end_to_end() {
+        let dir = format!(
+            "{}/fixtures/census-rung2-2026-07-07/nonmax",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let load = |suffix: &str| -> VerifiableFunction {
+            for entry in std::fs::read_dir(&dir).expect("dir") {
+                let path = entry.expect("e").path();
+                if path.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let f: VerifiableFunction =
+                    serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+                if f.def_path == suffix {
+                    return f;
+                }
+            }
+            panic!("{suffix} not in the nonmax dir");
+        };
+        let mut reg = std::collections::BTreeMap::new();
+        // Link 1: the leaf.
+        let nz_get = load("core::num::nonzero::NonZero::<u8>::get");
+        assert!(
+            crate::mirsem::function_fully_faithful_witness_with_callees(&nz_get, &reg)
+                .is_some_and(|c| c.is_modulo_3()),
+            "link 1: the regenerated NonZero::<u8>::get must certify registry-free"
+        );
+        reg.insert(nz_get.def_path.clone(), crate::mirsem::CalleeFact::of_certified(&nz_get));
+        // Link 2: the widened call-arg arm.
+        let nm_get = load("lib::NonMaxU8::get");
+        assert!(
+            crate::mirsem::sem_call_then_pureop_of_mir(&nm_get, &reg).is_some(),
+            "link 2: the (*self).0 NonZero-chain arg must model (the widened arm)"
+        );
+        assert!(
+            call_then_pureop_fully_faithful_via_trustir(&nm_get, &reg),
+            "link 2: NonMaxU8::get must certify trust-ir-primary"
+        );
+        reg.insert(nm_get.def_path.clone(), crate::mirsem::CalleeFact::of_certified(&nm_get));
+        // Link 3: the retracted row returns.
+        let ba = load("lib::<impl core::ops::bit::BitAndAssign<lib::NonMaxU8> for u8>::bitand_assign");
+        assert!(
+            mutator_cell_post_fully_faithful_via_trustir(&ba, &reg),
+            "link 3: the u8-cell bitand_assign — the 2026-08-14 retraction — returns"
+        );
+        // The fail-closed control: an EMPTY registry still declines link 3 (the
+        // establishment clause is what the chain feeds, not a bypass).
+        assert!(!mutator_cell_post_fully_faithful_via_trustir(&ba, &Default::default()));
+    }
+
 
     /// POSITIVE — the hand-built shape and THE REAL COMMITTED DUMP both mint and
     /// certify through the full disjunct. The model is pinned structurally:
@@ -37489,6 +38281,45 @@ mod call_chain_pureop_trustir_lane_tests {
         assert!(
             fallback.is_empty(),
             "no row in this corpus may remain on the MirSem fallback, got {fallback:?}"
+        );
+    }
+}
+
+/// Tripwire for [`INSTANTIATOR_ORD_LEAF_VC_HASH`]'s hash domain.
+///
+/// The pinned digest is RAW serde over `(&VcKind, &Formula)`. Raw bytes and
+/// canonical model bytes (`trust_types::stable_model_json_bytes`) agree for
+/// this material today; the next additive `#[serde(default)] Option<_>` field
+/// inside `VcKind` or `Formula` makes them diverge — the exact drift class
+/// that moved the VC digest when `VerificationCondition::obligation` landed.
+/// When this test fails, the hash domain is about to move: either route
+/// `vc_kind_formula_hash` through the canonicalizer and re-derive the pin
+/// byte-verified (the discipline the pin's own comment records), or ratify
+/// the new raw bytes deliberately. Never let the pin move silently.
+#[cfg(test)]
+mod vc_kind_formula_hash_domain_tripwire {
+    use trust_types::{Formula, Sort, VcKind};
+
+    #[test]
+    fn raw_and_canonical_bytes_agree_for_the_pinned_material_shape() {
+        let kind = VcKind::Assertion { message: "ord leaf".to_string() };
+        let formula = Formula::Ite(
+            Box::new(Formula::BvULt(
+                Box::new(Formula::Var("discr__3".to_string(), Sort::BitVec(64))),
+                Box::new(Formula::BitVec { value: 2, width: 64 }),
+                64,
+            )),
+            Box::new(Formula::Bool(true)),
+            Box::new(Formula::Bool(false)),
+        );
+        let material = (&kind, &formula);
+        let raw = serde_json::to_vec(&material).expect("raw serde");
+        let canonical =
+            trust_types::stable_model_json_bytes(&material).expect("canonical serde");
+        assert_eq!(
+            raw, canonical,
+            "raw and canonical VC-material bytes diverged: an additive model field \
+             is about to silently move INSTANTIATOR_ORD_LEAF_VC_HASH's domain"
         );
     }
 }

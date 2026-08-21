@@ -1219,6 +1219,13 @@ pub struct ExtCtxt<'a> {
     /// `-Zmacro-stats` data.
     pub macro_stats: FxHashMap<(Symbol, MacroKind), MacroStat>,
     pub nb_macro_errors: usize,
+    /// Trust (I8): the `.clean` units already loaded by `clean mod name;`
+    /// items this compilation, keyed by resolved file path. The crate's Clean
+    /// environment is one header-first batch, so a unit may be included ONCE
+    /// per crate; `module::load_clean_unit` reads and writes this ledger and
+    /// refuses the second inclusion at its own span, pointing at the first
+    /// (ruling v7/D3). Empty for every crate with no `clean mod` item.
+    pub trust_clean_units_loaded: FxHashMap<PathBuf, Span>,
 }
 
 impl<'a> ExtCtxt<'a> {
@@ -1250,6 +1257,7 @@ impl<'a> ExtCtxt<'a> {
             buffered_early_lint: vec![],
             macro_stats: Default::default(),
             nb_macro_errors: 0,
+            trust_clean_units_loaded: FxHashMap::default(),
         }
     }
 

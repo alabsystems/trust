@@ -1,0 +1,5 @@
+-- Trust I8: declares the SAME name as the inline island in
+-- `clean_unit_inline_duplicate.rs`. The crate's single Clean environment must
+-- refuse the duplicate — for a unit exactly as it would for a second inline
+-- island — before any mint exists.
+def dup_pick (a b : UInt64) : UInt64 := b

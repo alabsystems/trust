@@ -802,7 +802,12 @@ impl<'tcx> TyCtxt<'tcx> {
             }
             Node::Crate(..) => String::from("(root_crate)"),
             Node::WherePredicate(_) => node_str("where predicate"),
-            Node::Synthetic => unreachable!(),
+            // Trust (I5): a Clean-origin def's synthetic HIR owner reaches
+            // debug rendering the same way it reaches span rendering (the
+            // sibling arm in `hir_span_with_body`, measured under compiletest
+            // JSON diagnostics). A label is the honest answer for a node whose
+            // whole point is having no HIR.
+            Node::Synthetic => node_str("synthetic (Clean-origin)"),
             Node::Err(_) => node_str("error"),
             Node::PreciseCapturingNonLifetimeArg(_param) => node_str("parameter"),
         }
@@ -1078,7 +1083,17 @@ impl<'tcx> TyCtxt<'tcx> {
             Node::Crate(item) => item.spans.inner_span,
             Node::WherePredicate(pred) => pred.span,
             Node::PreciseCapturingNonLifetimeArg(param) => param.ident.span,
-            Node::Synthetic => unreachable!(),
+            // Trust (I5): a Clean-origin def has a synthetic HIR owner
+            // (`feed_hir`), and diagnostic rendering CAN reach it — measured
+            // under `--error-format json`, where the span machinery walks HIR
+            // for a note attached to a Clean-origin body's obligation
+            // (`hir_span_with_body` on the synthetic node; human rendering
+            // never took this path, which is why the direct lane missed it and
+            // compiletest found it). The honest span for a def with no HIR is
+            // its `def_span`, which the mint fed from the island declaration —
+            // exactly where a user should be pointed. `unreachable!()` was
+            // right when nothing synthetic existed; it is not right now.
+            Node::Synthetic => self.def_span(hir_id.owner.to_def_id()),
             Node::Err(span) => span,
         }
     }

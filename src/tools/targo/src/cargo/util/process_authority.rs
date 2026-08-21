@@ -919,8 +919,6 @@ fn validate_unprivileged_authority_path(
     authority: &str,
     mode: PathnameAuthorityMode,
 ) -> CargoResult<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
     use std::path::Component;
 
     let effective_uid = unsafe { libc::geteuid() };
@@ -950,15 +948,50 @@ fn validate_unprivileged_authority_path(
             path.display()
         )
     })?;
-    if canonical != path {
-        anyhow::bail!(
-            "{authority} path `{}` is not already canonical (`{}`); verified pathname authority forbids aliases and redirection",
-            path.display(),
-            canonical.display()
-        );
+
+    // Trust: a launch path that reaches the object through a symlink is
+    // AUTHENTICATED, not refused. `rustup toolchain link` can only install a
+    // custom toolchain as a symlink, so the old "must already be canonical"
+    // rule did not defend the toolchain — it made the VERIFIED lane
+    // (`targo trust check`) unreachable through the only entry point users
+    // have, which is the one lane whose whole purpose is to be run
+    // continuously.
+    //
+    // WHY THIS SITE IS STRICTER THAN THE TWO IDENTITY GUARDS. Tippy's
+    // `path_identity` and the protected-subcommand guard PIN each hop's
+    // identity and revalidate it around the operation, so they can afford the
+    // POSIX-precise rule and admit a sticky world-writable holding directory
+    // (`/tmp`), where only an entry's own owner may replace it. This predicate
+    // has no pinning to fall back on: it is prevention only, re-proved at every
+    // execution edge, with just the leaf bound to an opened object. So a hop is
+    // held to this site's OWN uniform per-component predicate — owner is root
+    // or the invoking identity, closed to group/world writes with no sticky
+    // exemption, and proven outside our ACL write authority when foreign-owned.
+    // The result is that admitting a redirection grants no principal any
+    // authority they did not already have over the canonical path itself.
+    validate_launch_path_symlink_hops(path, &canonical, authority, mode, effective_uid)?;
+
+    // Trust: hops are admitted in the PARENT chain only. A launcher's identity
+    // is bound to one opened object with `O_NOFOLLOW`
+    // (`validate_opened_tool_launcher`), so a leaf that is itself a redirection
+    // could never satisfy that binding; refuse it here with a message that says
+    // why instead of letting the open fail obscurely later.
+    if !leaf_is_directory {
+        let launch_leaf = std::fs::symlink_metadata(path).with_context(|| {
+            format!("failed to inspect {authority} path `{}`", path.display())
+        })?;
+        if !metadata_is_plain_file_for_authority(&launch_leaf) {
+            anyhow::bail!(
+                "{authority} path `{}` is not a plain regular file; a launcher is bound to one opened object and cannot itself be reached through a redirection",
+                path.display()
+            );
+        }
     }
 
-    let components = path.components().collect::<Vec<_>>();
+    // Authenticate the CANONICAL path: that is where the object actually lives,
+    // and every component of it must satisfy the substitution predicate. The
+    // launch spelling contributes only its hops, checked above.
+    let components = canonical.components().collect::<Vec<_>>();
     let mut current = PathBuf::new();
     for (index, component) in components.iter().enumerate() {
         match component {
@@ -997,47 +1030,67 @@ fn validate_unprivileged_authority_path(
         }
         validate_authority_ownership(&metadata, &current, authority, mode, effective_uid)?;
 
-        // Trust: an ACL can grant write authority that the mode bits do not
-        // show, so mode bits alone do not prove a foreign-owned component is
-        // closed to us. Prove it for every component this identity does not
-        // already own. On a component the caller *does* own the probe is
-        // vacuous — `W_OK` succeeds by construction — so running it there would
-        // not test anything; it would only convert the normal case into a
-        // refusal, which is exactly the defect this module had.
-        if metadata.uid() != effective_uid {
-            let encoded = std::ffi::CString::new(current.as_os_str().as_bytes()).map_err(|_| {
-                anyhow::anyhow!(
-                    "{authority} path component `{}` contains an interior NUL",
-                    current.display()
-                )
-            })?;
-            if unsafe { libc::access(encoded.as_ptr(), libc::W_OK) } == 0 {
-                anyhow::bail!(
-                    "{authority} path component `{}` remains writable by Targo's effective identity (uid={effective_uid}); ACL-backed write authority is incompatible with verified pathname execution",
-                    current.display()
-                );
-            }
-            let access_error = std::io::Error::last_os_error();
-            // Trust: EACCES, EROFS and EPERM are all *denials* — each one is a
-            // proof that this identity cannot write the component. EPERM is not
-            // an exotic case: on macOS every SIP-protected system path
-            // (`/usr`, `/usr/lib`, `/System`) answers `access(W_OK)` with EPERM
-            // rather than EACCES, and `/usr/lib` is a directory Targo itself
-            // appends to the verified loader closure. Treating EPERM as an
-            // inconclusive error made the strictest platform the one that could
-            // not be authenticated.
-            if access_error.kind() != std::io::ErrorKind::PermissionDenied
-                && access_error.raw_os_error() != Some(libc::EROFS)
-                && access_error.raw_os_error() != Some(libc::EPERM)
-            {
-                return Err(access_error).with_context(|| {
-                    format!(
-                        "failed to prove that {authority} path component `{}` is outside Targo's write authority",
-                        current.display()
-                    )
-                });
-            }
-        }
+        prove_outside_caller_write_authority(&metadata, &current, authority, effective_uid)?;
+    }
+    Ok(())
+}
+
+/// Trust: an ACL can grant write authority that the mode bits do not show, so
+/// mode bits alone do not prove a foreign-owned object is closed to us. Prove it
+/// for every object this identity does not already own. On an object the caller
+/// *does* own the probe is vacuous — `W_OK` succeeds by construction — so
+/// running it there would not test anything; it would only convert the normal
+/// case into a refusal, which is exactly the defect this module had.
+///
+/// Applied to path components and, since the launch path may now be reached
+/// through symlinks, to the directory holding each symlink hop. It is
+/// deliberately NOT applied to a hop's own link object: `access(2)` FOLLOWS
+/// symlinks, so probing a link reports its target's writability and would prove
+/// the wrong thing.
+#[cfg(unix)]
+fn prove_outside_caller_write_authority(
+    metadata: &std::fs::Metadata,
+    current: &Path,
+    authority: &str,
+    effective_uid: u32,
+) -> CargoResult<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.uid() == effective_uid {
+        return Ok(());
+    }
+    let encoded = std::ffi::CString::new(current.as_os_str().as_bytes()).map_err(|_| {
+        anyhow::anyhow!(
+            "{authority} path component `{}` contains an interior NUL",
+            current.display()
+        )
+    })?;
+    if unsafe { libc::access(encoded.as_ptr(), libc::W_OK) } == 0 {
+        anyhow::bail!(
+            "{authority} path component `{}` remains writable by Targo's effective identity (uid={effective_uid}); ACL-backed write authority is incompatible with verified pathname execution",
+            current.display()
+        );
+    }
+    let access_error = std::io::Error::last_os_error();
+    // Trust: EACCES, EROFS and EPERM are all *denials* — each one is a
+    // proof that this identity cannot write the component. EPERM is not
+    // an exotic case: on macOS every SIP-protected system path
+    // (`/usr`, `/usr/lib`, `/System`) answers `access(W_OK)` with EPERM
+    // rather than EACCES, and `/usr/lib` is a directory Targo itself
+    // appends to the verified loader closure. Treating EPERM as an
+    // inconclusive error made the strictest platform the one that could
+    // not be authenticated.
+    if access_error.kind() != std::io::ErrorKind::PermissionDenied
+        && access_error.raw_os_error() != Some(libc::EROFS)
+        && access_error.raw_os_error() != Some(libc::EPERM)
+    {
+        return Err(access_error).with_context(|| {
+            format!(
+                "failed to prove that {authority} path component `{}` is outside Targo's write authority",
+                current.display()
+            )
+        });
     }
     Ok(())
 }
@@ -1083,6 +1136,181 @@ fn validate_authority_ownership(
             current.display(),
             metadata.uid(),
             metadata.mode() & 0o7777,
+        );
+    }
+    Ok(())
+}
+
+/// Trust: resolve the launch path one component at a time and hold every
+/// symlink it goes through to this site's substitution predicate.
+///
+/// The walk exists because `Path::ancestors` cannot see a hop introduced by a
+/// previous hop's target, and that is precisely the shape a promoted toolchain
+/// has: `~/.rustup/toolchains/trust -> ~/toolchains/trust-current ->
+/// trust-<rev>`, where the middle link is the one an atomic promotion rewrites.
+/// Enumerating only the launch path's own ancestors would authenticate the
+/// first link and never look at the second.
+///
+/// Two objects decide whether a hop can be redirected, and they are checked
+/// differently:
+///
+/// * the LINK — only its owner is examined. Its mode bits are deliberately
+///   ignored because Linux reports every symlink as `0o777` and ignores the
+///   bits entirely, so testing them would refuse every symlink on Linux while
+///   proving nothing anywhere. Its ACL is not probed either: `access(2)` follows
+///   symlinks, so the probe would report the TARGET's writability.
+/// * the DIRECTORY HOLDING IT — the actual substitution primitive, since a
+///   symlink's target is immutable and the only way to retarget one is to
+///   replace the directory entry. It gets the identical predicate every path
+///   component gets, ACL probe included.
+///
+/// Finally the walk is cross-checked against `canonicalize`: if a hop is
+/// rewritten while the walk is in progress the two disagree and the path is
+/// refused, so this can never authenticate a prefix of a path that resolves
+/// somewhere else.
+#[cfg(unix)]
+fn validate_launch_path_symlink_hops(
+    launch: &Path,
+    canonical: &Path,
+    authority: &str,
+    mode: PathnameAuthorityMode,
+    effective_uid: u32,
+) -> CargoResult<()> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Component;
+
+    /// A resolution needing more hops than this is a loop or an attack, not a
+    /// toolchain layout; Linux's own limit is 40.
+    const MAX_LAUNCH_SYMLINK_HOPS: usize = 64;
+
+    fn push_components(
+        path: &Path,
+        out: &mut VecDeque<OsString>,
+        authority: &str,
+    ) -> CargoResult<()> {
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::CurDir | Component::ParentDir | Component::Normal(_) => {
+                    out.push_back(component.as_os_str().to_owned());
+                }
+                Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "{authority} path `{}` carries a platform prefix component",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut remaining = VecDeque::new();
+    push_components(launch, &mut remaining, authority)?;
+    let mut resolved = PathBuf::from("/");
+    let mut hops = 0_usize;
+    while let Some(name) = remaining.pop_front() {
+        if name == OsString::from(Component::CurDir.as_os_str()) {
+            continue;
+        }
+        if name == OsString::from(Component::ParentDir.as_os_str()) {
+            // `resolved` is fully resolved at every step, so a lexical pop is
+            // what the kernel does too, and `/..` is `/`.
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
+            format!(
+                "failed to inspect {authority} launch path component `{}`",
+                candidate.display()
+            )
+        })?;
+        if !metadata.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        hops += 1;
+        if hops > MAX_LAUNCH_SYMLINK_HOPS {
+            anyhow::bail!(
+                "{authority} path `{}` resolves through more than {MAX_LAUNCH_SYMLINK_HOPS} symlinks",
+                launch.display()
+            );
+        }
+
+        let owner_ok = if mode.requires_privileged_owner() {
+            metadata.uid() == 0
+        } else {
+            metadata.uid() == 0 || metadata.uid() == effective_uid
+        };
+        if !owner_ok {
+            anyhow::bail!(
+                "{authority} launch path symlink `{}` is owned by uid={}, which is not permitted to own a redirection into the verified toolchain (invoking uid={effective_uid}); its owner can repoint it at another sysroot",
+                candidate.display(),
+                metadata.uid(),
+            );
+        }
+
+        // The holding directory is where the substitution primitive lives, and
+        // it gets the full per-component predicate.
+        let parent_metadata = std::fs::symlink_metadata(&resolved).with_context(|| {
+            format!(
+                "failed to inspect the directory `{}` holding {authority} launch path symlink `{}`",
+                resolved.display(),
+                candidate.display()
+            )
+        })?;
+        if !metadata_is_plain_directory(&parent_metadata) {
+            anyhow::bail!(
+                "the directory `{}` holding {authority} launch path symlink `{}` is not a plain directory",
+                resolved.display(),
+                candidate.display()
+            );
+        }
+        validate_authority_ownership(
+            &parent_metadata,
+            &resolved,
+            authority,
+            mode,
+            effective_uid,
+        )?;
+        prove_outside_caller_write_authority(
+            &parent_metadata,
+            &resolved,
+            authority,
+            effective_uid,
+        )?;
+
+        let target = std::fs::read_link(&candidate).with_context(|| {
+            format!(
+                "failed to read {authority} launch path symlink `{}`",
+                candidate.display()
+            )
+        })?;
+        if target.as_os_str().is_empty() {
+            anyhow::bail!(
+                "{authority} launch path symlink `{}` has an empty target",
+                candidate.display()
+            );
+        }
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        let mut expansion = VecDeque::new();
+        push_components(&target, &mut expansion, authority)?;
+        while let Some(component) = expansion.pop_back() {
+            remaining.push_front(component);
+        }
+    }
+
+    if resolved != canonical {
+        anyhow::bail!(
+            "{authority} path `{}` resolves to `{}`, but its authenticated symlink chain resolves to `{}`",
+            launch.display(),
+            canonical.display(),
+            resolved.display()
         );
     }
     Ok(())
@@ -1771,20 +1999,7 @@ fn scan_verified_tool_runtime_library_paths(tool: &Path) -> CargoResult<Vec<Path
             tool.display()
         )
     })?;
-    let lexical_sysroot = lexical_bin_dir.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "authenticated Targo toolchain directory `{}` has no sysroot",
-            lexical_bin_dir.display()
-        )
-    })?;
-
     let mut paths = Vec::new();
-    if !validate_plain_toolchain_directory_path(lexical_sysroot, lexical_bin_dir)? {
-        anyhow::bail!(
-            "authenticated tool directory `{}` disappeared during runtime-path validation",
-            lexical_bin_dir.display()
-        );
-    }
     let bin_dir = lexical_bin_dir.canonicalize().with_context(|| {
         format!(
             "failed to canonicalize authenticated tool directory `{}`",
@@ -1797,6 +2012,25 @@ fn scan_verified_tool_runtime_library_paths(tool: &Path) -> CargoResult<Vec<Path
             bin_dir.display()
         )
     })?;
+    // Trust: the structural "no redirection between the sysroot and its `bin`"
+    // check runs on the CANONICAL pair, for the same reason the pathname
+    // predicate above authenticates the canonical path: that is where the
+    // objects actually live, and it is the layout the loader will see.
+    //
+    // It used to run on the LEXICAL pair, which additionally required the
+    // launch spelling itself to be redirection-free — and a rustup-linked
+    // toolchain's lexical sysroot IS the symlink rustup created, so this
+    // refused the verified lane a second time, independently of the pathname
+    // predicate. Nothing is lost by moving it: the launch spelling's hops are
+    // authenticated by `validate_unprivileged_authority_path`, which runs on
+    // this same tool, and the internal structure below the sysroot is still
+    // held to plain directories with no symlink components.
+    if !validate_plain_toolchain_directory_path(sysroot, &bin_dir)? {
+        anyhow::bail!(
+            "authenticated tool directory `{}` disappeared during runtime-path validation",
+            bin_dir.display()
+        );
+    }
     push_verified_runtime_directory(&mut paths, sysroot, sysroot.join("lib"))?;
 
     let mut rustlib_paths = Vec::new();

@@ -1,0 +1,112 @@
+{
+  "name": "from",
+  "def_path": "<u64 as core::convert::From<u64>>::from",
+  "span": {
+    "file": "core/src/convert/mod.rs",
+    "line_start": 790,
+    "col_start": 4,
+    "line_end": 792,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "t"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/convert/mod.rs",
+                "line_start": 791,
+                "col_start": 8,
+                "line_end": 791,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "t",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "t",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

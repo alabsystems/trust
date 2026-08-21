@@ -565,6 +565,17 @@ struct RefArgForwardGuard<'a> {
     // Trust (wave-EP): arm-binding payload temps `_t = &(((*_arg) as V).k); _x = copy (*_t)` — the
     // `_arg`-as-borrow-base is admitted, on the same footing as the wave-30 interior borrow.
     payload_temps: &'a HashSet<Local>,
+    // Trust (wave-AF): address-forward temps `_t = &((*_arg).k)` / `_t = &(((*_arg) as V).k);
+    // g(copy _t)` over a NON-scalar field — the `_arg`-as-borrow-base is admitted on the same
+    // footing as the wave-30 interior borrow and the wave-EP payload borrow. Scalarity of the
+    // field never entered this guard's property: what it protects is that the reference VALUE
+    // `_arg` does not escape, and what is stored in `_t` is a borrow of the REFERENT's field.
+    addr_fwd_temps: &'a HashSet<Local>,
+    // Trust (wave-W3): relay SOURCES — `_b = &(((*_arg) as V).k)` whose single use is the
+    // reborrow `_g = &(*_b)` rather than a call argument. Same borrow places, same
+    // forward-only property, and for the same reason: what is stored in `_b` is a borrow of the
+    // REFERENT's field, not the reference value `_arg`.
+    relay_srcs: &'a HashSet<Local>,
     violation: Option<Local>,
 }
 impl<'tcx> Visitor<'tcx> for RefArgForwardGuard<'_> {
@@ -678,6 +689,35 @@ impl<'tcx> Visitor<'tcx> for RefArgForwardGuard<'_> {
                     && matches!(src.projection[0], ProjectionElem::Deref)
                     && matches!(src.projection[1], ProjectionElem::Downcast(..))
                     && matches!(src.projection[2], ProjectionElem::Field(..))
+                {
+                    return;
+                }
+            }
+            // Trust (wave-AF): the ADDRESS-FORWARD borrow `_t = &((*_p).k)` /
+            // `_t = &(((*_p) as V).k)` where the field is NOT a fragment scalar. Same two places
+            // as the wave-29/30 interior borrow and the wave-EP payload borrow above, and the
+            // forward-only property is untouched for the same reason both of those give: what is
+            // stored in `_t` is a borrow of the REFERENT's field, not the reference value `_p`,
+            // and `addr_forward_temps` proved (mentions == 2) that `_t`'s only other appearance is
+            // a bare call argument — so `_p` is not observed beyond being the borrow base and
+            // nothing derived from it is dereferenced here. `_t` must be a certified
+            // `addr_forward_temps` local and the destination must not itself be a ref arg;
+            // anything longer, shorter or differently shaped still walks and flags.
+            if let Rvalue::Ref(_, BorrowKind::Shared, src) = rvalue {
+                if !self.ref_args.contains(&place.local)
+                    && place.projection.is_empty()
+                    && (self.addr_fwd_temps.contains(&place.local)
+                        || self.relay_srcs.contains(&place.local))
+                    && self.ref_args.contains(&src.local)
+                    && matches!(
+                        src.projection.as_slice(),
+                        [ProjectionElem::Deref, ProjectionElem::Field(..)]
+                            | [
+                                ProjectionElem::Deref,
+                                ProjectionElem::Downcast(..),
+                                ProjectionElem::Field(..)
+                            ]
+                    )
                 {
                     return;
                 }
@@ -846,8 +886,17 @@ fn ref_args_forward_only<'tcx>(
     ref_args: &HashSet<Local>,
     interior_arg_temps: &HashSet<Local>,
     payload_temps: &HashSet<Local>,
+    addr_fwd_temps: &HashSet<Local>,
+    relay_srcs: &HashSet<Local>,
 ) -> Result<(), String> {
-    let mut g = RefArgForwardGuard { ref_args, interior_arg_temps, payload_temps, violation: None };
+    let mut g = RefArgForwardGuard {
+        ref_args,
+        interior_arg_temps,
+        payload_temps,
+        addr_fwd_temps,
+        relay_srcs,
+        violation: None,
+    };
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         g.visit_basic_block_data(bb, data);
     }
@@ -1147,6 +1196,42 @@ fn place_ok<'tcx>(body: &Body<'tcx>, place: &Place<'tcx>) -> Result<(), String> 
     }
 }
 
+/// Trust (wave-AF, 2026-08-19): the FIELD TYPE of an INTERIOR place read through a SHARED-ref ARG
+/// — either `((*_p).k)` (projection `[Deref, Field(k, fty)]`) or the by-REF enum payload
+/// `(((*_p) as V).k)` (projection `[Deref, Downcast(v), Field(k, fty)]`, and then `_p`'s pointee
+/// must be an enum) — or `None` when `place` is neither.
+///
+/// Extracted so the READ path and the ADDRESS path differ in EXACTLY ONE clause and in nothing
+/// else. The READ path ([`is_ref_enum_payload_read`], `place_ok`) requires `scalar_ok(fty)`
+/// because it produces a VALUE of that type; the ADDRESS path ([`addr_forward_temps`]) does not,
+/// because it produces only a thin shared reference and the paired confinement proves nothing is
+/// ever loaded through it.
+///
+/// NOT AN ARM OF `place_ok`, for `place_ok`'s own stated reason: it is direction-blind and is
+/// called on assign DESTINATIONS, so admitting a non-scalar field there would also admit a STORE
+/// through a shared reference. This helper is only ever consulted from the BORROW path.
+fn interior_field_ty<'tcx>(body: &Body<'tcx>, place: &Place<'tcx>) -> Option<ty::Ty<'tcx>> {
+    // Base must be a SHARED-ref ARG, exactly as `place_ok`'s `[Deref, …]` arms require.
+    if place.local.as_usize() < 1 || place.local.as_usize() > body.arg_count {
+        return None;
+    }
+    let ty::Ref(_, pointee, m) = *body.local_decls[place.local].ty.kind() else {
+        return None;
+    };
+    if !m.is_not() {
+        return None;
+    }
+    match place.projection.as_slice() {
+        [ProjectionElem::Deref, ProjectionElem::Field(_, fty)] => Some(*fty),
+        [ProjectionElem::Deref, ProjectionElem::Downcast(..), ProjectionElem::Field(_, fty)]
+            if matches!(pointee.kind(), ty::Adt(adt, _) if adt.is_enum()) =>
+        {
+            Some(*fty)
+        }
+        _ => None,
+    }
+}
+
 /// Trust (T2c): is `place` the by-REF enum payload READ `(((*_p) as V).k)` — projection EXACTLY
 /// `[Deref, Downcast(v), Field(k, scalar)]` with the base a SHARED-ref ARG whose pointee is an
 /// enum? This is the COMPOSITION of two shapes `place_ok` already admits at two levels — wave-24's
@@ -1172,6 +1257,433 @@ fn is_ref_enum_payload_read<'tcx>(body: &Body<'tcx>, place: &Place<'tcx>) -> boo
             ty::Ref(_, pointee, m) if m.is_not()
                 && matches!(pointee.kind(), ty::Adt(adt, _) if adt.is_enum())
         )
+}
+
+/// Trust (wave-AF, 2026-08-19): may the flip DECLARE a shared-reference local `&P` for a
+/// NON-scalar `P` whose ADDRESS this body only ever forwards?
+///
+/// `scalar_ok(fty)` on the borrowed field was carrying THREE properties at once. Two of them are
+/// not owed on the address path, and the third is — so it is spelled here instead of inherited.
+///
+/// * **`P` has no drop glue** — NOT owed. `_t` is a BORROW: `&P` is `Copy` and `!needs_drop` for
+///   every `P`, and a shared borrow mints no move path at all —
+///   `rustc_mir_dataflow/src/move_paths/builder.rs:441`, `gather_rvalue`'s
+///   `Rvalue::Ref(..) => {}` — so `ElaborateDrops` finds nothing to elaborate and NO DROP
+///   OBLIGATION IS TRANSFERRED. The obligation stays with whoever OWNS the aggregate, and that is
+///   the CALLER: the borrow base is a shared-ref PARAM this body cannot even write through.
+/// * **a value of `P` has a known width** — NOT owed, and this is the SHIM's own recorded reason
+///   for the same relaxation on its side of the seam (`to_mir.rs:6956-6963`, the T2d arm: *"This
+///   arm loads nothing … A payload whose address is taken and never dereferenced here needs no
+///   width argument, because no width is read"*; and `to_mir.rs:5425-5429`, wave-T2e: *"the
+///   borrowed field no longer has to be a fragment SCALAR … scalarity was an ARGUMENT for
+///   uniqueness, never its source"*). [`addr_forward_temps`]'s mentions == 2 clause is what makes
+///   "never dereferenced" a proof rather than a hope.
+/// * **`&P` is a THIN pointer** — OWED, and it is the one property `scalar_ok` was supplying
+///   silently. An unsized `P` makes `&P` a WIDE `(data, metadata)` pair and the fragment models
+///   pointer metadata nowhere. **This clause is not hypothetical: 2 of the 29 `-O0` fragment
+///   local-type refusals in `clean-kernel` are `&'{erased} str`** (`<mode::AxiomId as
+///   Display>::fmt`, `<mode::CleanMode as Display>::fmt`), which this predicate REFUSES.
+///
+///   Both PEERS already apply exactly this gate to exactly these lanes, so the three sides now
+///   agree by construction rather than by coincidence: the producer's by-ref payload binding
+///   (`lib.rs:22908-22915`, `ptr_thin = pointee.is_sized(tcx, te)`, tag `"EnumMatch(ref payload
+///   non-thin binding)"`) and the shim's interior-borrow erasure (`to_mir.rs:5439-5442`, which
+///   emits only when `fat_shape(&FieldTy) == Thin`).
+///
+///   Conservative in the safe direction: an `extern type` tail is `!Sized` yet ITS pointers are
+///   THIN (the `PointeeMeta` note, `lib.rs:2869-2871`), so `is_sized` REFUSES a shape that would
+///   in fact have been fine. Refusing more is fail-closed.
+///
+/// Concrete-only (param/infer-free) as everywhere else in the fragment, and as both peers require
+/// of the same field type (`to_mir.rs:5451-5457`).
+fn concrete_thin_pointee_admits(has_param: bool, has_infer: bool, is_sized: bool) -> bool {
+    !has_param && !has_infer && is_sized
+}
+
+fn thin_shared_pointee_ok<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let has_param = ty.has_non_region_param();
+    let has_infer = ty.has_non_region_infer();
+    // Preserve the old fail-fast query boundary: there is no reason to ask
+    // rustc for a concrete layout property when the type is not concrete.
+    let is_sized =
+        !has_param && !has_infer && ty.is_sized(tcx, ty::TypingEnv::fully_monomorphized());
+    concrete_thin_pointee_admits(has_param, has_infer, is_sized)
+}
+
+/// Trust (wave-AF, 2026-08-19): the set of shared-ref TEMP locals holding the ADDRESS of an
+/// interior place that is FORWARDED WHOLE into a call and never dereferenced —
+/// `_t = &((*_p).k); g(copy _t)` (the shim's T2e interior-borrow reconstruction,
+/// `to_mir.rs:5415-5459`) and `_t = &(((*_p) as V).k); g(copy _t)` (the T2d by-REF enum payload
+/// ADDRESS arm, `to_mir.rs:6947-7024`, which is what
+/// `match self { Level::Max(l1, l2) => l1.is_zero() && .. }` lowers to: the payload is never
+/// loaded, its address is taken and handed to a call).
+///
+/// This is [`interior_arg_temps`]'s discipline over [`interior_field_ty`]'s two borrowed-place
+/// shapes, and it is a THIRD separate set rather than a widening of [`interior_arg_temps`] or
+/// [`payload_borrow_temps`], for the reason wave-EP already gave: folding them together would let
+/// one set's temp inherit another's USE KIND on the strength of neither having been measured.
+///
+/// **The ONE clause that is new, and the whole of what this lane changes:** the borrowed field
+/// type is NOT required to be `scalar_ok`. Everything else is the existing discipline verbatim.
+/// See [`thin_shared_pointee_ok`] for what that clause was carrying and which part of it survives.
+///
+/// Admitted iff ALL of:
+///   * `_t` is a NON-arg, non-`_0` local declared `&P` SHARED (`m.is_not()`) with
+///     [`thin_shared_pointee_ok`] — so the local is a thin pointer and `P` is concrete;
+///   * EXACTLY ONE def, `_t = Rvalue::Ref(_, Shared, borrowed)`, with `borrowed` a place
+///     [`interior_field_ty`] recognizes AND its field type EQUAL to `_t`'s declared pointee — so
+///     `Subtyper` inserts nothing (`add_subtyping_projections.rs:39-47` acts only where the
+///     region-erased place and rvalue types DIFFER);
+///   * EXACTLY ONE use, a BARE `Operand::Copy|Move(_t)` (empty projection) in a `Call`'s `args`.
+///     `Copy` is admitted because `&P` IS `Copy` and the shim spells every Copy-typed place
+///     `Copy` (`to_mir.rs:5347-5353`); the wave-GH2 memory-ABI `Copy`-vs-`Move` divergence is
+///     specific to indirectly-passed STRUCT args and is fail-closed separately at the `Call` arm,
+///     which does not fire for a reference (an Immediate scalar under every ABI);
+///   * TOTAL value-mentions == 2 (the def dest + the one use). Storage markers are `NonUse` and
+///     uncounted, exactly as in [`interior_arg_temps`] and [`payload_borrow_temps`].
+///
+/// **That last clause is the load-bearing one.** It is what proves `_t` is NEVER DEREFERENCED:
+/// a deref-read, a reborrow, a second forward, a store — each is a third mention and rejects. So
+/// no value of type `P` is ever produced in this body, which is precisely why `P`'s drop glue and
+/// `P`'s width are not this fragment's business. `P` is `LevelArc`, `HashMap<..>`, `Vec<..>` —
+/// `Drop`-bearing, `Arc`-backed, niched, all of it — and none of that is ever materialised here.
+///
+/// FAIL-CLOSED and NARROWING-ONLY: a local not in this set keeps every refusal it had. The
+/// differential independently re-checks the derived body against built, and the comparator renders
+/// the borrow as `iref(a{p},K)` on both sides, so a wrong field or variant can only cost the flip,
+/// never ship.
+fn addr_forward_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
+    // Total place-local mentions per local (dest + every operand/projection occurrence), by the
+    // same VALUE-mention rule `interior_arg_temps` uses.
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let mut borrow_def: HashMap<Local, u32> = HashMap::new();
+    let mut callarg_use: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            let StatementKind::Assign(assign) = &stmt.kind else { continue };
+            let (place, rvalue) = &**assign;
+            // The address definition, into a bare NON-arg, non-`_0` local declared
+            // shared-ref-to-a-thin-concrete-pointee.
+            if !place.projection.is_empty()
+                || place.local == RETURN_PLACE
+                || place.local.as_usize() <= body.arg_count
+            {
+                continue;
+            }
+            let ty::Ref(_, pointee, m) = *body.local_decls[place.local].ty.kind() else { continue };
+            if !m.is_not() || !thin_shared_pointee_ok(tcx, pointee) {
+                continue;
+            }
+            if let Rvalue::Ref(_, BorrowKind::Shared, borrowed) = rvalue {
+                if interior_field_ty(body, borrowed) == Some(pointee) {
+                    *borrow_def.entry(place.local).or_default() += 1;
+                }
+            }
+        }
+        if let Some(term) = &data.terminator {
+            if let TerminatorKind::Call { args, .. } = &term.kind {
+                for arg in args.iter() {
+                    if let Operand::Copy(p) | Operand::Move(p) = &arg.node {
+                        if p.projection.is_empty() {
+                            *callarg_use.entry(p.local).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    borrow_def
+        .iter()
+        .filter(|(l, &d)| d == 1 && mentions.get(l) == Some(&2) && callarg_use.get(l) == Some(&1))
+        .map(|(l, _)| *l)
+        .collect()
+}
+
+/// Trust (wave-W3, 2026-08-20): the DEREF-RECURSION REFERENCE RELAY — the four shared-ref temps
+/// the shim mints per `x.p()` where `x: &Wrapper`, `Wrapper: Deref<Target = T>` is a USER impl,
+/// and `p` is a method on `T`. This is `clean_kernel::level::Level::is_zero` / `::is_nonzero`, the
+/// designated crystal target, and every body in its class.
+///
+/// # The shape, and why it is FOUR locals and not one
+///
+/// `l1.p()` is `T::p(&*<Wrapper as Deref>::deref(&*l1))` — TWO calls, and built MIR spells the
+/// address that travels between them with a chain of four temps (measured off this driver's own
+/// built MIR for `Level::is_zero`; wave-DR reproduces the same chain and its 28 storage markers,
+/// which is what made `markers_exact` hold and turned this body's SILENT decline into a LOUD one):
+///
+/// ```text
+///   StorageLive(_b); _b = &(((*_1) as Max).0: LevelArc);   // the arm BINDING      &Wrapper
+///   StorageLive(_g); _g = &(*_b);                          // the argument REBORROW &Wrapper
+///   StorageLive(_d); _d = <LevelArc as Deref>::deref(move _g) -> ..;  // the accessor DEST &T
+///   _a = &(*_d);                                           // the AUTOREF           &T
+///   StorageDead(_g);
+///   _r = Level::is_zero(move _a) -> ..;
+/// ```
+///
+/// Each link is a shared reference to a NON-scalar pointee, so `local_ty_ok` refuses the first one
+/// it reaches and the whole body falls back. The four decompose into exactly TWO roles:
+///
+/// * a **SOURCE** (`_b`, `_d`) — an address PRODUCED here, either as the interior/enum-payload
+///   borrow of a shared-ref ARG ([`interior_field_ty`]'s two places, the wave-AF shapes) or as a
+///   bare `Call` DESTINATION; reborrowed exactly once into a forwarder;
+/// * a **FORWARD** (`_g`, `_a`) — `_f = &(*_s)` off a source, handed to exactly one call.
+///
+/// The chain length is pinned at exactly two links. A source is never itself a forward and a
+/// forward is never a source, so nothing longer, and nothing cyclic, can enter: `_f = &(*_f)` is
+/// excluded explicitly, and a would-be third link has neither a root def nor a source's use.
+///
+/// # THE READ-ONLY OBLIGATION, AND WHY IT IS A PROOF
+///
+/// Every member carries TOTAL value-mentions == 2 — the def, and one use. Storage markers and
+/// debuginfo are `PlaceContext::NonUse` and are not counted, exactly as in [`interior_arg_temps`],
+/// [`payload_borrow_temps`] and [`addr_forward_temps`]; a real read or write is always a
+/// Non/MutatingUse and IS counted, so no observation can hide behind the exemption.
+///
+/// The def writes `_t` ITSELF (a `Rvalue::Ref` into the bare local, or a call destination), never
+/// through it. The use is drawn from exactly two syntactic forms, and each is enumerated here
+/// rather than assumed:
+///
+/// * a bare `Operand::Copy|Move(_t)` (EMPTY projection) in a `Call`'s `args` — a non-mutating use
+///   of the pointer VALUE;
+/// * the base of `_f = Rvalue::Ref(_, BorrowKind::Shared, (*_t))` — a shared borrow, which takes
+///   an ADDRESS: it loads no value out of `*_t` and stores none into it.
+///
+/// **Therefore no store through any member exists in this body, and that is counted, not
+/// asserted.** A store `(*_t)…= v` is a MutatingUse mention of `_t` — a THIRD mention — and is
+/// rejected. So is a load `copy (*_t)`, a `&mut (*_t)` reborrow (which also fails the
+/// `BorrowKind::Shared` requirement), a second forward, and any projected use. No value of the
+/// pointee is ever materialised in this body, which is why the pointee's drop glue and width are
+/// not this fragment's business — wave-AF's argument, and it holds link for link.
+///
+/// **And the admission is spelled where a destination cannot reach it.** Like [`interior_field_ty`]
+/// and [`is_ref_enum_payload_read`], this is NOT an arm of `place_ok`. `place_ok` is
+/// direction-blind and `gate_derived_body` calls it on every assign DESTINATION; its only
+/// `[Deref]` arm requires the base to be an **ARG** local with a **scalar** pointee, and every
+/// member of this set is NON-arg by its first clause. So a destination `(*_t)` / `(*_t).k` is
+/// refused by `place_ok` even with the mention count removed. The two refusals are INDEPENDENT,
+/// and the mutation probes measure each.
+///
+/// # The remaining clauses
+///
+/// * `_t` is a NON-arg, non-`_0` local declared `&P` SHARED (`m.is_not()`) with
+///   [`thin_shared_pointee_ok`] — concrete, and a THIN pointer, since the fragment models pointer
+///   metadata nowhere. This is the clause that refuses a `Deref<Target = str>` relay.
+/// * a FORWARD's declared pointee EQUALS its source's, so `Subtyper` inserts nothing
+///   (`add_subtyping_projections.rs:39-47` acts only where the region-erased place and rvalue
+///   types differ); a SOURCE's borrowed field type likewise equals its own declared pointee.
+/// * EXACTLY ONE def and EXACTLY ONE use per member, and a source's single reborrow use must be
+///   the very forward that names it.
+///
+/// FAIL-CLOSED and NARROWING-ONLY: a local not in this set keeps every refusal it had. The
+/// differential independently re-checks the derived body against built (`DerivedAgreed` +
+/// `markers_exact` are both already required before this gate runs), so a wrong field, variant or
+/// callee can only cost the flip, never ship.
+#[derive(Default)]
+struct DerefRelay {
+    /// The address PRODUCERS — the arm binding `_b` and the accessor destination `_d`.
+    srcs: HashSet<Local>,
+    /// The address FORWARDS — the argument reborrow `_g` and the autoref `_a`.
+    fwds: HashSet<Local>,
+}
+
+/// The facts which certify one W3 source/forward pair. Keeping this as one
+/// value makes the production predicate directly executable in unit tests;
+/// in particular, the `mentions == 2` wall is not left as an uncommitted
+/// producer observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelayPairFacts {
+    forward_reborrow_defs: u32,
+    forward_root_defs: u32,
+    forward_mentions: u32,
+    forward_callarg_uses: u32,
+    source_root_defs: u32,
+    source_is_forward: bool,
+    source_mentions: u32,
+    source_reborrow_use_is_exact: bool,
+    source_callarg_uses: u32,
+}
+
+fn relay_pair_admits(facts: RelayPairFacts) -> bool {
+    facts.forward_reborrow_defs == 1
+        && facts.forward_root_defs == 0
+        && facts.forward_mentions == 2
+        && facts.forward_callarg_uses == 1
+        && facts.source_root_defs == 1
+        && !facts.source_is_forward
+        && facts.source_mentions == 2
+        && facts.source_reborrow_use_is_exact
+        && facts.source_callarg_uses == 0
+}
+
+impl DerefRelay {
+    fn contains(&self, l: &Local) -> bool {
+        self.srcs.contains(l) || self.fwds.contains(l)
+    }
+}
+
+/// Is `borrowed` the borrow `place` is admitted to hold, given `place` is a relay member? A SOURCE
+/// holds one of [`interior_field_ty`]'s two interior places (field type == its declared pointee);
+/// a FORWARD holds the bare reborrow `(*_s)` of a SOURCE. Anything else falls through to
+/// `place_ok` and fails closed there.
+fn is_relay_borrow<'tcx>(
+    body: &Body<'tcx>,
+    relay: &DerefRelay,
+    place: &Place<'tcx>,
+    borrowed: &Place<'tcx>,
+) -> bool {
+    if place.local == RETURN_PLACE || !place.projection.is_empty() {
+        return false;
+    }
+    let ty::Ref(_, pointee, _) = *body.local_decls[place.local].ty.kind() else {
+        return false;
+    };
+    if relay.srcs.contains(&place.local) {
+        return interior_field_ty(body, borrowed) == Some(pointee);
+    }
+    relay.fwds.contains(&place.local)
+        && borrowed.projection.len() == 1
+        && matches!(borrowed.projection[0], ProjectionElem::Deref)
+        && relay.srcs.contains(&borrowed.local)
+        // Defence in depth: `deref_relay_temps` admitted the pair only with equal pointees, so
+        // `Subtyper` inserts nothing. Re-derive it here rather than inherit it, so a future
+        // producer that puts two relay pairs in one body cannot cross-wire them past this arm.
+        && matches!(
+            body.local_decls[borrowed.local].ty.kind(),
+            ty::Ref(_, p2, m2) if m2.is_not() && *p2 == pointee
+        )
+}
+
+fn deref_relay_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> DerefRelay {
+    // Total VALUE-mention count per local — the same rule `interior_arg_temps` uses.
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let thin = |ty: ty::Ty<'tcx>| thin_shared_pointee_ok(tcx, ty);
+    // The declaration every member must carry: a NON-arg, non-`_0` local declared `&P` SHARED with
+    // `P` concrete and thin. Returns `P`.
+    let decl_ok = |l: Local| -> Option<ty::Ty<'tcx>> {
+        if l == RETURN_PLACE
+            || l.as_usize() <= body.arg_count
+            || l.as_usize() >= body.local_decls.len()
+        {
+            return None;
+        }
+        let ty::Ref(_, pointee, m) = *body.local_decls[l].ty.kind() else {
+            return None;
+        };
+        (m.is_not() && thin(pointee)).then_some(pointee)
+    };
+
+    // One pass: every def and every use shape this set can name.
+    // A SOURCE's def — the interior/payload borrow, or a bare call destination.
+    let mut root_def: HashMap<Local, u32> = HashMap::new();
+    // A FORWARD's def `_f = &(*_s)`: forward -> (source, count).
+    let mut reborrow_def: HashMap<Local, (Local, u32)> = HashMap::new();
+    // The matching SOURCE use: source -> (forward, count).
+    let mut reborrow_use: HashMap<Local, (Local, u32)> = HashMap::new();
+    // A bare `Copy|Move` call argument.
+    let mut callarg_use: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            let StatementKind::Assign(assign) = &stmt.kind else { continue };
+            let (place, rvalue) = &**assign;
+            let Rvalue::Ref(_, BorrowKind::Shared, borrowed) = rvalue else { continue };
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let Some(pointee) = decl_ok(place.local) else { continue };
+            if interior_field_ty(body, borrowed) == Some(pointee) {
+                *root_def.entry(place.local).or_default() += 1;
+                continue;
+            }
+            // `_f = &(*_s)`. `borrowed.local != place.local` excludes the self-referential
+            // `_f = &(*_f)`, whose two mentions would otherwise satisfy the count while reading
+            // an uninitialised local.
+            if borrowed.projection.len() == 1
+                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                && borrowed.local != place.local
+                && decl_ok(borrowed.local) == Some(pointee)
+            {
+                let d = reborrow_def.entry(place.local).or_insert((borrowed.local, 0));
+                d.0 = borrowed.local;
+                d.1 += 1;
+                let u = reborrow_use.entry(borrowed.local).or_insert((place.local, 0));
+                u.0 = place.local;
+                u.1 += 1;
+            }
+        }
+        if let Some(term) = &data.terminator {
+            if let TerminatorKind::Call { args, destination, .. } = &term.kind {
+                if destination.projection.is_empty() && decl_ok(destination.local).is_some() {
+                    *root_def.entry(destination.local).or_default() += 1;
+                }
+                for arg in args.iter() {
+                    if let Operand::Copy(p) | Operand::Move(p) = &arg.node {
+                        if p.projection.is_empty() {
+                            *callarg_use.entry(p.local).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Admit a FORWARD only together with the SOURCE it names, both fully certified here. The
+    // source's own conditions are checked inline rather than by a second fixpoint, which is what
+    // keeps the relation acyclic and the chain exactly two links long.
+    let mut fwds: HashSet<Local> = HashSet::new();
+    let mut srcs: HashSet<Local> = HashSet::new();
+    for (&f, &(s, n)) in reborrow_def.iter() {
+        let facts = RelayPairFacts {
+            forward_reborrow_defs: n,
+            forward_root_defs: root_def.get(&f).copied().unwrap_or_default(),
+            forward_mentions: mentions.get(&f).copied().unwrap_or_default(),
+            forward_callarg_uses: callarg_use.get(&f).copied().unwrap_or_default(),
+            source_root_defs: root_def.get(&s).copied().unwrap_or_default(),
+            source_is_forward: reborrow_def.contains_key(&s),
+            source_mentions: mentions.get(&s).copied().unwrap_or_default(),
+            source_reborrow_use_is_exact: reborrow_use.get(&s) == Some(&(f, 1)),
+            source_callarg_uses: callarg_use.get(&s).copied().unwrap_or_default(),
+        };
+        if !relay_pair_admits(facts) {
+            continue;
+        }
+        fwds.insert(f);
+        srcs.insert(s);
+    }
+    DerefRelay { srcs, fwds }
 }
 
 /// Trust (wave-EP, 2026-08-16): the set of shared-ref TEMP locals the shim emits for an ARM-BINDING
@@ -1328,6 +1840,72 @@ fn term_name(kind: &TerminatorKind<'_>) -> &'static str {
 /// Allow-list verification that the derived body is inside the slice-1 fragment — the property
 /// that makes every pass from `Built` to `Runtime(Optimized)` (including the mandatory final
 /// validation) total over it. Anything else fails closed.
+/// Trust (lane L9, 2026-08-19): **THE LOOP PLAN'S `()` REGION LOCALS** — the FOURTH non-scalar
+/// marked local this fragment admits, and the one whose proof is the strongest of the four.
+///
+/// `plan_loop_markers` reproduces built's storage spans for a `loop { if c { break; } BODY }` by
+/// minting two locals that hold NO VALUE AT ALL: the loop's own `()` value (built's `_2`, opened
+/// in the pre-header and retired at the loop exit) and the `if`-statement's `()` value (built's
+/// `_4`, opened in the header every iteration and retired on both edges out of its region). They
+/// exist so the derived body's marker SEQUENCE is built's — which `markers_exact` then verifies
+/// against built independently — and for nothing else.
+///
+/// Admitted iff ALL of:
+///   * the local is NON-arg and not `_0`;
+///   * it is declared `()`;
+///   * it carries at least one storage marker (otherwise there is nothing to admit);
+///   * **TOTAL value-mentions == 0.** Storage markers are `NonUse` and uncounted, exactly as in
+///     [`interior_arg_temps`], [`payload_borrow_temps`] and [`addr_forward_temps`].
+///
+/// **THAT LAST CLAUSE IS STRICTLY STRONGER THAN THE THREE SETS ABOVE, which rest on
+/// value-mentions == 2 (one def, one use).** Zero mentions means the local is never defined, never
+/// read, never moved, never borrowed and never stored to: no value of its type is produced in this
+/// body at all, so every pass is total over the marker exactly as over a scalar one. `()` is
+/// additionally a ZST, so the `llvm.lifetime` intrinsics codegen emits for it at `-O` describe an
+/// empty range; `RemoveStorageMarkers` deletes them outright at `-O0`.
+///
+/// FAIL-CLOSED and NARROWING-ONLY: a local not in this set keeps every refusal it had, and a
+/// body outside the loop plan has no such local, so no body admitted today changes. The oracle
+/// re-checks the marker sequence against built regardless, so a wrong span can only cost the
+/// flip, never ship.
+fn unit_region_temps<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let mut marked: HashSet<Local> = HashSet::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            if let StatementKind::StorageLive(l) | StatementKind::StorageDead(l) = &stmt.kind {
+                marked.insert(*l);
+            }
+        }
+    }
+    marked
+        .into_iter()
+        .filter(|l| {
+            *l != RETURN_PLACE
+                && l.as_usize() > body.arg_count
+                && body.local_decls[*l].ty.is_unit()
+                && !mentions.contains_key(l)
+        })
+        .collect()
+}
+
 fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), String> {
     if body.coroutine.is_some() {
         return Err("derived body carries coroutine info".to_string());
@@ -1358,6 +1936,18 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
     // single-deref-read shape (`payload_borrow_temps` proves total place-mentions == 2, so no other
     // observation exists).
     let payload_temps = payload_borrow_temps(body);
+    // Trust (lane L9): the loop plan's two `()` REGION locals — value-mentions == 0, so the local
+    // is a storage span and nothing else. See [`unit_region_temps`].
+    let unit_regions = unit_region_temps(body);
+    // Trust (wave-AF): shared-ref temps holding the ADDRESS of a NON-scalar interior place,
+    // forwarded whole into one call and NEVER dereferenced (`_t = &((*_p).k); g(copy _t)` and its
+    // enum-payload twin) — admitted below by their single-def / single-call-arg-use shape
+    // (`addr_forward_temps` proves total place-mentions == 2, so no other observation exists).
+    let addr_fwd_temps = addr_forward_temps(tcx, body);
+    // Trust (wave-W3): the deref-recursion reference relay — the arm binding, its argument
+    // reborrow, the accessor's destination and its autoref, each proven (mentions == 2) to be an
+    // address in transit that this body never dereferences. See [`deref_relay_temps`].
+    let relay = deref_relay_temps(tcx, body);
     // Trust (wave-GH2): NON-arg struct temps holding a call result consumed whole by a later call
     // (`_2 = Arguments::from_str(..); _print(move _2)`). Copy + Drop-free + concrete only
     // (`temp_struct_ty_ok`); every mention confined by `struct_temps_confined` below.
@@ -1378,6 +1968,26 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
         // scan proved it is used ONLY there (mentions == 2), so every replayed pass is total over it
         // exactly as over the wave-29b/wave-30 interior temps.
         if payload_temps.contains(&l) {
+            continue;
+        }
+        // Trust (wave-AF): the address-forward temp `_t: &FieldTy` with `FieldTy` NOT a fragment
+        // scalar — `_t = &((*_p).k); g(copy _t)` and its `[Deref, Downcast, Field]` twin. Its
+        // borrow-into-temp is admitted by the `Rvalue::Ref` arm + `RefArgForwardGuard`, and its
+        // one call-argument use by `operand_ok` (a bare local place). `addr_forward_temps` proved
+        // it is used ONLY there (mentions == 2), so `_t` is NEVER DEREFERENCED and no value of
+        // `FieldTy` is ever produced in this body — which is why `FieldTy`'s drop glue and width
+        // are not this fragment's business. `thin_shared_pointee_ok` separately keeps `_t` a THIN
+        // pointer, the one thing the retired `scalar_ok(fty)` was silently supplying.
+        if addr_fwd_temps.contains(&l) {
+            continue;
+        }
+        // Trust (wave-W3): a relay member `_t: &P` with `P` NOT a fragment scalar — the four
+        // links of `x.p()` through an overloaded `Deref`. Its def is admitted by the `Rvalue::Ref`
+        // arm (`is_relay_borrow`) or, for the accessor destination, by the `Call` arm's bare-local
+        // destination; its one use by `operand_ok` (a bare local place) or by the reborrow that
+        // names it. `deref_relay_temps` proved it is used ONLY there (mentions == 2), so `_t` is
+        // never dereferenced and no value of `P` is ever produced in this body.
+        if relay.contains(&l) {
             continue;
         }
         // Trust (wave-15): the RETURN local `_0` of a SHARED-ref identity return
@@ -1441,7 +2051,14 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
     // A never-mentioned ref arg trivially satisfies this; a forwarded one must appear ONLY as a
     // bare call argument (a projected/aggregate/other use is an observation → fail closed).
     if !fwd_ref_args.is_empty() {
-        ref_args_forward_only(body, &fwd_ref_args, &interior_arg_temps, &payload_temps)?;
+        ref_args_forward_only(
+            body,
+            &fwd_ref_args,
+            &interior_arg_temps,
+            &payload_temps,
+            &addr_fwd_temps,
+            &relay.srcs,
+        )?;
     }
     // Trust (wave-S → B10 stage 2, RETIRED): the read+write order-mix fail-close that stood here
     // guarded the OLD order-blind canonical form (a shared-ref READ folded into the value channel
@@ -1529,7 +2146,9 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                             if place.projection.is_empty()
                                 && (place.local == RETURN_PLACE
                                     || interior_arg_temps.contains(&place.local)
-                                    || payload_temps.contains(&place.local)) =>
+                                    || payload_temps.contains(&place.local)
+                                    || addr_fwd_temps.contains(&place.local)
+                                    || relay.contains(&place.local)) =>
                         {
                             // The `_0 = &(*_t)` reborrow of an interior temp (wave-29b): `[Deref]` on a
                             // certified interior temp is total (a plain deref of a `&FieldTy` temp the
@@ -1546,7 +2165,26 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                             // admission is spelled here, on the borrow path only.
                             let is_payload_borrow = payload_temps.contains(&place.local)
                                 && is_ref_enum_payload_read(body, borrowed);
-                            if !is_temp_reborrow && !is_payload_borrow {
+                            // Trust (wave-AF): the address-forward borrow — the SAME two interior
+                            // places, with the field type NOT required to be a fragment scalar.
+                            // `place_ok` is direction-blind and is called on assign DESTINATIONS,
+                            // so the non-scalar admission is spelled HERE, on the borrow path
+                            // only, and can never be reached by a store. `addr_forward_temps`
+                            // certified the base (a SHARED-ref ARG), the field type (concrete,
+                            // thin, equal to `_t`'s pointee), and — decisively — that `_t` is
+                            // never dereferenced.
+                            let is_addr_fwd_borrow = addr_fwd_temps.contains(&place.local)
+                                && interior_field_ty(body, borrowed).is_some();
+                            // Trust (wave-W3): the relay's two borrow defs — a SOURCE's interior
+                            // place, and a FORWARD's bare `(*_s)` reborrow of a SOURCE. Spelled
+                            // here, on the borrow path, for `place_ok`'s own stated reason: it is
+                            // direction-blind, so neither shape may become an arm of it.
+                            let is_relay = is_relay_borrow(body, &relay, place, borrowed);
+                            if !is_temp_reborrow
+                                && !is_payload_borrow
+                                && !is_addr_fwd_borrow
+                                && !is_relay
+                            {
                                 place_ok(body, borrowed)?;
                             }
                         }
@@ -1672,9 +2310,18 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                 // the marker exactly as over a scalar one, and the two marker sequences coincide
                 // by construction — that is what `markers_exact` then verifies against built.
                 StatementKind::StorageLive(l) | StatementKind::StorageDead(l) => {
+                    // Trust (wave-W3): a FOURTH admitted non-scalar marked local — a relay
+                    // member. Built's own match lowering brackets all four links with
+                    // `StorageLive`/`StorageDead` (28 marker lines on `Level::is_zero`), which is
+                    // exactly what wave-DR reproduces, so `markers_exact` holds only if these
+                    // markers are here. The argument is wave-29b's, unchanged: the mentions == 2
+                    // scan proved the local is used ONLY as its def + one use, so every pass is
+                    // total over the marker exactly as over a scalar one.
                     if !scalar_ok(body.local_decls[*l].ty)
                         && !interior_arg_temps.contains(l)
                         && !payload_temps.contains(l)
+                        && !unit_regions.contains(l)
+                        && !relay.contains(l)
                     {
                         return Err(format!(
                             "storage marker on non-scalar local _{}",
@@ -1807,7 +2454,9 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                     }
                 }
                 // Destination: a BARE local (the shim's fresh temp; its type already
-                // passed the local-decl gate above — scalar/unit only).
+                // passed the local-decl gate above — a fragment scalar/unit, a wave-J callee-return
+                // struct/enum, or (wave-W3) a relay SOURCE `&P`, which that gate admitted only
+                // after proving the local is an address this body never dereferences).
                 if !destination.projection.is_empty() {
                     return Err("projected call destination outside fragment".to_string());
                 }
@@ -1866,12 +2515,44 @@ fn asserts_in_dfs_order<'tcx>(body: &Body<'tcx>) -> Result<Vec<BasicBlock>, Stri
             // Trust (wave-6): calls interleave with asserts in call-carrying bodies; the
             // canonical preorder continues through the call's RETURN target — the same
             // successor rule the differential's walks use, so `DerivedAgreed`'s 1:1 assert
-            // correspondence carries over verbatim. The normal sibling is post-
-            // `run_analysis_to_runtime_passes` here (`RemoveNoopLandingPads` already
-            // normalized the built `Cleanup(lone-resume)` to `Continue`), and the derived
-            // body is `Continue` by construction — anything else is out of fragment.
+            // correspondence carries over verbatim.
+            //
+            // Trust (wave-W3b, 2026-08-20): `Unreachable` joins `Continue`, and the reason is
+            // that this walk runs over BOTH bodies AT DIFFERENT PHASES. The clause was written
+            // for a `panic=unwind` world — "the normal sibling is post-
+            // `run_analysis_to_runtime_passes`, where `RemoveNoopLandingPads` already normalized
+            // the built `Cleanup(lone-resume)` to `Continue`". Under `panic=abort` that premise
+            // is FALSE and unsatisfiable: `AbortUnwindingCalls`
+            // (`rustc_mir_transform::abort_unwinding_calls`, inside
+            // `run_runtime_lowering_passes`) sees `layout::fn_can_unwind == false` for every
+            // Rust-ABI callee and rewrites EVERY call's unwind to `UnwindAction::Unreachable`.
+            // So on a `panic=abort` crate NO call-carrying body can present a `Continue` built
+            // call, and this walk refused every one of them — measured on `clean-kernel`
+            // (`profile.release` sets `panic = "abort"`): **403 bodies at `-O0`**, and at `-O3`
+            // it is what stood between `level::Level::is_zero` / `::is_nonzero` and the flip
+            // once wave-W3 cleared their locals.
+            //
+            // Admitting it does NOT weaken the derived fragment, and that is checked, not
+            // argued: `gate_derived_body`'s own `Call` arm still requires
+            // `UnwindAction::Continue` on the DERIVED body and runs BEFORE this walk
+            // (`derive_flip_body` calls the gate, then `verify_assert_parity`). What changes is
+            // only what this walk tolerates on the BUILT sibling — a body the flip does not
+            // produce and does not control.
+            //
+            // The two bodies still agree by CONSTRUCTION at codegen: `advance_built_to_runtime`
+            // replays `run_analysis_to_runtime_passes` — the same public entry, the same
+            // `AbortUnwindingCalls`, the same session panic strategy and the same callee ABIs
+            // (the call `func` operands are pinned to built's by `raw_call_channel` and the ABI
+            // gate) — so the derived body receives the identical `Continue -> Unreachable`
+            // rewrite before it ever reaches codegen.
+            //
+            // `Cleanup(bb)` stays REFUSED and that clause is the load-bearing one: a cleanup
+            // successor is a block this DFS does not walk, so an `Assert` inside it would be
+            // missing from the enumeration. `Terminate(_)` stays refused too (fail-closed; it is
+            // the `!body_can_unwind` arm, a shape this fragment has never measured).
+            // `Unreachable` carries NO successor block at all, so the enumeration stays complete.
             TerminatorKind::Call { target, unwind, .. } => {
-                if !matches!(unwind, UnwindAction::Continue) {
+                if !span_stitch_call_unwind_admits(unwind) {
                     return Err("call with non-Continue unwind in span stitching".to_string());
                 }
                 let Some(target) = target else {
@@ -1897,6 +2578,14 @@ fn asserts_in_dfs_order<'tcx>(body: &Body<'tcx>) -> Result<Vec<BasicBlock>, Stri
         }
     }
     Ok(asserts)
+}
+
+/// Unlike the derived-body structural gate, span stitching walks the
+/// post-runtime-pass built sibling as well. `panic=abort` rewrites its Rust
+/// calls to `Unreachable`; cleanup-bearing and terminating shapes remain out
+/// of fragment.
+fn span_stitch_call_unwind_admits(unwind: &UnwindAction) -> bool {
+    matches!(unwind, UnwindAction::Continue | UnwindAction::Unreachable)
 }
 
 /// The KIND-identity of one fragment assert for pairwise matching. Trust (wave-U): the div-by-zero
@@ -1961,4 +2650,87 @@ fn verify_assert_parity<'tcx>(derived: &Body<'tcx>, normal: &Body<'tcx>) -> Resu
         }
     }
     Ok(d_asserts.len())
+}
+
+#[cfg(test)]
+mod w3_regression_tests {
+    use rustc_middle::mir::UnwindTerminateReason;
+
+    use super::*;
+
+    const ACCEPT_PAIR: RelayPairFacts = RelayPairFacts {
+        forward_reborrow_defs: 1,
+        forward_root_defs: 0,
+        forward_mentions: 2,
+        forward_callarg_uses: 1,
+        source_root_defs: 1,
+        source_is_forward: false,
+        source_mentions: 2,
+        source_reborrow_use_is_exact: true,
+        source_callarg_uses: 0,
+    };
+
+    #[test]
+    fn w3_exact_source_forward_pair_admits() {
+        assert!(
+            relay_pair_admits(ACCEPT_PAIR),
+            "a gate which refuses the exact four-temp W3 relay would make the lane vacuous",
+        );
+    }
+
+    #[test]
+    fn w3_wide_or_non_concrete_pointee_is_refused() {
+        assert!(concrete_thin_pointee_admits(false, false, true));
+        assert!(
+            !concrete_thin_pointee_admits(false, false, false),
+            "a wide Deref::Target such as str carries metadata this fragment does not model",
+        );
+        assert!(!concrete_thin_pointee_admits(true, false, true));
+        assert!(!concrete_thin_pointee_admits(false, true, true));
+    }
+
+    #[test]
+    fn w3_any_forbidden_extra_use_is_refused() {
+        let mut extra_source_observation = ACCEPT_PAIR;
+        extra_source_observation.source_mentions = 3;
+        assert!(
+            !relay_pair_admits(extra_source_observation),
+            "a load, store, second reborrow, or other third source mention must close the lane",
+        );
+
+        let mut extra_forward_observation = ACCEPT_PAIR;
+        extra_forward_observation.forward_mentions = 3;
+        assert!(
+            !relay_pair_admits(extra_forward_observation),
+            "a load, store, or other third forward mention must close the lane",
+        );
+
+        let mut second_forward = ACCEPT_PAIR;
+        second_forward.source_reborrow_use_is_exact = false;
+        assert!(!relay_pair_admits(second_forward));
+
+        let mut second_callarg = ACCEPT_PAIR;
+        second_callarg.forward_callarg_uses = 2;
+        assert!(!relay_pair_admits(second_callarg));
+    }
+
+    #[test]
+    fn w3b_accepts_abort_unreachable_but_not_unwalked_unwind_shapes() {
+        assert!(span_stitch_call_unwind_admits(&UnwindAction::Continue));
+        assert!(
+            span_stitch_call_unwind_admits(&UnwindAction::Unreachable),
+            "panic=abort rewrites the built sibling to Unreachable before span stitching",
+        );
+        assert!(!span_stitch_call_unwind_admits(&UnwindAction::Cleanup(BasicBlock::from_u32(1),)));
+        assert!(!span_stitch_call_unwind_admits(&UnwindAction::Terminate(
+            UnwindTerminateReason::Abi,
+        )));
+    }
+
+    #[test]
+    fn w3b_legacy_continue_only_mutant_is_killed() {
+        let continue_only = |unwind: &UnwindAction| matches!(unwind, UnwindAction::Continue);
+        assert!(!continue_only(&UnwindAction::Unreachable));
+        assert!(span_stitch_call_unwind_admits(&UnwindAction::Unreachable));
+    }
 }

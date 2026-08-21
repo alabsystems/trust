@@ -316,6 +316,93 @@ fn analyze_arg_count(cfg: &crate::cfg::Cfg, arch: LiftArch) -> usize {
     }
 }
 
+/// One candidate function-entry register binding for a lifted CFG: an ABI
+/// argument register, its machine-state formula variable name (the lift's
+/// `MachineState::symbolic` seeds `Var("X{gpr_index}")` on both ISAs), and
+/// its TrustIR local index in this architecture's `LocalLayout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryRegisterBindingCandidate {
+    /// ABI argument slot (0 = first argument register).
+    pub abi_index: usize,
+    /// Formula-namespace variable name, e.g. `"X7"`.
+    pub var_name: String,
+    /// ISA register name matching the TrustIR `LocalDecl`, e.g. `"RDI"`.
+    pub reg_name: String,
+    /// The register's TrustIR local index.
+    pub local_index: usize,
+}
+
+/// Entry-register binding CANDIDATES for a lifted CFG: the ABI argument
+/// register PREFIX `0..=max(observed)`, where "observed" is the entry-block
+/// read-before-write observation ([`observed_argument_registers`]). A prefix
+/// — never the raw observed set — so a candidate's position always equals its
+/// ABI slot and a consumer binding `params[i]` to argument `i` cannot be
+/// positionally ambiguous.
+///
+/// This is EVIDENCE for candidacy only, not authority: every individual
+/// binding must be justified per use by the consumer's own write-freedom
+/// analysis over the body it lowers (trust-cg-bridge's
+/// `compute_entry_preservation`). Returns an empty list — no candidates,
+/// consumers refuse — when the CFG's entry block is not `blocks[0]` or block
+/// ids diverge from vector positions, because the consumer's analysis
+/// convention (entry = first block, ids = positions) would not describe this
+/// CFG.
+#[must_use]
+pub fn entry_register_binding_candidates(
+    cfg: &crate::cfg::Cfg,
+    arch: LiftArch,
+) -> Vec<EntryRegisterBindingCandidate> {
+    if cfg.entry != 0 || cfg.blocks.is_empty() {
+        return vec![];
+    }
+    if cfg.blocks.iter().enumerate().any(|(position, block)| block.id != position) {
+        return vec![];
+    }
+
+    let observed: Vec<bool> = match arch {
+        LiftArch::Aarch64 => observed_arg_registers_aarch64(&cfg.blocks[cfg.entry]).to_vec(),
+        LiftArch::X86_64 => observed_arg_registers_x86_64(&cfg.blocks[cfg.entry]).to_vec(),
+    };
+    let Some(max_observed) = observed.iter().rposition(|&used| used) else {
+        return vec![];
+    };
+    entry_register_binding_prefix(arch, max_observed)
+}
+
+/// The pure candidate table behind [`entry_register_binding_candidates`]: the
+/// ABI argument-register prefix `0..=max_abi_index` with each register's
+/// formula variable name and TrustIR local index. For consumers that hold a
+/// `DecompiledFunction`'s recorded observation facts (parameter index = ABI
+/// slot) rather than the CFG itself. Clamped to the architecture's argument
+/// register count.
+#[must_use]
+pub fn entry_register_binding_prefix(
+    arch: LiftArch,
+    max_abi_index: usize,
+) -> Vec<EntryRegisterBindingCandidate> {
+    let gpr_indices: &[u8] = match arch {
+        LiftArch::Aarch64 => &[0, 1, 2, 3, 4, 5, 6, 7],
+        LiftArch::X86_64 => &[7, 6, 2, 1, 8, 9], // RDI, RSI, RDX, RCX, R8, R9
+    };
+    let layout = match arch {
+        LiftArch::Aarch64 => crate::semantic_lift::LocalLayout::aarch64(),
+        LiftArch::X86_64 => crate::semantic_lift::LocalLayout::x86_64(),
+    };
+    let names = argument_register_names(arch);
+    let last = max_abi_index.min(gpr_indices.len() - 1);
+    (0..=last)
+        .map(|abi_index| {
+            let gpr_index = gpr_indices[abi_index];
+            EntryRegisterBindingCandidate {
+                abi_index,
+                var_name: format!("X{gpr_index}"),
+                reg_name: names[abi_index].to_string(),
+                local_index: layout.gpr(gpr_index),
+            }
+        })
+        .collect()
+}
+
 fn observed_argument_registers(cfg: &crate::cfg::Cfg, arch: LiftArch) -> Vec<String> {
     let Some(entry_block) = cfg.blocks.get(cfg.entry) else {
         return vec![];
@@ -1030,6 +1117,57 @@ mod tests {
         assert_eq!(signature.argument_registers, vec!["RDI", "RSI", "RDX", "RCX", "R8", "R9"]);
         assert_eq!(signature.observed_argument_registers, vec!["RDI"]);
         assert_eq!(signature.arg_count, 1);
+    }
+
+    #[test]
+    fn test_entry_register_binding_candidates_are_an_abi_prefix() {
+        let x86_64_dec = X86_64Decoder::new();
+        // MOV RAX, [RSI] — observes RSI (ABI slot 1) but not RDI (slot 0):
+        // the candidate list must still be the PREFIX [RDI, RSI], so a
+        // consumer binding params[i] to ABI slot i is never positionally
+        // ambiguous.
+        let mov_insn =
+            trust_disasm::arch::Decoder::decode(&x86_64_dec, &[0x48, 0x8B, 0x06], 0x1000)
+                .expect("decode MOV RAX, [RSI]");
+        let ret_insn =
+            trust_disasm::arch::Decoder::decode(&x86_64_dec, &[0xC3], 0x1003).expect("decode RET");
+        let cfg = cfg_with_entry_block(vec![mov_insn, ret_insn]);
+
+        let candidates = entry_register_binding_candidates(&cfg, LiftArch::X86_64);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    (candidate.abi_index, candidate.var_name.as_str(), candidate.reg_name.as_str(), candidate.local_index)
+                })
+                .collect::<Vec<_>>(),
+            vec![(0, "X7", "RDI", 8), (1, "X6", "RSI", 7)],
+        );
+    }
+
+    #[test]
+    fn test_entry_register_binding_candidates_empty_when_nothing_is_observed() {
+        let x86_64_dec = X86_64Decoder::new();
+        let ret_insn =
+            trust_disasm::arch::Decoder::decode(&x86_64_dec, &[0xC3], 0x1000).expect("decode RET");
+        let cfg = cfg_with_entry_block(vec![ret_insn]);
+        assert!(entry_register_binding_candidates(&cfg, LiftArch::X86_64).is_empty());
+    }
+
+    #[test]
+    fn test_entry_register_binding_candidates_refuse_a_nonzero_entry_index() {
+        let x86_64_dec = X86_64Decoder::new();
+        let mov_insn =
+            trust_disasm::arch::Decoder::decode(&x86_64_dec, &[0x48, 0x8B, 0x07], 0x1000)
+                .expect("decode MOV RAX, [RDI]");
+        let ret_insn =
+            trust_disasm::arch::Decoder::decode(&x86_64_dec, &[0xC3], 0x1003).expect("decode RET");
+        let mut cfg = cfg_with_entry_block(vec![mov_insn, ret_insn]);
+        cfg.entry = 1;
+        assert!(
+            entry_register_binding_candidates(&cfg, LiftArch::X86_64).is_empty(),
+            "a CFG whose entry is not blocks[0] is outside the consumer's analysis convention"
+        );
     }
 
     #[test]

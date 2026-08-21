@@ -526,6 +526,22 @@ pub(super) fn build_semantic_guard_map_impl(
                     // `#[ensures]` over it) is pinned separately under the raw `_0`
                     // name in the postcondition lane — see `saturating_call_dest_value`.
                     term_facts.push(Formula::Eq(Box::new(dest_var.clone()), Box::new(clamped)));
+                } else if let Some((_, intrinsic_facts)) =
+                    value_modeled_intrinsic_facts(func, &block.terminator, &dest_var)
+                {
+                    // `dest = ctpop/ctlz/cttz/bswap/bitreverse(x)` — a body-less rustc
+                    // intrinsic. It has NO MIR in any build, so before this lane the only
+                    // model was "cannot panic" and the dest was an unconstrained havoc:
+                    // `arr[x.count_ones() as usize]` into `[_; 33]` was FALSELY REFUTED
+                    // with `count_ones = 4294967295`. Pin the dest to the intrinsic's
+                    // EXACT bitvector definition (and, for the counting family, its
+                    // `[0, W]` range). The return-slot case is re-emitted under the raw
+                    // `_0` name in the postcondition lane, as the saturating pin above is.
+                    //
+                    // ADDS FACTS: see `intrinsic_semantics`'s header for the exhaustive
+                    // width-8 differential test and the falsification fixtures that stand
+                    // behind each definition.
+                    term_facts.extend(intrinsic_facts);
                 } else if let Some(fact) = float_bits_call_dest_fact(func, &block.terminator) {
                     // `bits = v.to_bits()` / `r = f64::from_bits(b)`: an EXACT
                     // bit-REINTERPRETATION (no rounding / no conversion), modeled

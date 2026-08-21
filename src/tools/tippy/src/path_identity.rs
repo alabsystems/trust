@@ -25,6 +25,47 @@
 //! directory, from any unrelated process, aborted an in-flight compile with
 //! "changed identity or contents" — a failure with no relation to toolchain
 //! integrity, and no action the user could take except "hold the machine still".
+//!
+//! # Why a symlink on the LAUNCH path is admitted, and what it costs
+//!
+//! `capture` used to refuse outright whenever the selected directory was not
+//! already canonical. That refusal was a blunt stand-in for the real property,
+//! and it made the launch-path/canonical-path machinery below it unreachable:
+//! rustup ALWAYS installs a linked custom toolchain as a symlink, so the refusal
+//! made every protected subcommand unusable through the only entry point users
+//! have.
+//!
+//! The property that actually matters is SUBSTITUTION — the same one
+//! `targo`'s `process_authority` module states for pathname-backed execution:
+//! between authentication and use, no principal *other than the invoking
+//! identity* may be able to swap the object the pathname resolves to. Measured
+//! against that property a symlink hop is not privileged over a directory:
+//! replacing either one requires write access to the SAME containing directory,
+//! and replacing either one is caught the same way, by pinned `device`/`inode`
+//! identity. So a symlink hop is admitted, and then held to strictly more than
+//! a directory ancestor is:
+//!
+//! * every hop is enumerated by RESOLVING the launch path one component at a
+//!   time — not by reading `Path::ancestors`, which cannot see a hop that a
+//!   previous hop's target introduced (`~/.rustup/toolchains/trust` names
+//!   `~/toolchains/trust-current`, and it is `trust-current` that the promotion
+//!   flip rewrites);
+//! * every hop is pinned by EXACT metadata plus its link target — a symlink has
+//!   no interior to churn, so unlike a directory it needs no slack, and any
+//!   replacement (new inode) or rename-and-restore (`ctime` moves, `mtime` does
+//!   not) is refused;
+//! * every hop must additionally be OWNED by root or the invoking identity and
+//!   live in a directory that no other principal may write. This is prevention
+//!   rather than detection, and it is the one check the canonical-only rule did
+//!   buy that pinning alone does not.
+//! * `confirm_canonical_root` re-resolves the launch path at every edge, so a
+//!   net change in where it lands is refused independently of all of the above.
+//!
+//! The residual is unchanged and is the module's standing one: this is
+//! detect-then-reject, not stable-handle execution. A hop flipped inside the
+//! guarded window can be observed by the child before the post-check refuses its
+//! result — exactly as a redirected directory ancestor can be, which is why the
+//! two are treated as one class.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -552,6 +593,11 @@ impl AuthenticatedExecutable {
 pub(crate) struct AuthenticatedDirectoryChain {
     root: PathBuf,
     canonical_root: PathBuf,
+    /// Every symlink traversed while resolving `root` to `canonical_root`, in
+    /// resolution order. Empty when the launch path is already canonical, and
+    /// always empty on Windows, where reparse points are held by the directory
+    /// chain's own share-mode handles instead. See the module docs.
+    symlink_hops: Vec<AuthenticatedSymlinkHop>,
     directories: Vec<AuthenticatedDirectory>,
     // Retain the selected directory objects from initial authentication until
     // the complete guarded operation finishes. Windows opens these without
@@ -607,31 +653,32 @@ impl AuthenticatedDirectoryChain {
                 root.display()
             )
         })?;
-        #[cfg(unix)]
-        if canonical != root {
-            return Err(format!(
-                "selected Trust toolchain directory `{}` traverses a symlink or non-canonical path to `{}`",
-                root.display(),
-                canonical.display()
-            ));
-        }
 
-        let paths = launch_and_canonical_ancestors(root, &canonical);
+        // A non-canonical launch path is authenticated, not refused: the
+        // toolchain that must be held to its identity is the CANONICAL one —
+        // the directory the binaries actually live in — and every symlink the
+        // launch path goes through becomes a pinned member of the chain in its
+        // own right. See the module docs for why that is not weaker than the
+        // canonical-only refusal it replaces.
+        let symlink_hops = capture_launch_symlink_hops(root, &canonical)?;
+        let hop_paths = symlink_hops.iter().map(|hop| hop.path.clone()).collect::<Vec<_>>();
+        let paths = launch_and_canonical_ancestors(root, &canonical, &hop_paths);
         let (directories, selected_handles) = capture_directory_chain(&paths, root, &canonical)?;
         let chain = Self {
             root: root.to_owned(),
             canonical_root: canonical,
+            symlink_hops,
             directories,
             _selected_handles: selected_handles,
         };
-        chain.confirm_canonical_root()?;
+        chain.confirm_launch_path_resolution()?;
         chain.confirm_stable_with_guard(&chain._selected_handles)?;
         let _ = chain.revalidate()?;
         Ok(chain)
     }
 
     pub(crate) fn revalidate(&self) -> Result<DirectoryChainGuard, String> {
-        self.confirm_canonical_root()?;
+        self.confirm_launch_path_resolution()?;
         let mut handles = Vec::with_capacity(self.directories.len());
         for expected in &self.directories {
             let (snapshot, handle) = checked_directory(&expected.path, expected.role)?;
@@ -645,8 +692,27 @@ impl AuthenticatedDirectoryChain {
         }
         let guard = DirectoryChainGuard { handles };
         self.confirm_stable_with_guard(&guard)?;
-        self.confirm_canonical_root()?;
+        self.confirm_launch_path_resolution()?;
         Ok(guard)
+    }
+
+    /// Re-prove that the launch path still resolves to the authenticated
+    /// toolchain: every recorded symlink hop is still the exact object it was,
+    /// still pointing where it pointed, and the launch path as a whole still
+    /// lands on the same canonical root.
+    ///
+    /// These are two independent nets over the same threat and both are cheap,
+    /// so both run at every edge `confirm_canonical_root` used to run at. The
+    /// hop check catches a redirect that was undone before this edge (a new
+    /// inode, or the `ctime`-without-`mtime` signature of a rename-and-restore);
+    /// the canonical check catches a redirect that is still in place, including
+    /// one through an object no hop names because the hop list itself was
+    /// resolved under a different filesystem state.
+    fn confirm_launch_path_resolution(&self) -> Result<(), String> {
+        for hop in &self.symlink_hops {
+            hop.confirm_authentic()?;
+        }
+        self.confirm_canonical_root()
     }
 
     fn confirm_canonical_root(&self) -> Result<(), String> {
@@ -735,14 +801,299 @@ pub(crate) struct DirectoryChainGuard {
     handles: Vec<fs::File>,
 }
 
-fn launch_and_canonical_ancestors(launch: &Path, canonical: &Path) -> Vec<PathBuf> {
+/// Every DIRECTORY on the launch and canonical paths, in that order, with the
+/// symlink hops removed.
+///
+/// A hop is excluded because it is not a directory and is authenticated
+/// separately, to a stricter standard, by [`AuthenticatedSymlinkHop`]. Note
+/// that a launch ancestor reached THROUGH a hop stays in this list: it is a real
+/// directory, and pinning that spelling is what makes a retargeted hop change
+/// the identity of the launch path's own selected directory.
+fn launch_and_canonical_ancestors(launch: &Path, canonical: &Path, hops: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for ancestor in launch.ancestors().chain(canonical.ancestors()) {
+        if hops.iter().any(|hop| hop == ancestor) {
+            continue;
+        }
         if !paths.iter().any(|path| path == ancestor) {
             paths.push(ancestor.to_owned());
         }
     }
     paths
+}
+
+/// One symlink traversed while resolving the launch path, pinned by exact
+/// metadata AND by the target it names.
+///
+/// A symlink has no interior, so — unlike a directory ancestor — nothing about
+/// it churns for unrelated reasons and it is held to full snapshot equality.
+/// Its containing directory is a directory and does churn, so that one is held
+/// to authority only, exactly as [`DirectoryRole::Ancestor`] is.
+#[derive(Debug)]
+struct AuthenticatedSymlinkHop {
+    path: PathBuf,
+    target: PathBuf,
+    snapshot: PathSnapshot,
+    parent: PathBuf,
+    parent_snapshot: PathSnapshot,
+}
+
+impl AuthenticatedSymlinkHop {
+    fn confirm_authentic(&self) -> Result<(), String> {
+        let (snapshot, target) = symlink_hop_reading(&self.path)?;
+        if !snapshot.same_file(&self.snapshot) || snapshot != self.snapshot || target != self.target {
+            return Err(format!(
+                "selected Trust toolchain launch path symlink `{}` changed identity, permissions, or target (was `{}`, now `{}`)",
+                self.path.display(),
+                self.target.display(),
+                target.display()
+            ));
+        }
+        let parent = fs::symlink_metadata(&self.parent).map_err(|error| {
+            format!(
+                "could not re-inspect the directory `{}` holding Trust toolchain launch path symlink `{}`: {error}",
+                self.parent.display(),
+                self.path.display()
+            )
+        })?;
+        let parent_snapshot = checked_directory_snapshot(&self.parent, &parent, None)?;
+        if !self.parent_snapshot.same_directory_authority(&parent_snapshot)
+            || self.parent_snapshot.metadata_tampered_since(&parent_snapshot)
+        {
+            return Err(format!(
+                "the directory `{}` holding Trust toolchain launch path symlink `{}` changed identity or authority",
+                self.parent.display(),
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read one symlink's own metadata and target together, refusing anything that
+/// is no longer a symlink.
+fn symlink_hop_reading(path: &Path) -> Result<(PathSnapshot, PathBuf), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "Trust toolchain launch path symlink `{}` is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Trust toolchain launch path component `{}` is no longer a symlink",
+            path.display()
+        ));
+    }
+    let target = fs::read_link(path).map_err(|error| {
+        format!(
+            "could not read Trust toolchain launch path symlink `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let snapshot = PathSnapshot::from_metadata(&metadata, None, path, "Trust toolchain launch path symlink")?;
+    Ok((snapshot, target))
+}
+
+/// Resolve `root` one component at a time, authenticating every symlink hop the
+/// resolution goes through, and prove the walk lands exactly where
+/// `Path::canonicalize` said it would.
+///
+/// The independent cross-check against `canonical` is what makes this walk safe
+/// to rely on: if a hop is rewritten while the walk is in progress the two
+/// disagree and the capture is refused, so the hop list can never be a partial
+/// view of a path that resolves somewhere else.
+#[cfg(unix)]
+fn capture_launch_symlink_hops(root: &Path, canonical: &Path) -> Result<Vec<AuthenticatedSymlinkHop>, String> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    /// A resolution that needs more hops than this is a loop or an attack, not
+    /// a toolchain layout; Linux's own limit is 40.
+    const MAX_LAUNCH_SYMLINK_HOPS: usize = 64;
+
+    let mut remaining = VecDeque::new();
+    push_path_components(root, &mut remaining)?;
+    let mut resolved = PathBuf::from("/");
+    let mut hops: Vec<AuthenticatedSymlinkHop> = Vec::new();
+    while let Some(name) = remaining.pop_front() {
+        if name == OsString::from(Component::CurDir.as_os_str()) {
+            continue;
+        }
+        if name == OsString::from(Component::ParentDir.as_os_str()) {
+            // `resolved` is fully resolved at every step, so a lexical pop is
+            // what the kernel does too. `/..` is `/`, which `pop` gives.
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+            format!(
+                "selected Trust toolchain launch path component `{}` is unavailable: {error}",
+                candidate.display()
+            )
+        })?;
+        if !metadata.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        if hops.len() >= MAX_LAUNCH_SYMLINK_HOPS {
+            return Err(format!(
+                "selected Trust toolchain directory `{}` resolves through more than {MAX_LAUNCH_SYMLINK_HOPS} symlinks",
+                root.display()
+            ));
+        }
+        let hop = capture_symlink_hop(&candidate, &resolved)?;
+        if hop.target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        let mut expansion = VecDeque::new();
+        push_path_components(&hop.target, &mut expansion)?;
+        if expansion.is_empty() {
+            return Err(format!(
+                "Trust toolchain launch path symlink `{}` has an empty target",
+                candidate.display()
+            ));
+        }
+        while let Some(component) = expansion.pop_back() {
+            remaining.push_front(component);
+        }
+        hops.push(hop);
+    }
+    if resolved != canonical {
+        return Err(format!(
+            "selected Trust toolchain directory `{}` resolves to `{}`, but its authenticated symlink chain resolves to `{}`",
+            root.display(),
+            canonical.display(),
+            resolved.display()
+        ));
+    }
+    Ok(hops)
+}
+
+/// Windows reaches the launch/canonical machinery already: reparse points are
+/// held by [`open_directory`]'s share mode, which denies the rename and
+/// retarget this walk exists to detect on unix.
+#[cfg(not(unix))]
+fn capture_launch_symlink_hops(_root: &Path, _canonical: &Path) -> Result<Vec<AuthenticatedSymlinkHop>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn push_path_components(path: &Path, out: &mut std::collections::VecDeque<std::ffi::OsString>) -> Result<(), String> {
+    use std::path::Component;
+
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir | Component::ParentDir | Component::Normal(_) => {
+                out.push_back(component.as_os_str().to_owned());
+            }
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "Trust toolchain launch path `{}` carries a platform prefix component",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Authenticate one symlink hop and the directory that holds it.
+///
+/// Trust: this is the SUBSTITUTION check, and it is deliberately the same
+/// quantifier `targo`'s `process_authority` module applies to a pathname-backed
+/// execution object — no principal other than root or the invoking identity may
+/// be able to replace this object. Two things decide that for a symlink:
+///
+/// * who owns the LINK — with a sticky containing directory, only its owner (or
+///   the directory's owner, or root) may replace or rename it; and
+/// * who may write the DIRECTORY that holds it — that, not the link, is the
+///   substitution primitive, because a symlink's target is immutable and the
+///   only way to retarget one is to replace the directory entry.
+///
+/// The link's OWN mode bits are deliberately not examined. Linux reports every
+/// symlink as `0o777` and ignores the bits entirely, so testing them would
+/// refuse every symlink on Linux while proving nothing on any platform.
+#[cfg(unix)]
+fn capture_symlink_hop(path: &Path, parent: &Path) -> Result<AuthenticatedSymlinkHop, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let invoking_uid = invoking_uid();
+    let (snapshot, target) = symlink_hop_reading(path)?;
+    let link = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "Trust toolchain launch path symlink `{}` is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    if link.uid() != 0 && link.uid() != invoking_uid {
+        return Err(format!(
+            "Trust toolchain launch path symlink `{}` is owned by uid={}, which is neither root nor the invoking identity (uid={invoking_uid}); a redirection a foreign principal owns can be repointed at another sysroot",
+            path.display(),
+            link.uid()
+        ));
+    }
+
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+        format!(
+            "could not inspect the directory `{}` holding Trust toolchain launch path symlink `{}`: {error}",
+            parent.display(),
+            path.display()
+        )
+    })?;
+    let parent_snapshot = checked_directory_snapshot(parent, &parent_metadata, None)?;
+    if parent_metadata.uid() != 0 && parent_metadata.uid() != invoking_uid {
+        return Err(format!(
+            "the directory `{}` holding Trust toolchain launch path symlink `{}` is owned by uid={}, which is neither root nor the invoking identity (uid={invoking_uid}); its owner can repoint the symlink at another sysroot",
+            parent.display(),
+            path.display(),
+            parent_metadata.uid()
+        ));
+    }
+    // Sticky (`0o1000`) is the exemption POSIX defines for exactly this: in a
+    // sticky directory only the entry's own owner, the directory's owner, or
+    // root may remove or rename an entry, and both of those owners were just
+    // proven to be root or the invoking identity. Without sticky, a group- or
+    // world-writable directory hands any local principal the ability to replace
+    // the link. That is the attack, and `/tmp` is why the exemption is worth
+    // spelling out rather than refusing the whole class.
+    if parent_metadata.mode() & 0o022 != 0 && parent_metadata.mode() & 0o1000 == 0 {
+        return Err(format!(
+            "the directory `{}` holding Trust toolchain launch path symlink `{}` is group- or world-writable without the sticky bit (mode={:#o}); any local principal could repoint the symlink at another sysroot",
+            parent.display(),
+            path.display(),
+            parent_metadata.mode() & 0o7777
+        ));
+    }
+
+    Ok(AuthenticatedSymlinkHop {
+        path: path.to_owned(),
+        target,
+        snapshot,
+        parent: parent.to_owned(),
+        parent_snapshot,
+    })
+}
+
+// Trust: the effective uid, declared directly rather than pulled in as a
+// dependency. This module is compiled into both Tippy binaries, neither of
+// which links `libc` as a Cargo dependency, and the file already declares the
+// Windows identity API it needs the same way. `geteuid` takes no arguments,
+// cannot fail, sets no errno, and returns `uid_t`, which is `u32` on every unix
+// Trust targets.
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "geteuid"]
+    fn c_geteuid() -> u32;
+}
+
+#[cfg(unix)]
+fn invoking_uid() -> u32 {
+    // SAFETY: `geteuid` is a nullary libc call that always succeeds.
+    unsafe { c_geteuid() }
 }
 
 fn capture_directory_chain(
@@ -753,9 +1104,11 @@ fn capture_directory_chain(
     let mut directories = Vec::with_capacity(paths.len());
     let mut handles = Vec::with_capacity(paths.len());
     for path in paths {
-        // Both spellings of the selected directory are the selected directory;
-        // on unix `capture` has already proven them equal, but Windows reaches
-        // here with a canonical form that may differ from the launch path.
+        // Both spellings of the selected directory are the selected directory.
+        // When the launch path goes through a symlink the two differ, and when
+        // the launch path IS the symlink only the canonical spelling appears
+        // here at all — which is the intended outcome: the directory held to
+        // exact metadata is the one the binaries actually live in.
         let role = if path == root || path == canonical_root {
             DirectoryRole::Selected
         } else {
@@ -1009,9 +1362,10 @@ mod ancestor_churn_tests {
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     /// `<temp>/<unique>/ancestor/selected` — a private two-level chain, so the
-    /// "ancestor" this test mutates is one this test owns. Canonicalized
-    /// because `capture` refuses a path that traverses a symlink, and macOS
-    /// hands out `/var/folders/...` behind one.
+    /// "ancestor" this test mutates is one this test owns. Canonicalized so
+    /// these fixtures exercise the plain directory chain only: macOS hands out
+    /// `/var/folders/...` behind `/var -> private/var`, and the launch-symlink
+    /// machinery is pinned separately in `launch_symlink_tests`.
     fn fixture(label: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1121,6 +1475,177 @@ mod ancestor_churn_tests {
         assert!(
             verdict.is_err(),
             "a world-writable ancestor is a changed authority and must be refused",
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// THE LAUNCH-SYMLINK CONTRACT. `capture` used to refuse any launch path that
+/// was not already canonical, which made every rustup-linked toolchain — the
+/// only kind rustup can create for a custom channel — unusable. These tests pin
+/// both halves of what replaced it: a symlink hop no other principal can rewrite
+/// is admitted and its canonical toolchain authenticated, and a hop that is
+/// redirected, restored, or reachable by another principal is refused.
+#[cfg(all(test, unix))]
+mod launch_symlink_tests {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, fs};
+
+    use super::AuthenticatedDirectoryChain;
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    /// A private fixture root holding a real `sealed/bin` toolchain and a
+    /// `decoy/bin` to redirect at.
+    fn fixture(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let temp = env::temp_dir().canonicalize().unwrap_or_else(|_| env::temp_dir());
+        let root = temp.join(format!(
+            "tippy-launch-symlink-{label}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("sealed").join("bin")).expect("create sealed toolchain");
+        fs::create_dir_all(root.join("decoy").join("bin")).expect("create decoy toolchain");
+        root
+    }
+
+    /// THE BUG THIS FIXES. `rustup toolchain link` always installs a symlink,
+    /// and this machine's `trust` channel deliberately resolves through a second
+    /// hop (`trust-current -> trust-<rev>`) that an atomic flip promotes. Both
+    /// spellings must authenticate, and both must authenticate the SAME
+    /// canonical directory.
+    #[test]
+    fn a_symlinked_launch_path_authenticates_the_canonical_toolchain() {
+        let root = fixture("accept");
+        let current = root.join("trust-current");
+        let linked = root.join("linked");
+        symlink(root.join("sealed"), &current).expect("create promotion symlink");
+        symlink(&current, &linked).expect("create rustup-style symlink");
+
+        // The launch path IS a symlink (rustup names the toolchain directory).
+        let chain = AuthenticatedDirectoryChain::capture(&linked)
+            .expect("a rustup-style symlinked toolchain directory must authenticate");
+        assert_eq!(
+            chain.canonical_root,
+            root.join("sealed"),
+            "the authenticated directory must be the canonical one the binaries live in"
+        );
+        assert_eq!(
+            chain.symlink_hops.len(),
+            2,
+            "both hops must be pinned, including the intermediate one `Path::ancestors` cannot see"
+        );
+        chain.revalidate().expect("an untouched symlinked launch path must stay authentic");
+
+        // The launch path merely goes THROUGH symlinks (`<toolchain>/bin`).
+        let bin = AuthenticatedDirectoryChain::capture(&linked.join("bin"))
+            .expect("a bin directory reached through symlinks must authenticate");
+        assert_eq!(bin.canonical_root, root.join("sealed").join("bin"));
+        bin.revalidate().expect("an untouched symlinked bin path must stay authentic");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// THE HALF THAT MUST NOT RELAX: redirecting a hop after capture is the
+    /// whole threat the canonical-only refusal existed to stop, and it is still
+    /// refused — here through the INTERMEDIATE hop, which is invisible to
+    /// `Path::ancestors` and is exactly the object a promotion flip rewrites.
+    #[test]
+    fn a_retargeted_intermediate_launch_symlink_is_rejected() {
+        let root = fixture("retarget");
+        let current = root.join("trust-current");
+        let linked = root.join("linked");
+        symlink(root.join("sealed"), &current).expect("create promotion symlink");
+        symlink(&current, &linked).expect("create rustup-style symlink");
+        let chain = AuthenticatedDirectoryChain::capture(&linked).expect("capture symlinked chain");
+
+        // Exactly what an atomic promotion (or an attacker) does.
+        let staged = root.join("trust-staged");
+        symlink(root.join("decoy"), &staged).expect("stage the replacement");
+        fs::rename(&staged, &current).expect("flip the promotion symlink");
+
+        assert!(
+            chain.revalidate().is_err(),
+            "a retargeted intermediate symlink hop must be refused",
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A redirect that is UNDONE before the post-check still has to be caught,
+    /// or the guard only refuses attackers who forget to clean up. Renaming the
+    /// hop aside and back restores its inode and target, but rename moves
+    /// `ctime` and leaves `mtime` alone — the same signature the directory chain
+    /// uses.
+    #[test]
+    fn a_renamed_and_restored_launch_symlink_is_rejected() {
+        let root = fixture("restore");
+        let linked = root.join("linked");
+        symlink(root.join("sealed"), &linked).expect("create rustup-style symlink");
+        let chain = AuthenticatedDirectoryChain::capture(&linked).expect("capture symlinked chain");
+
+        let parked = root.join("parked");
+        fs::rename(&linked, &parked).expect("park the symlink");
+        fs::rename(&parked, &linked).expect("restore the symlink");
+
+        assert!(
+            chain.revalidate().is_err(),
+            "a redirect-and-restore of a launch symlink must be refused even though identity is back",
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// THE NEGATIVE THAT PROVES THE RULE IS ABOUT SUBSTITUTION, NOT ABOUT
+    /// SYMLINKS: a hop any local principal can replace is refused outright, at
+    /// capture, before anything is authenticated — and the SAME hop is accepted
+    /// once its containing directory is closed again. The second half is what
+    /// shows the refusal is caused by the writability and not by the symlink.
+    #[test]
+    fn a_launch_symlink_in_a_world_writable_directory_is_refused() {
+        let root = fixture("hostile");
+        let hostile = root.join("hostile");
+        fs::create_dir(&hostile).expect("create the directory that will hold the hop");
+        let linked = hostile.join("linked");
+        symlink(root.join("sealed"), &linked).expect("create the hop");
+
+        fs::set_permissions(&hostile, fs::Permissions::from_mode(0o777))
+            .expect("make the holding directory world-writable");
+        let error = AuthenticatedDirectoryChain::capture(&linked)
+            .err()
+            .expect("a symlink any local principal can replace must be refused");
+        assert!(
+            error.contains("group- or world-writable"),
+            "the refusal must name the substitution primitive, got: {error}"
+        );
+
+        fs::set_permissions(&hostile, fs::Permissions::from_mode(0o755))
+            .expect("close the holding directory again");
+        AuthenticatedDirectoryChain::capture(&linked)
+            .expect("the same hop must authenticate once no other principal can replace it");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The chain-vs-`canonicalize` cross-check is what makes the hop list
+    /// trustworthy, so a launch path that does not resolve to a directory at all
+    /// must still fail closed rather than authenticate a partial walk.
+    #[test]
+    fn a_dangling_launch_symlink_is_refused() {
+        let root = fixture("dangling");
+        let linked = root.join("linked");
+        symlink(root.join("absent"), &linked).expect("create a dangling hop");
+
+        assert!(
+            AuthenticatedDirectoryChain::capture(&linked).is_err(),
+            "a launch path that resolves to nothing must be refused",
         );
 
         let _ = fs::remove_dir_all(&root);

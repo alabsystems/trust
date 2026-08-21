@@ -9,13 +9,28 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{InliningThreshold, OptLevel};
 
-use crate::{inline, pass_manager as pm};
+use crate::{clean_origin_mir, inline, pass_manager as pm};
 
 pub(super) fn provide(providers: &mut Providers) {
     providers.cross_crate_inlinable = cross_crate_inlinable;
 }
 
 fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    // Trust: (I7, plan S6) — a Clean-origin def is ALWAYS cross-crate inlinable.
+    // Its gated MIR always travels (`should_encode_mir`'s registry arm), and
+    // `true` here is what excludes it from `reachable_non_generics` — the
+    // mechanism is symbol_export's cross_crate_inlinable filter (the I7 review's
+    // corrected chain), NOT absence from `reachable_set` (in a `pub mod` of an
+    // rlib the def IS reachable). Consequence: an importing crate codegens ITS
+    // OWN copy through the guarded extern decode arms — the readmission
+    // chokepoint — instead of linking an upstream symbol its own readmission
+    // never saw and which the exporter (whose mono roots are HIR-driven) never
+    // emits. Registry lookup first, before `codegen_fn_attrs`: a Clean-origin
+    // def is exactly what HIR-derived inventories cannot see, and this def's
+    // attrs are a fed empty map.
+    if clean_origin_mir::is_clean_origin(tcx, def_id) {
+        return true;
+    }
     let codegen_fn_attrs = tcx.codegen_fn_attrs(def_id);
     // If this has an extern indicator, then this function is globally shared and thus will not
     // generate cgu-internal copies which would make it cross-crate inlinable.

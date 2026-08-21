@@ -63,7 +63,15 @@ step "Toolchain coherence (stage0 bins + -Z flags vs trustc)" \
 step "Stage0 seed freshness" \
   "$PYTHON_BIN" scripts/check_seed_freshness.py
 
-# 3. Test-parity ledger: no expired entries / active entries missing expires_on.
+# 3. THE ORACLE FREEZE. The differential is what every AI-generated compiler
+#    component is checked against, so the files that implement it are pinned by
+#    BLOB and may only move with a written waiver naming the exact new blob.
+#    Read-only, four `git hash-object` calls; mutation-proved by
+#    `scripts/check_frozen_files.sh --selftest` (nine planted defects).
+step "Oracle freeze (frozen differential/flip files vs their pins)" \
+  bash scripts/check_frozen_files.sh
+
+# 4. Test-parity ledger: no expired entries / active entries missing expires_on.
 #    Drop-in-by-construction depends on this ledger staying live.
 if [ -f scripts/check_ledger_expirations.py ]; then
   step "Test-parity ledger expirations (warn window 14d)" \
@@ -73,6 +81,17 @@ else
   echo "=== Test-parity ledger expirations ==="
   echo "SKIP: scripts/check_ledger_expirations.py not present"
 fi
+
+# 4. trust-ir tag -> lane family map: every fail-closed tag the producer can emit
+#    must have a family entry. Source-only, ~1s. Without this gate three agents
+#    partitioned the same corpus three different ways (pattern-family sole
+#    107/164/197, memory-family sole 128/337/342) and every roadmap rank keyed on
+#    a family boundary was unfalsifiable. A new tag added by a slice now fails the
+#    push until it is classified, so a family cannot silently widen.
+step "trust-ir tag/family map (every producer tag has a family)" \
+  "$PYTHON_BIN" scripts/trust_ir_tag_families.py --check
+step "trust-ir tag/family map SELFTEST (the gate actually fails on a broken map)" \
+  "$PYTHON_BIN" scripts/trust_ir_tag_families.py --selftest
 
 echo ""
 echo "Note: stage2-dependent gates (scripts/check_all.sh, libstd verification,"

@@ -1,0 +1,4 @@
+-- Trust I8 parity helper: the same projection `clean_origin_call_parity.rs`
+-- pins inline, authored out-of-line. Loaded by
+-- `clean mod clean_unit_parity_helper;` in `clean_unit_call_parity.rs`.
+def pick (a b : UInt64) : UInt64 := a

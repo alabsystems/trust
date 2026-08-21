@@ -85,7 +85,11 @@ fn threaded_cell_funcs() -> Vec<VerifiableFunction> {
     let Ty::Datatype { name: res_name, variants: res_variants } = &fm.body.return_ty else {
         panic!("threaded members return the result pair, got {:?}", fm.body.return_ty);
     };
-    assert_eq!(res_name, "res::Res");
+    // The extraction def-path gained its crate prefix when the fixture was
+    // regenerated (trust-mir-extract's own consumers accept both spellings,
+    // e.g. `"expr::Expr" | "clean_kernel::expr::Expr"`); this shape pin
+    // follows the fixture's canonical current name.
+    assert_eq!(res_name, "clean_kernel::res::Res");
     assert_eq!(res_variants.len(), 1, "the pair has one constructor Mk(Fuel, E)");
     let res_sort = Sort::from_ty(&fm.body.return_ty);
     let fuel_param_ty = &fm.body.locals.iter().find(|d| d.index == 1).expect("param _1").ty;
@@ -127,8 +131,10 @@ fn cell_counter_threaded_cluster_certifies_end_to_end() {
     let vcs = threaded_budget_functional_vcs(&funcs);
     assert_eq!(vcs.len(), 17, "2 bases + 6 cases + 2 refbases + 6 refcases + conclusion");
     assert!(
-        property(&vcs[16])
-            .contains("threaded-induction:fuel=fuel::Fuel:Z|S;res=res::Res:Mk;data=expr::E"),
+        property(&vcs[16]).contains(
+            "threaded-induction:fuel=clean_kernel::fuel::Fuel:Z|S;\
+             res=clean_kernel::res::Res:Mk;data=clean_kernel::expr::E"
+        ),
         "the conclusion is marker-bound to the threaded fuel/result/payload datatypes: {}",
         property(&vcs[16])
     );

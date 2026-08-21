@@ -1353,7 +1353,7 @@ fn test_thread_local_ref_rvalue_uses_sealed_address_model() {
             elem: Box::new(Ty::u8()),
             len_sym: trust_types::ConstLen { index: 0, name: "N".into() },
         },
-        Ty::Dynamic { trait_name: "test::Trait".into() },
+        Ty::Dynamic { trait_name: "test::Trait".into(), principal_key: Some("test::Trait".into()) },
     ] {
         for fat_destination in [
             Ty::Ref { mutable: false, inner: Box::new(fat_pointee.clone()) },

@@ -64,7 +64,10 @@ use rustc_errors::{ErrorGuaranteed, catch_fatal_errors};
 use rustc_hir as hir;
 use rustc_hir::attrs::{EiiDecl, EiiImpl, StrippedCfgItem};
 use rustc_hir::def::{DefKind, DocLinkResMap};
-use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LocalDefIdSet, LocalModDefId};
+// Trust: (I7) — `DefIndex` for `trust_clean_origin_exports`.
+use rustc_hir::def_id::{
+    CrateNum, DefId, DefIdMap, DefIndex, LocalDefId, LocalDefIdSet, LocalModDefId,
+};
 use rustc_hir::lang_items::{LangItem, LanguageItems};
 use rustc_hir::{ItemLocalId, PreciseCapturingArgKind};
 use rustc_index::IndexVec;
@@ -809,6 +812,132 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    // Trust: (I7) — the Clean-origin cross-crate ENCODE lane. Three queries, all
+    // `separate_provide_extern` on the `trust_contracts` template; local providers live in
+    // `rustc_mir_transform::clean_origin_export` (beside the sole constructor of a
+    // Clean-origin `Body`), extern arms in `rustc_metadata`'s cstore.
+    //
+    // None is `cache_on_disk`: a defeq verdict is not incrementally cacheable (design doc
+    // §8), and the digest provider re-runs the kernel per session on purpose — a toolchain
+    // swap also invalidates the incremental cache wholesale, so a cached verdict can never
+    // outlive its kernel.
+    //
+    // ANTI-TAMPER SCOPE, stated honestly (I7 review, defect 3): the
+    // `changed_trust_critical_query_provider` ratchet in `rustc_interface` runs only while
+    // Trust query semantics are active — `-Ztrust-verify=off` disables it — so a runtime
+    // provider override of these queries is refused ONLY in trust-semantics-active modes.
+    // The in-tree providers are part of the compiler TCB in every mode; `override_queries`
+    // is an embedder API outside that boundary. The decode wave landed the chokepoint (the
+    // guarded extern `optimized_mir`/`mir_for_ctfe` arms and the readmission trio below),
+    // but the reject list itself lives in `rustc_interface/src/passes.rs`, which belongs
+    // to a different wave's file set — the rows for the six I7 queries and the two extern
+    // MIR chokepoint arms are therefore still OUTSTANDING, and even once added they extend
+    // only over the active modes. Do not cite the ratchet as tamper protection for the
+    // import lane.
+
+    /// Trust: (I7) — the wire bytes of the Clean-origin verdict digest for `key`
+    /// (`trust_clean_origin::admission::VerdictDigest::encode` output; rustc never names the
+    /// Clean closure's types — the bytes are opaque here and versioned by the digest's own
+    /// magic+format).
+    ///
+    /// `None` means "not a Clean-origin def" — the ordinary answer for every Rust item. The
+    /// LOCAL provider never returns `None` for a def in the Clean-origin mint registry: it
+    /// fatals on any refusal instead, because a missing digest row is how importers
+    /// recognise ordinary Rust and skipping a row would fail OPEN (I7 risk R1).
+    query trust_clean_verdict_digest(key: DefId) -> Option<&'tcx Vec<u8>> {
+        desc { "minting the Clean-origin verdict digest for `{}`", tcx.def_path_str(key) }
+        arena_cache
+        separate_provide_extern
+    }
+
+    /// Trust: (I7) — the crate's `clean {{ ... }}` island sources, in authored order.
+    ///
+    /// Declaration TRANSPORT for the import lane (I7 decision (e)): the importer
+    /// re-elaborates these sources under its OWN kernel and compares the digest's claims
+    /// against that locally recomputed content. Text is transport, never authority — a
+    /// tampered source produces different local content and the readmission comparison
+    /// refuses. Empty for every crate without Clean-origin exports.
+    query trust_clean_island_sources(key: CrateNum) -> &'tcx Vec<String> {
+        desc { "collecting `clean {{ ... }}` island sources of `{}`", tcx.crate_name(key) }
+        arena_cache
+        separate_provide_extern
+    }
+
+    /// Trust: (I7) — the Clean-origin defs of `key`, by `DefIndex`.
+    ///
+    /// The digest table's second, independent encoding (I7 risk R1): the importer refuses a
+    /// LISTED def whose digest row is missing or undecodable, so a dropped row demotes
+    /// nothing to ordinary Rust. Sourced from the resolver's mint registry, never from a
+    /// HIR-derived inventory — a Clean-origin def is exactly the thing HIR walks cannot see.
+    query trust_clean_origin_exports(key: CrateNum) -> &'tcx Vec<DefIndex> {
+        desc { "listing Clean-origin defs of `{}`", tcx.crate_name(key) }
+        // `no_hash` because `DefIndex` deliberately has no `HashStable` impl (it is not
+        // stable across sessions). Invalidation flows through this query's dep edges; what
+        // is lost is only the recomputed-to-same-value early-out.
+        no_hash
+        arena_cache
+        separate_provide_extern
+    }
+
+    /// Trust: (I7) — the Clean-origin cross-crate IMPORT lane: re-admission of one
+    /// imported certificate, per def. An extern Clean-origin body is served ONLY through
+    /// this query.
+    ///
+    /// THE CHOKEPOINT CONTRACT: the extern `optimized_mir`/`mir_for_ctfe` decode arms
+    /// (`rustc_metadata`'s cstore) `ensure_done` this query for every def its exporting
+    /// crate lists in `trust_clean_origin_exports`, BEFORE the decoded body is served.
+    /// The provider (`rustc_mir_transform::clean_origin_import`) either RETURNS — meaning
+    /// the digest row existed and decoded whole, the exporter's island sources
+    /// re-elaborated under the LOCAL kernel, `trust_clean_origin::readmit` accepted every
+    /// field against the local kernel version and local environment content, and every
+    /// decodable body row re-passed the faithfulness gate locally — or FATALS with the
+    /// refusal's v7/D3 note (what mismatched, and the options). There is no third
+    /// outcome. A kernel-version skew is a REFUSAL this wave: the re-check-and-mint lane
+    /// is `trust-clean-origin/src/admission.rs`'s documented seam, deliberately not
+    /// built, and the acceptance control ("re-checked or refused, never accepted on a
+    /// matching source hash") is satisfied by refusal.
+    ///
+    /// Fail-closed in every mode: the provider is not behind `-Ztrust-verify=off` (same
+    /// rule as the sole local constructor), and in a build where the import provider is
+    /// not wired a LISTED def dies at the query system's missing-provider ICE rather
+    /// than being served ungated — fail-closed without the note, never fail-open.
+    ///
+    /// Returns `()` rather than evidence: `Readmitted` is crate-side sealed evidence and
+    /// stays crate-side; this query RUNNING TO COMPLETION is the compiler-side fact the
+    /// chokepoint consumes. Not `separate_provide_extern` — the one provider owns both
+    /// halves of the decision (local keys return immediately: locals are gated at the
+    /// sole constructor).
+    query trust_clean_extern_readmission(key: DefId) {
+        desc { "re-admitting the imported Clean-origin certificate for `{}`", tcx.def_path_str(key) }
+    }
+
+    /// Trust: (I7) — DECODE-ONLY access to an extern def's encoded `optimized_mir` row,
+    /// WITHOUT the readmission ensure. `None` means the row is not encoded.
+    ///
+    /// Exists solely to break the ensure-inside-decode cycle: the
+    /// `trust_clean_extern_readmission` provider must re-gate the very bodies the
+    /// guarded arms would serve, and asking the guarded `optimized_mir` for them would
+    /// re-enter its own ensure. Every other consumer must go through the guarded
+    /// `optimized_mir`/`mir_for_ctfe`; a new caller of this query is a bypass of the I7
+    /// chokepoint and wrong by construction (I7 risk R2 — the standing hazard of this
+    /// design, flagged for review). The local arm is a `bug!`: local bodies come from
+    /// the sole constructor, which cannot return one without a `Faithful`.
+    query trust_clean_extern_unreadmitted_optimized_mir(key: DefId) -> Option<&'tcx mir::Body<'tcx>> {
+        desc { "decoding the not-yet-readmitted extern `optimized_mir` for `{}`", tcx.def_path_str(key) }
+        separate_provide_extern
+    }
+
+    /// Trust: (I7) — DECODE-ONLY twin of
+    /// `trust_clean_extern_unreadmitted_optimized_mir` for the `mir_for_ctfe`
+    /// row. Both rows are encoded for a Clean-origin def (`should_encode_mir`'s registry
+    /// arm) and both decodable surfaces are re-gated, so a `constness` drift that flips
+    /// the table choice cannot route around the gate (I7 risk R8). Same sole-legitimate-
+    /// caller rule as the twin.
+    query trust_clean_extern_unreadmitted_mir_for_ctfe(key: DefId) -> Option<&'tcx mir::Body<'tcx>> {
+        desc { "decoding the not-yet-readmitted extern `mir_for_ctfe` for `{}`", tcx.def_path_str(key) }
+        separate_provide_extern
+    }
+
     /// The `DefId` is the `DefId` of the containing MIR body. Promoteds do not have their own
     /// `DefId`. This function returns all promoteds in the specified body. The body references
     /// promoteds by the `DefId` and the `mir::Promoted` index. This is necessary, because
@@ -938,6 +1067,15 @@ rustc_queries! {
             tcx.def_path_str(key)
         }
         separate_provide_extern
+        // Trust (I5): a Clean-origin def is an ordinary (non-`always`) `const
+        // fn`, which makes `is_conditionally_const` true, which makes the
+        // metadata encoder call this — and the provider
+        // (`rustc_hir_analysis/src/collect/predicates_of.rs`) `bug!`s on a
+        // synthetic HIR owner. The fed value is EMPTY, which is not a
+        // convenience: a Clean `def` in the emittable fragment has no generics
+        // and no bounds, so there is no condition for it to be const under.
+        // Fed only at the mint site in `rustc_resolve`.
+        feedable
     }
 
     /// Compute the const bounds that are implied for a conditionally-const item.
@@ -1224,6 +1362,17 @@ rustc_queries! {
         cache_on_disk
         handle_cycle_error
         separate_provide_extern
+        // Trust (I5): a Clean-origin `DefId` has no HIR, and `fn_sig`'s provider
+        // in `rustc_hir_analysis/src/collect.rs` opens by destructuring
+        // `tcx.hir_node(hir_id)`. The signature is not GUESSED for such a def:
+        // it is derived from the discharged total carriers of the Clean
+        // declaration's own type (`trust_clean_carrier::carrier_signature_for`,
+        // which cannot exist with a partial position), and fed at the mint site
+        // in `rustc_resolve/src/def_collector.rs` alongside `type_of` and
+        // `feed_hir()`. The ONLY feeder is that mint site; every other def
+        // still goes to the HIR provider. Without this, minting the `DefId`
+        // would convert a clean `E0425` into an ICE.
+        feedable
     }
 
     /// Performs lint checking for the module.
@@ -1594,6 +1743,15 @@ rustc_queries! {
     query fn_arg_idents(def_id: DefId) -> &'tcx [Option<rustc_span::Ident>] {
         desc { "looking up function parameter identifiers for `{}`", tcx.def_path_str(def_id) }
         separate_provide_extern
+        // Trust (I5): the provider (`rustc_middle/src/hir/mod.rs`) ends in a
+        // `span_bug!` for anything that is neither a body owner nor a
+        // required trait/foreign fn, and the metadata encoder calls it for
+        // EVERY local `DefKind::Fn`. A Clean-origin def is a `Fn` with no HIR
+        // body, so it must answer here. The fed value is one `None` per
+        // parameter — honest, because a Clean declaration's parameter has no
+        // Rust identifier, which is exactly what `None` means in this table.
+        // Fed only at the mint site in `rustc_resolve`.
+        feedable
     }
 
     /// Gets the rendered value of the specified constant or associated constant.

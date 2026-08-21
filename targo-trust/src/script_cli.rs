@@ -33,7 +33,7 @@ const CERTIFIED_MONITOR_EXPECTED_HEAD_ENV: &str = "TRUST_CERTIFIED_MONITOR_EXPEC
 const CERTIFIED_MONITOR_LOG_DIR_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_LOG_DIR";
 const CERTIFIED_MONITOR_RUN_ID_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_RUN_ID";
 const CERTIFIED_MONITOR_PAYLOAD_IDENTITY_SCHEMA: &str =
-    "trust.certified-monitor-e2e-payload-identity.v4";
+    "trust.certified-monitor-e2e-payload-identity.v5";
 const CERTIFIED_MONITOR_NATIVE_AUTHORITY_SCHEMA: &str =
     "trust.certified-monitor-native-authority.v1";
 const CERTIFIED_MONITOR_EVIDENCE_MANIFEST: &str = "evidence.sha256";
@@ -42,6 +42,7 @@ const CERTIFIED_MONITOR_PAYLOAD_FILES: &[&str] = &[
     "compiled-test-inventory.log",
     "real_targo_test_instruments_library_used_by_integration_test.log",
     "real_targo_test_executes_loop_invariant_violation.log",
+    "real_targo_test_executes_e5_tailcall_and_extended_carriers.log",
     "real_targo_test_executes_authorized_satisfying_integration_test.log",
     "real_targo_test_rejects_unharnessed_test_target_before_execution.log",
 ];
@@ -2734,16 +2735,19 @@ mod tests {
         assert_eq!(spec.runner, MaintenanceRunner::Shell);
         assert!(spec.fixed_args.is_empty());
 
-        let script = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("repository root")
-                .join(spec.script),
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root");
+        let script = std::fs::read_to_string(repository_root.join(spec.script))
+            .expect("read certified-monitor release gate");
+        let lock_source_gate = std::fs::read_to_string(
+            repository_root.join("scripts/check_lockfile_no_git_sources.sh"),
         )
-        .expect("read certified-monitor release gate");
+        .expect("read certified-monitor lock source gate");
         for test in [
             "tests::real_targo_test_instruments_library_used_by_integration_test",
             "tests::real_targo_test_executes_loop_invariant_violation",
+            "tests::real_targo_test_executes_e5_tailcall_and_extended_carriers",
             "tests::real_targo_test_executes_authorized_satisfying_integration_test",
             "tests::real_targo_test_rejects_unharnessed_test_target_before_execution",
         ] {
@@ -2776,7 +2780,10 @@ mod tests {
         assert!(script.contains("private registry archive $archive"));
         assert!(script.contains("cp -a -- \"$source_index/.\""));
         assert!(script.contains("require_plain_tree"));
-        assert!(script.contains("admits only checksummed registry archives"));
+        assert!(script.contains("check_lockfile_no_git_sources.sh"));
+        assert!(lock_source_gate.contains("admits only checksummed registry archives"));
+        assert!(lock_source_gate.contains("malformed/non-canonical package source row"));
+        assert!(lock_source_gate.contains("unsupported non-registry package source row"));
         assert!(!script.contains("ln -s -- \"$source_git_db\""));
         assert!(script.contains("registry/src, git/checkouts"));
         assert!(script.contains("cleanup_private_target"));

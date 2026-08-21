@@ -32,6 +32,13 @@ clean-elab = { workspace = true }
 # Trust: E9 citation unification — clause elaboration + the honesty meter.
 trust-cert-meter = { workspace = true }
 trust-spec-elab = { workspace = true }
+# Trust: I2 (docs/design/2026-08-04-two-language-compiler-architecture.md §7).
+# The symbol-status vocabulary. This crate is the FIRST holder of
+# `trust_symbols::CicKernelRecheck` — it is the crate where a `cert_meter`
+# certification audit actually returns — so the sealed-seam review obligation
+# named in `trust-symbols`' `KernelAuthority` docs lands here. Path, not
+# `workspace = true`, so it resolves the same from the compiler workspace.
+trust-symbols = { path = "../trust-symbols" }
 bincode = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }

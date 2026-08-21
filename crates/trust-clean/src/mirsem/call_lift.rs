@@ -207,36 +207,58 @@ pub(super) fn is_internal_char_range_fact(
 // can consult the resolved header-`next()` `CalleeFact` (fail-closed unless it declares no
 // `requires`), mirroring the via_mirsem_call_requires pillar every registry consumer
 // carries.
+/// Trust: STABLE CALLEE IDS (2026-08-19) — the id is a CONTENT KEY of the
+/// resolved def-path (FNV-1a 64 with the high bit forced), replacing the old
+/// BTreeMap POSITION. The audits (2026-08-17, the project twin's round) recorded
+/// the position id's hazard: the registry GROWS between functions in the
+/// callees-first census order, so the same numeric id denoted different callees
+/// at different points in one run, and positions 0..7 numerically overlapped the
+/// synthetic intrinsic id space. Both were semantically inert — every kernel
+/// instance builds a fresh env and the id is a vacuous Nat in a universal
+/// transport — but the hazard condition ("any future shared-env or
+/// cross-function identity use") is now closed structurally instead of by
+/// vigilance: the same callee gets the same id at every registry size, and the
+/// forced high bit keeps the entire space disjoint from the synthetic 0..7
+/// range by construction. Hash collisions across distinct def-paths are
+/// negligible at corpus scale (birthday ≈ 2·10⁻¹³ at 2000 keys) and would be
+/// harmless today for the same vacuity reason — but the id is no longer an
+/// accidental function of registry membership.
+pub(crate) fn stable_callee_id(def_path: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in def_path.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h | (1 << 63)
+}
+
 pub(crate) fn resolve_certified_callee<'a>(
     callees: &'a std::collections::BTreeMap<String, CalleeFact>,
     callee: &str,
 ) -> Option<(&'a str, &'a CalleeFact, u64)> {
     use trust_types::call_graph::canonical_trait_method;
     if let Some((k, f)) = callees.get_key_value(callee) {
-        let id = callees.keys().position(|x| x == k)?;
-        return Some((k.as_str(), f, u64::try_from(id).ok()?));
+        return Some((k.as_str(), f, stable_callee_id(k)));
     }
     let suffix = format!("::{callee}");
-    let mut hits = callees.iter().enumerate().filter(|(_, (k, _))| k.ends_with(&suffix));
-    if let Some((id, (k, f))) = hits.next() {
+    let mut hits = callees.iter().filter(|(k, _)| k.ends_with(&suffix));
+    if let Some((k, f)) = hits.next() {
         if hits.next().is_some() {
             return None; // ambiguous suffix — never guess (fail-closed).
         }
-        return Some((k.as_str(), f, u64::try_from(id).ok()?));
+        return Some((k.as_str(), f, stable_callee_id(k)));
     }
     // Trust: Item 2 — TRAIT-IMPL CANONICAL-TUPLE match. Only when the callee parses
     // as a trait method (else `canonical_trait_method` returns `None` and we decline,
     // exactly as before). EXACT tuple equality — never substring/fuzzy.
     let query = canonical_trait_method(callee)?;
-    let mut canon_hits = callees
-        .iter()
-        .enumerate()
-        .filter(|(_, (k, _))| canonical_trait_method(k).as_ref() == Some(&query));
-    let (id, (k, f)) = canon_hits.next()?;
+    let mut canon_hits =
+        callees.iter().filter(|(k, _)| canonical_trait_method(k).as_ref() == Some(&query));
+    let (k, f) = canon_hits.next()?;
     if canon_hits.next().is_some() {
         return None; // ambiguous canonical tuple — fail-closed.
     }
-    Some((k.as_str(), f, u64::try_from(id).ok()?))
+    Some((k.as_str(), f, stable_callee_id(k)))
 }
 
 /// Whether this statement (potentially) WRITES the given local — the fail-closed
@@ -765,9 +787,16 @@ pub(super) fn sem_call_arg_field_read_operand(
     // admits `Expr::has_fvar_quick` forwarding its immutable `ExprMeta` field
     // to `ExprMeta::has_fvar`; mutable references, wider/multi-field wrappers,
     // enums, and layout-marked ADTs still fail closed.
+    // Trust: TRANSPARENT-UNWRAP call-arg widening (2026-08-19) — the chain
+    // predicate joins the exact-u64 form as a SIBLING (`||`, strictly monotone):
+    // `NonMaxU8::get` forwards its immutable `(*self).0 : NonZero<u8>` field
+    // (a stamped two-level transparent chain) to `NonZero::<u8>::get`, the same
+    // deterministic-opaque-token shape at a different width and depth.
     if let Some(Ty::Ref { mutable: false, inner }) = body.locals.get(p.local).map(|l| &l.ty)
         && let Ty::Adt { fields, .. } = inner.as_ref()
-        && fields.get(*fld).is_some_and(|(_, ty)| opaque_guard_newtype_u64(ty))
+        && fields.get(*fld).is_some_and(|(_, ty)| {
+            opaque_guard_newtype_u64(ty) || opaque_guard_newtype_chain(ty)
+        })
     {
         if param_reassigned_by_stmt(body, p.local) || deref_write_exists(body, p.local) {
             return None;

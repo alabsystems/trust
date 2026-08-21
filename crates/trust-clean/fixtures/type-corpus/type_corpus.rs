@@ -567,7 +567,7 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
     c.push(("str", "&str", Ty::Slice { elem: Box::new(u8_ty()) }));
 
     // --- trait objects / functions / closures ---
-    c.push(("dyn_trait", "dyn Trait", Ty::Dynamic { trait_name: "Trait".into() }));
+    c.push(("dyn_trait", "dyn Trait", Ty::Dynamic { trait_name: "Trait".into(), principal_key: Some("Trait".into()) }));
     c.push((
         "fn_ptr",
         "fn(i32) -> u8",
@@ -634,22 +634,28 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
         Ty::Array { elem: Box::new(i32_ty()), len: 4 },
     ));
 
-    // TYPE-ZOO #2 — impl Trait (RPIT/TAIT): an opaque return type is an
-    // EXISTENTIAL `Sigma (T:Type), Vtable T` (the `dyn` analogue under the
-    // `Trust.Impl.<trait>` name). Modeled here as a dedicated impl-Trait marker.
-    c.push((
-        "impl_trait",
-        "impl Iterator (RPIT existential)",
-        Ty::Dynamic { trait_name: "@impl::core::iter::Iterator".into() },
-    ));
+    // Trust (vtable slice 19): the `impl_trait` probe (`@impl::core::iter::Iterator`) is
+    // GONE. It modeled a spelling nothing produces — the extractor's sole `TyKind::Dynamic`
+    // arm cannot emit an `@impl::` prefix — so it measured a hand-written convention rather
+    // than production coverage, and the `Trust.Impl.*` machinery it exercised is deleted.
+    // Reviving `impl Trait` needs a first-class discriminator on `Ty`, not a string tag.
 
-    // TYPE-ZOO #3 — MULTI-BOUND trait object `dyn A + B + Send`: a `Sigma` over the
-    // CONJOINED vtable record (methods of A AND B; the marker `Send` contributes an
-    // empty obligation). A `+`-joined trait_name signals the multi-bound case.
+    // TYPE-ZOO #3 — AUTO-TRAIT-BEARING trait object `dyn Debug + Send`.
+    //
+    // This REPLACES a `dyn core::fmt::Debug + core::clone::Clone + Send` probe that could
+    // never occur: Rust admits only AUTO traits as additional bounds, so a second non-auto
+    // bound like `Clone` is rejected outright. The row below is the real shape, spelled the
+    // way the extractor spells it — the erased `trait_name` keeps ONLY the principal, and
+    // the auto trait survives solely in `principal_key`. That makes this probe the corpus
+    // witness for the slice-19 split: it must NOT share a carrier with bare `dyn Debug`,
+    // which under the old erased keying it did.
     c.push((
-        "dyn_multi_bound",
-        "dyn core::fmt::Debug + core::clone::Clone + Send",
-        Ty::Dynamic { trait_name: "core::fmt::Debug + core::clone::Clone + Send".into() },
+        "dyn_auto_bound",
+        "dyn core::fmt::Debug + Send",
+        Ty::Dynamic {
+            trait_name: "core::fmt::Debug".into(),
+            principal_key: Some("core::fmt::Debug+core::marker::Send".into()),
+        },
     ));
 
     // TYPE-ZOO #4 — HRTB `for<'a> Fn(&'a i32) -> bool`: the higher-ranked lifetime

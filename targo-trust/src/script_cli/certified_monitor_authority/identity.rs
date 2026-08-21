@@ -1,4 +1,4 @@
-//! Canonical parsing of the shell payload manifest and identity v4.
+//! Canonical parsing of the shell payload manifest and identity v5.
 
 use std::collections::{BTreeMap, BTreeSet};
 

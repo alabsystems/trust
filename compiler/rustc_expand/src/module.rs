@@ -1,16 +1,19 @@
 use std::iter::once;
 use std::path::{self, Path, PathBuf};
 
-use rustc_ast::{AttrVec, Attribute, Inline, Item, ModSpans};
+use rustc_ast::{AttrVec, Attribute, CleanIslandDecl, Inline, Item, ModSpans};
 use rustc_attr_parsing::template;
 use rustc_attr_parsing::validate_attr::emit_malformed_attribute;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Diag, ErrorGuaranteed};
 use rustc_parse::lexer::StripTokens;
-use rustc_parse::{exp, new_parser_from_file, unwrap_or_emit_fatal};
+use rustc_parse::{
+    exp, new_parser_from_file, trust_parse_clean_unit_decls, unwrap_or_emit_fatal,
+};
 use rustc_session::Session;
 use rustc_session::parse::ParseSess;
 use rustc_span::fatal_error::FatalError;
-use rustc_span::{Ident, Span, sym};
+use rustc_span::{Ident, Span, Symbol, sym};
 use thin_vec::ThinVec;
 
 use crate::base::ModuleData;
@@ -263,6 +266,168 @@ pub fn default_submod_path<'a>(
         (false, false) => Err(ModError::FileNotFound(ident, default_path, secondary_path)),
         (true, true) => Err(ModError::MultipleCandidates(ident, default_path, secondary_path)),
     }
+}
+
+/// Trust (I8): one loaded out-of-line Clean unit — the payload half of an
+/// `ItemKind::CleanIsland` whose `unloaded_unit` marker has just been
+/// resolved. After the caller installs it, the unit is indistinguishable from
+/// an inline island everywhere downstream, which is I8's acceptance control.
+pub(crate) struct LoadedCleanUnit {
+    pub content_span: Span,
+    pub text: Symbol,
+    pub decls: ThinVec<CleanIslandDecl>,
+}
+
+/// Trust (I8): load and REALLY PARSE the `.clean` unit named by
+/// `clean mod <ident>;`, at the same expansion seam where out-of-line
+/// `mod <ident>;` bodies load — so `#[cfg]` stripping has already run, and the
+/// directory state (`ModuleData` + `DirOwnership`, including `#[path]`) is the
+/// real one `mod` itself would use.
+///
+/// Path resolution is Rust's, with ONE deliberate subtraction: a single
+/// candidate `<dir>/<relative-prefix><ident>.clean`, no `<ident>/mod.clean`
+/// secondary. A `.clean` unit is a leaf by construction — its contents are
+/// Clean text, which cannot contain `clean mod`, so no unit ever owns a
+/// directory of sub-units — and one candidate also deletes the
+/// multiple-candidates ambiguity class, letting "file not found" name the
+/// exact path it looked for. `#[path = "…"]` is honoured through the same
+/// function `mod` uses (`mod_file_path_from_attr`), with the same semantics.
+///
+/// The loaded file becomes a real `SourceFile` (`SourceMap::load_file`), so
+/// Clean parse errors — and later, elaboration/kernel diagnostics remapped by
+/// the verify pass — land in `<ident>.clean` at the right line. `text` is the
+/// NORMALIZED source (BOM stripped, newlines folded by `SourceFile::new`),
+/// which is the same byte indexing rustc span arithmetic uses, so
+/// `content_span.lo() + offset` stays exact.
+///
+/// A `.clean` unit may be included ONCE per crate, and the refusal is eager
+/// (ruling v7/D3). The crate's Clean environment is a single header-first
+/// batch, so a second inclusion could never be right: it would either declare
+/// every name twice (a Clean-level rejection) or — because `load_file` dedups
+/// by path, giving both islands the SAME `content_span` — trip the verify
+/// pass's collapsed-span ambiguity error, whose macro-oriented wording would
+/// mislead. `loaded_units` is the crate-wide ledger (`ExtCtxt`); the second
+/// inclusion errors at its own span pointing at the first.
+///
+/// Every error path returns the inert empty payload (zero-width span, empty
+/// text, no decls — the shape of an empty inline island): fail-closed, no
+/// decls to mint, nothing to elaborate, never a claim.
+pub(crate) fn load_clean_unit(
+    sess: &Session,
+    ident: Ident,
+    span: Span, // the `clean mod ident;` item, blamed on errors
+    module: &ModuleData,
+    dir_ownership: DirOwnership,
+    attrs: &[Attribute],
+    loaded_units: &mut FxHashMap<PathBuf, Span>,
+) -> LoadedCleanUnit {
+    let empty = || LoadedCleanUnit {
+        content_span: span.shrink_to_lo(),
+        text: sym::empty,
+        decls: ThinVec::new(),
+    };
+
+    // `#[path]` first, byte-identically to `mod` (same function). Otherwise
+    // the single default candidate, honouring the same relative offset
+    // (`foo.rs` vs `mod.rs`) `default_submod_path` applies.
+    let file_path = if let Some(path) = mod_file_path_from_attr(sess, attrs, &module.dir_path) {
+        path
+    } else {
+        match dir_ownership {
+            DirOwnership::Owned { relative } => {
+                let relative_prefix = match relative {
+                    Some(relative) => format!("{}{}", relative.name, path::MAIN_SEPARATOR),
+                    None => String::new(),
+                };
+                module.dir_path.join(format!("{}{}.clean", relative_prefix, ident.name))
+            }
+            DirOwnership::UnownedViaBlock => {
+                // The mod-in-block rule, applied unchanged (ruling v7/D3:
+                // refusal with options).
+                sess.dcx()
+                    .struct_span_err(
+                        span,
+                        format!("`clean mod {ident};` inside a block needs a `#[path]` attribute"),
+                    )
+                    .with_note(
+                        "the enclosing block owns no directory, so there is no place to \
+                         resolve the `.clean` file from — the same rule as `mod …;` in a block",
+                    )
+                    .with_help(
+                        "options: add `#[path = \"…\"]` naming the file; move the unit to \
+                         module scope; or write the declarations inline as `clean { … }`",
+                    )
+                    .emit();
+                return empty();
+            }
+        }
+    };
+
+    if let Some(&first) = loaded_units.get(&file_path) {
+        sess.dcx()
+            .struct_span_err(
+                span,
+                format!("the Clean unit `{}` is included twice in this crate", file_path.display()),
+            )
+            .with_span_note(first, "first included here")
+            .with_note(
+                "a `.clean` unit registers its declarations in the crate's single Clean \
+                 environment, so a second inclusion would declare every name a second time",
+            )
+            .with_help(
+                "options: include the unit once — its declarations are citable from every \
+                 `clean { … }` island in the crate and callable through the module that \
+                 includes it; or split the text into two files if two units were intended",
+            )
+            .emit();
+        return empty();
+    }
+
+    if !sess.psess.source_map().file_exists(&file_path) {
+        sess.dcx()
+            .struct_span_err(span, format!("file not found for out-of-line Clean unit `{ident}`"))
+            .with_note(format!(
+                "`clean mod {ident};` loads Clean (Lean) source from `{}`, which does not exist",
+                file_path.display()
+            ))
+            .with_help(
+                "options: create the file at that path; name a different file with \
+                 `#[path = \"…\"]` on this item; or write the declarations inline as \
+                 `clean { … }`",
+            )
+            .emit();
+        return empty();
+    }
+
+    // Recorded before the read: a second inclusion after an I/O failure is
+    // still a duplicate of the same authored intent, and the refusal above is
+    // the better message than a repeated read error.
+    loaded_units.insert(file_path.clone(), span);
+
+    let file = match sess.psess.source_map().load_file(&file_path) {
+        Ok(file) => file,
+        Err(err) => {
+            sess.dcx()
+                .span_err(span, format!("couldn't read `{}`: {}", file_path.display(), err));
+            return empty();
+        }
+    };
+    let Some(src) = file.src.as_deref() else {
+        // Unreachable for a file loaded this instant, but never a panic: fail
+        // closed to the empty unit like every other arm.
+        sess.dcx().span_err(
+            span,
+            format!("source of `{}` is unavailable after loading", file_path.display()),
+        );
+        return empty();
+    };
+
+    // The unit file's OWN `SourceFile` range. Root syntax context, like every
+    // span an out-of-line Rust module's text gets from being parsed.
+    let content_span = Span::with_root_ctxt(file.start_pos, file.end_position());
+    let decls = trust_parse_clean_unit_decls(&sess.psess, content_span, src, ident);
+
+    LoadedCleanUnit { content_span, text: Symbol::intern(src), decls }
 }
 
 impl ModError<'_> {

@@ -38,6 +38,16 @@ use std::sync::LazyLock;
 use pass_manager::{self as pm, Lint, MirLint, MirPass, WithMinOptLevel};
 
 mod check_pointers;
+// Trust (I5): the SOLE CONSTRUCTOR of a Clean-origin `Body`, and the
+// carrier-typed faithfulness gate that stands in front of it. This is the one
+// direction in Trust that produces a value, so a disagreement is a wrong
+// binary; read that file's header before touching any of its four call sites
+// (`mir_keys`, `inner_optimized_mir`, `inner_mir_for_ctfe`, `promoted_mir`).
+mod clean_origin_mir;
+// Trust: (I7) — Clean-origin verdict-digest EXPORT providers (encode half).
+mod clean_origin_export;
+// Trust: (I7) — Clean-origin cross-crate IMPORT lane (readmission + re-gate).
+mod clean_origin_import;
 mod cost_checker;
 mod cross_crate_inline;
 mod deduce_param_attrs;
@@ -232,6 +242,9 @@ declare_passes! {
 // Trust #540 (R1): preserve the analysis-phase initialization seam while the
 // strengthening authority remains hard-disabled. The exported initializer
 // records no flip capability until a non-forgeable authority lane exists.
+// Trust (lane CTFE): the trivial-const flip probe. MEASUREMENT ONLY — gated on
+// `-Ztrust-ctfe-trivial-probe`, installs no body, changes no emitted code.
+pub use trust_ir_flip::probe_trivial_const_flips as trust_probe_trivial_const_flips;
 pub use trust_verify::trust_init_r1_attributions;
 pub use trust_verify::{
     initialize_ay_solver_identity as trust_initialize_ay_solver_identity,
@@ -268,6 +281,19 @@ pub fn provide(providers: &mut Providers) {
         trust_contracts: trust_contract_query::trust_contracts,
         trust_proof_results: trust_proof_query::trust_proof_results,
         trust_proof_telemetry: trust_proof_query::trust_proof_telemetry,
+        // Trust: (I7) — Clean-origin cross-crate ENCODE lane.
+        trust_clean_verdict_digest: clean_origin_export::trust_clean_verdict_digest,
+        trust_clean_island_sources: clean_origin_export::trust_clean_island_sources,
+        trust_clean_origin_exports: clean_origin_export::trust_clean_origin_exports,
+        // Trust: (I7) — Clean-origin cross-crate IMPORT lane: readmission at the
+        // extern MIR decode chokepoint (rustc_metadata's cstore arms ensure this
+        // query before serving a listed def's body), plus the bug!-on-local arms
+        // of the decode-only accessors the readmission re-gate uses.
+        trust_clean_extern_readmission: clean_origin_import::trust_clean_extern_readmission,
+        trust_clean_extern_unreadmitted_optimized_mir:
+            clean_origin_import::local_unreadmitted_optimized_mir,
+        trust_clean_extern_unreadmitted_mir_for_ctfe:
+            clean_origin_import::local_unreadmitted_mir_for_ctfe,
         ..providers.queries
     };
 }
@@ -388,6 +414,23 @@ fn mir_keys(tcx: TyCtxt<'_>, (): ()) -> FxIndexSet<LocalDefId> {
             }
         }
     }
+
+    // Trust (I5, wiring site 3): Clean-origin defs have MIR but are not HIR body
+    // owners, so the seed above cannot see them and no later loop reaches them
+    // either — a tuple ctor is found through `hir_crate_items`, which is also
+    // HIR. Without this insertion the body would never be demanded, never
+    // encoded in metadata, and never `--emit=mir` visible: the def would exist,
+    // resolve, and type-check, and then quietly have no code.
+    //
+    // This iterates the Clean-origin REGISTRY, not a filter over some other
+    // enumeration. That distinction is load-bearing and was got wrong once
+    // already: every `tcx`-side inventory of definitions available here —
+    // `hir_body_owners`, `hir_crate_items(()).definitions()`,
+    // `hir_crate_items(()).free_items()` — is derived from HIR, and a
+    // Clean-origin def is precisely the thing that has none. A predicate
+    // applied to any of them would be vacuously false forever and the omission
+    // would look like a working filter.
+    set.extend(clean_origin_mir::clean_origin_defs(tcx));
 
     set
 }
@@ -552,6 +595,23 @@ fn mir_for_trust_verification(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<&Bo
 }
 
 fn inner_mir_for_ctfe(tcx: TyCtxt<'_>, def: LocalDefId) -> Body<'_> {
+    // Trust (I5, wiring site 4a): THE VERY TOP, and deliberately so.
+    //
+    // Before `is_constructor`, and — load-bearing — before
+    // `hir_body_const_context` below, whose `None` arm is a hard
+    // `bug!("mir_for_ctfe called on non-const")`. A Clean-origin def has no HIR,
+    // so a const that calls one walks into that `bug!` unless the gate answers
+    // first. `mir_for_ctfe` is also why the gate cannot live on the codegen arm
+    // alone: a `const` never reaches `optimized_mir`, so a gate installed only
+    // there is bypassed by every constant in the program while the value is
+    // still baked into the binary.
+    //
+    // NOT behind `verification_enabled` and NOT behind `-Ztrust-verify=off`.
+    // The faithfulness gate is a compilation-correctness check on emitted code,
+    // not an obligation; a gate a flag can switch off is a lint.
+    if let Some(body) = clean_origin_mir::clean_origin_mir(tcx, def) {
+        return body;
+    }
     if tcx.is_constructor(def.to_def_id()) {
         // There's no reason to run all of the MIR passes on constructors when
         // we can just output the MIR we want directly. This also saves const
@@ -631,6 +691,28 @@ fn inner_mir_for_ctfe(tcx: TyCtxt<'_>, def: LocalDefId) -> Body<'_> {
 /// mir borrowck *before* doing so in order to ensure that borrowck can be run and doesn't
 /// end up missing the source MIR due to stealing happening.
 fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &Steal<Body<'_>> {
+    // Trust (I5, the ROOT fix for the mir_keys dead-end family): a Clean-origin
+    // def has no ordinary MIR pipeline — the walk below (`mir_borrowck` ->
+    // `mir_promoted` -> `mir_built` -> `check_match` -> `typeck`) dead-ends in
+    // `typeck`, which `span_bug!`s on a def with a synthetic HIR owner and no
+    // body. SIX separate consumers reached that dead-end one at a time (the
+    // verify pass's backing inventory, the R1 call-graph scan, the MIR
+    // pipeline, the R1 flip harvest, the coverage denominator, and the
+    // mutual-recursion oracle's adjacency), each patched at the caller before
+    // this seam was identified. Serving the query HERE makes it total over
+    // `mir_keys`, so every present and future consumer reads the same thing:
+    // the kernel-gated emission, which IS this def's body.
+    //
+    // `optimized_mir` is the cached authority for that emission (the gate runs
+    // once per def there); this clone is a handful of statements. The phase is
+    // `Runtime(Optimized)` — ahead of what this query normally carries — which
+    // is sound for every reader (they extract facts; none replays the
+    // analysis-to-runtime pipeline on it, and the ordinary pipeline that WOULD
+    // is bypassed for Clean-origin defs at `inner_optimized_mir`'s own early
+    // return). No cycle: the emission never reads this query.
+    if clean_origin_mir::is_clean_origin(tcx, def) {
+        return tcx.alloc_steal_mir(tcx.optimized_mir(def.to_def_id()).clone());
+    }
     if tcx.is_coroutine(def.to_def_id()) {
         tcx.ensure_done().mir_coroutine_witnesses(def);
     }
@@ -933,6 +1015,21 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
 
 /// Optimize the MIR and prepare it for codegen.
 fn optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> &Body<'_> {
+    // Trust (I5, wiring site 4b): THE VERY TOP of the codegen arm.
+    //
+    // Placed in the OUTER function rather than in `inner_optimized_mir` because
+    // `is_constructor` is tested here, and `is_constructor` reaches
+    // `def_kind`/HIR-derived state for a def that has neither. Same rules as
+    // the CTFE arm: sole constructor, fail-closed, and no verification switch
+    // disables it.
+    //
+    // The body is returned WITHOUT `run_optimization_passes`. That is not an
+    // omission: the gate's subject is the body this function returns, so a pass
+    // that rewrote it after the gate ran would put un-gated code in the binary.
+    // A widening that wants optimization must re-gate after it, not before.
+    if let Some(body) = clean_origin_mir::clean_origin_mir(tcx, did) {
+        return tcx.arena.alloc(body);
+    }
     if tcx.is_constructor(did.to_def_id()) {
         // There's no reason to run all of the MIR passes on constructors when
         // we can just output the MIR we want directly. This also saves const
@@ -1026,6 +1123,23 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
 /// Fetch all the promoteds of an item and prepare their MIR bodies to be ready for
 /// constant evaluation once all generic parameters become known.
 fn promoted_mir(tcx: TyCtxt<'_>, def: LocalDefId) -> &IndexVec<Promoted, Body<'_>> {
+    // Trust (I5, wiring site 4c): the arm the plan did not name, and the one
+    // that breaks first.
+    //
+    // The metadata encoder demands `promoted_mir` for every def in `mir_keys`,
+    // and the ordinary path here reaches `mir_borrowck` -> `typeck` -> HIR. A
+    // Clean-origin def has none of those. The early return mirrors the
+    // constructor arm directly above: a projection body promotes nothing, so
+    // the honest answer is an empty table, not a fabricated one.
+    //
+    // This does NOT re-run the gate, and must not: the promoted table is empty
+    // by construction for the emitted shape, so there is nothing here for a
+    // faithfulness verdict to be about. If a future shape can promote, its
+    // promoteds are emitted code and need their own gate — do not widen this
+    // early return to cover them.
+    if clean_origin_mir::is_clean_origin(tcx, def) {
+        return tcx.arena.alloc(IndexVec::new());
+    }
     if tcx.is_constructor(def.to_def_id()) {
         return tcx.arena.alloc(IndexVec::new());
     }

@@ -1435,6 +1435,8 @@ mod tests {
                 content_span: DUMMY_SP,
                 text: rustc_span::Symbol::intern(""),
                 decls: thin_vec::ThinVec::new(),
+                // Trust (I8): inline island — not a pending `clean mod` unit.
+                unloaded_unit: None,
             }
         ))));
     }

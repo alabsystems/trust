@@ -54,7 +54,9 @@
 //! | [`Segment`], [`SegmentPath`] | The producer-neutral path. `crate::m::f` and `Crate.m.f` parse to one value. |
 //! | [`Sort`], [`Namespace`] | Multi-sorted identity. A flat namespace would reject valid Rust (`mod m` beside `fn m`). |
 //! | [`Producer`] | Which language wrote the header. Recorded, never authority. |
-//! | [`Capability`], [`CarrierEvidence`] | PROOF/CALL. At I1 nothing can reach `Call`. |
+//! | [`Capability`], [`CarrierEvidence`] | PROOF/CALL, a declared two-element lattice. At I1 nothing can reach `Call`. |
+//! | [`ReferenceSet`], [`EffectiveCapability`], [`CapabilityClosure`] | I3's transitive proof-only firewall: what a declaration references, and the meet over it. |
+//! | [`ProofOnlyRefusal`] | The one spelling of "visible but not executable". |
 //! | [`TermDigest`] | Identity of the checked term. |
 //! | [`Assumption`], [`AxiomClosure`] | The disclosure surface. Non-empty ⇒ never `Certified`. |
 //! | [`KernelStatus`], [`KernelVerdict`] | Parsed / Elaborated / Reflected / KernelChecked. |
@@ -72,6 +74,11 @@
 //! * [`AxiomClosure::merge`] is *absorbing* on `unrecorded`: an audited-empty
 //!   closure merged with an unrecorded one is unrecorded. A transitive closure
 //!   is only as good as its worst component.
+//! * [`ReferenceSet::default`] is [`ReferenceSet::Unrecorded`] and
+//!   [`EffectiveCapability::meet`] is absorbing on it, for the same reason and
+//!   by the same rule: an edge nobody enumerated poisons the capability closure
+//!   instead of being assumed benign. `Recorded(∅)` — a leaf — is a *positive
+//!   finding* and is a different value.
 //! * Every refusal in this crate names the fix **with options** (author ruling
 //!   v7/D3). "Unsupported" with no next step is a defect; the reader is an AI
 //!   programmer.
@@ -475,24 +482,127 @@ impl Producer {
 ///
 /// `Call` subsumes `Proof`: a callable symbol is also observable. The converse
 /// is the firewall.
+///
+/// # It is a lattice, and the order is DECLARED rather than inherited (I3)
+///
+/// This is a two-element chain **ordered by executable authority**:
+///
+/// ```text
+///   Call     ⊤  — observable AND able to produce a value
+///    │
+///   Proof    ⊥  — observable only
+/// ```
+///
+/// The derived `Ord` agrees with that order, but agreeing by *declaration
+/// order* is an accident of how the variants happen to be typed out, and a
+/// later edit that reorders them would silently invert every `meet`. The order
+/// is therefore pinned by [`Capability::AUTHORITY_ASCENDING`] and by the
+/// `the_capability_order_is_declared_not_accidental` control, so reordering the
+/// variants breaks a test instead of breaking the firewall.
+///
+/// # Two orders, dual to each other — say which one you mean
+///
+/// * **Authority** (this order, and the one [`Capability::join`] /
+///   [`Capability::meet`] use): `Proof < Call`. CALL can do strictly more.
+/// * **Observation** (the dual, [`Capability::observes_at_least`]): a PROOF
+///   *context* observes strictly more symbols than a CALL context, because
+///   §4.1.1 lets PROOF name every declaration including private internals with
+///   zero annotations, while CALL obeys the declaring language's ordinary
+///   visibility.
+///
+/// Those two sentences are not in tension and the confusion between them is the
+/// likeliest way to get this backwards: PROOF sees more *symbols*, CALL holds
+/// more *authority over one symbol*. **Observation grants no executable
+/// authority — that is what makes total proof visibility sound.**
+///
+/// # `meet` is the operator the transitive firewall runs on
+///
+/// A declaration is at most as executable as the weakest thing it references:
+/// a `def` whose body names a proof-only symbol cannot emit a call or a load,
+/// so it is itself proof-only. That is [`Capability::meet`] folded over a
+/// reference set — see [`SymbolGraph::capability_closure`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Capability {
-    /// Nameable from proof contexts only.
+    /// Nameable from proof contexts only. The **bottom** of the authority
+    /// lattice, and therefore the fail-closed answer.
     Proof,
     /// Nameable from ordinary Rust code, and therefore able to **produce a
-    /// value**. A divergence here is a wrong binary, not a failed proof.
+    /// value**. A divergence here is a wrong binary, not a failed proof. The
+    /// **top** of the authority lattice.
     Call,
 }
 
 impl Capability {
+    /// The bottom of the authority lattice: observable, never executable.
+    ///
+    /// Named `LEAST` rather than `DEFAULT` on purpose — there is no `Default`
+    /// impl, because a capability that arrives by `..Default::default()` is a
+    /// capability nobody decided.
+    pub const LEAST: Self = Self::Proof;
+
+    /// The top of the authority lattice.
+    pub const GREATEST: Self = Self::Call;
+
+    /// Every capability in **ascending authority order**.
+    ///
+    /// The declared order of record. `Capability::AUTHORITY_ASCENDING` and the
+    /// derived `Ord` must agree, which is what the order control checks.
+    pub const AUTHORITY_ASCENDING: [Self; 2] = [Self::Proof, Self::Call];
+
     /// Whether holding `self` permits a use that requires `required`.
+    ///
+    /// This is the order relation `required ≤ self` in the authority order,
+    /// spelled out rather than derived so that it reads as the rule it is.
     #[must_use]
     pub fn permits(self, required: Self) -> bool {
         match (self, required) {
             (Self::Call, _) => true,
             (Self::Proof, Self::Proof) => true,
             (Self::Proof, Self::Call) => false,
+        }
+    }
+
+    /// Least upper bound in the authority order — the **stronger** capability.
+    ///
+    /// Deliberately rare in consumers. Joining capabilities *raises* authority,
+    /// and every escalation to CALL in this crate goes through
+    /// [`SymbolHeader::grant_call`], which demands evidence. `join` exists for
+    /// completeness of the lattice (and so `meet`'s absorbing behaviour can be
+    /// stated against its dual), not as a back door: it operates on capability
+    /// *values*, never on a header.
+    #[must_use]
+    pub fn join(self, other: Self) -> Self {
+        if self.permits(other) { self } else { other }
+    }
+
+    /// Greatest lower bound in the authority order — the **weaker** capability.
+    ///
+    /// This is the firewall's operator. Folding `meet` over a reference set
+    /// gives "as executable as the weakest thing reachable", which is exactly
+    /// the transitive proof-only rule: one proof-only edge anywhere in the
+    /// closure pulls the whole thing to [`Capability::Proof`].
+    #[must_use]
+    pub fn meet(self, other: Self) -> Self {
+        if self.permits(other) { other } else { self }
+    }
+
+    /// The **observation** order, dual to the authority order: whether a use
+    /// site holding `self` may *name* a symbol whose declared capability is
+    /// `symbol`.
+    ///
+    /// A PROOF context names everything (§4.1.1, zero annotations). A CALL
+    /// context names only what is executable. Note this is not `permits` with
+    /// the arguments swapped in disguise — it is the statement that makes the
+    /// asymmetry explicit at the call site rather than leaving the reader to
+    /// work out which side of `permits` is which.
+    #[must_use]
+    pub fn observes_at_least(self, symbol: Self) -> bool {
+        match self {
+            // PROOF is total observer capability.
+            Self::Proof => true,
+            // CALL obeys the declaring language's ordinary visibility.
+            Self::Call => symbol.permits(Self::Call),
         }
     }
 
@@ -506,6 +616,78 @@ impl Capability {
     }
 }
 
+/// A capability after the transitive firewall has run, or the fail-closed
+/// admission that it could not be run (I3).
+///
+/// The third state is not a third capability. It is the statement "the
+/// reference closure this answer would have to be taken over is incomplete",
+/// and it is deliberately shaped like [`AxiomClosure::unrecorded`]: the rule
+/// recorded in this crate's header — *a closure merged with an unrecorded one
+/// is unrecorded* — is the same rule, applied to a different closure. An
+/// unknown edge poisons the result rather than being assumed benign.
+///
+/// Fail-closed here means **falling to the bottom of the lattice, not
+/// erroring**: [`EffectiveCapability::Unrecorded`] permits exactly what
+/// [`Capability::LEAST`] permits, i.e. observation and nothing else. That is
+/// the right answer rather than a lenient one — observation grants no
+/// executable authority, so an unknown edge cannot make an observation unsound;
+/// it can only make an *execution* unsound, and execution is what is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EffectiveCapability {
+    /// The closure was complete and this is its meet.
+    Determined(Capability),
+    /// Some edge on some path was never recorded, or named a symbol the graph
+    /// has no header for.
+    Unrecorded,
+}
+
+impl EffectiveCapability {
+    /// The strongest capability that may be *claimed* — `Unrecorded` claims
+    /// [`Capability::LEAST`].
+    #[must_use]
+    pub fn claimable(self) -> Capability {
+        match self {
+            Self::Determined(capability) => capability,
+            Self::Unrecorded => Capability::LEAST,
+        }
+    }
+
+    /// Whether this permits a use requiring `required`.
+    #[must_use]
+    pub fn permits(self, required: Capability) -> bool {
+        self.claimable().permits(required)
+    }
+
+    /// Whether this symbol may never emit a call or a load.
+    #[must_use]
+    pub fn is_proof_only(self) -> bool {
+        !self.permits(Capability::Call)
+    }
+
+    /// Greatest lower bound, with `Unrecorded` **absorbing**.
+    ///
+    /// This is the line that makes the closure fail closed. It is stated as its
+    /// own method, not inlined into the fixpoint, so that the absorbing
+    /// behaviour is one testable fact rather than a property of a loop.
+    #[must_use]
+    pub fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unrecorded, _) | (_, Self::Unrecorded) => Self::Unrecorded,
+            (Self::Determined(a), Self::Determined(b)) => Self::Determined(a.meet(b)),
+        }
+    }
+
+    /// The stable wire name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Determined(capability) => capability.name(),
+            Self::Unrecorded => "unrecorded",
+        }
+    }
+}
+
 /// Evidence that a Clean type has a faithful Rust carrier.
 ///
 /// Shaped deliberately like `SingleWriterEvidence` in `trust-vcgen`, for the
@@ -515,10 +697,18 @@ impl Capability {
 /// only a carrier whose representation-faithfulness obligation has been
 /// discharged does.
 ///
-/// **Nothing constructs [`CarrierEvidence::Total`] at I1.** `trust-clean-carrier`
-/// (I4) is the seam it plugs into, and I4 lands before any `DefId` is minted
-/// precisely so that `Nat → u64` cannot be blessed by a defeq check that is
-/// already true of a wrapping binary (§5(b)).
+/// **`trust-clean-carrier` (I4) is the seam [`CarrierEvidence::Total`] plugs
+/// into**, and I4 lands before any `DefId` is minted precisely so that
+/// `Nat → u64` cannot be blessed by a defeq check that is already true of a
+/// wrapping binary (§5(b)).
+///
+/// Since I4, `Total` is **not constructible by assignment**. It is reachable
+/// only through [`SymbolHeader::with_total_carrier`], which demands a
+/// [`CarrierWitness`], which in turn exists only as the `Ok` of
+/// [`RepresentationObligation::discharge`]. [`SymbolHeader::with_carrier`]
+/// cannot express it: its parameter type is [`UnwitnessedCarrier`], which has
+/// no `Total` variant, so "someone set `Total` without an obligation" is not a
+/// review failure — it does not compile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[non_exhaustive]
 pub enum CarrierEvidence {
@@ -531,6 +721,479 @@ pub enum CarrierEvidence {
     /// representation-faithfulness obligation discharged.
     Total,
 }
+
+/// Carrier evidence a caller may record without a witness.
+///
+/// Deliberately a *different type* from [`CarrierEvidence`] rather than a
+/// runtime check on it: [`CarrierEvidence::Total`] is the one value that lets a
+/// Clean declaration produce a Rust value, so the type system, not a code
+/// review, is what keeps it out of an unchecked setter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[non_exhaustive]
+pub enum UnwitnessedCarrier {
+    /// No carrier.
+    #[default]
+    None,
+    /// A carrier asserted by a caller and not proved. Grants nothing.
+    Declared,
+}
+
+impl From<UnwitnessedCarrier> for CarrierEvidence {
+    fn from(value: UnwitnessedCarrier) -> Self {
+        match value {
+            UnwitnessedCarrier::None => Self::None,
+            UnwitnessedCarrier::Declared => Self::Declared,
+        }
+    }
+}
+
+/// How many distinct values a type can hold, as far as the carrier map knows.
+///
+/// This is the fact the faithfulness obligation turns on, and the reason it is
+/// spelled as an enum rather than a `u32`: "unbounded" and "bounded by a number
+/// I do not know yet" are different facts from "bounded by 64 bits", and
+/// collapsing either onto a width is how `Nat` becomes `u64`.
+///
+/// **Deliberately NOT `#[non_exhaustive]`**, unlike everything else in this
+/// crate's public vocabulary. `#[non_exhaustive]` forces every downstream match
+/// to carry a wildcard arm, and a wildcard arm over a soundness classification
+/// is a fail-open default waiting for a fifth variant. Adding a variant here
+/// *should* break `trust-clean-carrier` at compile time and make someone decide
+/// what it means — that is cheaper than a carrier map that silently sorts a new
+/// kind of extent into whatever its `_` arm happened to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CarrierExtent {
+    /// Exactly `2^bits` values, and arithmetic wraps at that modulus.
+    Bits(u32),
+    /// Unboundedly many values (`Nat`, `Int`). Never has a fixed-width carrier.
+    Unbounded,
+    /// Bounded, but by a width this compilation has not resolved (`USize`,
+    /// whose width is `System.Platform.numBits`).
+    TargetDependent,
+    /// Not a type of values at all (`Prop`, a `Sort`). A proposition is
+    /// observed, never produced.
+    NotAValue,
+}
+
+/// Whether the carrier's operations agree with the Clean type's, not merely its
+/// values.
+///
+/// Value-level injectivity is **not** sufficient and this enum is why. Clean
+/// `UInt8` embeds injectively into Rust `u64`, yet `UInt8.add 200 100 = 44`
+/// while `200u64 + 100u64 = 300`: a carrier faithful on values can still be
+/// unfaithful on arithmetic, and the emitted binary follows the arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[non_exhaustive]
+pub enum OperationAgreement {
+    /// Nobody established it. The default, and it discharges nothing.
+    #[default]
+    Unestablished,
+    /// Every operation of the Clean type is the carrier's operation on the
+    /// nose — same result for every input, including at the wrap boundary.
+    ExactOnEveryOperation,
+    /// The carrier is a **trusted runtime**: a Trust-owned implementation of
+    /// the Clean type's semantics, shipped and executed, whose agreement with
+    /// the kernel is **evidence, not proof** — this variant is a TCB row by
+    /// name (`docs/TCB.md`, "Bignum carrier runtime").
+    ///
+    /// Categorically different from [`Self::ExactOnEveryOperation`], which
+    /// states a same-wrap-modulus fact checkable from the two extents alone.
+    /// Here there is no modulus and nothing width-shaped to re-check: the claim
+    /// is that `trust_bignum::Nat` (crates/trust-bignum) implements Lean `Nat`
+    /// semantics exactly. The evidence class, stated honestly: (1)
+    /// hardware-referenced `u128` agreement tests
+    /// (crates/trust-bignum/tests/u64_agreement.rs, multi_limb.rs); (2)
+    /// hand-transcribed Lean semantics pinned as tests with clean-kernel source
+    /// citations (tests/lean_semantics.rs); (3) an **executed differential**
+    /// against the real `clean_kernel` reduction lanes — kernel `whnf` of
+    /// `Nat.add/sub/mul/div/mod/beq/ble` on randomized multi-limb literals
+    /// versus this runtime (tests/kernel_differential.rs, a dev-dependency
+    /// only; the shipped runtime stays independently authored and
+    /// zero-dependency). A semantic mismatch here is a WRONG BINARY the kernel
+    /// still accepts — which is why [`RepresentationObligation::discharge`]
+    /// additionally pins the exact `(clean_type, rust_carrier)` pairing and
+    /// refuses this agreement kind everywhere else.
+    TrustedRuntimeAgreement,
+}
+
+/// How wide a discharged carrier is: a fixed number of bits, or unbounded and
+/// exact via a trusted runtime.
+///
+/// **Deliberately NOT `#[non_exhaustive]`** — same rationale as
+/// [`CarrierExtent`]: a wildcard arm over a soundness classification is a
+/// fail-open default. A consumer that sizes a wire record or picks a rustc
+/// type by width must decide what "unbounded" means for it, at compile time,
+/// the day a variant is added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CarrierWidth {
+    /// Exactly this many bits, exact on every operation at that modulus.
+    Bits(u32),
+    /// Unbounded, exact on every value and operation **by trusted runtime**
+    /// ([`OperationAgreement::TrustedRuntimeAgreement`] — a TCB row, not a
+    /// proof).
+    UnboundedExact,
+}
+
+/// The exact `(clean_type, rust_carrier)` pairings a
+/// [`OperationAgreement::TrustedRuntimeAgreement`] discharge may witness —
+/// one entry per shipped trusted runtime, kept in lockstep with the
+/// `docs/TCB.md` carrier-runtime rows.
+///
+/// This table is what makes a witness for a pairing the runtime does not
+/// carry **unconstructible** rather than merely undeclared. Both `Nat` and
+/// `Int` honestly report [`CarrierExtent::Unbounded`], and
+/// [`RepresentationObligation::new`] is public — so without the pin, any
+/// unbounded/unbounded string pair stating `TrustedRuntimeAgreement` would
+/// discharge, though ℤ is not carried by a ℕ runtime. An unverified caller
+/// declaration may not shrink what the re-check is taken over (the
+/// single-writer rule, applied here).
+const TRUSTED_RUNTIME_CARRIERS: &[(&str, &str)] = &[("Nat", "trust_bignum::Nat")];
+
+/// The representation-faithfulness obligation, stated so that **this** crate
+/// can re-check it without an elaborator, a parser, or a kernel.
+///
+/// The producer (I4's `trust-clean-carrier`) supplies the facts; the re-check
+/// below decides whether those facts entail faithfulness. That division is the
+/// point. This crate cannot verify that `clean_extent` really is the extent of
+/// `clean_type` — it deliberately cannot name a Clean parser. What it *can* do,
+/// and does, is refuse to mint [`CarrierEvidence::Total`] for any obligation
+/// whose own statement does not entail a faithful carrier, which is exactly the
+/// `Nat → u64` case: an obligation that honestly reports
+/// [`CarrierExtent::Unbounded`] can never discharge at any **fixed width**.
+/// The sole unbounded lane (I6) is the pinned trusted-runtime pairing table
+/// [`TRUSTED_RUNTIME_CARRIERS`] — `Nat` at `trust_bignum::Nat` — which is a
+/// disclosed TCB row, not a width check, and is refused for every other pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepresentationObligation {
+    clean_type: String,
+    rust_carrier: String,
+    clean_extent: CarrierExtent,
+    rust_extent: CarrierExtent,
+    operations: OperationAgreement,
+}
+
+impl RepresentationObligation {
+    /// State the obligation.
+    #[must_use]
+    pub fn new(
+        clean_type: impl Into<String>,
+        rust_carrier: impl Into<String>,
+        clean_extent: CarrierExtent,
+        rust_extent: CarrierExtent,
+        operations: OperationAgreement,
+    ) -> Self {
+        Self {
+            clean_type: clean_type.into(),
+            rust_carrier: rust_carrier.into(),
+            clean_extent,
+            rust_extent,
+            operations,
+        }
+    }
+
+    /// The Clean type the obligation is about.
+    #[must_use]
+    pub fn clean_type(&self) -> &str {
+        &self.clean_type
+    }
+
+    /// The Rust carrier proposed for it.
+    #[must_use]
+    pub fn rust_carrier(&self) -> &str {
+        &self.rust_carrier
+    }
+
+    /// Discharge it, or say precisely which clause failed.
+    ///
+    /// Two arms, each fail-closed on the agreement KIND its extents require:
+    ///
+    /// * **Fixed-width** — both extents are [`CarrierExtent::Bits`], the two
+    ///   widths are **equal** (not `≤`: a narrowing truncates; a widening
+    ///   preserves values but changes the wrap modulus, and the binary follows
+    ///   the modulus), and the operations agree
+    ///   [`OperationAgreement::ExactOnEveryOperation`]. A fixed-width pairing
+    ///   claiming [`OperationAgreement::TrustedRuntimeAgreement`] is refused —
+    ///   a width fact is checkable here and must be checked, never trusted.
+    /// * **Trusted runtime (I6)** — both extents are
+    ///   [`CarrierExtent::Unbounded`], the `(clean_type, rust_carrier)` pair is
+    ///   in the pinned [`TRUSTED_RUNTIME_CARRIERS`] table, and the operations
+    ///   are stated [`OperationAgreement::TrustedRuntimeAgreement`]. The
+    ///   pairing pin comes FIRST: a witness for a pair no shipped runtime
+    ///   carries (`Int` at `trust_bignum::Nat`) is unconstructible whatever
+    ///   agreement was stated.
+    ///
+    /// Every other extent combination — mixed, target-dependent, non-value —
+    /// refuses via [`ObligationNotDischarged::NoFixedExtent`].
+    ///
+    /// # Errors
+    ///
+    /// [`ObligationNotDischarged`], naming the failing clause and the fix.
+    pub fn discharge(self) -> Result<CarrierWitness, ObligationNotDischarged> {
+        match (self.clean_extent, self.rust_extent) {
+            (CarrierExtent::Bits(clean_bits), CarrierExtent::Bits(rust_bits)) => {
+                if clean_bits != rust_bits {
+                    return Err(ObligationNotDischarged::ExtentMismatch {
+                        clean_type: self.clean_type,
+                        rust_carrier: self.rust_carrier,
+                        clean_bits,
+                        rust_bits,
+                    });
+                }
+                match self.operations {
+                    OperationAgreement::ExactOnEveryOperation => Ok(CarrierWitness {
+                        clean_type: self.clean_type,
+                        rust_carrier: self.rust_carrier,
+                        width: CarrierWidth::Bits(clean_bits),
+                    }),
+                    // A trusted-runtime claim on a FIXED-WIDTH pairing is the
+                    // wrong kind of evidence, not merely absent evidence: the
+                    // width fact is checkable, so trusting is refused.
+                    stated @ OperationAgreement::TrustedRuntimeAgreement => {
+                        Err(ObligationNotDischarged::WrongAgreementKind {
+                            clean_type: self.clean_type,
+                            rust_carrier: self.rust_carrier,
+                            stated,
+                            required: OperationAgreement::ExactOnEveryOperation,
+                        })
+                    }
+                    _ => Err(ObligationNotDischarged::OperationsUnestablished {
+                        clean_type: self.clean_type,
+                        rust_carrier: self.rust_carrier,
+                    }),
+                }
+            }
+            (CarrierExtent::Unbounded, CarrierExtent::Unbounded) => {
+                // THE PAIRING PIN, first. Both `Nat` and `Int` honestly report
+                // `Unbounded` and `RepresentationObligation::new` is public, so
+                // without this check any unbounded/unbounded string pair
+                // stating `TrustedRuntimeAgreement` would witness — including
+                // pairs no shipped runtime carries. Producer discipline in the
+                // carrier map is not a re-check.
+                if !TRUSTED_RUNTIME_CARRIERS
+                    .contains(&(self.clean_type.as_str(), self.rust_carrier.as_str()))
+                {
+                    return Err(ObligationNotDischarged::UntrustedRuntimePairing {
+                        clean_type: self.clean_type,
+                        rust_carrier: self.rust_carrier,
+                    });
+                }
+                match self.operations {
+                    OperationAgreement::TrustedRuntimeAgreement => Ok(CarrierWitness {
+                        clean_type: self.clean_type,
+                        rust_carrier: self.rust_carrier,
+                        width: CarrierWidth::UnboundedExact,
+                    }),
+                    OperationAgreement::Unestablished => {
+                        Err(ObligationNotDischarged::OperationsUnestablished {
+                            clean_type: self.clean_type,
+                            rust_carrier: self.rust_carrier,
+                        })
+                    }
+                    // `ExactOnEveryOperation` states a wrap-modulus fact, and
+                    // an unbounded type has no modulus: the statement itself is
+                    // ill-formed here, so it is refused as the wrong KIND
+                    // rather than folded into the trusted lane. (Any future
+                    // agreement variant lands here too — fail-closed.)
+                    stated => Err(ObligationNotDischarged::WrongAgreementKind {
+                        clean_type: self.clean_type,
+                        rust_carrier: self.rust_carrier,
+                        stated,
+                        required: OperationAgreement::TrustedRuntimeAgreement,
+                    }),
+                }
+            }
+            (clean_extent, rust_extent) => Err(ObligationNotDischarged::NoFixedExtent {
+                clean_type: self.clean_type,
+                rust_carrier: self.rust_carrier,
+                clean_extent,
+                rust_extent,
+            }),
+        }
+    }
+}
+
+/// Proof-of-discharge for one carrier. **The only thing that mints
+/// [`CarrierEvidence::Total`].**
+///
+/// Its fields are private and it has no public constructor: the sole way to
+/// obtain one is [`RepresentationObligation::discharge`], so a `CarrierWitness`
+/// in hand *is* the statement "the faithfulness obligation was stated and it
+/// passed the re-check".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarrierWitness {
+    clean_type: String,
+    rust_carrier: String,
+    width: CarrierWidth,
+}
+
+impl CarrierWitness {
+    /// The Clean type carried.
+    #[must_use]
+    pub fn clean_type(&self) -> &str {
+        &self.clean_type
+    }
+
+    /// The Rust carrier.
+    #[must_use]
+    pub fn rust_carrier(&self) -> &str {
+        &self.rust_carrier
+    }
+
+    /// The discharged width: a common fixed width, or unbounded-exact by
+    /// trusted runtime. (Replaces the old `bits() -> u32` — a hard rename, so
+    /// every consumer decides what "unbounded" means for it.)
+    #[must_use]
+    pub fn width(&self) -> CarrierWidth {
+        self.width
+    }
+}
+
+impl fmt::Display for CarrierWitness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.width {
+            CarrierWidth::Bits(bits) => write!(
+                f,
+                "{} carried by {} ({} bits, exact)",
+                self.clean_type, self.rust_carrier, bits
+            ),
+            CarrierWidth::UnboundedExact => write!(
+                f,
+                "{} carried by {} (unbounded, exact by trusted runtime)",
+                self.clean_type, self.rust_carrier
+            ),
+        }
+    }
+}
+
+/// Why the representation-faithfulness obligation did not discharge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ObligationNotDischarged {
+    /// One of the two types has no fixed number of bits.
+    NoFixedExtent {
+        /// The Clean type.
+        clean_type: String,
+        /// The proposed Rust carrier.
+        rust_carrier: String,
+        /// What the Clean type's extent was stated to be.
+        clean_extent: CarrierExtent,
+        /// What the Rust carrier's extent was stated to be.
+        rust_extent: CarrierExtent,
+    },
+    /// Both are fixed-width, but the widths differ.
+    ExtentMismatch {
+        /// The Clean type.
+        clean_type: String,
+        /// The proposed Rust carrier.
+        rust_carrier: String,
+        /// The Clean type's width.
+        clean_bits: u32,
+        /// The carrier's width.
+        rust_bits: u32,
+    },
+    /// The widths line up but nobody established that the operations do.
+    OperationsUnestablished {
+        /// The Clean type.
+        clean_type: String,
+        /// The proposed Rust carrier.
+        rust_carrier: String,
+    },
+    /// The agreement KIND stated is not the kind this pairing's extents
+    /// require: a fixed-width pairing claiming a trusted runtime (a checkable
+    /// fact must be checked, never trusted), or an unbounded pairing claiming
+    /// a wrap-modulus fact (there is no modulus to state).
+    WrongAgreementKind {
+        /// The Clean type.
+        clean_type: String,
+        /// The proposed Rust carrier.
+        rust_carrier: String,
+        /// The agreement the obligation stated.
+        stated: OperationAgreement,
+        /// The agreement kind this pairing's extents require.
+        required: OperationAgreement,
+    },
+    /// An unbounded/unbounded pairing outside the pinned
+    /// [`TRUSTED_RUNTIME_CARRIERS`] table: no shipped trusted runtime carries
+    /// it, so a trusted-runtime discharge is unconstructible for it — `Int` at
+    /// `trust_bignum::Nat` is the canonical instance (ℤ is not carried by a ℕ
+    /// runtime, though both honestly report `Unbounded`).
+    UntrustedRuntimePairing {
+        /// The Clean type.
+        clean_type: String,
+        /// The proposed Rust carrier.
+        rust_carrier: String,
+    },
+}
+
+impl fmt::Display for ObligationNotDischarged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoFixedExtent { clean_type, rust_carrier, clean_extent, rust_extent } => write!(
+                f,
+                "`{clean_type}` has no faithful `{rust_carrier}` carrier: its extent is \
+                 {clean_extent:?} and the carrier's is {rust_extent:?}, so no total map \
+                 exists — the carrier would have to truncate, and a truncating carrier \
+                 emits a wrong binary that the kernel still accepts.\n\
+                 options: (1) give the declaration a fixed-width Clean type (`UInt8`, \
+                 `UInt16`, `UInt32`, `UInt64`, `Bool`) and take the exact carrier; \
+                 (2) keep it PROOF-only — an unbounded or dependent type keeps PROOF and \
+                 loses CALL, and is never approximated; (3) if the value is genuinely \
+                 unbounded, drop the fixed-width request and take the default carrier — \
+                 `Nat` is carried by `trust_bignum::Nat`, exactly and unboundedly, with \
+                 no source change"
+            ),
+            Self::ExtentMismatch { clean_type, rust_carrier, clean_bits, rust_bits } => write!(
+                f,
+                "`{clean_type}` is {clean_bits} bits and `{rust_carrier}` is {rust_bits} \
+                 bits, so the carrier is not exact. A narrowing truncates; a widening \
+                 keeps every value but changes the wrap modulus, and the emitted \
+                 arithmetic follows the modulus.\n\
+                 options: (1) request the exact carrier for a {clean_bits}-bit Clean \
+                 type; (2) change the Clean type to the {rust_bits}-bit one, so both \
+                 sides agree by construction; (3) keep it PROOF-only"
+            ),
+            Self::OperationsUnestablished { clean_type, rust_carrier } => write!(
+                f,
+                "`{clean_type}` and `{rust_carrier}` are the same width, but nobody \
+                 established that their operations agree — equal cardinality is not \
+                 representation faithfulness.\n\
+                 options: (1) supply `OperationAgreement::ExactOnEveryOperation` from a \
+                 carrier map that models the type's arithmetic; (2) keep it PROOF-only"
+            ),
+            Self::WrongAgreementKind { clean_type, rust_carrier, stated, required } => write!(
+                f,
+                "`{clean_type}` at `{rust_carrier}` stated the wrong KIND of operation \
+                 agreement: {stated:?}, where this pairing's extents require \
+                 {required:?}. A fixed-width pairing must state the checkable \
+                 wrap-modulus fact — a checkable fact is checked, never trusted; an \
+                 unbounded pairing has no modulus to state and can only be carried by \
+                 a trusted runtime, disclosed as such.\n\
+                 options: (1) state {required:?} from a carrier map that actually \
+                 establishes it for this pairing; (2) keep the declaration PROOF-only; \
+                 (3) if this is a new runtime-carried pairing, extend the trusted \
+                 runtime AND the pinned pairing table AND the docs/TCB.md row \
+                 together — extending capability extends the CHECK, never trust (v7/D2)"
+            ),
+            Self::UntrustedRuntimePairing { clean_type, rust_carrier } => write!(
+                f,
+                "`{clean_type}` at `{rust_carrier}`: both are unbounded, but no shipped \
+                 trusted runtime carries this pairing, so the trusted-runtime discharge \
+                 is refused. Unbounded extents alone do not make a carrier — `Int` at \
+                 `trust_bignum::Nat` is the canonical wrong pair: a natural-number \
+                 runtime carries no negative value, and the emitted binary would follow \
+                 the runtime.\n\
+                 options: (1) if the value is a natural number, declare it `Nat` and \
+                 take the pinned carrier `trust_bignum::Nat`; (2) keep the declaration \
+                 PROOF-only, where an unbounded type is free; (3) if this pairing should \
+                 be carried, ship its runtime and extend the pinned table AND the \
+                 docs/TCB.md row together — extending capability extends the CHECK, \
+                 never trust (v7/D2)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObligationNotDischarged {}
 
 // ---------------------------------------------------------------------------
 // Term digest
@@ -923,10 +1586,17 @@ pub enum KernelStatus {
     /// environment by `crates/trust-clean`'s R functor (I2).
     ///
     /// Distinct from [`KernelStatus::KernelChecked`] on purpose: the
-    /// reflection is TCB (`docs/TCB.md` row "Clean-origin faithfulness
-    /// reflection"), and the status has to say so rather than let a reflected
-    /// carrier be cited where a kernel-checked declaration is required. I2's
-    /// control is exactly that refusal.
+    /// reflection is TCB, and the status has to say so rather than let a
+    /// reflected carrier be cited where a kernel-checked declaration is
+    /// required. I2's control is exactly that refusal, and
+    /// [`KernelStatus::require_kernel_check`] is the seam that performs it.
+    ///
+    /// Where the trust actually sits, in `docs/TCB.md` terms: the reflection is
+    /// the "construction of the goal" clause of the `EnsuresCitationDischarge`
+    /// row — *"that the goal really is the authored clause with `result` bound
+    /// to the E6-imported defining equation"*. The kernel re-checks the cited
+    /// theorem against that goal; nothing re-checks that the imported constant
+    /// denotes the Rust `fn` it was minted from.
     Reflected,
     /// The Clean CIC kernel re-checked this declaration's own obligation.
     ///
@@ -1007,7 +1677,123 @@ impl KernelStatus {
             Self::KernelChecked(_) => "kernel-checked",
         }
     }
+
+    /// Whether this symbol is a reflected Rust carrier (I2).
+    #[must_use]
+    pub fn is_reflected(&self) -> bool {
+        matches!(self, Self::Reflected)
+    }
+
+    /// Demand a kernel re-check **at a citation site**, and refuse anything
+    /// else.
+    ///
+    /// This is I2's enforcement seam. The decision of record
+    /// (`docs/design/2026-08-04-two-language-compiler-architecture.md` §7)
+    /// states the control this method exists to pass: *"a `Reflected` symbol
+    /// cited where `KernelChecked` is required must be REFUSED, not silently
+    /// accepted."*
+    ///
+    /// The reason it cannot be a `matches!` at each call site is the reason
+    /// [`Certification`] is not an enum variant: the refusal has to *explain
+    /// itself*, and the explanation for a reflected carrier is specific —
+    /// the kernel checked that the carrier's body inhabits its type, and never
+    /// checked that the carrier **denotes** the Rust item, because that
+    /// correspondence is asserted by the compiler and is TCB. A caller that
+    /// accepts a `Reflected` symbol here reports a claim the kernel never made.
+    ///
+    /// Fail-closed by construction: every non-`KernelChecked` status — including
+    /// any variant added later, since the enum is `#[non_exhaustive]` — refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelCheckRequired`] whenever the kernel did not re-check this
+    /// declaration's own obligation.
+    pub fn require_kernel_check(
+        &self,
+        cited_as: &str,
+    ) -> Result<&KernelVerdict, KernelCheckRequired> {
+        match self {
+            Self::KernelChecked(verdict) => Ok(verdict),
+            other => Err(KernelCheckRequired {
+                cited_as: cited_as.to_string(),
+                status: other.name(),
+                reflected: other.is_reflected(),
+            }),
+        }
+    }
 }
+
+/// A symbol was cited where a Clean CIC kernel re-check is required, and it
+/// does not carry one.
+///
+/// Produced only by [`KernelStatus::require_kernel_check`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelCheckRequired {
+    cited_as: String,
+    status: &'static str,
+    reflected: bool,
+}
+
+impl KernelCheckRequired {
+    /// The name as it was cited.
+    #[must_use]
+    pub fn cited_as(&self) -> &str {
+        &self.cited_as
+    }
+
+    /// The wire name of the status the symbol actually carries.
+    #[must_use]
+    pub fn status_name(&self) -> &'static str {
+        self.status
+    }
+
+    /// Whether the refused symbol was a reflected Rust carrier — the I2 case,
+    /// which gets the reflection-specific explanation.
+    #[must_use]
+    pub fn is_reflected(&self) -> bool {
+        self.reflected
+    }
+}
+
+impl fmt::Display for KernelCheckRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { cited_as, status, reflected } = self;
+        write!(
+            f,
+            "`{cited_as}` is a `{status}` symbol, but this position requires a \
+             declaration the Clean CIC kernel re-checked (`kernel-checked`)."
+        )?;
+        if *reflected {
+            write!(
+                f,
+                " A reflected symbol is a Rust item projected into the Clean \
+                 environment by the compiler (I2): the kernel checked that the \
+                 carrier's body inhabits its type, but it never re-checked that \
+                 the carrier DENOTES the Rust item — that correspondence is \
+                 asserted by the compiler and is TCB (`docs/TCB.md`).\n\
+                 options: (1) cite the Clean declaration this position is for — \
+                 a `def` written in a `clean {{ … }}` island, which the kernel \
+                 does re-check; (2) if you meant to reason ABOUT the Rust item, \
+                 state a Clean `theorem` over the reflected carrier and cite \
+                 THAT theorem: the theorem is kernel-checked even though the \
+                 carrier it mentions is not; (3) keep the reflected carrier and \
+                 use it where a reflected carrier is what is required — a spec \
+                 call site — where it is admitted and reported without a \
+                 kernel-check claim"
+            )
+        } else {
+            write!(
+                f,
+                "\noptions: (1) let the kernel re-check it — a `{status}` symbol \
+                 has not reached the certification audit yet; (2) cite a \
+                 declaration that has; (3) keep it and accept a row that is not \
+                 reported Certified"
+            )
+        }
+    }
+}
+
+impl std::error::Error for KernelCheckRequired {}
 
 /// The three tiers a status can report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1127,9 +1913,20 @@ mod sealed {
 /// This crate cannot name the kernel — that is the point of §5(a)'s structural
 /// layer — so it cannot itself verify that whoever calls
 /// [`CicKernelRecheck::held_by_kernel_recheck`] really holds a kernel return
-/// value. That last step is a review obligation on exactly **one** call site
-/// (`trust-clean-env`, the only crate in the tree that links `clean-kernel` and
-/// this crate together), which is the smallest surface it can be reduced to.
+/// value. That last step is a review obligation on the call sites that link
+/// `clean-kernel` and this crate together, which is the smallest surface it can
+/// be reduced to. Today that is **one** site, and it is enumerated here so the
+/// count cannot drift silently:
+///
+/// * `trust_certify::clean_island::admit_certified_island_definition` (I2) —
+///   mints the status for a Clean island `def` after `cert_meter::grade`
+///   returns `Certified`. Reviewed against the three clauses below at the call
+///   site itself.
+///
+/// `trust-clean-env` (the planned I1 crate) will be the second when it lands.
+/// A reflected Rust carrier is deliberately **not** on this list: it gets
+/// [`KernelStatus::Reflected`], which any crate may set, precisely because the
+/// reflection is TCB.
 ///
 /// It is deliberately **not** a cargo feature. Cargo unifies features across a
 /// build, so a `kernel-authority` feature enabled by `trust-clean-env` would be
@@ -1235,6 +2032,10 @@ pub struct SymbolHeader {
     producer: Producer,
     capability: Capability,
     carrier: CarrierEvidence,
+    /// The discharge that justified `carrier == Total`, kept for audit. `None`
+    /// for every other carrier state, and the two move together: `Total` is set
+    /// only by `with_total_carrier`, which sets this at the same time.
+    carrier_witness: Option<CarrierWitness>,
     status: KernelStatus,
 }
 
@@ -1251,6 +2052,7 @@ impl SymbolHeader {
             producer,
             capability: Capability::Proof,
             carrier: CarrierEvidence::None,
+            carrier_witness: None,
             status: KernelStatus::Parsed,
         }
     }
@@ -1305,10 +2107,41 @@ impl SymbolHeader {
         self
     }
 
-    /// Record carrier evidence (I4).
+    /// The discharge that justified a `Total` carrier, if there is one.
+    ///
+    /// `Some` exactly when [`Self::carrier`] is [`CarrierEvidence::Total`].
     #[must_use]
-    pub fn with_carrier(mut self, carrier: CarrierEvidence) -> Self {
-        self.carrier = carrier;
+    pub fn carrier_witness(&self) -> Option<&CarrierWitness> {
+        self.carrier_witness.as_ref()
+    }
+
+    /// Record carrier evidence that needs no witness (I4).
+    ///
+    /// [`CarrierEvidence::Total`] is **not expressible here** — the parameter
+    /// is [`UnwitnessedCarrier`], which has no `Total` variant. That is the
+    /// whole mechanism: the value that grants CALL cannot be assigned, only
+    /// witnessed. Use [`Self::with_total_carrier`].
+    ///
+    /// Recording an unwitnessed carrier over a witnessed one also drops the
+    /// witness, so the pair can never disagree.
+    #[must_use]
+    pub fn with_carrier(mut self, carrier: UnwitnessedCarrier) -> Self {
+        self.carrier = carrier.into();
+        self.carrier_witness = None;
+        self
+    }
+
+    /// Record a carrier whose representation-faithfulness obligation is
+    /// discharged (I4) — the **only** route to [`CarrierEvidence::Total`] and
+    /// therefore the only route to CALL.
+    ///
+    /// The witness is retained on the header so that an audit can ask *which*
+    /// obligation justified the capability, rather than finding a bare enum
+    /// value with no provenance.
+    #[must_use]
+    pub fn with_total_carrier(mut self, witness: CarrierWitness) -> Self {
+        self.carrier = CarrierEvidence::Total;
+        self.carrier_witness = Some(witness);
         self
     }
 
@@ -1402,16 +2235,225 @@ impl fmt::Display for CapabilityRefused {
                  composed with a `u64 -> Nat` admission is definitionally \
                  equal while the emitted code wraps.\n\
                  options: (1) give the declaration a fixed-width Clean type \
-                 whose carrier is total (I5's first fragment); (2) wait for \
-                 the bignum carrier (I6), which closes this without any source \
-                 change; (3) keep it PROOF-only — a dependent or unbounded \
-                 type keeps PROOF and loses CALL, and is never approximated"
+                 whose carrier is total (I5's first fragment); (2) if the \
+                 value is a genuinely unbounded natural, declare it `Nat` — \
+                 the I6 bignum carrier `trust_bignum::Nat` carries `Nat` \
+                 exactly and unboundedly, with no width to pick; (3) keep it \
+                 PROOF-only — a dependent or unbounded type keeps PROOF and \
+                 loses CALL, and is never approximated"
             ),
         }
     }
 }
 
 impl std::error::Error for CapabilityRefused {}
+
+/// What one declaration references, or the admission that we do not know.
+///
+/// Shaped like [`AxiomClosure`] on purpose: `Recorded(∅)` — "we looked and it
+/// references nothing" — and `Unrecorded` — "nobody looked" — are different
+/// facts, and collapsing them is how a closure silently becomes a promise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReferenceSet {
+    /// The producer enumerated this declaration's references. An empty set is
+    /// a positive finding: a leaf.
+    Recorded(BTreeSet<SymbolId>),
+    /// No producer enumerated them. Poisons the closure.
+    Unrecorded,
+}
+
+impl ReferenceSet {
+    /// A recorded, audited-empty reference set — a leaf declaration.
+    #[must_use]
+    pub fn leaf() -> Self {
+        Self::Recorded(BTreeSet::new())
+    }
+}
+
+impl Default for ReferenceSet {
+    /// [`ReferenceSet::Unrecorded`]. A `#[derive(Default)]` downstream must not
+    /// be able to mint a leaf by omission — same reason
+    /// [`AxiomClosure::default`] is `unrecorded`.
+    fn default() -> Self {
+        Self::Unrecorded
+    }
+}
+
+/// Why a symbol may be observed but not executed.
+///
+/// One spelling of the refusal, in the crate that owns the lattice, so the
+/// elaborator and any future CALL-position consumer cannot drift into two
+/// different sentences about one rule. The wording is mandated: **"visible but
+/// not executable"**, never "not found" — the symbol *is* found, and saying
+/// otherwise sends the reader to look for a typo that is not there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProofOnlyRefusal {
+    /// The symbol itself grants PROOF only.
+    Declared {
+        /// The symbol, as the use site spelled it.
+        symbol: String,
+    },
+    /// The symbol grants CALL, but its reference closure reaches something
+    /// that does not.
+    Transitive {
+        /// The symbol, as the use site spelled it.
+        symbol: String,
+        /// A proof-only symbol reachable from it. One witness, not the set —
+        /// the first one is what the reader has to fix.
+        via: String,
+    },
+    /// The reference closure is incomplete, so no CALL claim can be made.
+    ClosureUnrecorded {
+        /// The symbol, as the use site spelled it.
+        symbol: String,
+    },
+}
+
+impl ProofOnlyRefusal {
+    /// The symbol the refusal is about, as spelled by the use site.
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Declared { symbol }
+            | Self::Transitive { symbol, .. }
+            | Self::ClosureUnrecorded { symbol } => symbol,
+        }
+    }
+}
+
+impl fmt::Display for ProofOnlyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Declared { symbol } => write!(
+                f,
+                "`{symbol}` is visible but not executable: it is a PROOF-only \
+                 declaration, and this position needs a value. Observation \
+                 grants no executable authority — that is what makes total \
+                 proof visibility sound, so this is a capability refusal and \
+                 NOT a name-resolution failure; the declaration is right where \
+                 you think it is.\n\
+                 options: (1) name it from a proof position instead — a \
+                 `requires`/`ensures` clause or a `clean {{ … }}` island may \
+                 name it with no annotation at all, including private \
+                 internals; (2) if you need the value, give the declaration a \
+                 total Rust carrier so CALL can be granted (increment I4 \
+                 mints the carrier, I5 the `DefId`); (3) state the property \
+                 you wanted through the declaration's operational relation and \
+                 keep the executable path in Rust"
+            ),
+            Self::Transitive { symbol, via } => write!(
+                f,
+                "`{symbol}` is visible but not executable: it is PROOF-only \
+                 transitively, because its reference closure reaches the \
+                 PROOF-only `{via}`. A declaration is at most as executable as \
+                 the weakest thing it references — a proof-only edge can never \
+                 emit a call or a load, feed const evaluation, determine \
+                 layout, dispatch or monomorphization, or discharge an unsafe \
+                 obligation, and that restriction is inherited by everything \
+                 built on it.\n\
+                 options: (1) name `{symbol}` from a proof position, where the \
+                 whole closure is observable; (2) make `{via}` executable — it \
+                 is the binding edge, and granting it CALL lifts `{symbol}` \
+                 with no other change; (3) split `{symbol}` so the executable \
+                 half does not reference `{via}`"
+            ),
+            Self::ClosureUnrecorded { symbol } => write!(
+                f,
+                "`{symbol}` is visible but not executable: its reference \
+                 closure is INCOMPLETE, so no CALL claim can be made about it. \
+                 This is not a finding that `{symbol}` is proof-only — it is \
+                 the refusal to guess. A closure is only as good as its worst \
+                 component, so an unrecorded edge poisons the answer rather \
+                 than being assumed benign.\n\
+                 options: (1) record the declaration's references (a leaf \
+                 records `ReferenceSet::leaf()`, which is a positive finding \
+                 and not the same as recording nothing); (2) name it from a \
+                 proof position, which needs no closure at all because \
+                 observation grants no executable authority; (3) if the \
+                 producer genuinely cannot enumerate references for this sort \
+                 of declaration, it keeps PROOF — that is the fail-closed \
+                 state and it is never widened by default"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProofOnlyRefusal {}
+
+/// The transitive proof-only firewall, computed (I3).
+///
+/// One [`EffectiveCapability`] per symbol, being the meet of the symbol's own
+/// declared capability with the effective capability of everything reachable
+/// from it. Built by [`SymbolGraph::capability_closure`]; there is no
+/// constructor that takes a map, because a closure someone assembled by hand
+/// is a promise, and this type exists to not be one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityClosure {
+    effective: BTreeMap<SymbolId, EffectiveCapability>,
+    /// The proof-only witness for each transitively-demoted symbol.
+    witness: BTreeMap<SymbolId, SymbolId>,
+}
+
+impl CapabilityClosure {
+    /// The effective capability of `id`.
+    ///
+    /// A symbol the graph never saw answers [`EffectiveCapability::Unrecorded`]
+    /// rather than `None`: a consumer that cannot determine a capability must
+    /// refuse, and an `Option` invites `unwrap_or(Call)`.
+    #[must_use]
+    pub fn effective(&self, id: &SymbolId) -> EffectiveCapability {
+        self.effective.get(id).copied().unwrap_or(EffectiveCapability::Unrecorded)
+    }
+
+    /// Whether `id` may never emit a call or a load.
+    #[must_use]
+    pub fn is_proof_only(&self, id: &SymbolId) -> bool {
+        self.effective(id).is_proof_only()
+    }
+
+    /// Every row, in path order.
+    pub fn rows(&self) -> impl Iterator<Item = (&SymbolId, EffectiveCapability)> {
+        self.effective.iter().map(|(id, capability)| (id, *capability))
+    }
+
+    /// Enforce the firewall at a use site.
+    ///
+    /// `use_site` is the capability the *position* holds — PROOF for a spec
+    /// clause or a `clean { … }` island, CALL for anything that will emit a
+    /// call, a load, a const evaluation or a layout decision. `spelled` is how
+    /// the use site named the symbol, so the refusal quotes the user's text.
+    ///
+    /// # Errors
+    ///
+    /// [`ProofOnlyRefusal`] when the position needs CALL and the closure does
+    /// not grant it. A PROOF use site never errors — §4.1.1 gives it total
+    /// observer capability, and that is control (b) of I3.
+    pub fn require(
+        &self,
+        id: &SymbolId,
+        use_site: Capability,
+        spelled: &str,
+    ) -> Result<(), ProofOnlyRefusal> {
+        let effective = self.effective(id);
+        if use_site.observes_at_least(effective.claimable()) {
+            return Ok(());
+        }
+        Err(match effective {
+            EffectiveCapability::Unrecorded => {
+                ProofOnlyRefusal::ClosureUnrecorded { symbol: spelled.to_string() }
+            }
+            EffectiveCapability::Determined(_) => match self.witness.get(id) {
+                Some(via) => ProofOnlyRefusal::Transitive {
+                    symbol: spelled.to_string(),
+                    via: via.path().to_string(),
+                },
+                None => ProofOnlyRefusal::Declared { symbol: spelled.to_string() },
+            },
+        })
+    }
+}
 
 /// Two declarations claimed one name in one namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1486,9 +2528,21 @@ impl std::error::Error for UnknownSymbol {}
 /// load-bearing**. A `BTreeMap` keyed on [`SymbolId`] has no order to be
 /// load-bearing about; the property is pinned by
 /// `declaration_order_does_not_change_the_graph` below.
+///
+/// # I3 — it is a graph now, and the edges are what the firewall runs on
+///
+/// Before I3 this type was a `BTreeMap` with a graph's name: it stored headers
+/// and no relation, so "proof-private references are tagged proof-only,
+/// **transitively**" had nothing to be transitive over. `references` is that
+/// relation. It is kept beside `headers` rather than inside [`SymbolHeader`]
+/// because a header is phase-1 information — available before any body is
+/// elaborated — whereas what a declaration references is phase-2 information,
+/// and a field that is `Unrecorded` for the entire first phase invites a reader
+/// to treat `Unrecorded` as "not yet" rather than as "refuse".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SymbolGraph {
     headers: BTreeMap<SymbolId, SymbolHeader>,
+    references: BTreeMap<SymbolId, ReferenceSet>,
 }
 
 impl SymbolGraph {
@@ -1566,6 +2620,126 @@ impl SymbolGraph {
         self.headers.is_empty()
     }
 
+    /// Phase 2: record what `id` references.
+    ///
+    /// An empty `refs` is a **positive finding** — this declaration is a leaf —
+    /// and is not the same as never calling this method, which leaves the
+    /// symbol [`ReferenceSet::Unrecorded`] and poisons every closure through
+    /// it. That asymmetry is the whole fail-closed rule; see
+    /// [`SymbolGraph::capability_closure`].
+    ///
+    /// References to symbols the graph has no header for are accepted and
+    /// recorded: they are not a caller error, they are a *finding*, and the
+    /// closure turns them into [`EffectiveCapability::Unrecorded`] there. A
+    /// producer that had to drop an unknown edge to satisfy this method would
+    /// be recording a smaller, cleaner, wrong closure.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownSymbol`] if phase 1 never saw `id` itself.
+    pub fn record_references<I>(&mut self, id: &SymbolId, refs: I) -> Result<(), UnknownSymbol>
+    where
+        I: IntoIterator<Item = SymbolId>,
+    {
+        if !self.headers.contains_key(id) {
+            return Err(UnknownSymbol { id: id.clone() });
+        }
+        self.references.insert(id.clone(), ReferenceSet::Recorded(refs.into_iter().collect()));
+        Ok(())
+    }
+
+    /// What `id` references. A symbol phase 2 never spoke about answers
+    /// [`ReferenceSet::Unrecorded`].
+    #[must_use]
+    pub fn references(&self, id: &SymbolId) -> &ReferenceSet {
+        const UNRECORDED: &ReferenceSet = &ReferenceSet::Unrecorded;
+        self.references.get(id).unwrap_or(UNRECORDED)
+    }
+
+    /// Compute the transitive proof-only firewall (I3).
+    ///
+    /// The equation, stated once so the loop below is only its implementation:
+    ///
+    /// ```text
+    ///   eff(s) = declared(s) ⊓ ⨅ { eff(t) | t ∈ refs(s) }
+    /// ```
+    ///
+    /// with `⊓` [`EffectiveCapability::meet`], `refs(s) = Unrecorded` and any
+    /// `t` with no header both yielding [`EffectiveCapability::Unrecorded`],
+    /// which is absorbing. Read plainly: **a declaration is at most as
+    /// executable as the weakest thing it references, and not knowing what it
+    /// references is worse than knowing something bad.**
+    ///
+    /// Computed as a greatest fixpoint descending from the declared
+    /// capabilities. That polarity matters: starting at the top and descending
+    /// makes a **cycle** — two mutually-referencing declarations — settle at
+    /// the meet of the cycle rather than deadlock or default to `Call`, so a
+    /// recursive `def` is handled by the algorithm and not by a special case.
+    /// The chain has height 3 (`Unrecorded < Proof < Call`), so the loop
+    /// converges in at most `len` rounds; the bound is asserted rather than
+    /// assumed.
+    #[must_use]
+    pub fn capability_closure(&self) -> CapabilityClosure {
+        let mut effective: BTreeMap<SymbolId, EffectiveCapability> = self
+            .headers
+            .iter()
+            .map(|(id, header)| (id.clone(), EffectiveCapability::Determined(header.capability)))
+            .collect();
+        let mut witness: BTreeMap<SymbolId, SymbolId> = BTreeMap::new();
+
+        // Descend to the fixpoint. `len + 1` rounds is a strict upper bound:
+        // each round that changes anything lowers at least one symbol along a
+        // 3-high chain, and the extra round is the one that observes stability.
+        for _ in 0..=self.headers.len() {
+            let mut changed = false;
+            for id in self.headers.keys() {
+                let declared = EffectiveCapability::Determined(self.headers[id].capability);
+                let (folded, found) = match self.references(id) {
+                    ReferenceSet::Unrecorded => (EffectiveCapability::Unrecorded, None),
+                    ReferenceSet::Recorded(refs) => {
+                        let mut acc = declared;
+                        let mut first_proof_only = None;
+                        for target in refs {
+                            let target_effective = match effective.get(target) {
+                                Some(value) => *value,
+                                // An edge to a symbol with no header: we know
+                                // the edge exists and nothing about where it
+                                // goes. Poison, do not skip.
+                                None => EffectiveCapability::Unrecorded,
+                            };
+                            if first_proof_only.is_none() && target_effective.is_proof_only() {
+                                first_proof_only = Some(target.clone());
+                            }
+                            acc = acc.meet(target_effective);
+                        }
+                        (acc, first_proof_only)
+                    }
+                };
+                if effective[id] != folded {
+                    effective.insert(id.clone(), folded);
+                    changed = true;
+                }
+                // Record the witness only when the symbol's OWN capability was
+                // adequate and an edge is what removed it — otherwise the
+                // refusal would blame a neighbour for a local decision.
+                if declared.permits(Capability::Call) && folded.is_proof_only() {
+                    if let Some(via) = found {
+                        witness.insert(id.clone(), via);
+                    }
+                }
+            }
+            if !changed {
+                return CapabilityClosure { effective, witness };
+            }
+        }
+        // Unreachable for a 3-high chain; if the lattice ever grows, this is
+        // the fail-closed exit rather than a silently truncated iteration.
+        CapabilityClosure {
+            effective: effective.into_keys().map(|id| (id, EffectiveCapability::Unrecorded)).collect(),
+            witness: BTreeMap::new(),
+        }
+    }
+
     /// Every kernel-checked-but-assumption-bearing row, with its disclosure.
     ///
     /// This is the surface the binding rule names: the assumptions are
@@ -1634,18 +2808,62 @@ impl SymbolGraph {
 /// };
 /// ```
 ///
-/// # 4. The positive control — this one MUST compile
+/// # 4. `CarrierEvidence::Total` cannot be assigned (I4)
 ///
-/// If the three above failed for an unrelated reason (a typo, a renamed item)
+/// The carrier seam is the same shape as the kernel seam one layer down, and
+/// it matters more: a false `KernelChecked` costs a wrong *claim*, a false
+/// `Total` costs a wrong *binary*. `with_carrier` takes an
+/// [`UnwitnessedCarrier`], which has no `Total` variant, so the assignment is
+/// not a review item — it is a type error.
+///
+/// ```compile_fail,E0308
+/// use trust_symbols::{CarrierEvidence, Producer, SegmentPath, Sort, SymbolHeader};
+///
+/// let path = SegmentPath::parse_rust("crate::f").unwrap();
+/// let _ = SymbolHeader::new(path, Sort::Term, Producer::Clean)
+///     .with_carrier(CarrierEvidence::Total);
+/// ```
+///
+/// # 5. `CarrierWitness` cannot be written as a literal
+///
+/// The other way in is to build the witness directly. Its fields are private
+/// and it has no public constructor: `RepresentationObligation::discharge` is
+/// the only producer.
+///
+/// ```compile_fail,E0451
+/// let _ = trust_symbols::CarrierWitness {
+///     clean_type: "Nat".into(),
+///     rust_carrier: "u64".into(),
+///     width: trust_symbols::CarrierWidth::Bits(64),
+/// };
+/// ```
+///
+/// # 6. The positive control — this one MUST compile
+///
+/// If the five above failed for an unrelated reason (a typo, a renamed item)
 /// they would still "pass", so the same API is exercised positively here. A
 /// `compile_fail` block without this partner is not evidence.
 ///
 /// ```
-/// use trust_symbols::{AxiomClosure, CicKernelRecheck, KernelAuthority, TermDigest};
+/// use trust_symbols::{
+///     AxiomClosure, CarrierExtent, CarrierWidth, CicKernelRecheck, KernelAuthority,
+///     OperationAgreement, RepresentationObligation, TermDigest,
+/// };
 ///
 /// let authority = CicKernelRecheck::held_by_kernel_recheck();
 /// let status = authority.kernel_checked(TermDigest::of_bytes(b"term"), AxiomClosure::audited([]));
 /// assert!(status.is_certified());
+///
+/// let witness = RepresentationObligation::new(
+///     "UInt64",
+///     "u64",
+///     CarrierExtent::Bits(64),
+///     CarrierExtent::Bits(64),
+///     OperationAgreement::ExactOnEveryOperation,
+/// )
+/// .discharge()
+/// .expect("exact carrier");
+/// assert_eq!(witness.width(), CarrierWidth::Bits(64));
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct CompileFailControls;
@@ -1669,6 +2887,24 @@ mod tests {
     fn certified_status() -> KernelStatus {
         CicKernelRecheck::held_by_kernel_recheck()
             .kernel_checked(TermDigest::of_bytes(b"t"), AxiomClosure::audited([]))
+    }
+
+    /// The one discharged carrier obligation these tests use: Clean `UInt64`
+    /// carried by Rust `u64`, exact on both extent and operations.
+    ///
+    /// It goes through `discharge()` rather than being fabricated, so every
+    /// test that reaches `CarrierEvidence::Total` below reaches it the same way
+    /// production code must.
+    fn uint64_witness() -> CarrierWitness {
+        RepresentationObligation::new(
+            "UInt64",
+            "u64",
+            CarrierExtent::Bits(64),
+            CarrierExtent::Bits(64),
+            OperationAgreement::ExactOnEveryOperation,
+        )
+        .discharge()
+        .expect("UInt64 -> u64 is exact on extent and operations")
     }
 
     // -- Paths ------------------------------------------------------------
@@ -1886,6 +3122,60 @@ mod tests {
         });
     }
 
+    /// **I2's control at the vocabulary level.** A `Reflected` symbol cited
+    /// where a kernel re-check is required must be REFUSED, and the refusal
+    /// must name the reflection specifically — "unsupported" with no next step
+    /// is a defect (v7/D3).
+    #[test]
+    fn a_reflected_symbol_is_refused_where_a_kernel_check_is_required() {
+        let reflected = KernelStatus::Reflected;
+        let refusal = reflected
+            .require_kernel_check("trust_import_crate__min2")
+            .expect_err("a reflected carrier must be refused where KernelChecked is required");
+        assert_eq!(refusal.status_name(), "reflected");
+        assert!(refusal.is_reflected());
+        assert_eq!(refusal.cited_as(), "trust_import_crate__min2");
+        let text = refusal.to_string();
+        assert!(text.contains("TCB"), "the refusal must say why: {text}");
+        assert!(text.contains("options:"), "v7/D3: the refusal carries the fix: {text}");
+
+        // Every other non-kernel-checked status refuses too — fail-closed is
+        // the `_` arm, not an enumeration that a new variant can slip past.
+        for status in [KernelStatus::Parsed, KernelStatus::Elaborated] {
+            let refusal = status.require_kernel_check("x").expect_err("must refuse");
+            assert!(!refusal.is_reflected());
+            assert!(refusal.to_string().contains("options:"));
+        }
+
+        // And the kernel-checked one is admitted, carrying its verdict.
+        let checked = certified_status();
+        let verdict = checked.require_kernel_check("island_def").expect("kernel-checked passes");
+        assert!(verdict.closure().is_audited_empty());
+        assert!(!checked.is_reflected());
+    }
+
+    /// A reflected carrier is never Certified and never CALL-able, and the
+    /// disclosure says which of the two it is.
+    #[test]
+    fn a_reflected_carrier_is_proof_only_and_not_certified() {
+        let path = SegmentPath::parse_rust("crate::min2").unwrap();
+        let header = SymbolHeader::new(path, Sort::Term, Producer::Rust)
+            .with_status(KernelStatus::Reflected)
+            .with_total_carrier(uint64_witness());
+        assert_eq!(header.status().name(), "reflected");
+        assert!(!header.status().is_certified());
+        assert_eq!(header.status().certification().tier(), CertificationTier::NotKernelChecked);
+        // A total carrier is NOT enough: CALL also needs Certified, which a
+        // reflection can never reach.
+        assert!(matches!(
+            header.grant_call(),
+            Err(CapabilityRefused::NotCertified { .. })
+        ));
+        // `Reflected` carries no closure at all, and that is `unrecorded`,
+        // never `empty` — the fail-closed side.
+        assert!(!KernelStatus::Reflected.closure().is_recorded());
+    }
+
     /// `unrecorded` is not `empty`. A producer holding only `axiom_deps(&Name)`
     /// has a name list, not an authority verdict — `axiom_deps` never
     /// re-typechecks, so a structurally-inserted theorem has an empty one and
@@ -2024,6 +3314,247 @@ mod tests {
         assert!(!KernelStatus::Elaborated.is_certified());
     }
 
+    // -- Capability: the lattice (I3) --------------------------------------
+
+    /// The order of record is `Proof < Call` in AUTHORITY. The derived `Ord`
+    /// agrees with it today only because the variants happen to be typed out
+    /// in that order — so pin it, and a reorder breaks a test instead of
+    /// silently inverting every `meet` in the firewall.
+    #[test]
+    fn the_capability_order_is_declared_not_accidental() {
+        assert_eq!(Capability::AUTHORITY_ASCENDING, [Capability::Proof, Capability::Call]);
+        assert!(Capability::Proof < Capability::Call, "derived Ord must be the authority order");
+        assert_eq!(Capability::LEAST, Capability::Proof);
+        assert_eq!(Capability::GREATEST, Capability::Call);
+        for (i, weaker) in Capability::AUTHORITY_ASCENDING.iter().enumerate() {
+            for stronger in &Capability::AUTHORITY_ASCENDING[i..] {
+                assert!(stronger.permits(*weaker), "{stronger:?} must permit {weaker:?}");
+            }
+        }
+    }
+
+    /// A two-element chain, checked exhaustively: `join`/`meet` are the lub/glb
+    /// of the authority order, absorbing/idempotent/commutative/associative.
+    #[test]
+    fn capability_is_a_lattice() {
+        let all = Capability::AUTHORITY_ASCENDING;
+        for a in all {
+            assert_eq!(a.join(a), a, "idempotent");
+            assert_eq!(a.meet(a), a, "idempotent");
+            assert_eq!(a.join(Capability::LEAST), a, "LEAST is the join identity");
+            assert_eq!(a.meet(Capability::GREATEST), a, "GREATEST is the meet identity");
+            for b in all {
+                assert_eq!(a.join(b), b.join(a), "commutative");
+                assert_eq!(a.meet(b), b.meet(a), "commutative");
+                assert!(a.join(b).permits(a), "join is an upper bound");
+                assert!(a.permits(a.meet(b)), "meet is a lower bound");
+                assert_eq!(a.join(b), std::cmp::max(a, b));
+                assert_eq!(a.meet(b), std::cmp::min(a, b));
+                for c in all {
+                    assert_eq!(a.join(b).join(c), a.join(b.join(c)), "associative");
+                    assert_eq!(a.meet(b).meet(c), a.meet(b.meet(c)), "associative");
+                }
+            }
+        }
+        // The sentence the whole firewall rests on.
+        assert_eq!(Capability::Call.meet(Capability::Proof), Capability::Proof);
+    }
+
+    /// AUTHORITY and OBSERVATION are dual, and the duality is the ratified
+    /// semantics: PROOF sees more SYMBOLS, CALL holds more AUTHORITY over one.
+    /// If these ever coincide, someone has collapsed §4.1.1 into one axis.
+    #[test]
+    fn observation_is_the_dual_of_authority() {
+        // §4.1.1: PROOF is total observer capability — it names EVERYTHING.
+        assert!(Capability::Proof.observes_at_least(Capability::Proof));
+        assert!(Capability::Proof.observes_at_least(Capability::Call));
+        // CALL obeys ordinary visibility: it may not name a proof-only symbol.
+        assert!(Capability::Call.observes_at_least(Capability::Call));
+        assert!(!Capability::Call.observes_at_least(Capability::Proof));
+        // Strictly more: the observation order is not the authority order.
+        assert!(Capability::Proof.observes_at_least(Capability::Call));
+        assert!(!Capability::Proof.permits(Capability::Call));
+    }
+
+    /// The visibility axis must not become a function of the frontend
+    /// firewall's provenance axis (decision doc §2, and the rationale carried
+    /// in `Capability`'s own doc comment). This is a *documentation* control:
+    /// if the rationale is deleted, the reason the two are separate is gone and
+    /// the next reader merges them.
+    #[test]
+    fn the_reason_capability_is_not_proofrole_survives_in_the_source() {
+        let source = include_str!("lib.rs");
+        assert!(
+            source.contains("provenance-vs-belief"),
+            "the ProofRole rationale must stay in-source next to `Capability`"
+        );
+        assert!(
+            source.contains("how good the extractor happened to be"),
+            "the ProofRole rationale must stay in-source next to `Capability`"
+        );
+    }
+
+    // -- Capability: the transitive firewall (I3) ---------------------------
+
+    fn term(graph: &mut SymbolGraph, path: &str) -> SymbolId {
+        let header = SymbolHeader::new(rust_path(path), Sort::Term, Producer::Clean);
+        let id = header.id().clone();
+        graph.declare(header).expect("fresh path");
+        id
+    }
+
+    fn callable_term(graph: &mut SymbolGraph, path: &str) -> SymbolId {
+        let header = SymbolHeader::new(rust_path(path), Sort::Term, Producer::Rust)
+            .with_status(certified_status())
+            .with_total_carrier(uint64_witness())
+            .grant_call()
+            .expect("certified + total carrier");
+        let id = header.id().clone();
+        graph.declare(header).expect("fresh path");
+        id
+    }
+
+    /// The closure's fail-closed default: a symbol whose references were never
+    /// enumerated is `Unrecorded`, which permits observation and nothing else.
+    /// `Recorded(∅)` is a DIFFERENT value — a positive leaf finding — and that
+    /// difference is the entire rule.
+    #[test]
+    fn an_unrecorded_reference_set_is_not_an_empty_one() {
+        assert_eq!(ReferenceSet::default(), ReferenceSet::Unrecorded);
+        assert_ne!(ReferenceSet::leaf(), ReferenceSet::Unrecorded);
+
+        let mut graph = SymbolGraph::new();
+        let leaf = callable_term(&mut graph, "crate::leaf");
+        let silent = callable_term(&mut graph, "crate::silent");
+        graph.record_references(&leaf, []).expect("declared");
+
+        let closure = graph.capability_closure();
+        assert_eq!(closure.effective(&leaf), EffectiveCapability::Determined(Capability::Call));
+        assert_eq!(closure.effective(&silent), EffectiveCapability::Unrecorded);
+        assert!(closure.is_proof_only(&silent), "an unrecorded closure may not execute");
+        assert!(!closure.effective(&silent).permits(Capability::Call));
+        assert!(closure.effective(&silent).permits(Capability::Proof), "observation is unaffected");
+    }
+
+    /// The transitive rule itself: `g -> h -> proof_only` demotes BOTH, and the
+    /// refusal names the binding edge rather than blaming the symbol the user
+    /// wrote.
+    #[test]
+    fn proof_only_is_inherited_transitively() {
+        let mut graph = SymbolGraph::new();
+        let secret = term(&mut graph, "crate::secret"); // PROOF by construction
+        let h = callable_term(&mut graph, "crate::h");
+        let g = callable_term(&mut graph, "crate::g");
+        graph.record_references(&secret, []).expect("declared");
+        graph.record_references(&h, [secret.clone()]).expect("declared");
+        graph.record_references(&g, [h.clone()]).expect("declared");
+
+        let closure = graph.capability_closure();
+        assert!(closure.is_proof_only(&secret));
+        assert!(closure.is_proof_only(&h), "one proof-only edge demotes the referrer");
+        assert!(closure.is_proof_only(&g), "and the demotion is transitive");
+
+        // PROOF observes all three with no annotation (control (b), in-graph).
+        for id in [&secret, &h, &g] {
+            closure.require(id, Capability::Proof, "spelled").expect("PROOF names everything");
+        }
+        // CALL is refused, and the refusal names the WITNESS, not `g` itself.
+        let err = closure.require(&g, Capability::Call, "g").expect_err("CALL must be refused");
+        assert!(matches!(err, ProofOnlyRefusal::Transitive { .. }), "{err:?}");
+        assert!(err.to_string().contains("visible but not executable"), "{err}");
+        assert!(!err.to_string().contains("not found"), "{err}");
+        assert!(err.to_string().contains("crate::h"), "the binding edge must be named: {err}");
+        assert!(err.to_string().contains("options:"), "{err}");
+
+        // A locally proof-only symbol is refused as DECLARED, not transitively.
+        let err = closure.require(&secret, Capability::Call, "secret").expect_err("refused");
+        assert!(matches!(err, ProofOnlyRefusal::Declared { .. }), "{err:?}");
+    }
+
+    /// An edge to a symbol with NO header poisons the closure. It is not
+    /// skipped: "we know there is an edge and nothing about where it goes" is
+    /// strictly worse than knowing it goes somewhere proof-only.
+    #[test]
+    fn an_edge_to_an_undeclared_symbol_poisons_the_closure() {
+        let mut graph = SymbolGraph::new();
+        let g = callable_term(&mut graph, "crate::g");
+        let dangling = SymbolId::new(rust_path("crate::nowhere"), Namespace::Value);
+        graph.record_references(&g, [dangling]).expect("declared");
+
+        let closure = graph.capability_closure();
+        assert_eq!(closure.effective(&g), EffectiveCapability::Unrecorded);
+        let err = closure.require(&g, Capability::Call, "g").expect_err("refused");
+        assert!(matches!(err, ProofOnlyRefusal::ClosureUnrecorded { .. }), "{err:?}");
+        assert!(err.to_string().contains("visible but not executable"), "{err}");
+        assert!(err.to_string().contains("INCOMPLETE"), "{err}");
+    }
+
+    /// `Unrecorded` is absorbing under `meet`, exactly as `AxiomClosure::merge`
+    /// is on its own `unrecorded` — same rule, different closure.
+    #[test]
+    fn the_capability_meet_is_absorbing_on_unrecorded() {
+        use EffectiveCapability::{Determined, Unrecorded};
+        for value in [Determined(Capability::Call), Determined(Capability::Proof), Unrecorded] {
+            assert_eq!(value.meet(Unrecorded), Unrecorded);
+            assert_eq!(Unrecorded.meet(value), Unrecorded);
+        }
+        assert_eq!(
+            Determined(Capability::Call).meet(Determined(Capability::Proof)),
+            Determined(Capability::Proof)
+        );
+        assert_eq!(Unrecorded.claimable(), Capability::LEAST);
+    }
+
+    /// A reference CYCLE settles at the meet of the cycle instead of
+    /// deadlocking or defaulting to `Call`. Recursion is handled by the
+    /// fixpoint's polarity, not by a special case.
+    #[test]
+    fn a_reference_cycle_settles_at_the_meet() {
+        let mut graph = SymbolGraph::new();
+        let a = callable_term(&mut graph, "crate::a");
+        let b = callable_term(&mut graph, "crate::b");
+        graph.record_references(&a, [b.clone()]).expect("declared");
+        graph.record_references(&b, [a.clone()]).expect("declared");
+        let closure = graph.capability_closure();
+        assert_eq!(closure.effective(&a), EffectiveCapability::Determined(Capability::Call));
+        assert_eq!(closure.effective(&b), EffectiveCapability::Determined(Capability::Call));
+
+        // Now poison the cycle from outside: both members must fall.
+        let secret = term(&mut graph, "crate::secret");
+        graph.record_references(&secret, []).expect("declared");
+        graph.record_references(&b, [a.clone(), secret]).expect("declared");
+        let closure = graph.capability_closure();
+        assert!(closure.is_proof_only(&b), "the poisoned member falls");
+        assert!(closure.is_proof_only(&a), "and drags the cycle with it");
+    }
+
+    /// Phase 2 may not invent references for a symbol phase 1 never saw — the
+    /// same rule `record_status` already enforces, so the two phases cannot
+    /// disagree about which symbols exist.
+    #[test]
+    fn references_cannot_be_recorded_for_an_undeclared_symbol() {
+        let mut graph = SymbolGraph::new();
+        let ghost = SymbolId::new(rust_path("crate::ghost"), Namespace::Value);
+        let err = graph.record_references(&ghost, []).expect_err("undeclared");
+        assert_eq!(err.id, ghost);
+    }
+
+    /// The closure never *raises* a capability: whatever a producer records, a
+    /// symbol's effective capability is bounded by its declared one.
+    #[test]
+    fn the_closure_only_ever_lowers() {
+        let mut graph = SymbolGraph::new();
+        let proof_only = term(&mut graph, "crate::p");
+        let callable = callable_term(&mut graph, "crate::c");
+        graph.record_references(&proof_only, [callable.clone()]).expect("declared");
+        graph.record_references(&callable, []).expect("declared");
+        let closure = graph.capability_closure();
+        assert!(
+            closure.is_proof_only(&proof_only),
+            "referencing a CALL symbol cannot promote a PROOF-only declaration"
+        );
+    }
+
     // -- Capability -------------------------------------------------------
 
     /// I1 SCOPE: ZERO CALL capability. A fresh header is PROOF-only, and the
@@ -2064,7 +3595,7 @@ mod tests {
         );
         let header = SymbolHeader::new(rust_path("crate::m::f"), Sort::Term, Producer::Clean)
             .with_status(status)
-            .with_carrier(CarrierEvidence::Total);
+            .with_total_carrier(uint64_witness());
         let err = header.grant_call().expect_err("assumption-bearing may not CALL");
         assert!(matches!(err, CapabilityRefused::NotCertified { .. }));
         assert!(err.to_string().contains("key_lemma"));
@@ -2077,10 +3608,11 @@ mod tests {
     /// equal while the emitted code wraps (§5(b), G3).
     #[test]
     fn call_is_refused_without_a_total_carrier() {
-        for carrier in [CarrierEvidence::None, CarrierEvidence::Declared] {
+        for carrier in [UnwitnessedCarrier::None, UnwitnessedCarrier::Declared] {
             let header = SymbolHeader::new(rust_path("crate::m::f"), Sort::Term, Producer::Clean)
                 .with_status(certified_status())
                 .with_carrier(carrier);
+            assert!(header.carrier_witness().is_none(), "an unwitnessed carrier has no witness");
             let err = header.grant_call().expect_err("a declared carrier grants nothing");
             assert!(matches!(err, CapabilityRefused::NoTotalCarrier { .. }));
             let rendered = err.to_string();
@@ -2088,6 +3620,184 @@ mod tests {
             assert!(rendered.contains("options:"), "{rendered}");
         }
         assert_eq!(CarrierEvidence::default(), CarrierEvidence::None);
+        assert_eq!(UnwitnessedCarrier::default(), UnwitnessedCarrier::None);
+    }
+
+    /// **I4's seam control.** `CarrierEvidence::Total` is not assignable: it is
+    /// minted only by `with_total_carrier`, which requires a `CarrierWitness`,
+    /// which is only ever the `Ok` of `RepresentationObligation::discharge`.
+    ///
+    /// The compile-time half of this claim is that `with_carrier` cannot even
+    /// be *called* with `Total` — its parameter type has no such variant — so
+    /// it is checked by the type system on every build rather than here.
+    #[test]
+    fn total_is_reachable_only_through_a_discharged_obligation() {
+        // The `Nat -> u64` obligation, stated HONESTLY, cannot discharge — at
+        // any width. This is the miscompile, refused at its source.
+        for width in [8_u32, 16, 32, 64] {
+            let err = RepresentationObligation::new(
+                "Nat",
+                format!("u{width}"),
+                CarrierExtent::Unbounded,
+                CarrierExtent::Bits(width),
+                OperationAgreement::ExactOnEveryOperation,
+            )
+            .discharge()
+            .expect_err("an unbounded Clean type has no fixed-width carrier");
+            assert!(matches!(err, ObligationNotDischarged::NoFixedExtent { .. }));
+            let text = err.to_string();
+            assert!(text.contains("Nat"), "{text}");
+            assert!(text.contains("options:"), "v7/D3: {text}");
+        }
+
+        // A width disagreement is refused in BOTH directions: narrowing
+        // truncates, widening changes the wrap modulus.
+        for (clean_bits, rust_bits) in [(64_u32, 32_u32), (8, 64)] {
+            let err = RepresentationObligation::new(
+                format!("UInt{clean_bits}"),
+                format!("u{rust_bits}"),
+                CarrierExtent::Bits(clean_bits),
+                CarrierExtent::Bits(rust_bits),
+                OperationAgreement::ExactOnEveryOperation,
+            )
+            .discharge()
+            .expect_err("an inexact width is not a faithful carrier");
+            assert!(matches!(err, ObligationNotDischarged::ExtentMismatch { .. }));
+        }
+
+        // Equal cardinality is NOT faithfulness: the operations must agree too.
+        let err = RepresentationObligation::new(
+            "UInt64",
+            "u64",
+            CarrierExtent::Bits(64),
+            CarrierExtent::Bits(64),
+            OperationAgreement::Unestablished,
+        )
+        .discharge()
+        .expect_err("unestablished operations discharge nothing");
+        assert!(matches!(err, ObligationNotDischarged::OperationsUnestablished { .. }));
+
+        // A `Prop` is observed, never produced.
+        assert!(matches!(
+            RepresentationObligation::new(
+                "Prop",
+                "bool",
+                CarrierExtent::NotAValue,
+                CarrierExtent::Bits(1),
+                OperationAgreement::ExactOnEveryOperation,
+            )
+            .discharge(),
+            Err(ObligationNotDischarged::NoFixedExtent { .. })
+        ));
+
+        // A target-dependent width is bounded but not KNOWN, which is not the
+        // same fact and does not discharge either.
+        assert!(matches!(
+            RepresentationObligation::new(
+                "USize",
+                "usize",
+                CarrierExtent::TargetDependent,
+                CarrierExtent::Bits(64),
+                OperationAgreement::ExactOnEveryOperation,
+            )
+            .discharge(),
+            Err(ObligationNotDischarged::NoFixedExtent { .. })
+        ));
+
+        // I6 — the trusted-runtime lane, positive: the ONE pinned pairing, at
+        // the ONE agreement kind its extents require, discharges.
+        let bignum_witness = RepresentationObligation::new(
+            "Nat",
+            "trust_bignum::Nat",
+            CarrierExtent::Unbounded,
+            CarrierExtent::Unbounded,
+            OperationAgreement::TrustedRuntimeAgreement,
+        )
+        .discharge()
+        .expect("the pinned Nat/trust_bignum::Nat pairing discharges");
+        assert_eq!(bignum_witness.width(), CarrierWidth::UnboundedExact);
+        assert!(
+            bignum_witness.to_string().contains("trusted runtime"),
+            "the witness must SAY it rests on a trusted runtime: {bignum_witness}"
+        );
+
+        // I6 negative 1: an unbounded pairing claiming the fixed-width
+        // agreement kind states a modulus fact that has no modulus.
+        let err = RepresentationObligation::new(
+            "Nat",
+            "trust_bignum::Nat",
+            CarrierExtent::Unbounded,
+            CarrierExtent::Unbounded,
+            OperationAgreement::ExactOnEveryOperation,
+        )
+        .discharge()
+        .expect_err("an unbounded pairing cannot state a wrap-modulus agreement");
+        assert!(matches!(err, ObligationNotDischarged::WrongAgreementKind { .. }), "{err:?}");
+        assert!(err.to_string().contains("options:"), "v7/D3: {err}");
+
+        // I6 negative 2: a fixed-width pairing claiming the trusted runtime —
+        // a checkable fact must be checked, never trusted.
+        let err = RepresentationObligation::new(
+            "UInt64",
+            "u64",
+            CarrierExtent::Bits(64),
+            CarrierExtent::Bits(64),
+            OperationAgreement::TrustedRuntimeAgreement,
+        )
+        .discharge()
+        .expect_err("a fixed-width pairing may not substitute trust for the width check");
+        assert!(matches!(err, ObligationNotDischarged::WrongAgreementKind { .. }), "{err:?}");
+
+        // I6 negative 3 — THE PAIRING PIN. `Int` honestly reports Unbounded,
+        // exactly like `Nat`, and the constructor is public: without the pin
+        // this would witness, and ℤ is not carried by a ℕ runtime.
+        let err = RepresentationObligation::new(
+            "Int",
+            "trust_bignum::Nat",
+            CarrierExtent::Unbounded,
+            CarrierExtent::Unbounded,
+            OperationAgreement::TrustedRuntimeAgreement,
+        )
+        .discharge()
+        .expect_err("a pairing no shipped runtime carries must be unconstructible");
+        assert!(matches!(err, ObligationNotDischarged::UntrustedRuntimePairing { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("Int"), "{text}");
+        assert!(text.contains("options:"), "v7/D3: {text}");
+
+        // I6 negative 4: the same pin, from the carrier side — an impersonator
+        // runtime under a different path is not the pinned pairing.
+        assert!(matches!(
+            RepresentationObligation::new(
+                "Nat",
+                "evil::Nat",
+                CarrierExtent::Unbounded,
+                CarrierExtent::Unbounded,
+                OperationAgreement::TrustedRuntimeAgreement,
+            )
+            .discharge(),
+            Err(ObligationNotDischarged::UntrustedRuntimePairing { .. })
+        ));
+
+        // The positive: the witness records WHAT justified the capability.
+        let header = SymbolHeader::new(rust_path("crate::m::f"), Sort::Term, Producer::Clean)
+            .with_status(certified_status())
+            .with_total_carrier(uint64_witness());
+        assert_eq!(header.carrier(), CarrierEvidence::Total);
+        let witness = header.carrier_witness().expect("Total carries its witness");
+        assert_eq!(witness.clean_type(), "UInt64");
+        assert_eq!(witness.rust_carrier(), "u64");
+        assert_eq!(witness.width(), CarrierWidth::Bits(64));
+
+        // Recording an unwitnessed carrier over it drops BOTH, so the pair can
+        // never disagree.
+        let downgraded = header.with_carrier(UnwitnessedCarrier::Declared);
+        assert_eq!(downgraded.carrier(), CarrierEvidence::Declared);
+        assert!(downgraded.carrier_witness().is_none());
+        assert!(matches!(
+            downgraded.grant_call(),
+            Err(CapabilityRefused::NoTotalCarrier { .. })
+        ));
     }
 
     /// The positive control, so the four refusals above are not just "grant_call
@@ -2097,7 +3807,7 @@ mod tests {
     fn call_is_granted_only_when_both_conditions_hold() {
         let header = SymbolHeader::new(rust_path("crate::m::f"), Sort::Term, Producer::Clean)
             .with_status(certified_status())
-            .with_carrier(CarrierEvidence::Total)
+            .with_total_carrier(uint64_witness())
             .grant_call()
             .expect("certified + total carrier");
         assert_eq!(header.capability(), Capability::Call);

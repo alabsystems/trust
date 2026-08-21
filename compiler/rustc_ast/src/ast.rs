@@ -4241,7 +4241,23 @@ impl CleanDeclKind {
 /// elaborator re-parses the island text (which the island also carries) with
 /// the tactic-pattern table it owns, and that parse — not this one — is what
 /// feeds the kernel.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Debug, StableHash)]
+///
+/// # `node_id` is AST-only, and `StableHash` is hand-written because of it
+///
+/// I5 needs a per-declaration [`NodeId`]: `Resolver::create_def` keys both its
+/// duplicate-definition assert and its `node_id -> def_id` insert on one, and
+/// `DUMMY_NODE_ID` makes it skip the insert — so a def minted for a declaration
+/// would exist with nothing able to find it again. See the `node_id` field docs.
+///
+/// A `NodeId` must never enter incremental state: [`NodeId`]'s own `StableHash`
+/// impl *panics* rather than hash one. This struct is reused verbatim by
+/// `rustc_hir::ItemKind::CleanIsland`, so the derive would make every
+/// incremental hash of an island panic. Lowering therefore resets the field to
+/// `DUMMY_NODE_ID` (`rustc_ast_lowering/src/item.rs`) and the impl below skips
+/// it. Both halves are deliberate: the reset means the HIR never *carries* a
+/// resolution-time id, and the skip means it could not be hashed even if some
+/// later edit forgot to reset it.
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Debug)]
 pub struct CleanIslandDecl {
     pub kind: CleanDeclKind,
     /// The declared name, already interned. `sym::empty` for the commands that
@@ -4251,6 +4267,32 @@ pub struct CleanIslandDecl {
     /// island-relative byte offsets remapped onto the island's `content_span`.
     /// Diagnostics built from this land inside the island.
     pub span: Span,
+    /// Trust (I5): the resolution-time identity of this declaration.
+    ///
+    /// Written as `DUMMY_NODE_ID` by the parser and renumbered by
+    /// `InvocationCollector::visit_id` during expansion — i.e. **before** def
+    /// collection runs — because the shared visitor walks this field.
+    ///
+    /// It exists so that a `DefId` minted for this declaration has the same
+    /// kind of identity every other definition has. It is *not* evidence that
+    /// anything was minted: no mint happens without the I5 preconditions
+    /// (`crates/trust-clean-origin/src/mint.rs`), and this id is allocated for
+    /// every declaration regardless.
+    ///
+    /// **Meaningless outside the AST.** Reset to `DUMMY_NODE_ID` by lowering
+    /// and never hashed; see the type docs.
+    pub node_id: NodeId,
+}
+
+// Trust (I5): hand-written to skip `node_id`. See the type docs — `NodeId`'s
+// own `StableHash` panics, and this struct is shared with the HIR.
+impl StableHash for CleanIslandDecl {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        let Self { kind, name, span, node_id: _ } = self;
+        kind.stable_hash(hcx, hasher);
+        name.stable_hash(hcx, hasher);
+        span.stable_hash(hcx, hasher);
+    }
 }
 
 /// Trust: the payload of an [`ItemKind::CleanIsland`] — the real parse of a
@@ -4260,6 +4302,20 @@ pub struct CleanIslandDecl {
 /// A Clean *parse* error is reported as an ordinary rustc parse-time
 /// diagnostic spanned inside the island. A parse SUCCESS means only that: it
 /// never implies kernel authority.
+///
+/// Trust (I8): the same node also carries the OUT-OF-LINE form,
+/// `clean mod name;`, in two states. Between rustc's parse and macro
+/// expansion the node is PENDING — `unloaded_unit: Some(name)` with a
+/// zero-width `content_span`, empty `text` and no `decls` (the inert shape of
+/// an empty island, so a defect that let it survive downstream could not make
+/// a claim). During expansion, at the same seam where out-of-line `mod name;`
+/// bodies load (`rustc_expand`'s `ModKind::Unloaded` arm), the `.clean` file
+/// is loaded as a real `SourceFile`, REALLY PARSED by the real Clean parser,
+/// and this payload is replaced with the loaded one — after which a unit is
+/// indistinguishable from an inline island everywhere downstream. That
+/// indistinguishability is I8's acceptance control ("a `.clean` unit and an
+/// inline island must produce identical graph entries"), delivered by node
+/// shape rather than by translation.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct CleanIsland {
     /// Span of the island body (everything between the braces). Load-bearing:
@@ -4273,6 +4329,21 @@ pub struct CleanIsland {
     pub text: Symbol,
     /// The declarations `clean_parser` recognised, in source order.
     pub decls: ThinVec<CleanIslandDecl>,
+    /// Trust (I8): `Some(name)` while this island is a pending out-of-line
+    /// unit — `clean mod name;` — whose `.clean` file has not been loaded
+    /// yet; `None` for every inline island and for every unit once loaded.
+    ///
+    /// A FIELD rather than a side table or an in-band encoding, deliberately:
+    /// there is no key for a side table at parse time (every `NodeId` is
+    /// `DUMMY_NODE_ID` until `InvocationCollector`'s own walk, which is the
+    /// consumer of this marker), and every in-band encoding collides with a
+    /// reachable island state — `clean {name}` whose Clean parse failed is
+    /// byte-identical to `{text: name, decls: []}`, and misreading it would
+    /// LOAD A FILE THE USER NEVER NAMED. `Option<Ident>` adds no dependency
+    /// edge, is never lowered (loading precedes def collection, which
+    /// precedes lowering — `rustc_hir::ItemKind::CleanIsland` is unchanged),
+    /// and is `None` in every payload the verify pass or the mint can see.
+    pub unloaded_unit: Option<Ident>,
 }
 
 // Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
